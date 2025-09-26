@@ -1,0 +1,10 @@
+^D:\USERS\PROJECTS\NEW_DATASET\DATA_COLLECTION\PCCR\CPP-REMOTE-EYE\CPP_EYETRACKER\UTILS\CAM_MODEL\BUILD\CMAKEFILES\21BA83BEB78F398A2982675F2CCC2054\GENERATE.STAMP.RULE
+setlocal
+D:\apps\Cmake\bin\cmake.exe -SD:/users/projects/new_dataset/data_collection/PCCR/cpp-remote-eye/cpp_eyetracker/utils/cam_model -BD:/users/projects/new_dataset/data_collection/PCCR/cpp-remote-eye/cpp_eyetracker/utils/cam_model/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/users/projects/new_dataset/data_collection/PCCR/cpp-remote-eye/cpp_eyetracker/utils/cam_model/build/cam_model.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

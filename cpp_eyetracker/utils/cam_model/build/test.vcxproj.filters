@@ -1,0 +1,16 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="D:\users\projects\new_dataset\data_collection\PCCR\cpp-remote-eye\cpp_eyetracker\utils\cam_model\test.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="D:\users\projects\new_dataset\data_collection\PCCR\cpp-remote-eye\cpp_eyetracker\utils\cam_model\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{82F63F8F-1318-3BC1-B0AB-FB7984CBCC0F}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
