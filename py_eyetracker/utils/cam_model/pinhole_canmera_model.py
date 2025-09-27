@@ -64,3 +64,18 @@ class PinholeCameraModel:
         wcs = self.ccs_to_wcs(ccs)
         return wcs
     
+
+if __name__ == '__main__':
+    # Test the pinhole camera model
+    camera = PinholeCameraModel(
+        principal_point_x=100,
+        principal_point_y=100,
+        pixel_size_x_cm=0.01,
+        pixel_size_y_cm=0.01,
+        effective_focal_length_cm=50,
+        camera_angles=np.array([0, 0, np.pi/4]),
+        position=np.array([10, 10, 10])
+    )
+    ics = np.array([100, 100])
+    wcs = camera.ics_to_wcs(ics)
+    print(wcs)
