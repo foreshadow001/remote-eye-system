@@ -1,9 +1,28 @@
+// cmake -B build -S . -G "Visual Studio 17 2022"
+// cmake --build build --config Release
+
 #include "math_types.hpp"
 
 namespace gazeestimation {
 
-    // transfer the given vector in ICS to WCS
     class PinholeCameraModel {
+    /*
+    This class can transfer a point in ICS to WCS.
+    
+    Attributes:
+        intrinsic parameters:
+            principal_point_x: (double) the x coordinate of principal point in pixel.
+            principal_point_y: (double) the y coordinate of principal point in pixel.
+            pixel_size_cm_x: (double) the x pixel size in cm.
+            pixel_size_cm_y: (double) the y pixel size in cm.
+            effective_focal_length_cm: (double) the effective focal length of the camera.
+        extrinsic parameters:
+            camera_angles: (Vec3) the rotation vector of the camera.
+            position: (Vec3) the translation vector of the camera.
+
+    Fuctions:
+        ics_to_wcs: transfer a vector in ICS to WCS.
+    */
         private:
         Vec3 camera_angles;
         Mat3x3 actual_rotation_matrix;
@@ -26,7 +45,7 @@ namespace gazeestimation {
         principal_point_y(0),
         pixel_size_cm_x(0),
         pixel_size_cm_y(0),
-        effective_focal_length_cm(0) {}
+        effective_focal_length_cm(0) { }
 
         void set_camera_angles(double x, double y, double z) {
             camera_angles = make_vec3(x, y, z);
@@ -85,5 +104,6 @@ namespace gazeestimation {
             set_camera_angles(camera_angles[0], camera_angles[1], z);
         }
     }; // class PinholeCameraModel
+
 } // namespace gazeestimation
 

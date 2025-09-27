@@ -21,6 +21,10 @@ int main() {
 
     x = 100;
     y = 200;
+    std::cout << "Please input x: ";
+    std::cin >> x;
+    std::cout << "Please input y: ";
+    std::cin >> y;
     wcs = cam.ics_to_wcs(make_vec2(x, y));
     std::cout << "wcs: " << wcs.transpose() << std::endl;
 
