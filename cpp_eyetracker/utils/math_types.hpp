@@ -1,4 +1,3 @@
-#ifndef MATH_TYPES_HPP_INCLUDED
 #define MATH_TYPES_HPP_INCLUDED
 
 #include <Eigen/Core>
@@ -105,5 +104,3 @@ namespace gazeestimation {
 	/// Returns the midpoint of the shortest segment between the two lines o1+a * d1 and o2 + b * d2;
 	Vec3 shortest_line_segment(const Vec3& o1, const Vec3& d1, const Vec3& o2, const Vec3& d2);
 }
-
-#endif

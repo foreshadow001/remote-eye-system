@@ -86,6 +86,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
+      <AdditionalIncludeDirectories>D:\users\projects\new_dataset\data_collection\PCCR\cpp-remote-eye\cpp_eyetracker\utils\cam_model\..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>%(AdditionalOptions) /external:I "D:/apps/vcpkg/buildtrees/eigen3/src/a8c0519f1c-ba17d9986c.clean"</AdditionalOptions>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
@@ -110,10 +111,10 @@
     </ClCompile>
     <ResourceCompile>
       <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_DEBUG;_WINDOWS;CMAKE_INTDIR=\"Debug\"</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\users\projects\new_dataset\data_collection\PCCR\cpp-remote-eye\cpp_eyetracker\utils\cam_model\..;D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Midl>
-      <AdditionalIncludeDirectories>D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\users\projects\new_dataset\data_collection\PCCR\cpp-remote-eye\cpp_eyetracker\utils\cam_model\..;D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
       <HeaderFileName>%(Filename).h</HeaderFileName>
       <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
@@ -140,6 +141,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
+      <AdditionalIncludeDirectories>D:\users\projects\new_dataset\data_collection\PCCR\cpp-remote-eye\cpp_eyetracker\utils\cam_model\..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>%(AdditionalOptions) /external:I "D:/apps/vcpkg/buildtrees/eigen3/src/a8c0519f1c-ba17d9986c.clean"</AdditionalOptions>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
@@ -165,10 +167,10 @@
     </ClCompile>
     <ResourceCompile>
       <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR=\"Release\"</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\users\projects\new_dataset\data_collection\PCCR\cpp-remote-eye\cpp_eyetracker\utils\cam_model\..;D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Midl>
-      <AdditionalIncludeDirectories>D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\users\projects\new_dataset\data_collection\PCCR\cpp-remote-eye\cpp_eyetracker\utils\cam_model\..;D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
       <HeaderFileName>%(Filename).h</HeaderFileName>
       <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
@@ -195,6 +197,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">
     <ClCompile>
+      <AdditionalIncludeDirectories>D:\users\projects\new_dataset\data_collection\PCCR\cpp-remote-eye\cpp_eyetracker\utils\cam_model\..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>%(AdditionalOptions) /external:I "D:/apps/vcpkg/buildtrees/eigen3/src/a8c0519f1c-ba17d9986c.clean"</AdditionalOptions>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
@@ -220,10 +223,10 @@
     </ClCompile>
     <ResourceCompile>
       <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR=\"MinSizeRel\"</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\users\projects\new_dataset\data_collection\PCCR\cpp-remote-eye\cpp_eyetracker\utils\cam_model\..;D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Midl>
-      <AdditionalIncludeDirectories>D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\users\projects\new_dataset\data_collection\PCCR\cpp-remote-eye\cpp_eyetracker\utils\cam_model\..;D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
       <HeaderFileName>%(Filename).h</HeaderFileName>
       <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
@@ -250,6 +253,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">
     <ClCompile>
+      <AdditionalIncludeDirectories>D:\users\projects\new_dataset\data_collection\PCCR\cpp-remote-eye\cpp_eyetracker\utils\cam_model\..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>%(AdditionalOptions) /external:I "D:/apps/vcpkg/buildtrees/eigen3/src/a8c0519f1c-ba17d9986c.clean"</AdditionalOptions>
       <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
@@ -274,10 +278,10 @@
     </ClCompile>
     <ResourceCompile>
       <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_WINDOWS;NDEBUG;CMAKE_INTDIR=\"RelWithDebInfo\"</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\users\projects\new_dataset\data_collection\PCCR\cpp-remote-eye\cpp_eyetracker\utils\cam_model\..;D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Midl>
-      <AdditionalIncludeDirectories>D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>D:\users\projects\new_dataset\data_collection\PCCR\cpp-remote-eye\cpp_eyetracker\utils\cam_model\..;D:\apps\vcpkg\buildtrees\eigen3\src\a8c0519f1c-ba17d9986c.clean;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
       <HeaderFileName>%(Filename).h</HeaderFileName>
       <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
