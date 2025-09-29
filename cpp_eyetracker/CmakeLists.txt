@@ -1,17 +1,28 @@
 # /CmakeLists.txt
 
+# cmake minimum version
 cmake_minimum_required(VERSION 3.15)
+
+# set vcpkg toolchain file, which will be used to find dependencies
+set(CMAKE_TOOLCHAIN_FILE "D:/apps/vcpkg/scripts/buildsystems/vcpkg.cmake"
+    CACHE STRING "")
+
+# project name (https://cmake.com.cn/cmake/help/latest/command/project.html)
+# ⚠️ do not set more than one project under the premier directory,
+#    unless you want to create anoter project in the same directory.
 project(cpp_eyetracker LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(CMAKE_TOOLCHAIN_FILE "D:/apps/vcpkg/scripts/buildsystems/vcpkg.cmake"
-    CACHE STRING "")
-
+# choose build type
 option(BUILD_TESTING "Build tests" ON)
 if(BUILD_TESTING)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+# add subdirectories
 add_subdirectory(utils)
+
+# TODO: add install configuration

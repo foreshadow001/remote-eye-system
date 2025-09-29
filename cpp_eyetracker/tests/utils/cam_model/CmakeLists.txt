@@ -6,6 +6,6 @@ find_package(Eigen3 CONFIG REQUIRED)
 add_executable(test_cam_model test_cam_model.cpp)
 target_link_libraries(test_cam_model
     PRIVATE
-        cam_model::cam_model
-        utils
+        eyetracker::cam_model
+        eyetracker::utils
 )

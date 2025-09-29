@@ -1,0 +1,5 @@
+# vscode files
+.vscode/
+
+# build files
+cpp_eyetracker/build/

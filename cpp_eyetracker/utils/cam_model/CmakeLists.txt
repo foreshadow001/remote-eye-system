@@ -3,7 +3,7 @@
 find_package(Eigen3 CONFIG REQUIRED)
 
 add_library(cam_model INTERFACE)
-add_library(cam_model::cam_model ALIAS cam_model)
+add_library(eyetracker::cam_model ALIAS cam_model)
 
 target_include_directories(cam_model INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
