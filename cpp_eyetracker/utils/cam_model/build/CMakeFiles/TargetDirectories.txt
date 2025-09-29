@@ -1,3 +1,0 @@
-D:/users/projects/new_dataset/data_collection/PCCR/cpp-remote-eye/cpp_eyetracker/utils/cam_model/build/CMakeFiles/test.dir
-D:/users/projects/new_dataset/data_collection/PCCR/cpp-remote-eye/cpp_eyetracker/utils/cam_model/build/CMakeFiles/ALL_BUILD.dir
-D:/users/projects/new_dataset/data_collection/PCCR/cpp-remote-eye/cpp_eyetracker/utils/cam_model/build/CMakeFiles/ZERO_CHECK.dir

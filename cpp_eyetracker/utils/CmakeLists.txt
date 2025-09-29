@@ -1,0 +1,16 @@
+# /utils/CmakeLists.txt
+
+add_library(utils STATIC
+    src/math_types.cpp
+)
+
+target_include_directories(utils PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+find_package(Eigen3 CONFIG REQUIRED)
+target_link_libraries(utils PUBLIC Eigen3::Eigen)
+
+add_subdirectory(cam_model)
+add_subdirectory(eye_model)

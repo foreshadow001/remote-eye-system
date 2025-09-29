@@ -1,0 +1,4 @@
+# /tests/utils/CMakeLists.txt
+
+add_subdirectory(cam_model)
+add_subdirectory(eye_model)
