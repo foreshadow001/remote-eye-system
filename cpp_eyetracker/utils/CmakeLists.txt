@@ -16,3 +16,4 @@ target_link_libraries(utils PUBLIC Eigen3::Eigen)
 
 add_subdirectory(cam_model)
 add_subdirectory(eye_model)
+add_subdirectory(glint_detection)

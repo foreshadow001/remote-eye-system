@@ -1,0 +1,9 @@
+# /tests/utils/glint_detection/CmakeLists.txt
+
+find_package(OpenCV CONFIG REQUIRED)
+
+add_executable(test_glint test_glint.cpp)
+target_link_libraries(test_glint
+    PRIVATE
+        eyetracker::glint_detection
+)

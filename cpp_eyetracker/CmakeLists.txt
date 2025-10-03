@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.15)
 
 # set vcpkg toolchain file, which will be used to find dependencies
-set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+set(CMAKE_TOOLCHAIN_FILE "D:/apps/vcpkg/scripts/buildsystems/vcpkg.cmake"
     CACHE STRING "")
 
 # project name (https://cmake.com.cn/cmake/help/latest/command/project.html)
@@ -12,8 +12,10 @@ set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
 #    unless you want to create anoter project in the same directory.
 project(cpp_eyetracker LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_compile_options(/utf-8)
 
 # choose build type
 option(BUILD_TESTING "Build tests" ON)
