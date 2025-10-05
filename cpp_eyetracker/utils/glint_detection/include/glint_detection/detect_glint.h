@@ -1,6 +1,27 @@
 #include "opencv2/core.hpp"
 
 namespace glintdetection {
-//void GoalkeeperAnalysis::searchForGlints(Mat src, std::promise<vector<Point2f>> & p)
-std::pair<std::vector<cv::Point2f>, cv::Mat> searchForGlints(cv::Mat src, double firstEyeThresh);
+
+bool side2mid(int x, int y);
+
+std::vector<cv::Point2f>
+chooseBestMid(const std::list<cv::Point2f>& glintList,
+              const cv::Point2f& p1,
+              const cv::Point2f& p2);
+
+std::tuple<std::vector<cv::Point2f>, std::vector<cv::Point2f>>
+splitGlintsByEye(const std::vector<cv::Point2f>& glints, float distanceThr = 200.f);
+
+std::tuple<std::vector<cv::Point2f>, std::vector<cv::Point2f>, cv::Mat, cv::Mat>
+searchForGlints(cv::Mat src, double firstEyeThresh);
+
+std::tuple<std::vector<cv::Point2f>, cv::Mat>
+removeFalseGlints(std::vector<cv::Point2f> contourCenters, cv::Mat src);
+
+std::tuple<std::vector<cv::Point2f>, cv::Mat>
+findGeometry(const std::vector<cv::Point2f>& glintCandidates, cv::Mat src);
+
+std::tuple<std::vector<cv::Point2f>, cv::Mat>
+myfindGeometry(const std::vector<cv::Point2f>& glintCandidates, cv::Mat src);
+
 } // namespace glintdetection

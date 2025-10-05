@@ -8,7 +8,7 @@
 using namespace glintdetection;
 
 const std::string input_folder  = "D:/users/projects/new_dataset/data_collection/PCCR/test_dataset/images/src";
-const std::string output_folder = "D:/users/projects/new_dataset/data_collection/PCCR/test_dataset/images/gaussed";
+const std::string output_folder = "D:/users/projects/new_dataset/data_collection/PCCR/test_dataset/images/glints_geometric";
 
 int main() {
     // create output folder if not exist
@@ -24,26 +24,31 @@ int main() {
 
     int idx = 0;
     do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        {
             std::string filename = fd.cFileName;
             std::string filepath = input_folder + "\\" + filename;
 
             cv::Mat img = cv::imread(filepath, cv::IMREAD_COLOR);
-            if (img.empty()) {
+            if (img.empty())
+            {
                 std::cerr << "failed to read image: " << filepath << std::endl;
                 continue;
             }
 
             // call searchForGlints
-            auto result = searchForGlints(img, 50.0);
-            const auto& glints  = result.first;
-            const auto& gaussed = result.second;
+            auto [leftEyeGlints, rightEyeGlints, processed_img_left, processed_img_right] = searchForGlints(img, 50.0);
 
             // save the gaussed image
-            std::string outpath = output_folder + "\\" + filename;
-            cv::imwrite(outpath, gaussed);
+            std::string index = std::to_string(idx);
+            std::string num_glints = std::to_string(leftEyeGlints.size() + rightEyeGlints.size());
+            std::string outpath_left = output_folder + "\\" + "left_" + index + "_glints_" + num_glints + "_" + filename;
+            cv::imwrite(outpath_left, processed_img_left);
 
-            std::cout << "saved to " << outpath << " | num of glints: " << glints.size() << std::endl;
+            std::string outpath_right = output_folder + "\\" + "right_" + index + "_glints_" + num_glints + "_" + filename;
+            cv::imwrite(outpath_right, processed_img_right);
+
+            std::cout << "saved to " << output_folder << " | index: " + index << " | num of glints: " << num_glints << std::endl;
             idx++;
         }
     } while (::FindNextFile(hFind, &fd));
