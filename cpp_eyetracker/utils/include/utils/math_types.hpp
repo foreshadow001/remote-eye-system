@@ -1,4 +1,8 @@
-#define MATH_TYPES_HPP_INCLUDED
+// utils/include/utils/math_types.hpp
+#pragma once
+
+// #undef EIGEN_ALIGN
+// #define EIGEN_DONT_ALIGN_STATICALLY
 
 #include <Eigen/Core>
 
@@ -42,12 +46,12 @@ namespace gazeestimation {
 		return a.normalized();
 	}
 
-	inline double length(const Vec3& a)
+	inline double length_vec3(const Vec3& a)
 	{
 		return a.norm();
 	}
 
-	inline double length(const Vec2& a)
+	inline double length_vec2(const Vec2& a)
 	{
 		return a.norm();
 	}

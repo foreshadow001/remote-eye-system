@@ -1,0 +1,9 @@
+# /tests/utils/pupil_center/CmakeLists.txt
+
+find_package(OpenCV CONFIG REQUIRED)
+
+add_executable(test_pupil test_pupil.cpp)
+target_link_libraries(test_pupil
+    PRIVATE
+        eyetracker::pupil_center
+)

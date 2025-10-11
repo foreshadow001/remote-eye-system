@@ -15,6 +15,8 @@ project(cpp_eyetracker LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# set(CMAKE_VERBOSE_MAKEFILE ON)
+
 add_compile_options(/utf-8)
 
 # choose build type
@@ -26,5 +28,7 @@ endif()
 
 # add subdirectories
 add_subdirectory(utils)
+add_subdirectory(calib)
+add_subdirectory(inference)
 
 # TODO: add install configuration

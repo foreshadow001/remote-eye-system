@@ -1,0 +1,71 @@
+left pupil center: [567.63, 294.023]
+right pupil center: [203.604, 289.067]
+cornea center: (-3.67617, -8.13032, 66.8433)
+refraction point: (-3.5953, -7.8636, 66.1148)
+pupil center: (-3.62016, -7.92898, 66.479)
+optical axis unit: (0.133372, 0.479372, -0.867418)
+visual axis unit: (-0.217026, 0.500358, 0.838178)
+left pupil center: [622.025, 308.489]
+right pupil center: [235.995, 281.471]
+cornea center: (-3.90549, -7.61509, 60.8232)
+refraction point: (-3.9328, -7.32574, 60.0994)
+pupil center: (-3.94756, -7.39574, 60.4675)
+optical axis unit: (-0.100173, 0.522279, -0.846871)
+visual axis unit: (0.0116293, 0.542436, 0.840017)
+left pupil center: [561.708, 289.029]
+right pupil center: [213.802, 284.018]
+cornea center: (-3.62425, -8.00454, 66.2115)
+refraction point: (-3.4826, -7.72344, 65.4978)
+pupil center: (-3.5152, -7.79161, 65.8663)
+optical axis unit: (0.259637, 0.506985, -0.821921)
+visual axis unit: (-0.337643, 0.527446, 0.779614)
+left pupil center: [617.055, 258.028]
+right pupil center: [272.757, 251.55]
+cornea center: (-4.42527, -7.9643, 69.7777)
+refraction point: (-4.44206, -7.70486, 69.0423)
+pupil center: (-4.45772, -7.76747, 69.4081)
+optical axis unit: (-0.0772618, 0.468635, -0.880007)
+visual axis unit: (-0.0109235, 0.489817, 0.871757)
+left pupil center: [600.488, 293.353]
+right pupil center: [256.808, 288.674]
+cornea center: (-4.40796, -8.70677, 72.0289)
+refraction point: (-4.3516, -8.46916, 71.2881)
+pupil center: (-4.37499, -8.53008, 71.6493)
+optical axis unit: (0.0785105, 0.420676, -0.903808)
+visual axis unit: (-0.164031, 0.442679, 0.881549)
+left pupil center: [566.877, 312.821]
+right pupil center: [226.823, 309.605]
+cornea center: (-3.88515, -8.73091, 69.9222)
+refraction point: (-3.75397, -8.49514, 69.1903)
+pupil center: (-3.78479, -8.55743, 69.5531)
+optical axis unit: (0.23896, 0.413038, -0.878805)
+visual axis unit: (-0.319205, 0.435165, 0.841867)
+left pupil center: [622.849, 350.168]
+right pupil center: [277.5, 338.906]
+cornea center: (-4.63308, -9.43395, 71.3514)
+refraction point: (-4.63752, -9.20838, 70.6048)
+pupil center: (-4.65478, -9.27073, 70.9651)
+optical axis unit: (-0.0516556, 0.388627, -0.919946)
+visual axis unit: (-0.0361178, 0.411135, 0.910859)
+left pupil center: [595.57, 330.199]
+right pupil center: [256.682, 328.171]
+cornea center: (-4.40646, -9.35205, 73.0843)
+refraction point: (-4.34797, -9.13849, 72.3364)
+pupil center: (-4.37114, -9.19798, 72.6952)
+optical axis unit: (0.0840991, 0.366846, -0.926472)
+visual axis unit: (-0.169651, 0.389677, 0.905191)
+left pupil center: [583.152, 324.269]
+right pupil center: [244.796, 321.161]
+cornea center: (-4.25475, -9.15748, 72.3484)
+refraction point: (-4.12283, -8.9593, 71.6056)
+pupil center: (-4.15423, -9.01694, 71.9655)
+optical axis unit: (0.239323, 0.334607, -0.911462)
+visual axis unit: (-0.320376, 0.357887, 0.877084)
+left pupil center: [566.011, 339.197]
+right pupil center: [225.591, 337.565]
+cornea center: (-3.94087, -9.35659, 72.4939)
+refraction point: (-3.88222, -9.19438, 71.7332)
+pupil center: (-3.90358, -9.24769, 72.0899)
+optical axis unit: (0.0887819, 0.259287, -0.961711)
+visual axis unit: (-0.174547, 0.283494, 0.942955)
+processed 10 images.

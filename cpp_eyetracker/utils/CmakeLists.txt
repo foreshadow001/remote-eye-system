@@ -1,19 +1,23 @@
 # /utils/CmakeLists.txt
 
-# add static library for utils
-add_library(utils STATIC
-    src/math_types.cpp
-)
+add_subdirectory(cam_model)
+add_subdirectory(glint_detection)
+add_subdirectory(pupil_center)
+add_subdirectory(cam)
+
+add_library(utils INTERFACE) 
 add_library(eyetracker::utils ALIAS utils)
 
-target_include_directories(utils PUBLIC
+target_include_directories(utils INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 
 find_package(Eigen3 CONFIG REQUIRED)
-target_link_libraries(utils PUBLIC Eigen3::Eigen)
 
-add_subdirectory(cam_model)
-add_subdirectory(eye_model)
-add_subdirectory(glint_detection)
+# INTERFACE_LINK_LIBRARIES 专门用于 INTERFACE 目标
+target_link_libraries(utils INTERFACE 
+    eyetracker::cam_model
+    Eigen3::Eigen
+)
+

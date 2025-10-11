@@ -1,0 +1,18 @@
+# /calib/set_image/CmakeLists.txt
+
+find_package(OpenCV CONFIG REQUIRED)
+
+add_library(set_image INTERFACE)
+
+add_library(eyetracker::set_image ALIAS set_image)
+
+target_include_directories(set_image INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(set_image
+    INTERFACE
+        ${OpenCV_LIBS}
+)
+

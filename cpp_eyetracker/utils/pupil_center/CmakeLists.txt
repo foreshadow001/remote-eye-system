@@ -1,0 +1,19 @@
+# /utils/pupil_center/CmakeLists.txt
+
+find_package(OpenCV CONFIG REQUIRED)
+
+add_library(pupil_center INTERFACE)
+
+add_library(eyetracker::pupil_center ALIAS pupil_center)
+
+target_include_directories(pupil_center
+    INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(pupil_center
+    INTERFACE
+        eyetracker::glint_detection
+        ${OpenCV_LIBS}
+)

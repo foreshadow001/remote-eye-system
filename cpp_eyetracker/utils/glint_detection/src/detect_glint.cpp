@@ -11,7 +11,7 @@
 
 namespace glintdetection {
 
-bool local_debug = true;
+bool local_debug = false;
 
 bool side2mid(int x, int y)
 {
@@ -92,7 +92,7 @@ splitGlintsByEye(const std::vector<cv::Point2f>& glints, float distanceThr)
     const float refX = sorted.front().x;
 
     for (const auto& p : sorted)
-        (std::abs(p.x - refX) < distanceThr ? leftEye : rightEye).push_back(p);
+        (std::abs(p.x - refX) < distanceThr ? rightEye : leftEye).push_back(p);
 
     auto byY = [](const cv::Point2f& a, const cv::Point2f& b) { return a.y < b.y; };
     std::sort(leftEye.begin(), leftEye.end(), byY);
