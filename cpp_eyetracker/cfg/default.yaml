@@ -1,0 +1,41 @@
+# Calibration Offline Settings
+input_dir: "D:/users/projects/new_dataset/calib_records"
+output_dir: "D:/users/projects/new_dataset/calib_results"
+
+# Camera Settings
+cam_pos: [29.0, -31.0, 17.0]
+cam_calib_data_path:
+cam_angles: [-31.5, 0.0, 0.0]
+
+# Lights Settings
+lights_pos:
+ - [21, 3, 0]
+ - [-25, 3, 1]
+ - [0, -8, 6]
+
+# Calibration General Settings
+calib_init_values:
+  alpha: 5
+  beta: 1.5
+  R: 0.78
+  K: 0.42
+  n1: 1.3375
+  n2: 1.0
+  D: 0.53
+  eye_cam_dist_init: 40.0
+
+calib_values_bounds:
+  alpha: [-10, 10]
+  beta: [-5, 5]
+  R: [0.4, 1.5]
+  K: [0.1, 1.0]
+
+# Screen Settings
+screen_width_px: 2560
+screen_height_px: 1440
+screen_width_cm: 59.5
+screen_height_cm: 33.6
+
+# Visualization Settings
+viz: true
+viz_output_dir: "D:/users/projects/new_dataset/calib_viz"

@@ -3,7 +3,8 @@
 #pragma once
 #include <vector>
 
-#include "utils/math_types.hpp"
+#include "cfg/config.hpp"
+#include "core/math_types.hpp"
 #include "cam_model/pinhole_camera_model.hpp"
 
 namespace gazeestimation{
@@ -58,6 +59,7 @@ struct PupilCenterGlintInputs
 	std::vector<PupilCenterGlintInput> data;
 };
 
+/*
 struct EyeAndCameraParameters
 {
 	// eye parameters
@@ -75,6 +77,25 @@ struct EyeAndCameraParameters
 	std::vector<Vec3> light_positions; // light positions (ordered!, this is important for glint association)
 
 	double eye_cam_dist_init; // initial guess for the eye-camera distance
+};
+*/
+
+class EyeAndCameraParameters {
+public:
+    explicit EyeAndCameraParameters(const std::string& left_or_right);
+
+    // 数据成员
+    double alpha = 0.0;
+    double beta = 0.0;
+    double R = 0.0;
+    double K = 0.0;
+    double n1 = 0.0;
+    double n2 = 0.0;
+    double D = 0.0;
+    double eye_cam_dist_init = 0.0;
+
+    std::vector<PinholeCameraModel> cameras;
+    std::vector<Vec3> light_positions;
 };
 
 }

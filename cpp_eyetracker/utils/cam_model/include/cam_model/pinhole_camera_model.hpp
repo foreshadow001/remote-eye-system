@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "utils/math_types.hpp"
+#include "core/math_types.hpp"
 
 namespace gazeestimation {
 

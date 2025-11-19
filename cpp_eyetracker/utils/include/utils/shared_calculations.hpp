@@ -1,6 +1,6 @@
 #pragma once
 
-#include <utils/math_types.hpp>
+#include <core/math_types.hpp>
 #include <utils/gaze_estimation_types.hpp>
 
 namespace gazeestimation
@@ -186,19 +186,42 @@ Returns:
         cam_pos, pupil_image_wcs, cornea_center, R
     );
 
+    if (!std::isfinite(refraction_point[0])) {
+        std::cerr << "[NaN] calculateRefractionPoint -> " << refraction_point << "\n";
+        throw std::runtime_error("refraction_point is NaN");
+    }
+
     Vec3 pupil_center_wcs = calculatePupilCenterWCS(
         cam_pos, refraction_point, cornea_center, R, K, n1, n2
     );
+
+    if (!std::isfinite(pupil_center_wcs[0])) {
+        std::cerr << "[NaN] calculatePupilCenterWCS -> " << pupil_center_wcs << "\n";
+        throw std::runtime_error("pupil_center_wcs is NaN");
+    }
 
     // force the pupil center to be on the cornea surface
     if(use_chen_noise_reduction)
     {
         double cxpx = cornea_center[0] - pupil_center_wcs[0];
         double cypy = cornea_center[1] - pupil_center_wcs[1];
-        pupil_center_wcs[2] = cornea_center[2] - sqrt(K * K - cxpx * cxpx - cypy * cypy);
+        double under_sqrt = K * K - cxpx * cxpx - cypy * cypy;
+        std::cerr << "[DEBUG] under_sqrt = " << under_sqrt << "\n";
+        if (under_sqrt < 0) {
+            std::cerr << "[NaN] sqrt(" << under_sqrt << ") in Chen noise reduction\n";
+            throw std::runtime_error("under_sqrt < 0");
+        }
+        pupil_center_wcs[2] = cornea_center[2] - std::sqrt(under_sqrt);
     }
 
-    return normalized(pupil_center_wcs - cornea_center);
+    Vec3 optical_axis_unit = normalized(pupil_center_wcs - cornea_center);
+
+    if (!std::isfinite(optical_axis_unit[0])) {
+        std::cerr << "[NaN] normalized -> " << optical_axis_unit << "\n";
+        throw std::runtime_error("normalized axis is NaN");
+    }
+
+    return optical_axis_unit;
 }
 
 inline Vec3
@@ -291,15 +314,47 @@ Returns:
     */
 
     Vec3 zeta = normalized(cam_pos - refraction_point);
+    if (!std::isfinite(zeta[0])) {
+        std::cerr << "[NaN] normalized(cam_pos - refraction_point) -> " << zeta << "\n";
+        throw std::runtime_error("zeta is NaN");
+    }
     Vec3 eta = (refraction_point - cornea_center) / R;
+    if (!std::isfinite(eta[0])) {
+        std::cerr << "[NaN] (refraction_point - cornea_center) / R -> " << eta << "\n";
+        throw std::runtime_error("eta is NaN");
+    }
     double eta_dot_zeta = dot(eta, zeta);
 
-    double a = eta_dot_zeta - sqrt((n1 / n2)*(n1 / n2) - 1 + eta_dot_zeta * eta_dot_zeta);
+    double under_sqrt = (n1 / n2)*(n1 / n2) - 1 + eta_dot_zeta * eta_dot_zeta;
+    if (under_sqrt < 0) {
+        std::cerr << "[NaN] sqrt(" << under_sqrt << ") < 0 in pupil center calculation\n";
+        throw std::runtime_error("under_sqrt < 0");
+    }
+    double a = eta_dot_zeta - sqrt(under_sqrt);
     Vec3 iota =  (n2 / n1) * (a * eta - zeta);
+    if (!std::isfinite(iota[0])) {
+        std::cerr << "[NaN] iota = " << iota << "\n";
+        throw std::runtime_error("iota is NaN");
+    }
 
     double rc_dot_iota = dot((refraction_point - cornea_center), iota);
-    double kp = - 1 * rc_dot_iota - sqrt(rc_dot_iota*rc_dot_iota - (R * R - K * K));
-    return refraction_point + kp * iota;
+    double kp_under_sqrt = rc_dot_iota*rc_dot_iota - (R * R - K * K);
+    if (kp_under_sqrt < 0.0) {
+        // std::cerr << "[WARN] kp_under_sqrt = " << kp_under_sqrt << ", clamp to 0\n";
+        kp_under_sqrt = 0.0;   // ✅ 强制截断
+    }
+    if (kp_under_sqrt < 0) {
+        std::cerr << "[NaN] sqrt(" << kp_under_sqrt << ") < 0 in kp calculation\n";
+        throw std::runtime_error("kp_under_sqrt < 0");
+    }
+    double kp = - 1 * rc_dot_iota - sqrt(kp_under_sqrt);
+
+    Vec3 result = refraction_point + kp * iota;
+    if (!std::isfinite(result[0])) {
+        std::cerr << "[NaN] final result = " << result << "\n";
+        throw std::runtime_error("final pupil_center_wcs is NaN");
+    }
+    return result;
 }
 
 inline Vec3

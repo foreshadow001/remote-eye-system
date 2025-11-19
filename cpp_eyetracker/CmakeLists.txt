@@ -27,6 +27,8 @@ if(BUILD_TESTING)
 endif()
 
 # add subdirectories
+add_subdirectory(cfg)
+add_subdirectory(core)
 add_subdirectory(utils)
 add_subdirectory(calib)
 add_subdirectory(inference)

@@ -1,10 +1,12 @@
 # /inference/CmakeLists.txt
 
 # add static library for inference
-add_library(inference INTERFACE)
+add_library(inference STATIC
+    src/one_camera_spherical.cpp
+)
 add_library(eyetracker::inference ALIAS inference)
 
-target_include_directories(inference INTERFACE
+target_include_directories(inference PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
@@ -12,7 +14,7 @@ target_include_directories(inference INTERFACE
 find_package(Ceres CONFIG REQUIRED)
 
 target_link_libraries(inference 
-    INTERFACE
+    PUBLIC
         eyetracker::utils
         Ceres::ceres
 )

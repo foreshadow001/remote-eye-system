@@ -2,18 +2,20 @@
 
 find_package(OpenCV CONFIG REQUIRED)
 
-add_library(pupil_center INTERFACE)
+add_library(pupil_center STATIC
+    src/localize_pupil.cpp
+)
 
 add_library(eyetracker::pupil_center ALIAS pupil_center)
 
 target_include_directories(pupil_center
-    INTERFACE
+    PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
 )
 
 target_link_libraries(pupil_center
-    INTERFACE
+    PUBLIC
         eyetracker::glint_detection
         ${OpenCV_LIBS}
 )

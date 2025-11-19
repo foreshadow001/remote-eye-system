@@ -2,10 +2,12 @@
 
 add_subdirectory(set_image)
 
-add_library(calib INTERFACE)
+add_library(calib STATIC
+    src/calibration.cpp
+)
 add_library(eyetracker::calib ALIAS calib)
 
-target_include_directories(calib INTERFACE
+target_include_directories(calib PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
@@ -13,7 +15,7 @@ target_include_directories(calib INTERFACE
 find_package(Ceres CONFIG REQUIRED)
 
 target_link_libraries(calib 
-    INTERFACE
+    PUBLIC
         eyetracker::utils
         Ceres::ceres
 )

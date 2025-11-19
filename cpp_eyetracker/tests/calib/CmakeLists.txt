@@ -7,12 +7,6 @@ find_package(OpenCV CONFIG REQUIRED)
 
 set(TEST_CALIB_SOURCES
     test_calib.cpp
-    
-    ${CMAKE_SOURCE_DIR}/utils/src/math_types.cpp
-    ${CMAKE_SOURCE_DIR}/utils/src/gaze_estimation_types.cpp
-    ${CMAKE_SOURCE_DIR}/utils/glint_detection/src/detect_glint.cpp
-    ${CMAKE_SOURCE_DIR}/utils/pupil_center/src/localize_pupil.cpp 
-    ${CMAKE_SOURCE_DIR}/inference/src/one_camera_spherical.cpp 
 )
 
 add_executable(test_calib ${TEST_CALIB_SOURCES})
@@ -24,5 +18,5 @@ target_link_libraries(test_calib
         eyetracker::pupil_center
         eyetracker::utils
         eyetracker::calib
-        ${OpenCV_LIBS}
+        eyetracker::cfg
 )

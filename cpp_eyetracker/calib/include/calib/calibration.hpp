@@ -2,7 +2,7 @@
 
 #include <ceres/ceres.h>
 
-#include "utils/math_types.hpp"
+#include "core/math_types.hpp"
 #include "utils/gaze_estimation_types.hpp"
 
 namespace gazeestimation {
@@ -146,12 +146,27 @@ public:
             residual[index++] = diff[0];
             residual[index++] = diff[1];
             residual[index++] = diff[2];
-
-            // std::cout << "diff: " << diff[0] << ", " << diff[1] << "\n";
         }
 
         return true;
     }
 };
+
+Vec3
+result_processor(
+    const DefaultGazeEstimationResult& result,
+    const Vec3& actual_cam_pos
+);
+
+EyeAndCameraParameters
+variables_calibration_applicator(
+    EyeAndCameraParameters params,
+    double const* const* variables
+);
+
+const double* const* const
+vecvec_to_pointer_pointer(
+    std::vector<std::vector<double>>& a
+);
 
 } // namespace gazeestimation

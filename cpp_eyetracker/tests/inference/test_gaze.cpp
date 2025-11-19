@@ -4,7 +4,7 @@
 #include <opencv2/opencv.hpp>
 
 #include "utils/gaze_estimation_types.hpp"
-#include "utils/math_types.hpp"
+#include "core/math_types.hpp"
 #include "glint_detection/detect_glint.h"
 #include "pupil_center/localize_pupil.h"
 #include "inference/one_camera_spherical.hpp"

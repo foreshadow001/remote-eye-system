@@ -7,8 +7,11 @@
 #include <fstream>
 #include <iomanip>
 
+#include "cfg/config.hpp"
 #include "utils/gaze_estimation_types.hpp"
-#include "utils/math_types.hpp"
+#include "core/math_types.hpp"
+#include "utils/visualize.hpp"
+#include "utils/intersection.hpp"
 #include "glint_detection/detect_glint.h"
 #include "pupil_center/localize_pupil.h"
 #include "inference/one_camera_spherical.hpp"
@@ -16,6 +19,7 @@
 #include "calib/calibration.hpp"
 
 using namespace gazeestimation;
+using namespace visualization;
 namespace fs = std::filesystem;
 
 using OurCalibrationType = GenericCalibration<
@@ -23,143 +27,33 @@ using OurCalibrationType = GenericCalibration<
     PupilCenterGlintInputs,
     DefaultGazeEstimationResult>;
 
-
-// 在文件顶部加上：#include <sstream>
-
-cv::Mat visualizeGlintsAndPupil(
-    const cv::Mat& frame,
-    const std::vector<cv::Point2d>& glints,   // 期望 size == 3
-    const cv::Point2d& pupil_center,
-	const float radius)
-{
-    cv::Mat vis;
-    if (frame.channels() == 1) cv::cvtColor(frame, vis, cv::COLOR_GRAY2BGR);
-    else vis = frame.clone();
-
-    // 如果 glints 数量为 3，就连成三角形并标出
-    if (glints.size() == 3) {
-        std::vector<cv::Point> pts;
-        pts.reserve(3);
-        for (const auto& g : glints)
-            pts.emplace_back(cv::Point(cvRound(g.x), cvRound(g.y)));
-
-        // 画三角线
-        const cv::Scalar triColor(0, 255, 0); // 绿色
-        cv::polylines(vis, pts, true, triColor, 1, cv::LINE_AA);
-
-    } else {
-        // 如果没有 3 个 glint，也尝试把已有的点画出来
-        for (const auto& g : glints)
-            cv::circle(vis, cv::Point(cvRound(g.x), cvRound(g.y)), 3, cv::Scalar(0,200,200), cv::FILLED, cv::LINE_AA);
-    }
-
-    // 在瞳孔中心画十字
-    const int crossLen = 6;
-    const cv::Point center(cvRound(pupil_center.x), cvRound(pupil_center.y));
-    const cv::Scalar crossColor(0, 0, 255); // 红色
-    cv::line(vis, center + cv::Point(-crossLen, 0), center + cv::Point(crossLen, 0), crossColor, 1, cv::LINE_AA);
-    cv::line(vis, center + cv::Point(0, -crossLen), center + cv::Point(0, crossLen), crossColor, 1, cv::LINE_AA);
-    // 可选：画一个半透明圆环表示不确定区域（这里用实线）
-    cv::circle(vis, center, cvRound(radius), crossColor, 1, cv::LINE_AA);
-
-    // 可选：输出坐标文本（你可以注释掉）
-    std::ostringstream oss;
-    oss << "(" << center.x << "," << center.y << ")" << " " << cvRound(radius);
-    cv::putText(vis, oss.str(), center + cv::Point(8, -18),
-                cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(255,255,255), 1, cv::LINE_AA);
-
-    return vis;
-}
-
-
-// ================== 辅助函数 ==================
-
-EyeAndCameraParameters six_variable_calibration_applicator(
-    EyeAndCameraParameters params, double const* const* variables)
-{
-    params.alpha = variables[0][0];
-    params.beta = variables[1][0];
-    params.R = variables[2][0];
-    params.K = variables[3][0];
-    params.cameras[0].set_camera_angle_y(variables[4][0]);
-    params.cameras[0].set_camera_angle_z(variables[5][0]);
-    return params;
-}
-
-Vec3 result_processor(const DefaultGazeEstimationResult& result,
-                      double z_shift, const Vec3& wcs_offset)
-{
-    return calculatePointOfInterest(result.cornea_center,
-                                    result.visual_axis_unit,
-                                    z_shift) - wcs_offset;
-}
-
-const double* const* const vecvec_to_pointer_pointer(
-    std::vector<std::vector<double>>& a)
-{
-    std::vector<double*> tmp;
-    for (unsigned int i = 0; i < a.size(); i++)
-        tmp.push_back(&a[i][0]);
-    return &tmp[0];
-}
-
-
-// ================== 主函数 ==================
-
 int main() {
-    std::string folder_path = "D:/users/projects/new_dataset/calib_records";
+    std::cout << "Loading config file..." << std::endl;
+    Cfg cfg; // load config file
+    GazeTracker left_gazetracker = gazeestimation::GazeTracker(); // create left gazetracker
 
-    // === 通用设置 ===
-    GazeTracker left_gazetracker = gazeestimation::GazeTracker();
-	Vec3MedianFilter filter_le_pupil(5), filter_le_coc(5);
+    // set filters for pupil center and cornea center
+	// Vec3MedianFilter filter_le_pupil(5), filter_le_coc(5);
 	// left_gazetracker.setCorneaCenterFilter(std::bind(&Vec3MedianFilter::newSample, &filter_le_coc, std::placeholders::_1));
 	// left_gazetracker.setPupilCenterFilter(std::bind(&Vec3MedianFilter::newSample, &filter_le_pupil, std::placeholders::_1));
-
-    const Vec3 actual_camera_position = make_vec3(29.0, -31, 17);
-    const Vec3 wcs_offset = -actual_camera_position;
 
     PinholeCameraModel camera;
     camera.principal_point_x = 400;
     camera.principal_point_y = 300;
     camera.pixel_size_cm_x = 4.8 * 1e-4;
     camera.pixel_size_cm_y = 4.8 * 1e-4;
-    camera.effective_focal_length_cm = 1.2;//0.0119144;
-    camera.position = actual_camera_position + wcs_offset;
+    camera.effective_focal_length_cm = 1.2;
+    camera.position = make_vec3(0, 0, 0);
     camera.set_camera_angles(-deg_to_rad(31.5), 0, 0);
 
-    std::vector<Vec3> lights = {
-        actual_camera_position + make_vec3(21, 3, 0) + wcs_offset,
-        actual_camera_position + make_vec3(-25, 3, 1) + wcs_offset,
-        actual_camera_position + make_vec3(0, -8, 6) + wcs_offset
-    };
-
-    EyeAndCameraParameters left_parameters;
-    left_parameters.alpha = deg_to_rad(-5);
-    left_parameters.beta = deg_to_rad(-1.5);
-    left_parameters.R = 0.78;
-    left_parameters.K = 0.42;
-    left_parameters.n1 = 1.3375;
-    left_parameters.n2 = 1;
-    left_parameters.D = 0.53;
-    left_parameters.eye_cam_dist_init = 40;
+    EyeAndCameraParameters left_parameters("left");
     left_parameters.cameras.push_back(camera);
-    left_parameters.light_positions = lights;
 
-    // 屏幕信息
-    const double display_surface_size_cm_x = 59.5;
-    const double display_surface_size_cm_y = 33.6;
-    const double screen_resolution_x = 2560;
-    const double screen_resolution_y = 1440;
-    const double screen_pixel_size_x = display_surface_size_cm_x / screen_resolution_x;
-    const double screen_pixel_size_y = display_surface_size_cm_y / screen_resolution_y;
-    const double z_shift = -actual_camera_position[2];
-
-    // === 收集所有视频的标定样本 ===
     std::vector<std::pair<PupilCenterGlintInputs, Vec3>> calibrate_against_left;
 
     std::regex re(R"((?:\\|/)?([^\\/_]+)_(\d+)_(\d+)_([\d]+)\.avi$)");
 
-    for (const auto& entry : fs::directory_iterator(folder_path)) {
+    for (const auto& entry : fs::directory_iterator(cfg["input_dir"].as<std::string>())) {
         if (entry.path().extension() != ".avi") continue;
         std::string video_path = entry.path().string();
 
@@ -207,8 +101,7 @@ int main() {
             input_left.pupil_center = make_vec2(leftPupilCenter.x, leftPupilCenter.y);
             inputs_left.data.push_back(input_left);
 
-            Vec3 target = make_vec3(true_pog[0] * screen_pixel_size_x,
-                                    -true_pog[1] * screen_pixel_size_y, 0);
+            Vec3 target = PoGToWCS(true_pog, cfg);
             calibrate_against_left.push_back(std::make_pair(inputs_left, target));
 
 			// --- 将检测结果转换为 OpenCV 点 ----
@@ -258,31 +151,31 @@ int main() {
 
     std::vector<std::vector<double>> initial_values_left = {
         {left_parameters.alpha}, {left_parameters.beta},
-        {left_parameters.R}, {left_parameters.K},
-        {left_parameters.cameras[0].camera_angle_y()},
-        {left_parameters.cameras[0].camera_angle_z()}
+        {left_parameters.R}, {left_parameters.K}
+        // {left_parameters.cameras[0].camera_angle_y()},
+        // {left_parameters.cameras[0].camera_angle_z()}
     };
 
     std::vector<std::vector<std::pair<double, double>>> bounds = {
-        { {deg_to_rad(-6), deg_to_rad(6)} },
-        { {deg_to_rad(-5),  deg_to_rad(5)} },
-        { {0.4, 1.2} },
-        { {0.2, 0.8} },
-        { {deg_to_rad(-3),  deg_to_rad(3)} },
-        { {deg_to_rad(-3),  deg_to_rad(3)} }
+        { {deg_to_rad(cfg["calib_values_bounds"]["alpha"].asVector<double>()[0]), deg_to_rad(cfg["calib_values_bounds"]["alpha"].asVector<double>()[1])} },
+        { {deg_to_rad(cfg["calib_values_bounds"]["beta"].asVector<double>()[0]),  deg_to_rad(cfg["calib_values_bounds"]["beta"].asVector<double>()[1])} },
+        { {cfg["calib_values_bounds"]["R"].asVector<double>()[0],  cfg["calib_values_bounds"]["R"].asVector<double>()[1]} },
+        { {cfg["calib_values_bounds"]["K"].asVector<double>()[0],  cfg["calib_values_bounds"]["K"].asVector<double>()[1]} }
+        // { {deg_to_rad(-3),  deg_to_rad(3)} },
+        // { {deg_to_rad(-3),  deg_to_rad(3)} }
     };
 
     OurCalibrationType calibration;
     auto calibration_result_left = calibration.calibrate(
         left_gazetracker, left_parameters,
-        six_variable_calibration_applicator,
-        std::bind(result_processor, std::placeholders::_1, z_shift, wcs_offset),
+        variables_calibration_applicator,
+        std::bind(result_processor, std::placeholders::_1, cfg["cam_pos"].as<Vec3>()),
         calibrate_against_left,
         initial_values_left,
         bounds
     );
 
-    left_parameters = six_variable_calibration_applicator(
+    left_parameters = variables_calibration_applicator(
         left_parameters,
         vecvec_to_pointer_pointer(calibration_result_left)
     );
@@ -294,15 +187,7 @@ int main() {
               << rad_to_deg(left_parameters.beta) << " deg" << std::endl;
     std::cout << "R: " << left_parameters.R << std::endl;
     std::cout << "K: " << left_parameters.K << std::endl;
-    std::cout << "CamAy: "
-              << rad_to_deg(left_parameters.cameras[0].camera_angle_y()) << " deg" << std::endl;
-    std::cout << "CamAz: "
-              << rad_to_deg(left_parameters.cameras[0].camera_angle_z()) << " deg" << std::endl;
-
     std::cout << "\nCalibration finished successfully.\n";
-
-    // 如果前面已经定义过 z_shift，就千万别再定义一次
-    // const double z_shift = -actual_camera_position[2];   // <-- 删掉或注释掉
 
     std::ofstream fout("D:/users/projects/new_dataset/calib_inference_result.txt");
     if (!fout) {
@@ -322,8 +207,8 @@ int main() {
             DefaultGazeEstimationResult res =
                 left_gazetracker.estimate(inputs, left_parameters);
 
-            Vec3 pred_wcs = result_processor(res, z_shift, wcs_offset);
-			res.cornea_center += actual_camera_position;
+            Vec3 pred_wcs = result_processor(res, cfg["cam_pos"].as<Vec3>());
+			res.cornea_center += cfg["cam_pos"].as<Vec3>();
 
             // 输出一行，保留 6 位小数
             fout << std::fixed << std::setprecision(6)

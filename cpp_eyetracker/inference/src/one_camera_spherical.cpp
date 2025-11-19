@@ -84,12 +84,23 @@ Raises:
         eye_cam_params
     );
 
+    if (!std::isfinite(cornea_center[0])) {
+        std::cerr << "[NaN] solveCorneaCenter -> " << cornea_center << "\n";
+        throw std::runtime_error("cornea_center is NaN");
+    }
+
     if(cornea_center_filter)
     {
         cornea_center = cornea_center_filter(cornea_center);
     }
 
     Vec3 pupil_image_wcs = camera.ics_to_wcs(glints_pupil_center_data.pupil_center);
+
+    if (!std::isfinite(pupil_image_wcs[0])) {
+        std::cerr << "[NaN] ics_to_wcs -> " << pupil_image_wcs
+                  << "  input=" << glints_pupil_center_data.pupil_center << "\n";
+        throw std::runtime_error("pupil_image_wcs is NaN");
+    }
 
     if(pupil_center_filter)
     {
@@ -107,11 +118,21 @@ Raises:
         use_chen_noise_reduction
     );
 
+    if (!std::isfinite(optic_axis_unit[0])) {
+        std::cerr << "[NaN] calculateOpticalAxisUnit\n";
+        throw std::runtime_error("optic_axis_unit is NaN");
+    }
+
     const Vec3 visual_axis_unit = calculateVisualAxisUnit(
         optic_axis_unit,
         eye_cam_params.alpha,
         eye_cam_params.beta
     );
+
+    if (!std::isfinite(visual_axis_unit[0])) {
+        std::cerr << "[NaN] calculateVisualAxisUnit\n";
+        throw std::runtime_error("visual_axis_unit is NaN");
+    }
 
     DefaultGazeEstimationResult result;
     result.is_valid = true;

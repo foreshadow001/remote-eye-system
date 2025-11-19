@@ -1,0 +1,19 @@
+# /utils/CmakeLists.txt
+
+add_library(core STATIC
+    src/math_types.cpp
+)
+
+add_library(eyetracker::core ALIAS core)
+
+target_include_directories(core PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+find_package(Eigen3 CONFIG REQUIRED)
+
+target_link_libraries(core PUBLIC
+    Eigen3::Eigen
+)
+

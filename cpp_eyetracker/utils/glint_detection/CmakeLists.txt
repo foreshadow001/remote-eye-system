@@ -2,17 +2,19 @@
 
 find_package(OpenCV CONFIG REQUIRED)
 
-add_library(glint_detection INTERFACE)
+add_library(glint_detection STATIC
+    src/detect_glint.cpp
+)
 
 add_library(eyetracker::glint_detection ALIAS glint_detection)
 
 target_include_directories(glint_detection
-    INTERFACE
+    PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
 )
 
 target_link_libraries(glint_detection
-    INTERFACE
+    PUBLIC
         ${OpenCV_LIBS}
 )

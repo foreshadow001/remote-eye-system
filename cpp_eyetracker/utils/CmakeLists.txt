@@ -5,19 +5,24 @@ add_subdirectory(glint_detection)
 add_subdirectory(pupil_center)
 add_subdirectory(cam)
 
-add_library(utils INTERFACE) 
+add_library(utils STATIC
+    src/gaze_estimation_types.cpp
+    src/intersection.cpp
+    src/visualize.cpp
+)
+
 add_library(eyetracker::utils ALIAS utils)
 
-target_include_directories(utils INTERFACE
+target_include_directories(utils PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 
-find_package(Eigen3 CONFIG REQUIRED)
+find_package(OpenCV CONFIG REQUIRED)
 
-# INTERFACE_LINK_LIBRARIES 专门用于 INTERFACE 目标
-target_link_libraries(utils INTERFACE 
+target_link_libraries(utils PUBLIC
+    eyetracker::cfg
     eyetracker::cam_model
-    Eigen3::Eigen
+    ${OpenCV_LIBS}
 )
 

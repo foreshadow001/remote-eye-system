@@ -153,6 +153,6 @@ if __name__ == '__main__':
     if not data:
         print('data is empty')
         exit()
-    # idx = pick_frame(data)
-    # plot_3d_single(data[idx])
+    idx = pick_frame(data)
+    plot_3d_single(data[idx])
     plot_2d_distribution(data)

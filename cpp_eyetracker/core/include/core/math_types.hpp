@@ -1,4 +1,4 @@
-// utils/include/utils/math_types.hpp
+// utils/include/core/math_types.hpp
 #pragma once
 
 // #undef EIGEN_ALIGN
@@ -104,7 +104,5 @@ namespace gazeestimation {
 	{
 		return a.cross(b);
 	}
-
-	/// Returns the midpoint of the shortest segment between the two lines o1+a * d1 and o2 + b * d2;
-	Vec3 shortest_line_segment(const Vec3& o1, const Vec3& d1, const Vec3& o2, const Vec3& d2);
+	
 }
