@@ -1,16 +1,18 @@
 # cam/CMakeLists.txt
 cmake_minimum_required(VERSION 3.14)
 
-add_library(cam INTERFACE)
+add_library(cam STATIC
+    src/basler.cpp
+)
 add_library(eyetracker::cam ALIAS cam)
 
 # 包含头文件
-target_include_directories(cam INTERFACE
+target_include_directories(cam PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 
-set(PYLON_ROOT "D:/apps/Basler/Development")
+set(PYLON_ROOT "D:/apps/pylon/Development")
 
 if(NOT DEFINED PYLON_ROOT)
     message(WARNING "⚠️  PYLON_ROOT not set. Please specify path to Pylon SDK, e.g.:")
@@ -18,24 +20,24 @@ if(NOT DEFINED PYLON_ROOT)
 endif()
 
 if(PYLON_ROOT)
-    target_include_directories(cam INTERFACE
+    target_include_directories(cam PUBLIC
         "${PYLON_ROOT}/include"
     )
 
     if(WIN32)
         if(EXISTS "${PYLON_ROOT}/lib/x64")
-            target_link_directories(cam INTERFACE "${PYLON_ROOT}/lib/x64")
+            target_link_directories(cam PUBLIC "${PYLON_ROOT}/lib/x64")
         elseif(EXISTS "${PYLON_ROOT}/lib")
-            target_link_directories(cam INTERFACE "${PYLON_ROOT}/lib")
+            target_link_directories(cam PUBLIC "${PYLON_ROOT}/lib")
         endif()
     else()
-        target_link_directories(cam INTERFACE "${PYLON_ROOT}/lib64")
+        target_link_directories(cam PUBLIC "${PYLON_ROOT}/lib64")
     endif()
 endif()
 
 find_package(OpenCV REQUIRED)
 
-target_link_libraries(cam INTERFACE
+target_link_libraries(cam PUBLIC
     ${OpenCV_LIBS}
     PylonBase_v10
     GCBase_MD_VC141_v3_1_Basler_pylon_v3.lib

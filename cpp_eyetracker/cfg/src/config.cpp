@@ -41,7 +41,7 @@ bool Cfg::fileExists(const std::string& p) {
 }
 
 Cfg::Cfg(const std::string& filepath) {
-    filepath_ = filepath.empty() ? default_cfg_path_ : filepath;
+    filepath_ = filepath.empty() ? getConfigPath() : filepath;
 
     if (!fileExists(filepath_)) {
         red("[Cfg ERROR] Cannot find config file: " + filepath_);
@@ -54,4 +54,12 @@ Cfg::Cfg(const std::string& filepath) {
 
 CfgNode Cfg::operator[](const std::string& key) const {
     return CfgNode(root_[key], key);
+}
+
+std::string Cfg::getConfigPath() const {
+    // 获取当前源文件目录
+    std::string current_file_path = __FILE__;
+
+    // 将当前路径和相对路径拼接
+    return (std::filesystem::path(current_file_path).parent_path().parent_path().parent_path() / "cfg" / "default.yaml").string();
 }

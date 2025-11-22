@@ -1,4 +1,4 @@
 # /tests/CMakeLists.txt
 
 add_subdirectory(calib)
-# add_subdirectory(utils)
+add_subdirectory(utils)

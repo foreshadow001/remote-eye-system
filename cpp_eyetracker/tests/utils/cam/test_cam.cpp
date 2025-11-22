@@ -1,9 +1,11 @@
-#include "cam/basler.hpp"
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <chrono>
 #include <thread>
 #include <filesystem>
+
+#include "cam/basler.hpp"
+#include "cfg/config.hpp"
 
 namespace fs = std::filesystem;
 
@@ -13,7 +15,8 @@ using namespace gazeestimation;
 int main() {
     cout << "=== [TEST] Basler Camera Debug Tool ===" << endl;
 
-    BaslerCamera cam;
+    Cfg cfg;
+    BaslerCamera cam(cfg["test_one_cam"]["cam_index"].as<std::string>());
 
     // 打开相机
     if (!cam.open()) {
@@ -22,26 +25,30 @@ int main() {
     }
 
     // 设置参数
-    cam.setFrameRate(100.0);   // 帧率
-    cam.setGain(3.0);         // 增益
-    cam.setGamma(1.1);        // Gamma
-    cam.setExposureTime(10000); // 可选曝光设置，单位微秒
+    cam.setFrameRate(cfg["test_one_cam"]["fps"].as<double>());   // 帧率
+    cam.setGain(cfg["test_one_cam"]["gain"].as<double>());         // 增益
+    cam.setGamma(cfg["test_one_cam"]["gamma"].as<double>());        // Gamma
+    cam.setExposureTime(cfg["test_one_cam"]["exposure_time"].as<double>()); // 可选曝光设置，单位微秒
 
     cout << "[test_cam] Camera initialized successfully." << endl;
     cout << "Press 'r' to start recording, 's' to stop, 'q' to quit.\n";
 
     // 创建窗口
     cv::namedWindow("Basler Preview", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Basler Preview", 800, 600);
+    cv::resizeWindow(
+        "Basler Preview",
+        cfg["test_one_cam"]["frame_width"].as<int>(),
+        cfg["test_one_cam"]["frame_height"].as<int>()
+    );
 
     // 创建保存目录
-    string save_dir = "D:/users/projects/new_dataset/test_videos";
+    string save_dir = cfg["test_one_cam"]["save_dir"].as<std::string>();
     try {
         fs::create_directories(save_dir);
     } catch (const std::exception& e) {
         cerr << "[test_cam] Failed to create directory: " << e.what() << endl;
         return -1;
-    }
+    }   
 
     bool recording = false;
     bool running = true;
@@ -67,8 +74,8 @@ int main() {
                     auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
                     char buf[64];
                     strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", localtime(&t));
-                    current_filename = save_dir + "/record_" + string(buf) + ".mp4";
-                    cam.startRecording(current_filename);
+                    current_filename = save_dir + "/record_" + string(buf) + ".avi";
+                    cam.startRecording(current_filename, cfg["test_one_cam"]["fps"].as<double>());
                     recording = true;
                     cout << "[test_cam] Start recording -> " << current_filename << endl;
                 }

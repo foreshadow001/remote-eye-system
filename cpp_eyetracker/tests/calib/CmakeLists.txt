@@ -3,8 +3,6 @@
 # add_subdirectory(record_data)
 # add_subdirectory(set_image)
 
-find_package(OpenCV CONFIG REQUIRED)
-
 set(TEST_CALIB_SOURCES
     test_calib.cpp
 )

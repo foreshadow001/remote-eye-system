@@ -1,6 +1,6 @@
 # Calibration Offline Settings
-input_dir: "D:/users/projects/new_dataset/calib_records"
-output_dir: "D:/users/projects/new_dataset/calib_results"
+input_dir: "D:/ylx/calib_records"
+output_dir: "D:/ylx/calib_results"
 
 # Camera Settings
 cam_pos: [29.0, -31.0, 17.0]
@@ -38,4 +38,29 @@ screen_height_cm: 33.6
 
 # Visualization Settings
 viz: true
-viz_output_dir: "D:/users/projects/new_dataset/calib_viz"
+viz_output_dir: "D:/ylx/calib_viz"
+
+# Test one cam
+test_one_cam:
+  cam_index: 40061061
+  save_dir: "D:/ylx/test_one_cam"
+  fps: 90
+  gain: 0.0
+  gamma: 1.0
+  exposure_time: 10000.0
+  frame_width: 720
+  frame_height: 540
+
+# Test multi cam
+test_multi_cam:
+  cam_indices:
+    - 40061061
+    - 40061280
+    - 40109652
+  save_dir: "D:/ylx/calib/calib_three_cam"
+  fps: 90
+  gain: 0.0
+  gamma: 1.0
+  exposure_time: 10000.0
+  window_width: 1440
+  window_height: 1080

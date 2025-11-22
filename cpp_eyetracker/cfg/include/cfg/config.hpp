@@ -4,6 +4,7 @@
 #include <vector>
 #include <fstream>
 #include <iostream>
+#include <filesystem>
 
 #include "core/math_types.hpp"   // make_vec3, Vec3, Vec2
 
@@ -73,9 +74,7 @@ private:
 
     static bool fileExists(const std::string& p);
 
-    static constexpr const char* default_cfg_path_ =
-        "D:/users/projects/new_dataset/data_collection/PCCR/cpp-remote-eye/"
-        "cpp_eyetracker/cfg/default.yaml";
+    std::string getConfigPath() const;
 };
 
 template<>
@@ -135,6 +134,22 @@ inline std::vector<Vec2> CfgNode::as<std::vector<Vec2>>() const {
     for (const auto& item : node_) {
         CfgNode tmp(item, path_);
         out.push_back(tmp.as<Vec2>());
+    }
+    return out;
+}
+
+template<>
+inline std::vector<std::string> CfgNode::as<std::vector<std::string>>() const {
+    if (!node_.IsSequence()) {
+        std::cerr << "[Cfg ERROR] Expect [string...] at " << path_ << std::endl;
+        return {};
+    }
+
+    std::vector<std::string> out;
+    out.reserve(node_.size());
+
+    for (const auto& item : node_) {
+        out.push_back(item.as<std::string>());
     }
     return out;
 }

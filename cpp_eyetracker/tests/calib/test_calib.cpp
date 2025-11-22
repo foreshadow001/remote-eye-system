@@ -189,7 +189,7 @@ int main() {
     std::cout << "K: " << left_parameters.K << std::endl;
     std::cout << "\nCalibration finished successfully.\n";
 
-    std::ofstream fout("D:/users/projects/new_dataset/calib_inference_result.txt");
+    std::ofstream fout("D:/ylx/calib_inference_result.txt");
     if (!fout) {
         std::cerr << "[ERROR] Cannot open file: calib_inference_result.txt\n";
         return -1;
