@@ -11,8 +11,8 @@ result_processor(
 )
 {
     return calculatePointOfInterest(
-        result.cornea_center,
-        result.visual_axis_unit,
+        result.left.cornea_center,
+        result.left.visual_axis_unit,
         - actual_cam_pos[2]
     ) + actual_cam_pos;
 }
@@ -23,12 +23,15 @@ variables_calibration_applicator(
     double const* const* variables
 )
 {
-    params.alpha = variables[0][0];
-    params.beta = variables[1][0];
-    params.R = variables[2][0];
-    params.K = variables[3][0];
-    // params.cameras[0].set_camera_angle_y(variables[4][0]);
-    // params.cameras[0].set_camera_angle_z(variables[5][0]);
+    params.left.alpha = variables[0][0];
+    params.left.beta = variables[1][0];
+    params.left.R = variables[2][0];
+    params.left.K = variables[3][0];
+    
+    params.right.alpha = variables[4][0];
+    params.right.beta = variables[5][0];
+    params.right.R = variables[6][0];
+    params.right.K = variables[7][0];
     return params;
 }
 

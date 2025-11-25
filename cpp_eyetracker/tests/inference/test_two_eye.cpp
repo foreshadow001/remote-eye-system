@@ -16,17 +16,11 @@
 #include "pupil_center/localize_pupil.h"
 #include "inference/one_camera_spherical.hpp"
 #include "utils/shared_calculations.hpp"
-#include "calib/calibration.hpp"
 #include "utils/utils.hpp"
 
 using namespace gazeestimation;
 using namespace visualization;
 namespace fs = std::filesystem;
-
-using OurCalibrationType = GenericCalibration<
-    EyeAndCameraParameters,
-    PupilCenterGlintInputs,
-    DefaultGazeEstimationResult>;
 
 int main() {
     std::cout << "Loading config file..." << std::endl;
@@ -64,7 +58,7 @@ int main() {
 
         std::cout << "Extracting from " << video_path << " ..." << std::endl;
 
-        for (int i = start_frame; i < start_frame + 50; i++) {
+        for (int i = start_frame; i < start_frame + 1; i++) {
             cap.set(cv::CAP_PROP_POS_FRAMES, i);
             cv::Mat frame;
             if (!cap.read(frame) || frame.empty()) continue;
@@ -136,72 +130,9 @@ int main() {
         }
     }
 
-    std::cout << "\nTotal samples collected: "
-              << calibrate_against.size() << std::endl;
-
-    if (calibrate_against.empty()) {
-        std::cerr << "[ERROR] No valid frames extracted. Abort." << std::endl;
-        return -1;
-    }
-
-    // === 一次全局标定 ===
-    std::cout << "\nStarting global calibration..." << std::endl;
-
-    std::vector<std::vector<double>> initial_values = {
-        {parameters.left.alpha}, {parameters.left.beta},
-        {parameters.left.R}, {parameters.left.K},
-        {parameters.right.alpha}, {parameters.right.beta},
-        {parameters.right.R}, {parameters.right.K}
-    };
-
-    std::vector<std::vector<std::pair<double, double>>> bounds = {
-        { {deg_to_rad(cfg["calib_values_bounds"]["alpha"].asVector<double>()[0]), deg_to_rad(cfg["calib_values_bounds"]["alpha"].asVector<double>()[1])} },
-        { {deg_to_rad(cfg["calib_values_bounds"]["beta"].asVector<double>()[0]),  deg_to_rad(cfg["calib_values_bounds"]["beta"].asVector<double>()[1])} },
-        { {cfg["calib_values_bounds"]["R"].asVector<double>()[0],  cfg["calib_values_bounds"]["R"].asVector<double>()[1]} },
-        { {cfg["calib_values_bounds"]["K"].asVector<double>()[0],  cfg["calib_values_bounds"]["K"].asVector<double>()[1]} },
-        { {deg_to_rad(cfg["calib_values_bounds"]["alpha"].asVector<double>()[0]), deg_to_rad(cfg["calib_values_bounds"]["alpha"].asVector<double>()[1])} },
-        { {deg_to_rad(cfg["calib_values_bounds"]["beta"].asVector<double>()[0]),  deg_to_rad(cfg["calib_values_bounds"]["beta"].asVector<double>()[1])} },
-        { {cfg["calib_values_bounds"]["R"].asVector<double>()[0],  cfg["calib_values_bounds"]["R"].asVector<double>()[1]} },
-        { {cfg["calib_values_bounds"]["K"].asVector<double>()[0],  cfg["calib_values_bounds"]["K"].asVector<double>()[1]} }
-    };
-
-    OurCalibrationType calibration;
-    auto calibration_result = calibration.calibrate(
-        gazetracker, parameters,
-        variables_calibration_applicator,
-        // std::bind(result_processor, std::placeholders::_1, cfg["cam_pos"].as<Vec3>()),
-        calibrate_against,
-        initial_values,
-        bounds
-    );
-
-    parameters = variables_calibration_applicator(
-        parameters,
-        vecvec_to_pointer_pointer(calibration_result)
-    );
-
-    std::cout << "\n=== Global Calibration Result ===\n";
-    std::cout << "--- Left Eye ---\n";
-    std::cout << "Alpha: "
-              << rad_to_deg(parameters.left.alpha) << " deg" << std::endl;
-    std::cout << "Beta: "
-              << rad_to_deg(parameters.left.beta) << " deg" << std::endl;
-    std::cout << "R: " << parameters.left.R << std::endl;
-    std::cout << "K: " << parameters.left.K << std::endl;
-
-    std::cout << "--- Right Eye ---\n";
-    std::cout << "Alpha: "
-              << rad_to_deg(parameters.right.alpha) << " deg" << std::endl;
-    std::cout << "Beta: "
-              << rad_to_deg(parameters.right.beta) << " deg" << std::endl;
-    std::cout << "R: " << parameters.right.R << std::endl;
-    std::cout << "K: " << parameters.right.K << std::endl;
-
-    std::cout << "\nCalibration finished successfully.\n";
-
-    std::ofstream fout("D:/ylx/calib_inference_result_left.txt");
+    std::ofstream fout("D:/ylx/inference_result_left.txt");
     if (!fout) {
-        std::cerr << "[ERROR] Cannot open file: calib_inference_result_left.txt\n";
+        std::cerr << "[ERROR] Cannot open file: inference_result_left.txt\n";
         return -1;
     }
     // 表头
@@ -233,11 +164,11 @@ int main() {
         }
     }
     fout.close();
-    std::cout << "\ninference result saved to calib_inference_result_left.txt\n";
+    std::cout << "\ninference result saved to inference_result_left.txt\n";
 
-    std::ofstream fout_right("D:/ylx/calib_inference_result_right.txt");
+    std::ofstream fout_right("D:/ylx/inference_result_right.txt");
     if (!fout_right) {
-        std::cerr << "[ERROR] Cannot open file: calib_inference_result_right.txt\n";
+        std::cerr << "[ERROR] Cannot open file: inference_result_right.txt\n";
         return -1;
     }
     

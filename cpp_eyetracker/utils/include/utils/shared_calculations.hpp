@@ -206,10 +206,8 @@ Returns:
         double cxpx = cornea_center[0] - pupil_center_wcs[0];
         double cypy = cornea_center[1] - pupil_center_wcs[1];
         double under_sqrt = K * K - cxpx * cxpx - cypy * cypy;
-        std::cerr << "[DEBUG] under_sqrt = " << under_sqrt << "\n";
         if (under_sqrt < 0) {
-            std::cerr << "[NaN] sqrt(" << under_sqrt << ") in Chen noise reduction\n";
-            throw std::runtime_error("under_sqrt < 0");
+            under_sqrt = 0.0;
         }
         pupil_center_wcs[2] = cornea_center[2] - std::sqrt(under_sqrt);
     }

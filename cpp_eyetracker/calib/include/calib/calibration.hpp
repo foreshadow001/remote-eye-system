@@ -20,7 +20,6 @@ public:
         GazeEstimationMethod<Parameters, InputData, GazeEstimationResult>& estimation,
         Parameters& parameters,
         ParameterApplicator applicator,
-        ResultProcessor result_processor,
         CalibrationDataMap& data,
         std::vector<std::vector<double>> initial_values,
         std::vector<std::vector<std::pair<double, double>>> bounds);
@@ -32,7 +31,6 @@ std::vector<std::vector<double>> GenericCalibration<Parameters, InputData, GazeE
     GazeEstimationMethod<Parameters, InputData, GazeEstimationResult>& estimation,
     Parameters& parameters,
     ParameterApplicator applicator,
-    ResultProcessor result_processor,
     CalibrationDataMap& data,
     std::vector<std::vector<double>> initial_values,
     std::vector<std::vector<std::pair<double, double>>> bounds)
@@ -42,7 +40,7 @@ std::vector<std::vector<double>> GenericCalibration<Parameters, InputData, GazeE
     ceres::Problem problem;
 
     auto cost_function = new ceres::DynamicNumericDiffCostFunction<CalibrationErrorFunctor<Parameters, InputData, GazeEstimationResult>, ceres::CENTRAL>
-        (new CalibrationErrorFunctor<Parameters, InputData, GazeEstimationResult>(&estimation, &data, applicator, result_processor, parameters));
+        (new CalibrationErrorFunctor<Parameters, InputData, GazeEstimationResult>(&estimation, &data, applicator, parameters));
 
     for (int i = 0; i < initial_values.size(); i++)
     {
@@ -106,7 +104,6 @@ private:
     GazeEstimationMethod<Parameters, InputData, GazeEstimationResult>* const gaze_estimation;
     const typename GenericCalibration<Parameters, InputData, GazeEstimationResult>::CalibrationDataMap* const data;
     typename GenericCalibration<Parameters, InputData, GazeEstimationResult>::ParameterApplicator applicator;
-    typename GenericCalibration<Parameters, InputData, GazeEstimationResult>::ResultProcessor result_processor;
     const Parameters parameters;
 
 public:
@@ -114,13 +111,11 @@ public:
         GazeEstimationMethod<Parameters, InputData, GazeEstimationResult>* const gaze_estimation,
         const typename GenericCalibration<Parameters, InputData, GazeEstimationResult>::CalibrationDataMap* const data,
         typename GenericCalibration<Parameters, InputData, GazeEstimationResult>::ParameterApplicator applicator,
-        typename GenericCalibration<Parameters, InputData, GazeEstimationResult>::ResultProcessor result_proccessor,
         const Parameters parameters
     ) :
         gaze_estimation(gaze_estimation),
         data(data),
         applicator(applicator),
-        result_processor(result_proccessor),
         parameters(parameters)
     {
 
@@ -128,7 +123,7 @@ public:
 
     bool operator()(double const* const* variables, double* residual) const {
 
-        Parameters our_parameters = applicator(parameters, variables);
+        auto our_parameters = applicator(parameters, variables);
 
         double error = 0;
         Vec3 error_vec = make_vec3(0,0,0);
@@ -140,7 +135,7 @@ public:
             Vec3 truth = (*It).second;
 
             GazeEstimationResult result = gaze_estimation->estimate(data_in, our_parameters);
-            const Vec3 estimate = result_processor(result);
+            const Vec3 estimate = result.gaze_point;
             const Vec3 diff = truth - estimate;
                             
             residual[index++] = diff[0];

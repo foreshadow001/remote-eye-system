@@ -3,6 +3,9 @@
 #pragma once
 
 #include "core/math_types.hpp"
+#include "utils/utils.hpp"
+#include "cfg/config.hpp"
+#include "utils/shared_calculations.hpp"
 
 namespace gazeestimation {
 
@@ -25,11 +28,11 @@ Attributes:
 Fuctions:
     ics_to_wcs: transfer a vector in ICS to WCS.
 */
-    private:
+private:
     Vec3 camera_angles;
     Mat3x3 actual_rotation_matrix;
 
-    public:
+public:
     // camera intrinsic parameters
     double principal_point_x;
     double principal_point_y;
@@ -40,14 +43,54 @@ Fuctions:
     // position in WCS
     Vec3 position;
 
+    // 默认构造函数
     PinholeCameraModel():
-    camera_angles(make_vec3(0, 0, 0)),
-    actual_rotation_matrix(identity_matrix3x3()),
-    principal_point_x(0),
-    principal_point_y(0),
-    pixel_size_cm_x(0),
-    pixel_size_cm_y(0),
-    effective_focal_length_cm(0) { }
+        camera_angles(make_vec3(0, 0, 0)),
+        actual_rotation_matrix(identity_matrix3x3()),
+        principal_point_x(0),
+        principal_point_y(0),
+        pixel_size_cm_x(0),
+        pixel_size_cm_y(0),
+        effective_focal_length_cm(0),
+        position(make_vec3(0,0,0)) { }
+
+    PinholeCameraModel(int index) : PinholeCameraModel() {
+        Cfg cfg;
+        std::vector<std::string> cam_xml_paths = cfg["cam_xml_path"].as<std::vector<std::string>>();
+        // 1. 获取路径
+        std::string xml_path = cam_xml_paths[index];
+        
+        // 2. 加载参数
+        CameraParams params = LoadCameraParams(xml_path);
+
+        // 3. 赋值并进行单位转换 (HALCON 米 -> 类定义 厘米)
+        this->principal_point_x = params.cx; 
+        this->principal_point_y = params.cy; 
+        
+        this->pixel_size_cm_x = params.sx * 100.0; 
+        this->pixel_size_cm_y = params.sy * 100.0;
+        this->effective_focal_length_cm = params.focus * 100.0;
+
+        this->position = make_vec3(
+            params.T[0] * 100.0,
+            params.T[1] * 100.0,
+            params.T[2] * 100.0
+        );
+
+        auto normalize_angle = [](double angle_deg) -> double {
+            while (angle_deg > 180.0)  angle_deg -= 360.0;
+            while (angle_deg <= -180.0) angle_deg += 360.0;
+            return angle_deg;
+        };
+
+        double alpha = normalize_angle(params.R[0]);
+        double beta  = normalize_angle(params.R[1]);
+        double gamma = normalize_angle(params.R[2]);
+
+        
+
+        this->set_camera_angles(deg_to_rad(alpha), deg_to_rad(beta), deg_to_rad(gamma));
+    }
 
     void set_camera_angles(double x, double y, double z) {
         camera_angles = make_vec3(x, y, z);

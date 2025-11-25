@@ -12,14 +12,23 @@ namespace gazeestimation{
 class DefaultGazeEstimationResult
 {
 public:
+	DefaultGazeEstimationResult();
+
+	struct GazeEstimationResult
+	{
+		Vec3 cornea_center;
+		Vec3 visual_axis_unit;
+		Vec3 optical_axis_unit;
+	};
+
+	GazeEstimationResult left;
+	GazeEstimationResult right;
+
 	bool is_valid;
 	bool is_error;
-	Vec3 cornea_center;
-	Vec3 visual_axis_unit;
-	Vec3 optical_axis_unit;
+	Vec3 gaze_point;
 	std::string error;
 
-	explicit DefaultGazeEstimationResult();
 	static DefaultGazeEstimationResult make_error(std::string error);
 };
 
@@ -46,11 +55,17 @@ public:
 template <class CalibratedParameters>
 CalibrationMethod<CalibratedParameters>::~CalibrationMethod() {}
 
+struct SingleEyePupilCenterGlintInput
+{
+	std::vector<Vec2> glints;
+	Vec2 pupil_center;
+};
+
 // the input data for the gaze estimation method
 struct PupilCenterGlintInput
 {
-	std::vector<Vec2> glints;	
-	Vec2 pupil_center;
+	SingleEyePupilCenterGlintInput left;
+	SingleEyePupilCenterGlintInput right;
     bool is_valid;
 };
 
@@ -59,39 +74,24 @@ struct PupilCenterGlintInputs
 	std::vector<PupilCenterGlintInput> data;
 };
 
-/*
-struct EyeAndCameraParameters
-{
-	// eye parameters
-	double alpha;
-	double beta;
-	double R; // R in cm
-	double K; // K in cm
-	double n1;
-	double n2;
-	double D; // D in cm
-
-	std::vector<PinholeCameraModel> cameras;
-
-	// lights
-	std::vector<Vec3> light_positions; // light positions (ordered!, this is important for glint association)
-
-	double eye_cam_dist_init; // initial guess for the eye-camera distance
-};
-*/
-
 class EyeAndCameraParameters {
 public:
-    explicit EyeAndCameraParameters(const std::string& left_or_right);
+    EyeAndCameraParameters();
 
-    // 数据成员
-    double alpha = 0.0;
-    double beta = 0.0;
-    double R = 0.0;
-    double K = 0.0;
-    double n1 = 0.0;
-    double n2 = 0.0;
-    double D = 0.0;
+    // ---------- 左右眼参数 ----------
+    struct EyeParams {
+        double alpha = 0.0;
+        double beta = 0.0;
+        double R = 0.0;
+        double K = 0.0;
+        double n1 = 0.0;
+        double n2 = 0.0;
+        double D = 0.0;
+    };
+
+    EyeParams left;   // 左眼参数
+    EyeParams right;  // 右眼参数
+
     double eye_cam_dist_init = 0.0;
 
     std::vector<PinholeCameraModel> cameras;

@@ -19,10 +19,13 @@ target_include_directories(utils PUBLIC
 )
 
 find_package(OpenCV CONFIG REQUIRED)
+find_package(pugixml CONFIG REQUIRED)
 
 target_link_libraries(utils PUBLIC
+    eyetracker::core
     eyetracker::cfg
     eyetracker::cam_model
     ${OpenCV_LIBS}
+    pugixml::pugixml
 )
 

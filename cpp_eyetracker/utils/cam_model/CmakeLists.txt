@@ -10,4 +10,5 @@ target_include_directories(cam_model INTERFACE
 
 target_link_libraries(cam_model INTERFACE
     eyetracker::utils
+    eyetracker::cfg
 )

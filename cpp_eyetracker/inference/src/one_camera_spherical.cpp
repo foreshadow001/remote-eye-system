@@ -4,7 +4,6 @@
 */
 
 #include <iostream>
-#include <memory>
 #include <ceres/ceres.h>
 
 #include "utils/gaze_estimation_types.hpp"
@@ -17,6 +16,83 @@ using namespace gazeestimation;
 namespace gazeestimation
 {
 
+void GazeTracker::loadSettingsFromConfig()
+{
+    Cfg cfg;
+    
+    // 尝试获取 gaze_tracker 根节点
+    // 如果配置文件中没有这个节点，通常 Cfg 会抛出异常或者返回空节点，这里做简单的保护
+    if (!cfg["gaze_tracker"].isDefined()) {
+        std::cerr << "[Warning] 'gaze_tracker' section not found in config. Using defaults." << std::endl;
+        return;
+    }
+
+    auto settings = cfg["gaze_tracker"];
+
+    // -------------------------------------------------------
+    // 1. 加载 Chen 降噪算法开关
+    // -------------------------------------------------------
+    try {
+        if (settings["use_chen_noise_reduction"].isDefined()) {
+            this->use_chen_noise_reduction = settings["use_chen_noise_reduction"].as<bool>();
+            if (this->use_chen_noise_reduction) {
+                std::cout << "[Info] GazeTracker: Chen Noise Reduction ENABLED." << std::endl;
+            }
+        }
+    } catch (...) {
+        std::cerr << "[Error] Failed to load 'use_chen_noise_reduction'." << std::endl;
+    }
+
+    // -------------------------------------------------------
+    // 2. 加载角膜中心滤波器 (CC Filter)
+    // -------------------------------------------------------
+    if (settings["cc_filter"].isDefined()) {
+        auto cc_node = settings["cc_filter"];
+        bool enable = false;
+        int win_size = 5;
+
+        if (cc_node["enable"].isDefined()) enable = cc_node["enable"].as<bool>();
+        if (cc_node["window_size"].isDefined()) win_size = cc_node["window_size"].as<int>();
+
+        if (enable) {
+            this->ptr_cc_filter = std::make_unique<Vec3MedianFilter>(win_size);
+            // 绑定成员函数
+            this->setCorneaCenterFilter(
+                std::bind(&Vec3MedianFilter::newSample, this->ptr_cc_filter.get(), std::placeholders::_1)
+            );
+            std::cout << "[Info] GazeTracker: Cornea Center Filter ENABLED (Size: " << win_size << ")" << std::endl;
+        }
+    }
+
+    // -------------------------------------------------------
+    // 3. 加载瞳孔中心滤波器 (PC Filter)
+    // -------------------------------------------------------
+    if (settings["pc_filter"].isDefined()) {
+        auto pc_node = settings["pc_filter"];
+        bool enable = false;
+        int win_size = 5;
+
+        if (pc_node["enable"].isDefined()) enable = pc_node["enable"].as<bool>();
+        if (pc_node["window_size"].isDefined()) win_size = pc_node["window_size"].as<int>();
+
+        if (enable) {
+            this->ptr_pc_filter = std::make_unique<Vec3MedianFilter>(win_size);
+            // 绑定成员函数
+            this->setPupilCenterFilter(
+                std::bind(&Vec3MedianFilter::newSample, this->ptr_pc_filter.get(), std::placeholders::_1)
+            );
+            std::cout << "[Info] GazeTracker: Pupil Center Filter ENABLED (Size: " << win_size << ")" << std::endl;
+        }
+    }
+}
+
+// [修改] 构造函数：初始化成员变量并调用配置加载
+GazeTracker::GazeTracker() 
+    : use_chen_noise_reduction(false) // 默认值
+{
+    loadSettingsFromConfig();
+}
+
 void
 GazeTracker::setCorneaCenterFilter(Vec3Filter filter)
 {
@@ -28,9 +104,6 @@ GazeTracker::setPupilCenterFilter(Vec3Filter filter)
 {
     pupil_center_filter = filter;
 }
-
-GazeTracker::GazeTracker(bool use_chen_noise_reduction):
-use_chen_noise_reduction(use_chen_noise_reduction) {}
 
 DefaultGazeEstimationResult
 GazeTracker::estimate(
@@ -57,7 +130,12 @@ Raises:
         throw std::exception("This method must have exactly one pair of pupil center/glint.");
     }
     
-    if (glints_pupil_center.data[0].glints.size() < 2)
+    if (glints_pupil_center.data[0].left.glints.size() < 2)
+    {
+        throw std::exception("This method must have at least two glints.");
+    }
+
+    if (glints_pupil_center.data[0].right.glints.size() < 2)
     {
         throw std::exception("This method must have at least two glints.");
     }
@@ -67,78 +145,153 @@ Raises:
         throw std::exception("this method can only handle a single camera");
     }
 
-    int valid_glints = 0;
-    for(const auto& glint : glints_pupil_center.data[0].glints)
+    int left_valid_glints = 0;
+    for(const auto& glint : glints_pupil_center.data[0].left.glints)
     {
         if (isGlintValid(glint))
-            valid_glints++;
+            left_valid_glints++;
     }
 
-    if (valid_glints < 2) throw std::exception("not enough valid glints to estimate gaze");
+    if (left_valid_glints < 2) throw std::exception("not enough valid glints to estimate gaze");
+
+    int right_valid_glints = 0;
+    for(const auto& glint : glints_pupil_center.data[0].right.glints)
+    {
+        if (isGlintValid(glint))
+            right_valid_glints++;
+    }
+
+    if (right_valid_glints < 2) throw std::exception("not enough valid glints to estimate gaze");
 
     const PinholeCameraModel camera = eye_cam_params.cameras[0];
     const PupilCenterGlintInput glints_pupil_center_data = glints_pupil_center.data[0];
 
-    Vec3 cornea_center = solveCorneaCenter(
-        glints_pupil_center_data.glints,
-        eye_cam_params
+    Vec3 left_cornea_center = solveCorneaCenter(
+        glints_pupil_center_data.left.glints,
+        eye_cam_params.cameras[0],
+        eye_cam_params.light_positions,
+        eye_cam_params.left.R,
+        eye_cam_params.eye_cam_dist_init
     );
 
-    if (!std::isfinite(cornea_center[0])) {
-        std::cerr << "[NaN] solveCorneaCenter -> " << cornea_center << "\n";
-        throw std::runtime_error("cornea_center is NaN");
+    if (!std::isfinite(left_cornea_center[0])) {
+        std::cerr << "[NaN] solveCorneaCenter -> " << left_cornea_center << "\n";
+        throw std::runtime_error("left_cornea_center is NaN");
+    }
+
+    Vec3 right_cornea_center = solveCorneaCenter(
+        glints_pupil_center_data.right.glints,
+        eye_cam_params.cameras[0],
+        eye_cam_params.light_positions,
+        eye_cam_params.right.R,
+        eye_cam_params.eye_cam_dist_init
+    );
+
+    if (!std::isfinite(right_cornea_center[0])) {
+        std::cerr << "[NaN] solveCorneaCenter -> " << right_cornea_center << "\n";
+        throw std::runtime_error("right_cornea_center is NaN");
     }
 
     if(cornea_center_filter)
     {
-        cornea_center = cornea_center_filter(cornea_center);
+        left_cornea_center = cornea_center_filter(left_cornea_center);
+        right_cornea_center = cornea_center_filter(right_cornea_center);
     }
 
-    Vec3 pupil_image_wcs = camera.ics_to_wcs(glints_pupil_center_data.pupil_center);
+    Vec3 left_pupil_image_wcs = camera.ics_to_wcs(glints_pupil_center_data.left.pupil_center);
+    Vec3 right_pupil_image_wcs = camera.ics_to_wcs(glints_pupil_center_data.right.pupil_center);
 
-    if (!std::isfinite(pupil_image_wcs[0])) {
-        std::cerr << "[NaN] ics_to_wcs -> " << pupil_image_wcs
-                  << "  input=" << glints_pupil_center_data.pupil_center << "\n";
-        throw std::runtime_error("pupil_image_wcs is NaN");
+
+    if (!std::isfinite(left_pupil_image_wcs[0])) {
+        std::cerr << "[NaN] ics_to_wcs -> " << left_pupil_image_wcs
+                  << "  input=" << glints_pupil_center_data.left.pupil_center << "\n";
+        throw std::runtime_error("left_pupil_image_wcs is NaN");
+    }
+
+    if (!std::isfinite(right_pupil_image_wcs[0])) {
+        std::cerr << "[NaN] ics_to_wcs -> " << right_pupil_image_wcs
+                  << "  input=" << glints_pupil_center_data.right.pupil_center << "\n";
+        throw std::runtime_error("right_pupil_image_wcs is NaN");
     }
 
     if(pupil_center_filter)
     {
-        pupil_image_wcs = pupil_center_filter(pupil_image_wcs);
+        left_pupil_image_wcs = pupil_center_filter(left_pupil_image_wcs);
+        right_pupil_image_wcs = pupil_center_filter(right_pupil_image_wcs);
     }
 
-    const Vec3 optic_axis_unit = calculateOpticalAxisUnit(
-        pupil_image_wcs,
+    const Vec3 left_optic_axis_unit = calculateOpticalAxisUnit(
+        left_pupil_image_wcs,
         eye_cam_params.cameras[0].position,
-        cornea_center,
-        eye_cam_params.R,
-        eye_cam_params.K,
-        eye_cam_params.n1,
-        eye_cam_params.n2,
+        left_cornea_center,
+        eye_cam_params.left.R,
+        eye_cam_params.left.K,
+        eye_cam_params.left.n1,
+        eye_cam_params.left.n2,
         use_chen_noise_reduction
     );
 
-    if (!std::isfinite(optic_axis_unit[0])) {
-        std::cerr << "[NaN] calculateOpticalAxisUnit\n";
-        throw std::runtime_error("optic_axis_unit is NaN");
-    }
-
-    const Vec3 visual_axis_unit = calculateVisualAxisUnit(
-        optic_axis_unit,
-        eye_cam_params.alpha,
-        eye_cam_params.beta
+    const Vec3 right_optic_axis_unit = calculateOpticalAxisUnit(
+        right_pupil_image_wcs,
+        eye_cam_params.cameras[0].position,
+        right_cornea_center,
+        eye_cam_params.right.R,
+        eye_cam_params.right.K,
+        eye_cam_params.right.n1,
+        eye_cam_params.right.n2,
+        use_chen_noise_reduction
     );
 
-    if (!std::isfinite(visual_axis_unit[0])) {
+    if (!std::isfinite(left_optic_axis_unit[0])) {
+        std::cerr << "[NaN] calculateOpticalAxisUnit\n";
+        throw std::runtime_error("left_optic_axis_unit is NaN");
+    }
+
+    if (!std::isfinite(right_optic_axis_unit[0])) {
+        std::cerr << "[NaN] calculateOpticalAxisUnit\n";
+        throw std::runtime_error("right_optic_axis_unit is NaN");
+    }
+
+    const Vec3 left_visual_axis_unit = calculateVisualAxisUnit(
+        left_optic_axis_unit,
+        eye_cam_params.left.alpha,
+        eye_cam_params.left.beta
+    );
+
+    const Vec3 right_visual_axis_unit = calculateVisualAxisUnit(
+        right_optic_axis_unit,
+        eye_cam_params.right.alpha,
+        eye_cam_params.right.beta
+    );
+
+    if (!std::isfinite(left_visual_axis_unit[0])) {
         std::cerr << "[NaN] calculateVisualAxisUnit\n";
-        throw std::runtime_error("visual_axis_unit is NaN");
+        throw std::runtime_error("left_visual_axis_unit is NaN");
+    }
+
+    if (!std::isfinite(right_visual_axis_unit[0])) {
+        std::cerr << "[NaN] calculateVisualAxisUnit\n";
+        throw std::runtime_error("right_visual_axis_unit is NaN");
     }
 
     DefaultGazeEstimationResult result;
     result.is_valid = true;
-    result.cornea_center = cornea_center;
-    result.optical_axis_unit = optic_axis_unit;
-    result.visual_axis_unit = visual_axis_unit;
+    
+    result.left.cornea_center = left_cornea_center;
+    result.left.optical_axis_unit = left_optic_axis_unit;
+    result.left.visual_axis_unit = left_visual_axis_unit;
+
+    result.right.cornea_center = right_cornea_center;
+    result.right.optical_axis_unit = right_optic_axis_unit;
+    result.right.visual_axis_unit = right_visual_axis_unit;
+
+    result.gaze_point = computeGazeIntersection(
+        left_cornea_center,
+        left_visual_axis_unit,
+        right_cornea_center,
+        right_visual_axis_unit,
+        result.is_valid
+    );
 
     return result;
 
@@ -147,7 +300,10 @@ Raises:
 Vec3
 solveCorneaCenter(
     std::vector<Vec2> glints,
-    const EyeAndCameraParameters& eye_cam_params
+    PinholeCameraModel camera,
+    std::vector<Vec3> light_positions,
+    double R,
+    double eye_cam_dist_init
 )
 /*
 Estimate the center of cornea based on pupil center and glints.
@@ -168,16 +324,16 @@ Returns:
     for(int i = 0; i < glints.size(); i++)
     {
         if (!isGlintValid(glints[i])) continue;
-        glints_image_wcs.push_back(eye_cam_params.cameras[0].ics_to_wcs(glints[i]));
-        selected_lights.push_back(eye_cam_params.light_positions[i]);
+        glints_image_wcs.push_back(camera.ics_to_wcs(glints[i]));
+        selected_lights.push_back(light_positions[i]);
     }
 
     Vec3 cornea_center = calculateCorneaCenterWCS(
         &glints_image_wcs,
         &selected_lights,
-        eye_cam_params.cameras[0].position,
-        eye_cam_params.R,
-        eye_cam_params.eye_cam_dist_init
+        camera.position,
+        R,
+        eye_cam_dist_init
     );
 
     return cornea_center;

@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
-TXT = 'D:/users/Projects/new_dataset/calib_inference_result.txt'
+TXT = 'D:/ylx/calib_inference_result_left.txt'
 actual_camera_position = np.array([29.0, -31, 17])
 SCREEN_W = 59.5
 SCREEN_H = 33.6
