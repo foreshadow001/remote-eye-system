@@ -11,11 +11,11 @@
 
 namespace glintdetection {
 
-bool local_debug = true;
+bool local_debug = false;
 
 bool side2mid(int x, int y)
 {
-	return (x <= 15 && x >= 3 && y <= 5 && y >= 0);
+	return (x <= 20 && x >= 5 && y <= 10 && y >= 3); // 15 3 5 0
 }
 
 std::vector<cv::Point2f>

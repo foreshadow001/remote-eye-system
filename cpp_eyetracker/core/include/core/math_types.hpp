@@ -5,6 +5,7 @@
 // #define EIGEN_DONT_ALIGN_STATICALLY
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 
 namespace gazeestimation {
 

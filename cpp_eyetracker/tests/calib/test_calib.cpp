@@ -72,7 +72,7 @@ int main() {
             cv::Mat gray;
             cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
 
-            auto [leftEyeGlints, rightEyeGlints, processed_img_left, processed_img_right] =
+            auto [leftEyeGlints, rightEyeGlints, img_debug] =
                 glintdetection::searchForGlints(frame, 50.0);
             if (leftEyeGlints.size() != 3) continue;
             if (rightEyeGlints.size() != 3) continue;
