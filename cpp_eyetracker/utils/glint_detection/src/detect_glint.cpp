@@ -11,11 +11,11 @@
 
 namespace glintdetection {
 
-bool local_debug = false;
+bool local_debug = true;
 
 bool side2mid(int x, int y)
 {
-	return (x <= 20 && x >= 5 && y <= 10 && y >= 3);
+	return (x <= 15 && x >= 3 && y <= 5 && y >= 0);
 }
 
 std::vector<cv::Point2f>
@@ -101,7 +101,7 @@ splitGlintsByEye(const std::vector<cv::Point2f>& glints, float distanceThr)
     return {leftEye, rightEye};
 }
 
-std::tuple<std::vector<cv::Point2f>, std::vector<cv::Point2f>, cv::Mat, cv::Mat>
+std::tuple<std::vector<cv::Point2f>, std::vector<cv::Point2f>, cv::Mat>
 searchForGlints(cv::Mat src, double firstEyeThresh)
 {
 	cv::Mat gray;
@@ -132,11 +132,14 @@ searchForGlints(cv::Mat src, double firstEyeThresh)
 	cv::Mat abs_dst;
 	cv::convertScaleAbs(laplaced, abs_dst);
 	//convertScaleAbs(laplaced, abs_dst, (sigma + 1)*0.25);
-	
+
 	// 3 Find Contours
 	/// Detect edges using Threshold
-	cv::Mat threshold_output, threshold_output2, threshold_output3;
+	cv::Mat threshold_output;
 	cv::threshold(abs_dst, threshold_output, firstEyeThresh, 255, cv::THRESH_BINARY);
+
+	std::vector<cv::Point2f> leftEyeGlints_, rightEyeGlints_;
+	// return {leftEyeGlints_, rightEyeGlints_, threshold_output};
 
 	// FOR SPEED UP
 	std::vector<cv::Vec4i> hierarchy;
@@ -162,11 +165,12 @@ searchForGlints(cv::Mat src, double firstEyeThresh)
 	auto [glintCandidates, img_rm] = removeFalseGlints(contourCenter, src_copy);
 	auto [leftEyeGlintsCandidates, rightEyeGlintsCandidates] = splitGlintsByEye(glintCandidates);
 
-	auto [leftEyeGlints, img_left]  = myfindGeometry(leftEyeGlintsCandidates, src_copy_left);
+	auto leftEyeGlints  = findGeometry(leftEyeGlintsCandidates);
 	if (local_debug) std::cout << "num leftEyeGlints: " << leftEyeGlints.size() << std::endl;
-	auto [rightEyeGlints, img_right] = myfindGeometry(rightEyeGlintsCandidates, src_copy_right);
+	// auto rightEyeGlints = myfindGeometry(rightEyeGlintsCandidates);
+	std::vector<cv::Point2f> rightEyeGlints;
 	
-	return {leftEyeGlints, rightEyeGlints, img_left, img_right};
+	return {leftEyeGlints, rightEyeGlints, src};
 
 } // searchForGlints()
 
@@ -216,8 +220,8 @@ removeFalseGlints(std::vector<cv::Point2f> contourCenters, cv::Mat src)
 	return {glintCandidates, src};
 } // removeFalseGlints()
 
-std::tuple<std::vector<cv::Point2f>, cv::Mat>
-findGeometry(const std::vector<cv::Point2f>& glintCandidates, cv::Mat src)
+std::vector<cv::Point2f>
+findGeometry(const std::vector<cv::Point2f>& glintCandidates)
 {
 	std::vector<cv::Point2f> glintCombi;
 	std::list<cv::Point2f> glintList(glintCandidates.begin(), glintCandidates.end());
@@ -233,7 +237,7 @@ findGeometry(const std::vector<cv::Point2f>& glintCandidates, cv::Mat src)
 			int y = abs((*it).y - (*it1).y);
 
 			// found horizontal Point2f pair
-			if (x <= 30 && x >= 10 && y <= 3 && y >= 0) // original
+			if (x <= 15 && x >= 5 && y <= 5 && y >= 0) // original
 			{
 				int yTolerance = 5; // tolerance for y-coordinate
 
@@ -243,7 +247,6 @@ findGeometry(const std::vector<cv::Point2f>& glintCandidates, cv::Mat src)
 					if (local_debug)
 					{
 						std::cout << "1 found right to left" << std::endl;
-						cv::line(src, (*it), (*it1), cv::Scalar(255, 255, 255), 1, 8, 0);
 					}
 					for (std::list<cv::Point2f>::iterator it2 = glintList.begin(); it2 != glintList.end(); ++it2)
 					{
@@ -261,22 +264,13 @@ findGeometry(const std::vector<cv::Point2f>& glintCandidates, cv::Mat src)
 							// mid down to left
 							if (side2mid(x, y))
 							{
-								if (local_debug)
-								{
-									std::cout << "3 found mid down to left" << std::endl;
-
-									cv::line(src, (*it), (*it1), cv::Scalar(0, 0, 255), 1, 8, 0); // red		= 1. horizontal line a - b
-									cv::line(src, (*it), (*it2), cv::Scalar(255, 0, 255), 1, 8, 0); // magenta	= 2. diagonal line   a - c  
-									cv::line(src, (*it2), (*it1), cv::Scalar(0, 255, 255), 1, 8, 0); // yellow	= 3. diagonal line   c - b
-								}
-
 								std::vector<cv::Point2f> tmp;
 								tmp.emplace_back((*it));
 								tmp.emplace_back((*it1));
 								tmp.emplace_back((*it2));
 
 								glintCombi = tmp;
-								return {glintCombi, src};
+								return glintCombi;
 							}
 						}
 					}
@@ -286,7 +280,6 @@ findGeometry(const std::vector<cv::Point2f>& glintCandidates, cv::Mat src)
 					if (local_debug)
 					{
 						std::cout << "1 found left to right" << std::endl;
-						cv::line(src, (*it), (*it1), cv::Scalar(255, 255, 255), 1, 8, 0);
 					}
 					for (std::list<cv::Point2f>::iterator it2 = glintList.begin(); it2 != glintList.end(); ++it2)
 					{
@@ -307,21 +300,13 @@ findGeometry(const std::vector<cv::Point2f>& glintCandidates, cv::Mat src)
 							// mid down to right
 							if (side2mid(x, y))
 							{
-								if (local_debug)
-								{
-									std::cout << "3 found mid down to right" << std::endl;
-
-									cv::line(src, (*it), (*it1), cv::Scalar(0, 0, 255), 1, 8, 0); // red		= 1. horizontal line a - b
-									cv::line(src, (*it), (*it2), cv::Scalar(255, 0, 255), 1, 8, 0); // magenta	= 2. diagonal line   a - c  
-									cv::line(src, (*it2), (*it1), cv::Scalar(0, 255, 255), 1, 8, 0); // yellow	= 3. diagonal line   c - b
-								}
 								std::vector<cv::Point2f> tmp;
 								tmp.emplace_back((*it));
 								tmp.emplace_back((*it1));
 								tmp.emplace_back((*it2));
 
 								glintCombi = tmp;
-								return {glintCombi, src};
+								return glintCombi;
 							}
 						}
 					}
@@ -330,17 +315,17 @@ findGeometry(const std::vector<cv::Point2f>& glintCandidates, cv::Mat src)
 		}
 	}
 
-	return {glintCombi, src};
+	return glintCombi;
 }
 
-std::tuple<std::vector<cv::Point2f>, cv::Mat>
-myfindGeometry(const std::vector<cv::Point2f>& glintCandidates, cv::Mat src)
+std::vector<cv::Point2f>
+myfindGeometry(const std::vector<cv::Point2f>& glintCandidates)
 {
 	std::vector<cv::Point2f> glintCombi;
 	std::list<cv::Point2f> glintList(glintCandidates.begin(), glintCandidates.end());
 
     if (glintList.size() < 3)
-        return {glintCombi, src};
+        return glintCombi;
 
     for (auto it = glintList.begin(); it != glintList.end(); ++it)
     {
@@ -354,28 +339,12 @@ myfindGeometry(const std::vector<cv::Point2f>& glintCandidates, cv::Mat src)
                 auto mid   = result[2];
                 glintCombi = {left, right, mid};
 
-                if (local_debug)
-                {
-                    std::cout << "Found glint triangle: "
-                              << "L(" << left.x << "," << left.y << "), "
-                              << "R(" << right.x << "," << right.y << "), "
-                              << "M(" << mid.x << "," << mid.y << ")"
-                              << std::endl;
-
-                    cv::line(src, left, right, cv::Scalar(0, 0, 255), 1, 8, 0);
-                    cv::line(src, left, mid,  cv::Scalar(255, 0, 255), 1, 8, 0);
-                    cv::line(src, mid,  right, cv::Scalar(0, 255, 255), 1, 8, 0);
-                }
-
-                return {glintCombi, src};
+                return glintCombi;
             }
         }
     }
 
-    if (local_debug)
-        std::cout << "No valid glint combination found." << std::endl;
-
-    return {glintCombi, src};
+    return glintCombi;
 } // myfindGeometry()
 
 } // namespace glintdetection

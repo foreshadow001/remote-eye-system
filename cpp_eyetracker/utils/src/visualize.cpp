@@ -48,4 +48,33 @@ cv::Mat visualizeGlintsAndPupil(
     return vis;
 }
 
+cv::Mat
+visualizeGlints(
+    const cv::Mat& frame,
+    const std::vector<cv::Point2d>& glints
+)
+{
+    cv::Mat vis;
+    vis = frame.clone();
+
+    // 如果 glints 数量为 3，就连成三角形并标出
+    if (glints.size() == 3) {
+        std::vector<cv::Point> pts;
+        pts.reserve(3);
+        for (const auto& g : glints)
+            pts.emplace_back(cv::Point(cvRound(g.x), cvRound(g.y)));
+
+        // 画三角线
+        const cv::Scalar triColor(0, 255, 0); // 绿色
+        cv::polylines(vis, pts, true, triColor, 1, cv::LINE_AA);
+
+    } else {
+        // 如果没有 3 个 glint，也尝试把已有的点画出来
+        for (const auto& g : glints)
+            cv::circle(vis, cv::Point(cvRound(g.x), cvRound(g.y)), 3, cv::Scalar(0,200,200), cv::FILLED, cv::LINE_AA);
+    }
+
+    return vis;
+}
+
 }

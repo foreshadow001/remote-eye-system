@@ -13,4 +13,10 @@ visualizeGlintsAndPupil(
 	const float radius
 );
 
+cv::Mat
+visualizeGlints(
+    const cv::Mat& frame,
+    const std::vector<cv::Point2d>& glints
+);
+
 }

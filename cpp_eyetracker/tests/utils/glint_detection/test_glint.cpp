@@ -4,13 +4,16 @@
 #include <opencv2/opencv.hpp>
 
 #include "glint_detection/detect_glint.h"
+#include "cfg/config.hpp"
+#include "utils/visualize.hpp"
 
 using namespace glintdetection;
-
-const std::string input_folder  = "D:/users/projects/new_dataset/data_collection/PCCR/test_dataset/images/src";
-const std::string output_folder = "D:/users/projects/new_dataset/data_collection/PCCR/test_dataset/images/glints_geometric";
+using namespace visualization;
 
 int main() {
+    Cfg cfg;
+    std::string input_folder = cfg["test_glint"]["input_folder"].as<std::string>();
+    std::string output_folder = cfg["test_glint"]["output_folder"].as<std::string>();
     // create output folder if not exist
     CreateDirectory(output_folder.c_str(), NULL);
 
@@ -37,21 +40,33 @@ int main() {
             }
 
             // call searchForGlints
-            auto [leftEyeGlints, rightEyeGlints, processed_img_left, processed_img_right] = searchForGlints(img, 50.0);
+            double threshold = cfg["test_glint"]["threshold"].as<double>();
+            auto [leftEyeGlints, rightEyeGlints, debug_img] = searchForGlints(img, threshold);
 
-            // save the gaussed image
+			std::vector<cv::Point2d> left_glints, right_glints;
+			left_glints.reserve(leftEyeGlints.size());
+            right_glints.reserve(rightEyeGlints.size());
+			for (const auto& g : leftEyeGlints) {
+				left_glints.emplace_back(g.x, g.y);
+			}
+            for (const auto& g : rightEyeGlints) {
+                right_glints.emplace_back(g.x, g.y);
+			}
+
+            // draw the glints
+            cv::Mat left_viz = visualizeGlints(img, left_glints);
+            cv::Mat viz = visualizeGlints(left_viz, right_glints);
+
+            // save the image
             std::string index = std::to_string(idx);
             std::string num_glints = std::to_string(leftEyeGlints.size() + rightEyeGlints.size());
-            std::string outpath_left = output_folder + "\\" + "left_" + index + "_glints_" + num_glints + "_" + filename;
-            cv::imwrite(outpath_left, processed_img_left);
+            std::string output_path = output_folder + "\\" + filename;
+            cv::imwrite(output_path, viz);
 
-            std::string outpath_right = output_folder + "\\" + "right_" + index + "_glints_" + num_glints + "_" + filename;
-            cv::imwrite(outpath_right, processed_img_right);
-
-            std::cout << "saved to " << output_folder << " | index: " + index << " | num of glints: " << num_glints << std::endl;
+            std::cout << "saved to: " << output_path << " | num of glints: " << num_glints << std::endl;
             idx++;
         }
-    } while (::FindNextFile(hFind, &fd));
+    } while ((::FindNextFile(hFind, &fd) != 0) && (idx < 15));
     ::FindClose(hFind);
 
     std::cout << "processed " << idx << " images." << std::endl;

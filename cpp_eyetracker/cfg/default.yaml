@@ -89,3 +89,9 @@ test_multi_cam:
   exposure_time: 10000.0
   window_width: 1440
   window_height: 1080
+
+# Test glint
+test_glint:
+  input_folder: "D:/users/projects/new_dataset/test_multi_cam"
+  output_folder: "D:/users/projects/new_dataset/test_glint_result"
+  threshold: 200.0
