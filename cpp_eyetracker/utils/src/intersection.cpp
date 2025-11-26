@@ -21,64 +21,79 @@ PoGToWCS(
     );
 }
 
-Vec3 computeGazeIntersection(
-    const Vec3& origin_l,   // 左眼角膜中心
-    const Vec3& dir_l,      // 左眼视轴单位向量
-    const Vec3& origin_r,   // 右眼角膜中心
-    const Vec3& dir_r,      // 右眼视轴单位向量
-    bool& is_valid          // [输出] 结果是否有效
+// 假设 Vec3 支持 + - * 浮点数，dot(a,b) 和 a.normalized() 等
+Vec3
+computeGazeIntersection(
+    const Vec3& origin_l,   // 左眼角膜中心 (m)
+    const Vec3& dir_l_in,   // 左眼视轴方向（不一定归一）
+    const Vec3& origin_r,   // 右眼角膜中心 (m)
+    const Vec3& dir_r_in,   // 右眼视轴方向（不一定归一）
+    bool& is_valid          // 输出：是否有效
 )
 {
-    // 1. 计算起始点之间的向量 w0 = P_L - P_R
+    // 参数化：阈值（可调整）
+    const double EPS_DENOM = 1e-9;   // 判定平行的阈值
+    const double MAX_SEPARATION = 0.03; // 两最近点允许的最大分离（m），例如 3cm
+    const double MIN_FORWARD = -0.05;   // 若你希望 s,t 必须是“向前”，可以设为0；带点容差
+
+    // 先把方向归一化（重要）
+    Vec3 dir_l = dir_l_in;
+    Vec3 dir_r = dir_r_in;
+    double nl = dir_l.norm();
+    double nr = dir_r.norm();
+    if (nl <= 1e-12 || nr <= 1e-12) {
+        is_valid = false;
+        return (origin_l + origin_r) * 0.5; // 返回中点作为占位
+    }
+    dir_l = dir_l / nl;
+    dir_r = dir_r / nr;
+
+    // w0 = P_L - P_R (与你原式一致)
     Vec3 w0 = origin_l - origin_r;
 
-    // 2. 计算点积系数
-    // a = dir_l · dir_l (如果由于归一化，通常为 1)
-    // b = dir_l · dir_r
-    // c = dir_r · dir_r (如果由于归一化，通常为 1)
-    // d = dir_l · w0
-    // e = dir_r · w0
-    float a = dot(dir_l, dir_l);
-    float b = dot(dir_l, dir_r);
-    float c = dot(dir_r, dir_r);
-    float d = dot(dir_l, w0);
-    float e = dot(dir_r, w0);
+    double a = dot(dir_l, dir_l); // 理论上 1
+    double b = dot(dir_l, dir_r);
+    double c = dot(dir_r, dir_r); // 理论上 1
+    double d = dot(dir_l, w0);
+    double e = dot(dir_r, w0);
 
-    // 3. 计算分母 (ac - b^2)
-    float denom = a * c - b * b;
-
-    // 4. 检查平行情况
-    // 如果 denom 非常接近 0，说明视线平行（注视无穷远）或重合
-    if (std::abs(denom) < 1e-6f) {
-        is_valid = false; 
-        // 平行时通常无法计算交点，可以返回一个默认的远距离点，或者保持无效
-        // 这里简单的取左眼视线前方 1米处作为 fallback
-        return origin_l + dir_l * 1000.0f; 
-    }
-
-    // 5. 计算两条射线上的最近点参数 s (左眼) 和 t (右眼)
-    // s = (be - cd) / denom
-    // t = (ae - bd) / denom
-    float s = (b * e - c * d) / denom;
-    float t = (a * e - b * d) / denom;
-    
-    // 6. 额外的合理性检查 (可选)
-    // 如果 s 或 t 为负数，说明交点在脑袋后方，这是不合理的
-    if (s < 0 || t < 0) {
+    double denom = a * c - b * b;
+    if (std::abs(denom) < EPS_DENOM) {
+        // 近似平行：不能可靠求最近点
         is_valid = false;
+        // 返回左右眼中点投影在某个默认远处（不要返回巨大的 1000 单位）
+        // 这里返回两眼中心点前方 1 m 作为占位（但标记无效）
+        Vec3 mid_eye = (origin_l + origin_r) * 0.5;
+        Vec3 forward = (dir_l + dir_r) * 0.5;
+        if (forward.norm() < 1e-6) forward = Vec3(0,0,1); // 兜底
+        forward = forward / forward.norm();
+        return mid_eye + forward * 1.0; // 1 m 前方
     }
 
-    // 7. 计算两条射线上距离最近的两个点
+    // 两条线的最近点参数
+    double s = (b * e - c * d) / denom;
+    double t = (a * e - b * d) / denom;
+
+    // 计算最近点与它们之间的分离
     Vec3 point_on_l = origin_l + dir_l * s;
     Vec3 point_on_r = origin_r + dir_r * t;
+    double separation = (point_on_l - point_on_r).norm();
 
-    // 8. 返回这两个点的中点作为最终注视点
-    Vec3 gaze_point = (point_on_l + point_on_r) * 0.5f;
+    // 合理性检查：
+    // - 如果两最近点相距太远 => 无效
+    // - 可选：如果 s 或 t 明显为负（在头部后方），认为无效（取决于你定义）
+    bool s_t_forward_ok = (s >= MIN_FORWARD) && (t >= MIN_FORWARD);
+    if (separation > MAX_SEPARATION || !s_t_forward_ok) {
+        is_valid = false;
+    } else {
+        is_valid = true;
+    }
 
-    return gaze_point + make_vec3(29.0, -31.0, 17.0);
+    // 返回中点（即两最近点的中点）
+    Vec3 gaze_point = (point_on_l + point_on_r) * 0.5;
+    return gaze_point;
 }
 
-}
 
 Vec3
 rayPlaneIntersection(
@@ -183,4 +198,6 @@ screenToWCS(
     Vec3 wcs_point = cfg["screen_center"].as<Vec3>() + screen_u * u_distance + screen_v * v_distance;
 
     return wcs_point;
+}
+
 }

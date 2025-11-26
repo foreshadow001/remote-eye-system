@@ -165,10 +165,9 @@ searchForGlints(cv::Mat src, double firstEyeThresh)
 	auto [glintCandidates, img_rm] = removeFalseGlints(contourCenter, src_copy);
 	auto [leftEyeGlintsCandidates, rightEyeGlintsCandidates] = splitGlintsByEye(glintCandidates);
 
-	auto leftEyeGlints  = findGeometry(leftEyeGlintsCandidates);
+	auto leftEyeGlints  = myfindGeometry(leftEyeGlintsCandidates);
 	if (local_debug) std::cout << "num leftEyeGlints: " << leftEyeGlints.size() << std::endl;
-	// auto rightEyeGlints = myfindGeometry(rightEyeGlintsCandidates);
-	std::vector<cv::Point2f> rightEyeGlints;
+	auto rightEyeGlints = myfindGeometry(rightEyeGlintsCandidates);
 	
 	return {leftEyeGlints, rightEyeGlints, src};
 

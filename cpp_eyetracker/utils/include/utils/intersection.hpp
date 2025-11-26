@@ -20,4 +20,10 @@ computeGazeIntersection(
     bool& is_valid          // [输出] 结果是否有效
 );
 
+Vec3
+screenToWCS(
+    const Vec2& screen_point,
+    const Cfg& cfg
+);
+
 }

@@ -432,7 +432,7 @@ Returns:
 */
 {
     return make_vec3(
-        - std::sin(alpha) * std::cos(beta),
+        std::sin(alpha) * std::cos(beta),
         std::sin(beta),
         std::cos(alpha) * std::cos(beta)
     );

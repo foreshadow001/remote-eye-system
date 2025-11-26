@@ -293,6 +293,8 @@ Raises:
         result.is_valid
     );
 
+    // std::cout << "[GazeTracker] Gaze Point: " << vec3_to_string(result.gaze_point) << "\n";
+
     return result;
 
 } // estimate
@@ -325,6 +327,9 @@ Returns:
     {
         if (!isGlintValid(glints[i])) continue;
         glints_image_wcs.push_back(camera.ics_to_wcs(glints[i]));
+        // std::string debug_str = "[SC] glint " + std::to_string(i) + " ICS: " + std::to_string(glints[i][0]) + ", " + std::to_string(glints[i][1]);
+        // debug_str += " WCS: " + vec3_to_string(glints_image_wcs.back());
+        // std::cerr << debug_str << std::endl;
         selected_lights.push_back(light_positions[i]);
     }
 

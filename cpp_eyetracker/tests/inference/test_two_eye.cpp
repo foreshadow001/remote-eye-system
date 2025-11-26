@@ -16,11 +16,18 @@
 #include "pupil_center/localize_pupil.h"
 #include "inference/one_camera_spherical.hpp"
 #include "utils/shared_calculations.hpp"
+#include "calib/calibration.hpp"
 #include "utils/utils.hpp"
+#include "utils/intersection.hpp"
 
 using namespace gazeestimation;
 using namespace visualization;
 namespace fs = std::filesystem;
+
+using OurCalibrationType = GenericCalibration<
+    EyeAndCameraParameters,
+    PupilCenterGlintInputs,
+    DefaultGazeEstimationResult>;
 
 int main() {
     std::cout << "Loading config file..." << std::endl;
@@ -32,8 +39,13 @@ int main() {
 
     std::regex re(R"((?:\\|/)?([^\\/_]+)_(\d+)_(\d+)_([\d]+)\.avi$)");
 
+    int counter = 0;
+
     for (const auto& entry : fs::directory_iterator(cfg["input_dir"].as<std::string>())) {
         if (entry.path().extension() != ".avi") continue;
+
+        if (counter > 10) break;
+
         std::string video_path = entry.path().string();
 
         std::smatch match;
@@ -45,6 +57,9 @@ int main() {
         double pog_x = std::stod(match[3]);
         double pog_y = std::stod(match[4]);
         Vec2 true_pog = make_vec2(pog_x, pog_y);
+        // Vec3 target = PoGToWCS(true_pog, cfg);
+        Vec3 target = screenToWCS(true_pog, cfg);
+        std::cout << "target WCS: " << target.transpose() << std::endl;
 
         cv::VideoCapture cap(video_path);
         if (!cap.isOpened()) {
@@ -66,7 +81,7 @@ int main() {
             cv::Mat gray;
             cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
 
-            auto [leftEyeGlints, rightEyeGlints, processed_img_left, processed_img_right] =
+            auto [leftEyeGlints, rightEyeGlints, img_debug] =
                 glintdetection::searchForGlints(frame, 50.0);
             if (leftEyeGlints.size() != 3) continue;
             if (rightEyeGlints.size() != 3) continue;
@@ -87,8 +102,6 @@ int main() {
             input.right.pupil_center = make_vec2(rightPupilCenter.x, rightPupilCenter.y);
 
             inputs.data.push_back(input);
-
-            Vec3 target = PoGToWCS(true_pog, cfg);
             calibrate_against.push_back(std::make_pair(inputs, target));
 
 			// --- 将检测结果转换为 OpenCV 点 ----
@@ -128,11 +141,16 @@ int main() {
 			}
 
         }
+        counter++;
     }
+
+    std::cout << "\nTotal samples collected: "
+              << calibrate_against.size() << std::endl;
+
 
     std::ofstream fout("D:/ylx/inference_result_left.txt");
     if (!fout) {
-        std::cerr << "[ERROR] Cannot open file: inference_result_left.txt\n";
+        std::cerr << "[ERROR] Cannot open file: calib_inference_result_left.txt\n";
         return -1;
     }
     // 表头
@@ -148,7 +166,6 @@ int main() {
             DefaultGazeEstimationResult res = gazetracker.estimate(inputs, parameters);
 
             Vec3 pred_wcs = res.gaze_point;
-			res.left.cornea_center += cfg["cam_pos"].as<Vec3>();
 
             // 输出一行，保留 6 位小数
             fout << std::fixed << std::setprecision(6)
@@ -164,7 +181,7 @@ int main() {
         }
     }
     fout.close();
-    std::cout << "\ninference result saved to inference_result_left.txt\n";
+    std::cout << "\ninference result saved to calib_inference_result_left.txt\n";
 
     std::ofstream fout_right("D:/ylx/inference_result_right.txt");
     if (!fout_right) {
@@ -183,7 +200,6 @@ int main() {
         try {
             DefaultGazeEstimationResult res = gazetracker.estimate(inputs, parameters);
             Vec3 pred_wcs = res.gaze_point;
-            res.right.cornea_center += cfg["cam_pos"].as<Vec3>();
 
             fout_right << std::fixed << std::setprecision(6)
                        << res.right.cornea_center[0] << ' ' << res.right.cornea_center[1] << ' ' << res.right.cornea_center[2] << ' '
@@ -198,7 +214,7 @@ int main() {
         }
     }
     fout_right.close();
-    std::cout << "\ninference result saved to calib_inference_result_right.txt\n";
+    std::cout << "\ninference result saved to inference_result_right.txt\n";
 
     return 0;
 }

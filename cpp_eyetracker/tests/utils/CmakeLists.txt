@@ -1,4 +1,4 @@
 # /tests/utils/CMakeLists.txt
 
-# add_subdirectory(cam)
+add_subdirectory(cam)
 add_subdirectory(glint_detection)

@@ -11,6 +11,7 @@ add_executable(test_two_eye ${TEST_GAZE_SOURCES})
 target_link_libraries(test_two_eye
     PRIVATE
         eyetracker::cfg
+        eyetracker::calib
         eyetracker::inference
         eyetracker::glint_detection
         eyetracker::pupil_center

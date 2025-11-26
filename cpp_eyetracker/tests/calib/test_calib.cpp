@@ -18,6 +18,7 @@
 #include "utils/shared_calculations.hpp"
 #include "calib/calibration.hpp"
 #include "utils/utils.hpp"
+#include "utils/intersection.hpp"
 
 using namespace gazeestimation;
 using namespace visualization;
@@ -51,6 +52,9 @@ int main() {
         double pog_x = std::stod(match[3]);
         double pog_y = std::stod(match[4]);
         Vec2 true_pog = make_vec2(pog_x, pog_y);
+        // Vec3 target = PoGToWCS(true_pog, cfg);
+        Vec3 target = screenToWCS(true_pog, cfg);
+        std::cout << "target WCS: " << target.transpose() << std::endl;
 
         cv::VideoCapture cap(video_path);
         if (!cap.isOpened()) {
@@ -93,8 +97,6 @@ int main() {
             input.right.pupil_center = make_vec2(rightPupilCenter.x, rightPupilCenter.y);
 
             inputs.data.push_back(input);
-
-            Vec3 target = PoGToWCS(true_pog, cfg);
             calibrate_against.push_back(std::make_pair(inputs, target));
 
 			// --- 将检测结果转换为 OpenCV 点 ----
@@ -217,7 +219,6 @@ int main() {
             DefaultGazeEstimationResult res = gazetracker.estimate(inputs, parameters);
 
             Vec3 pred_wcs = res.gaze_point;
-			res.left.cornea_center += cfg["cam_pos"].as<Vec3>();
 
             // 输出一行，保留 6 位小数
             fout << std::fixed << std::setprecision(6)
@@ -252,7 +253,6 @@ int main() {
         try {
             DefaultGazeEstimationResult res = gazetracker.estimate(inputs, parameters);
             Vec3 pred_wcs = res.gaze_point;
-            res.right.cornea_center += cfg["cam_pos"].as<Vec3>();
 
             fout_right << std::fixed << std::setprecision(6)
                        << res.right.cornea_center[0] << ' ' << res.right.cornea_center[1] << ' ' << res.right.cornea_center[2] << ' '

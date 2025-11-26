@@ -109,8 +109,8 @@ public:
     // transfer the given vector in ICS to CCS
     Vec3 ics_to_ccs(const Vec2& position_ics) const {
         return make_vec3(
-            (position_ics[0] - principal_point_x) * pixel_size_cm_x,
-            (position_ics[1] - principal_point_y) * pixel_size_cm_y,
+            - (position_ics[0] - principal_point_x) * pixel_size_cm_x,
+            - (position_ics[1] - principal_point_y) * pixel_size_cm_y,
             - effective_focal_length_cm
         );
     }
@@ -122,7 +122,11 @@ public:
 
     // transfer the given vector in ICS to WCS
     Vec3 ics_to_wcs(const Vec2& position_ics) const {
-        return ccs_to_wcs(ics_to_ccs(position_ics));
+        Vec3 ccs = ics_to_ccs(position_ics);
+        // std::cout << "CCS: " << vec3_to_string(ccs) << std::endl;
+        Vec3 wcs = ccs_to_wcs(ccs);
+        // std::cout << "WCS: " << vec3_to_string(wcs) << std::endl;
+        return wcs;
     }
 
     double camera_angle_x() const {
