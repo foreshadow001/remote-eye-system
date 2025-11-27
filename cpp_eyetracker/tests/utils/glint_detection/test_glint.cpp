@@ -61,12 +61,12 @@ int main() {
             std::string index = std::to_string(idx);
             std::string num_glints = std::to_string(leftEyeGlints.size() + rightEyeGlints.size());
             std::string output_path = output_folder + "\\" + filename;
-            cv::imwrite(output_path, viz);
+            cv::imwrite(output_path, debug_img);
 
             std::cout << "saved to: " << output_path << " | num of glints: " << num_glints << std::endl;
             idx++;
         }
-    } while ((::FindNextFile(hFind, &fd) != 0) && (idx < 15));
+    } while ((::FindNextFile(hFind, &fd) != 0) && (idx < 200));
     ::FindClose(hFind);
 
     std::cout << "processed " << idx << " images." << std::endl;

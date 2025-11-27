@@ -152,8 +152,6 @@ searchForGlints(cv::Mat src, double firstEyeThresh)
 
 	cv::Mat src_copy, src_copy_left, src_copy_right;
 	src.copyTo(src_copy);
-	src.copyTo(src_copy_left);
-	src.copyTo(src_copy_right);
 
 	for (int i = 0; i < contours.size(); i++)
 	{
@@ -161,9 +159,13 @@ searchForGlints(cv::Mat src, double firstEyeThresh)
 		contourCenter.emplace_back(minRect[i].center.x, minRect[i].center.y);
 	}
 
+	// return {contourCenter, rightEyeGlints_, threshold_output};
+
 	// Detect glints on sclera and remove them from list ======================================================================
 	auto [glintCandidates, img_rm] = removeFalseGlints(contourCenter, src_copy);
 	auto [leftEyeGlintsCandidates, rightEyeGlintsCandidates] = splitGlintsByEye(glintCandidates);
+
+	return {leftEyeGlintsCandidates, rightEyeGlintsCandidates, threshold_output};
 
 	auto leftEyeGlints  = myfindGeometry(leftEyeGlintsCandidates);
 	if (local_debug) std::cout << "num leftEyeGlints: " << leftEyeGlints.size() << std::endl;

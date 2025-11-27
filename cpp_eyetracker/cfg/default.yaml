@@ -92,6 +92,6 @@ test_multi_cam:
 
 # Test glint
 test_glint:
-  input_folder: "D:/users/projects/new_dataset/test_multi_cam"
-  output_folder: "D:/users/projects/new_dataset/test_glint_result"
-  threshold: 200.0
+  input_folder: "D:/ylx/test_multi_cam"
+  output_folder: "D:/ylx/test_glint_result"
+  threshold: 125.0
