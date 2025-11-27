@@ -94,4 +94,4 @@ test_multi_cam:
 test_glint:
   input_folder: "D:/ylx/test_multi_cam"
   output_folder: "D:/ylx/test_glint_result"
-  threshold: 125.0
+  threshold: 125.0 
