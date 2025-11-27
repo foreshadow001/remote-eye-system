@@ -7,11 +7,14 @@
 #include <cmath>
 
 #include "glint_detection/detect_glint.h"
+#include "cfg/config.hpp"
 
 
 namespace glintdetection {
 
 bool local_debug = false;
+
+Cfg cfg;
 
 bool side2mid(int x, int y)
 {
@@ -111,7 +114,7 @@ searchForGlints(cv::Mat src, double firstEyeThresh)
 		cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
 	}
 
-	int kernel_size = 3; // better results in extreme cases
+	int kernel_size = cfg["test_glint"]["laplician_kernel_size"].as<int>(); // 3 better results in extreme cases
 	double scale = 1;
 	double delta = 0;
 	int ddepth = CV_16S;
@@ -138,8 +141,8 @@ searchForGlints(cv::Mat src, double firstEyeThresh)
 	cv::Mat threshold_output;
 	cv::threshold(abs_dst, threshold_output, firstEyeThresh, 255, cv::THRESH_BINARY);
 
-	std::vector<cv::Point2f> leftEyeGlints_, rightEyeGlints_;
-	// return {leftEyeGlints_, rightEyeGlints_, threshold_output};
+	std::vector<cv::Point2f> left_, right_;
+	return {left_, right_, threshold_output};
 
 	// FOR SPEED UP
 	std::vector<cv::Vec4i> hierarchy;
@@ -150,25 +153,30 @@ searchForGlints(cv::Mat src, double firstEyeThresh)
 	std::vector<cv::RotatedRect> minRect(contours.size());
 	std::vector<cv::Point2f> contourCenter(contours.size());
 
-	cv::Mat src_copy, src_copy_left, src_copy_right;
+	cv::Mat src_copy;
 	src.copyTo(src_copy);
 
 	for (int i = 0; i < contours.size(); i++)
 	{
 		minRect[i] = minAreaRect(cv::Mat(contours[i]));
 		contourCenter.emplace_back(minRect[i].center.x, minRect[i].center.y);
+
+		// draw all contours
+		cv::drawContours(threshold_output, contours, i, cv::Scalar(0, 255, 0), 1, 8, std::vector<cv::Vec4i>(), 0, cv::Point());
+		cv::circle(threshold_output, minRect[i].center, 2, cv::Scalar(255, 0, 0), -1);
+		cv::putText(threshold_output, std::to_string(i),
+					cv::Point2f(minRect[i].center.x, minRect[i].center.y + 10),
+					cv::FONT_HERSHEY_SIMPLEX, 0.3,	cv::Scalar(255, 255, 0), 1);
 	}
 
-	// return {contourCenter, rightEyeGlints_, threshold_output};
+	std::vector<cv::Point2f> glints_;
+	return {contourCenter, glints_, threshold_output};
 
 	// Detect glints on sclera and remove them from list ======================================================================
-	auto [glintCandidates, img_rm] = removeFalseGlints(contourCenter, src_copy);
-	auto [leftEyeGlintsCandidates, rightEyeGlintsCandidates] = splitGlintsByEye(glintCandidates);
-
-	return {leftEyeGlintsCandidates, rightEyeGlintsCandidates, threshold_output};
+	// auto [glintCandidates, img_rm] = removeFalseGlints(contourCenter, src_copy);
+	auto [leftEyeGlintsCandidates, rightEyeGlintsCandidates] = splitGlintsByEye(contourCenter, 50.0f);
 
 	auto leftEyeGlints  = myfindGeometry(leftEyeGlintsCandidates);
-	if (local_debug) std::cout << "num leftEyeGlints: " << leftEyeGlints.size() << std::endl;
 	auto rightEyeGlints = myfindGeometry(rightEyeGlintsCandidates);
 	
 	return {leftEyeGlints, rightEyeGlints, src};
@@ -179,7 +187,7 @@ std::tuple<std::vector<cv::Point2f>, cv::Mat>
 removeFalseGlints(std::vector<cv::Point2f> contourCenters, cv::Mat src)
 {
     const int a = 3;  // radius of circle around glint
-    const int maxMeanAroundGlint = 80; // max mean value around glint
+    const int maxMeanAroundGlint = 100; // max mean value around glint
     std::vector<cv::Point2f> glintCandidates;
 
     cv::Rect boundaries(0, 0, src.cols, src.rows);

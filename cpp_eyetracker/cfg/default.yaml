@@ -92,6 +92,7 @@ test_multi_cam:
 
 # Test glint
 test_glint:
-  input_folder: "D:/ylx/test_multi_cam"
-  output_folder: "D:/ylx/test_glint_result"
-  threshold: 125.0 
+  input_folder: "D:/users/projects/new_dataset/data_collection/PCCR/glint_input/front/3_3"
+  output_folder: "D:/users/projects/new_dataset/data_collection/PCCR/glint_input/front/3_3/threshold"
+  laplician_kernel_size: 1
+  threshold: 125.0
