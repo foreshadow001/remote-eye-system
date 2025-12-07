@@ -44,11 +44,11 @@ int main() {
             auto [leftEyeGlints, rightEyeGlints, debug_img] = searchForGlints(img, threshold);
 
 			std::vector<cv::Point2d> left_glints, right_glints;
-			left_glints.reserve(leftEyeGlints.size());
-            right_glints.reserve(rightEyeGlints.size());
+
 			for (const auto& g : leftEyeGlints) {
 				left_glints.emplace_back(g.x, g.y);
 			}
+
             for (const auto& g : rightEyeGlints) {
                 right_glints.emplace_back(g.x, g.y);
 			}
@@ -61,12 +61,12 @@ int main() {
             std::string index = std::to_string(idx);
             std::string num_glints = std::to_string(leftEyeGlints.size() + rightEyeGlints.size());
             std::string output_path = output_folder + "\\" + filename;
-            cv::imwrite(output_path, debug_img);
+            cv::imwrite(output_path, viz);
 
             std::cout << "saved to: " << output_path << " | num of glints: " << num_glints << std::endl;
             idx++;
         }
-    } while ((::FindNextFile(hFind, &fd) != 0) && (idx < 200));
+    } while ((::FindNextFile(hFind, &fd) != 0) && (idx < cfg["test_glint"]["num_images"].as<int>()));
     ::FindClose(hFind);
 
     std::cout << "processed " << idx << " images." << std::endl;
