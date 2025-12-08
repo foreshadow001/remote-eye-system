@@ -82,11 +82,11 @@ bool side2mid(
 			return false;
 		}
 	}
-	else if (left.y - right.y >= 2)
+	else if (left.y - right.y >= 2 && left.y - right.y < 3)
 	{
 		if (mode == "left_to_mid")
 		{
-			bool x_condition = (lm_x >= lr_x * 0.40 && lm_x <= lr_x * 0.60);
+			bool x_condition = (lm_x >= lr_x * 0.45 && lm_x <= lr_x * 0.70);
 			bool y_condition = (lm_y >= lr_x * 0.25 && lm_y <= lr_x * 0.50);
 			if (local_debug)
 			{
@@ -98,7 +98,7 @@ bool side2mid(
 		}
 		else if (mode == "right_to_mid")
 		{
-			bool x_condition = (rm_x >= lr_x * 0.40 && rm_x <= lr_x * 0.60);
+			bool x_condition = (rm_x >= lr_x * 0.30 && rm_x <= lr_x * 0.55);
 			bool y_condition = (rm_y >= lr_x * 0.25 && rm_y <= lr_x * 0.50);
 			if (local_debug)
 			{
