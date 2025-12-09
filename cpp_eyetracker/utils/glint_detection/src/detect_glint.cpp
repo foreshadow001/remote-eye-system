@@ -6,7 +6,7 @@
 #include <limits>
 #include <cmath>
 
-#include "glint_detection/detect_glint.h"
+#include "glint_detection/detect_glint.hpp"
 #include "cfg/config.hpp"
 
 
@@ -20,166 +20,133 @@ bool local_debug = cfg["test_glint"]["local_debug"].as<bool>();
 // 1. optimaize side2mid function (add delta y of left and right point as a parameter, and adjust the range accordingly).
 // 2. collect all the possible glint combinations, and choose the best one according to some criteria. ，  
 
-bool side2side(float x, float y)
-/*
-Find the horizontal pair of glints.
-
-Args:
-	x: the x distance between two glints
-	y: the y distance between two glints
-
-Returns:
-	true if the two glints can be considered as a horizontal pair, false otherwise.
-*/
+bool side2side(const cv::Point2f& l_pt, const cv::Point2f& r_pt)
 {
-	return (x >= 7 && x <= 16 && y >= 0 && y <= 5); // original 5 15 0 5
+	double lr_x = std::abs(l_pt.x - r_pt.x);
+	double lr_y = std::abs(l_pt.y - r_pt.y);
+
+	return (lr_x >= 7 && lr_x <= 16 && lr_y >= 0 && lr_y <= 5); // original 5 15 0 5
 }
 
 bool side2mid(
-	cv::Point2f mid,
-	cv::Point2f left,
-	cv::Point2f right,
-	std::string mode
+	const cv::Point2f& m_pt,
+	const cv::Point2f& l_pt,
+	const cv::Point2f& r_pt
 )
 {
-	float lr_x = std::abs(left.x - right.x);
-	float lr_y = std::abs(left.y - right.y);
-	float lm_x = mid.x - left.x;
-	float lm_y = mid.y - left.y;
-	float rm_x = right.x - mid.x;
-	float rm_y = mid.y - right.y;
+	double lr_x = std::abs(l_pt.x - r_pt.x);
+	double lr_y = std::abs(l_pt.y - r_pt.y);
+	double lm_x = m_pt.x - l_pt.x;
+	double lm_y = m_pt.y - l_pt.y;
+	double rm_x = r_pt.x - m_pt.x;
+	double rm_y = m_pt.y - r_pt.y;
+
+	// 0
+	// for simplicity, we only consider the case where left is lower than right
+	if (l_pt.y < r_pt.y)
+	{
+		double temp_lm_x = lm_x;
+		double temp_lm_y = lm_y;
+		lm_x = rm_x;
+		lm_y = rm_y;
+		rm_x = temp_lm_x;
+		rm_y = temp_lm_y;
+	}
 
 	// 1
 	// left right is horizontal
-	// note: front delta y is under 2， side delta y >= 2
 	if (lr_y < 2)
 	{
-		if (mode == "left_to_mid")
+		// left to mid
+		bool lm_x_condition = lm_x >= lr_x * 0.40 && lm_x <= lr_x * 0.60;
+		bool lm_y_condition = lm_y >= lr_x * 0.15 && lm_y <= lr_x * 0.35;
+		if (local_debug)
 		{
-			bool x_condition = (lm_x >= lr_x * 0.40 && lm_x <= lr_x * 0.60);
-			bool y_condition = (lm_y >= lr_x * 0.15 && lm_y <= lr_x * 0.35);
-			if (local_debug)
-			{
-				std::cout << "left to mid: " << std::endl;
-				std::cout << "lm_x: " << lm_x << " | lr_x: " << lr_x << " | lm_x/lr_x: " << lm_x / lr_x << " | qualified: " << x_condition << std::endl;
-				std::cout << "lm_y: " << lm_y << " | lr_y: " << lr_x << " | lm_y/lr_x: " << lm_y / lr_x << " | qualified: " << y_condition <<std::endl;
-			}
-			return (x_condition && y_condition);
+			std::cout << "left to mid: (lr_y < 2)" << std::endl;
+			std::cout << "lm_x: " << lm_x << " | lr_x: " << lr_x << " | lm_x/lr_x: " << lm_x / lr_x << " | qualified: " << lm_x_condition << std::endl;
+			std::cout << "lm_y: " << lm_y << " | lr_x: " << lr_x << " | lm_y/lr_x: " << lm_y / lr_x << " | qualified: " << lm_y_condition <<std::endl;
 		}
-		else if (mode == "right_to_mid")
+		bool lm_condition = lm_x_condition && lm_y_condition;
+
+		bool rm_x_condition = rm_x >= lr_x * 0.40 && rm_x <= lr_x * 0.60;
+		bool rm_y_condition = rm_y >= lr_x * 0.15 && rm_y <= lr_x * 0.35;
+		if (local_debug)
 		{
-			bool x_condition = (rm_x >= lr_x * 0.40 && rm_x <= lr_x * 0.60);
-			bool y_condition = (rm_y >= lr_x * 0.15 && rm_y <= lr_x * 0.35);
-			if (local_debug)
-			{
-				std::cout << "right to mid: " << std::endl;
-				std::cout << "rm_x: " << rm_x << " | lr_x: " << lr_x << " | rm_x/lr_x: " << rm_x / lr_x << " | qualified: " << x_condition << std::endl;
-				std::cout << "rm_y: " << rm_y << " | lr_y: " << lr_x << " | rm_y/lr_x: " << rm_y / lr_x << " | qualified: " << y_condition <<std::endl;
-			}
-			return (x_condition && y_condition);
+			std::cout << "right to mid: (lr_y < 2)" << std::endl;
+			std::cout << "rm_x: " << rm_x << " | lr_x: " << lr_x << " | rm_x/lr_x: " << rm_x / lr_x << " | qualified: " << rm_x_condition << std::endl;
+			std::cout << "rm_y: " << rm_y << " | lr_x: " << lr_x << " | rm_y/lr_x: " << rm_y / lr_x << " | qualified: " << rm_y_condition <<std::endl;
 		}
-		else {
-			return false;
-		}
+		bool rm_condition = rm_x_condition && rm_y_condition;
+
+		return lm_condition && rm_condition;
+
 	}
-	else if (left.y - right.y >= 2 && left.y - right.y < 3)
+	else if (lr_y >= 2 && lr_y < 3)
 	{
-		if (mode == "left_to_mid")
+		// left to mid
+		bool lm_x_condition = lm_x >= lr_x * 0.45 && lm_x <= lr_x * 0.70;
+		bool lm_y_condition = lm_y >= lr_x * 0.05 && lm_y <= lr_x * 0.25;
+		if (local_debug)
 		{
-			bool x_condition = (lm_x >= lr_x * 0.45 && lm_x <= lr_x * 0.70);
-			bool y_condition = (lm_y >= lr_x * 0.25 && lm_y <= lr_x * 0.50);
-			if (local_debug)
-			{
-				std::cout << "left to mid: " << std::endl;
-				std::cout << "lm_x: " << lm_x << " | lr_x: " << lr_x << " | lm_x/lr_x: " << lm_x / lr_x << " | qualified: " << x_condition << std::endl;
-				std::cout << "lm_y: " << lm_y << " | lr_y: " << lr_x << " | lm_y/lr_x: " << lm_y / lr_x << " | qualified: " << y_condition <<std::endl;
-			}
-			return (x_condition && y_condition);
+			std::cout << "left to mid: (2 <= lr_y < 3)" << std::endl;
+			std::cout << "lm_x: " << lm_x << " | lr_x: " << lr_x
+					  << " | lm_x/lr_x: " << lm_x / lr_x << " | qualified: " << lm_x_condition << std::endl;
+			std::cout << "lm_y: " << lm_y << " | lr_x: " << lr_x
+					  << " | lm_y/lr_x: " << lm_y / lr_x << " | qualified: " << lm_y_condition << std::endl;
 		}
-		else if (mode == "right_to_mid")
+		bool lm_condition = lm_x_condition && lm_y_condition;
+
+		// right to mid
+		bool rm_x_condition = rm_x >= lr_x * 0.30 && rm_x <= lr_x * 0.55;
+		bool rm_y_condition = rm_y >= lr_x * 0.25 && rm_y <= lr_x * 0.50;
+		if (local_debug)
 		{
-			bool x_condition = (rm_x >= lr_x * 0.30 && rm_x <= lr_x * 0.55);
-			bool y_condition = (rm_y >= lr_x * 0.25 && rm_y <= lr_x * 0.50);
-			if (local_debug)
-			{
-				std::cout << "right to mid: " << std::endl;
-				std::cout << "rm_x: " << rm_x << " | lr_x: " << lr_x << " | rm_x/lr_x: " << rm_x / lr_x << " | qualified: " << x_condition << std::endl;
-				std::cout << "rm_y: " << rm_y << " | lr_y: " << lr_x << " | rm_y/lr_x: " << rm_y / lr_x << " | qualified: " << y_condition <<std::endl;
-			}
-			return (x_condition && y_condition);
+			std::cout << "right to mid: (2 <= lr_y < 3)" << std::endl;
+			std::cout << "rm_x: " << rm_x << " | lr_x: " << lr_x
+					  << " | rm_x/lr_x: " << rm_x / lr_x << " | qualified: " << rm_x_condition << std::endl;
+			std::cout << "rm_y: " << rm_y << " | lr_x: " << lr_x
+					  << " | rm_y/lr_x: " << rm_y / lr_x << " | qualified: " << rm_y_condition << std::endl;
 		}
-		else {
-			return false;
-		}
+		bool rm_condition = rm_x_condition && rm_y_condition;
+
+		return lm_condition && rm_condition;
 	}
+	else if (lr_y >= 3 && lr_y <= 5)
+	{
+		// left to mid
+		bool lm_x_condition = lm_x >= lr_x * 0.45 && lm_x <= lr_x * 0.85;
+		bool lm_y_condition = lm_y >= lr_x * 0.04 && lm_y <= lr_x * 0.25;
+		if (local_debug)
+		{
+			std::cout << "left to mid: (3 <= lr_y <= 5)" << std::endl;
+			std::cout << "lm_x: " << lm_x << " | lr_x: " << lr_x
+					  << " | lm_x/lr_x: " << lm_x / lr_x << " | qualified: " << lm_x_condition << std::endl;
+			std::cout << "lm_y: " << lm_y << " | lr_y: " << lr_x
+					  << " | lm_y/lr_x: " << lm_y / lr_x << " | qualified: " << lm_y_condition << std::endl;
+		}
+		bool lm_condition = lm_x_condition && lm_y_condition;
+
+		// right to mid
+		bool rm_x_condition = rm_x >= lr_x * 0.15 && rm_x <= lr_x * 0.55;
+		bool rm_y_condition = rm_y >= lr_x * 0.30 && rm_y <= lr_x * 0.65;
+		if (local_debug)
+		{
+			std::cout << "right to mid: (3 <= lr_y < 5)" << std::endl;
+			std::cout << "rm_x: " << rm_x << " | lr_x: " << lr_x
+					  << " | rm_x/lr_x: " << rm_x / lr_x << " | qualified: " << rm_x_condition << std::endl;
+			std::cout << "rm_y: " << rm_y << " | lr_y: " << lr_x
+					  << " | rm_y/lr_x: " << rm_y / lr_x << " | qualified: " << rm_y_condition << std::endl;
+		}
+		bool rm_condition = rm_x_condition && rm_y_condition;
+
+		return lm_condition && rm_condition;
+	}
+	else
+	{
+		return false;
+	}
+
 	return false;
-	//return (x <= 8 && x >= 4 && y <= 5 && y >= 2); // 15 3 5 0 // original 20 5 10 3
-}
-
-bool side2mid(int x, int y)
-{
-	return (x <= 8 && x >= 4 && y <= 5 && y >= 2); // 15 3 5 0 // original 20 5 10 3
-}
-
-std::vector<cv::Point2f>
-chooseBestMid(const std::list<cv::Point2f>& glintList,
-              const cv::Point2f& p1,
-              const cv::Point2f& p2)
-{
-    // 0
-	// confirm left and right
-    cv::Point2f left  = (p1.x < p2.x) ? p1 : p2;
-    cv::Point2f right = (p1.x < p2.x) ? p2 : p1;
-
-    std::vector<cv::Point2f> midCandidates;
-
-    // 0
-	// calculate mid point
-    float midX = (left.x + right.x) / 2.0f;
-    float maxY = std::max(left.y, right.y);
-
-    // 1
-	// filter candidates
-    for (const auto& p : glintList)
-    {
-        if (p == left || p == right)
-            continue;
-
-        int x1 = p.x - left.x;
-        int y1 = p.y - left.y;
-        int x2 = right.x - p.x;
-        int y2 = p.y - right.y;
-
-        if (side2mid(x1, y1) && side2mid(x2, y2))
-        {
-            midCandidates.push_back(p);
-        }
-    }
-
-    // 2
-	// if no candidates, return empty vector
-    if (midCandidates.empty())
-        return {};
-
-    // 3
-	// find best mid point
-    double bestScore = std::numeric_limits<double>::max();
-    cv::Point2f bestMid;
-
-    for (const auto& m : midCandidates)
-    {
-        double dy = std::max(0.0f, m.y - maxY);
-        double dx = std::abs(m.x - midX);
-        double score = 2.0 * dy + 1.0 * dx;
-
-        if (score < bestScore)
-        {
-            bestScore = score;
-            bestMid = m;
-        }
-    }
-
-    return {left, right, bestMid};
 }
 
 std::tuple<std::vector<cv::Point2f>, std::vector<cv::Point2f>>
@@ -271,7 +238,12 @@ searchForGlints(cv::Mat src, double firstEyeThresh)
 	// Apply Laplace function
 	// Laplace Functino generates edges
 	cv::Mat laplaced;
+	// time the laplacian function
+	// cv::TickMeter tm;
+	// tm.start();
 	cv::Laplacian(gaussed, laplaced, ddepth, kernel_size, scale, delta, cv::BORDER_DEFAULT);
+	// tm.stop();
+	// std::cout << "Laplace function took " << tm.getTimeMilli() << " ms" << std::endl;
 	
 	// CHANGED
 	cv::Mat abs_dst;
@@ -279,7 +251,7 @@ searchForGlints(cv::Mat src, double firstEyeThresh)
 	// convertScaleAbs(laplaced, abs_dst, (sigma + 1)*0.25);
 
 	// 3 Find Contours
-	/// Detect edges using Threshold
+	// Detect edges using Threshold
 	cv::Mat threshold_output;
 	cv::threshold(abs_dst, threshold_output, firstEyeThresh, 255, cv::THRESH_BINARY);
 
@@ -294,7 +266,7 @@ searchForGlints(cv::Mat src, double firstEyeThresh)
 
 	if (local_debug)
 	{
-		std::cout << "Total contours found: " << contours.size() << std::endl;
+		std::cout << "\nTotal contours found: " << contours.size() << std::endl;
 	}
 
 	for (int i = 0; i < contours.size(); i++)
@@ -316,14 +288,14 @@ searchForGlints(cv::Mat src, double firstEyeThresh)
 	{
 		std::cout << "Left eye glint candidates: " << leftEyeGlintsCandidates.size() << std::endl;
 		std::cout << "Right eye glint candidates: " << rightEyeGlintsCandidates.size() << std::endl;
-		std::cout << "Start left eye glint geometry finding..." << std::endl;
+		std::cout << "\nStart left eye glint geometry finding..." << std::endl;
 	}
 
 	auto leftEyeGlints  = findGeometry(leftEyeGlintsCandidates);
 	if (local_debug)
 	{
 		std::cout << "Left eye glints found: " << leftEyeGlints.size() << std::endl;
-		std::cout << "Start right eye glint geometry finding..." << std::endl;
+		std::cout << "\nStart right eye glint geometry finding..." << std::endl;
 	}
 	auto rightEyeGlints = findGeometry(rightEyeGlintsCandidates);
 	if (local_debug)
@@ -381,8 +353,9 @@ removeFalseGlints(std::vector<cv::Point2f> contourCenters, cv::Mat src)
 	return {glintCandidates, src};
 } // removeFalseGlints()
 
+/*
 std::vector<cv::Point2f>
-findGeometry(const std::vector<cv::Point2f>& glintCandidates)
+oldfindGeometry(const std::vector<cv::Point2f>& glintCandidates)
 {
 	std::vector<cv::Point2f> glintCombi;
 	std::list<cv::Point2f> glintList(glintCandidates.begin(), glintCandidates.end());
@@ -513,34 +486,81 @@ findGeometry(const std::vector<cv::Point2f>& glintCandidates)
 
 	return glintCombi;
 }
+*/
 
 std::vector<cv::Point2f>
-myfindGeometry(const std::vector<cv::Point2f>& glintCandidates)
+findGeometry(const std::vector<cv::Point2f>& glintCandidates)
 {
-	std::vector<cv::Point2f> glintCombi;
-	std::list<cv::Point2f> glintList(glintCandidates.begin(), glintCandidates.end());
+	std::vector<std::vector<cv::Point2f>> glintGeometryCandidates;
 
-    if (glintList.size() < 3)
-        return glintCombi;
+	// Go throuth each Point2f in list
+	for (int i = 0; i < glintCandidates.size(); i++)
+	{
+		cv::Point2f temp_pt_1 = glintCandidates[i];
+		for (int j = i + 1; j < glintCandidates.size(); j++)
+		{
+			cv::Point2f temp_pt_2 = glintCandidates[j];
+			cv::Point2f l_pt = temp_pt_1.x < temp_pt_2.x ? temp_pt_1 : temp_pt_2;
+			cv::Point2f r_pt = temp_pt_1.x > temp_pt_2.x ? temp_pt_1 : temp_pt_2;
 
-    for (auto it = glintList.begin(); it != glintList.end(); ++it)
-    {
-        for (auto it1 = std::next(it); it1 != glintList.end(); ++it1)
-        {
-            auto result = chooseBestMid(glintList, *it, *it1);
-            if (!result.empty())
-            {
-                auto left  = result[0];
-                auto right = result[1];
-                auto mid   = result[2];
-                glintCombi = {left, right, mid};
+			// 1
+			// find horizontal pair
+			if (side2side(l_pt, r_pt)) // original 15 5 5 0
+			{
+				if (local_debug)
+				{
+					std::cout << "1 found horizontal pair" << std::endl;
+					std::cout << "left: (" << l_pt.x << ", " << l_pt.y << ")" << std::endl;
+					std::cout << "right: (" << r_pt.x << ", " << r_pt.y << ")" << std::endl;
+				}
+				for (int k = 0; k < glintCandidates.size(); k++)
+				{
+					if (k == i || k == j) continue;
 
-                return glintCombi;
-            }
-        }
-    }
+					cv::Point2f m_pt = glintCandidates[k];
+					if (local_debug) std::cout << "Checking potential mid down at: ("
+											   << m_pt.x << ", " << m_pt.y << ")" << std::endl;
 
-    return glintCombi;
-} // myfindGeometry()
+					// 2
+					// find mid point
+					if (side2mid(m_pt, l_pt, r_pt))
+					{
+						if (local_debug)
+						{
+							std::cout << "2 found mid point" << std::endl;
+							std::cout << "mid: (" << m_pt.x << ", " << m_pt.y << ")" << std::endl;
+						}
+
+						std::vector<cv::Point2f> glintGeometryCandidate;
+						glintGeometryCandidate.push_back(l_pt);
+						glintGeometryCandidate.push_back(m_pt);
+						glintGeometryCandidate.push_back(r_pt);
+
+						glintGeometryCandidates.push_back(glintGeometryCandidate);
+					}
+				}
+			}
+		}
+	}
+
+	std::vector<cv::Point2f> glintGeometry = findBestGeometry(glintGeometryCandidates);
+
+	return glintGeometry;
+}
+
+std::vector<cv::Point2f>
+findBestGeometry(const std::vector<std::vector<cv::Point2f>>& glintGeometryCandidates)
+{
+	std::vector<cv::Point2f> glintGeometry;
+
+	if (glintGeometryCandidates.empty())
+	{
+		return glintGeometry;
+	}
+
+	glintGeometry = glintGeometryCandidates[0];
+
+	return glintGeometry;
+}
 
 } // namespace glintdetection

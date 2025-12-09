@@ -3,8 +3,8 @@
 #include <iostream>
 #include <opencv2/opencv.hpp>
 
-#include "glint_detection/detect_glint.h"
-#include "pupil_center/localize_pupil.h"
+#include "glint_detection/detect_glint.hpp"
+#include "pupil_center/localize_pupil.hpp"
 
 const std::string input_folder  = "D:/users/projects/new_dataset/data_collection/PCCR/test_dataset/images/src";
 const std::string output_folder = "D:/users/projects/new_dataset/data_collection/PCCR/test_dataset/images/pupil_center_ellipse";

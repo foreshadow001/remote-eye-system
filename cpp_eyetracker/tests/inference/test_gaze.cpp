@@ -5,8 +5,8 @@
 
 #include "utils/gaze_estimation_types.hpp"
 #include "core/math_types.hpp"
-#include "glint_detection/detect_glint.h"
-#include "pupil_center/localize_pupil.h"
+#include "glint_detection/detect_glint.hpp"
+#include "pupil_center/localize_pupil.hpp"
 #include "inference/one_camera_spherical.hpp"
 
 using namespace gazeestimation;

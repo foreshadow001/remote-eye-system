@@ -2,12 +2,13 @@
 
 namespace glintdetection {
 
-bool side2mid(int x, int y);
+bool side2side(const cv::Point2f& l_pt, const cv::Point2f& r_pt);
 
-std::vector<cv::Point2f>
-chooseBestMid(const std::list<cv::Point2f>& glintList,
-              const cv::Point2f& p1,
-              const cv::Point2f& p2);
+bool side2mid(
+    const cv::Point2f& l_pt,
+    const cv::Point2f& r_pt,
+    const cv::Point2f& mid_pt
+);
 
 std::tuple<std::vector<cv::Point2f>, std::vector<cv::Point2f>>
 splitGlintsByEye(const std::vector<cv::Point2f>& glints, float distanceThrX = 100.f, float outlierThr = 200.f);
@@ -23,7 +24,8 @@ removeFalseGlints(std::vector<cv::Point2f> contourCenters, cv::Mat src);
 
 std::vector<cv::Point2f>
 findGeometry(const std::vector<cv::Point2f>& glintCandidates);
+
 std::vector<cv::Point2f>
-myfindGeometry(const std::vector<cv::Point2f>& glintCandidates);
+findBestGeometry(const std::vector<std::vector<cv::Point2f>>& glintGeometryCandidates);
 
 } // namespace glintdetection

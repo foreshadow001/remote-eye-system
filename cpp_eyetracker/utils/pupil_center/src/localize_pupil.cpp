@@ -3,8 +3,8 @@
 #include <chrono>
 #include <opencv2/opencv.hpp>
 
-#include "pupil_center/localize_pupil.h"
-#include "glint_detection/detect_glint.h"
+#include "pupil_center/localize_pupil.hpp"
+#include "glint_detection/detect_glint.hpp"
 
 namespace pupilcenter {
 

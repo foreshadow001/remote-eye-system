@@ -3,7 +3,7 @@
 #include <iostream>
 #include <opencv2/opencv.hpp>
 
-#include "glint_detection/detect_glint.h"
+#include "glint_detection/detect_glint.hpp"
 #include "cfg/config.hpp"
 #include "utils/visualize.hpp"
 
@@ -41,7 +41,12 @@ int main() {
 
             // call searchForGlints
             double threshold = cfg["test_glint"]["threshold"].as<double>();
+            // time the search
+            // cv::TickMeter tm;
+            // tm.start();
             auto [leftEyeGlints, rightEyeGlints, debug_img] = searchForGlints(img, threshold);
+            // tm.stop();
+            // std::cout << "search time: " << tm.getTimeMilli() << " ms" << std::endl;
 
 			std::vector<cv::Point2d> left_glints, right_glints;
 

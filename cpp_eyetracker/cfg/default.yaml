@@ -92,10 +92,10 @@ test_multi_cam:
 
 # Test glint
 test_glint:
-  local_debug: true
-  num_images: 200
-  input_folder: "D:/users/projects/new_dataset/data_collection/PCCR/glint_input/side/3_3"
-  output_folder: "D:/users/projects/new_dataset/data_collection/PCCR/glint_input/side/3_3/viz"
+  local_debug: false
+  num_images: 100
+  input_folder: "D:/ylx/glint_input/test"
+  output_folder: "D:/ylx/glint_input/test/viz"
   gaussion_kernel_size: 3
   laplician_kernel_size: 1
   threshold: 125.0
