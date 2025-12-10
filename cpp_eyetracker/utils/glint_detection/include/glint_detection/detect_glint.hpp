@@ -28,4 +28,18 @@ findGeometry(const std::vector<cv::Point2f>& glintCandidates);
 std::vector<cv::Point2f>
 findBestGeometry(const std::vector<std::vector<cv::Point2f>>& glintGeometryCandidates);
 
+bool relaxedSide2Side(const cv::Point2f& l_pt, const cv::Point2f& r_pt);
+
+bool relaxedSide2Mid(
+	const cv::Point2f& m_pt,
+	const cv::Point2f& l_pt,
+	const cv::Point2f& r_pt
+);
+
+std::tuple<std::vector<std::vector<cv::Point2f>>, std::vector<std::vector<cv::Point2f>>, cv::Mat>
+relaxedSearchForGlints(cv::Mat src, double firstEyeThresh);
+
+std::vector<std::vector<cv::Point2f>>
+relaxedFindGeometry(const std::vector<cv::Point2f>& glintCandidates);
+
 } // namespace glintdetection
