@@ -60,10 +60,8 @@ int main() {
                 continue;
             }
 
-            double threshold = cfg["test_glint"]["threshold"].as<double>();
-
             // 2. 调用宽松搜索，获取所有候选组合和Debug图
-            auto [leftTriList, rightTriList, debug_img] = relaxedSearchForGlints(img, threshold);
+            auto [leftTriList, rightTriList, debug_img] = searchForGlints(img, cfg);
 
             // 3. 写入 CSV 数据
             // Left Eyes

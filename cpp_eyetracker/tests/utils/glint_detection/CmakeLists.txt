@@ -8,6 +8,7 @@ target_link_libraries(test_glint
         eyetracker::cfg
         eyetracker::utils
         eyetracker::glint_detection
+        ${OpenCV_LIBS}
 )
 
 add_executable(collect_glint collect_glint.cpp)

@@ -1,7 +1,10 @@
 /**
  * calculate_params.cpp
- * 读取CSV，计算 side2side (lr_x, lr_y) 和 side2mid 的各项超参数分布
- * 绘制可视化图并输出推荐参数。
+ * 1. 读取 YAML 配置获取宽松范围定义和分类条件。
+ * 2. 读取 CSV，根据 YAML 定义的区间动态收集样本数据。
+ * 3. 计算 Side2Side 和 Side2Mid 推荐超参数 (Min-ext, Max+ext)。
+ * 4. 可视化散点分布 (高清分辨率)。
+ * 5. 将结果写回 YAML 文件。
  */
 
 #include <iostream>
@@ -12,103 +15,175 @@
 #include <algorithm>
 #include <map>
 #include <cmath>
-#include <iomanip> // 用于控制输出精度
+#include <iomanip>
 #include <opencv2/opencv.hpp>
 #include "cfg/config.hpp"
 
 using namespace std;
 
+// --- 数据结构 ---
+
 struct Record {
-    string img;
-    string side;
     double lx, ly, rx, ry, mx, my;
 };
 
-// 简单的字符串分割
+struct RangeResult {
+    double rec_min;
+    double rec_max;
+    double data_min;
+    double data_max;
+};
+
+// --- 辅助函数 ---
+
 vector<string> split(const string& s, char delimiter) {
     vector<string> tokens;
     string token;
     istringstream tokenStream(s);
-    while (getline(tokenStream, token, delimiter)) {
-        tokens.push_back(token);
-    }
+    while (getline(tokenStream, token, delimiter)) tokens.push_back(token);
     return tokens;
 }
 
-// 绘制分布图的辅助函数
-void drawDistribution(cv::Mat& canvas, const vector<double>& values, string title, cv::Rect roi, cv::Scalar color) {
+/**
+ * 计算推荐区间
+ */
+RangeResult processData(const vector<double>& vec, double ext_min, double ext_max, bool is_ratio) {
+    RangeResult r = {0.0, 0.0, 0.0, 0.0};
+    if (vec.empty()) return r;
+
+    r.data_min = *min_element(vec.begin(), vec.end());
+    r.data_max = *max_element(vec.begin(), vec.end());
+
+    double rec_min = r.data_min - ext_min;
+    double rec_max = r.data_max + ext_max;
+
+    // 施加边界约束
+    r.rec_min = std::max(0.0, rec_min);
+    if (is_ratio) {
+        r.rec_max = std::min(1.0, rec_max);
+    } else {
+        r.rec_max = rec_max;
+    }
+    return r;
+}
+
+/**
+ * 绘制分布图 (高清分辨率设置)
+ */
+void visualize(cv::Mat& canvas, const vector<double>& values, const string& title, 
+               const cv::Rect& roi, const cv::Scalar& color, const RangeResult& rr) {
     if (values.empty()) return;
 
-    double min_v = *min_element(values.begin(), values.end());
-    double max_v = *max_element(values.begin(), values.end());
-    
-    // 稍微扩大绘图范围，防止点画在边界上
-    double plot_min = min_v - (max_v - min_v) * 0.1;
-    double plot_max = max_v + (max_v - min_v) * 0.1;
-    if (plot_min == plot_max) { plot_min -= 1.0; plot_max += 1.0; } // 防止单一值导致除零
+    // --- 高清绘图参数 ---
+    double fontScale = 1.1; // 更大的字体
+    int thickness = 3;      // 更粗的线条
+    int pointSize = 5;      // 更大的数据点
+    int lineThickness = 4;  // 推荐线粗细
 
-    // 绘制背景框
-    cv::rectangle(canvas, roi, cv::Scalar(245, 245, 245), -1);
-    cv::rectangle(canvas, roi, cv::Scalar(200, 200, 200), 1);
+    // 绘制背景
+    cv::rectangle(canvas, roi, cv::Scalar(250, 250, 250), -1);
+    cv::rectangle(canvas, roi, cv::Scalar(200, 200, 200), 2);
 
-    // 绘制标题
-    cv::putText(canvas, title, cv::Point(roi.x + 5, roi.y + 20), cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0,0,0), 1, cv::LINE_AA);
+    // 标题
+    cv::putText(canvas, title, cv::Point(roi.x + 15, roi.y + 45), 
+                cv::FONT_HERSHEY_SIMPLEX, fontScale, cv::Scalar(0,0,0), thickness);
 
-    // 绘制范围文字 (Min/Max)
+    // 数据范围文本 (底部)
     char buf[100];
-    sprintf(buf, "Min:%.2f Max:%.2f", min_v, max_v);
-    cv::putText(canvas, buf, cv::Point(roi.x + 5, roi.y + roi.height - 8), cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(50,50,50), 1, cv::LINE_AA);
+    sprintf(buf, "Data Range: %.2f ~ %.2f", rr.data_min, rr.data_max);
+    cv::putText(canvas, buf, cv::Point(roi.x + 15, roi.y + roi.height - 15), 
+                cv::FONT_HERSHEY_SIMPLEX, fontScale * 0.7, cv::Scalar(80,80,80), 2);
+
+    // Y轴映射 Lambda
+    double plot_min = std::min(rr.data_min, rr.rec_min);
+    double plot_max = std::max(rr.data_max, rr.rec_max);
+    double range = plot_max - plot_min;
+    if (range < 1e-5) range = 1.0; 
+
+    // 稍微扩宽上下视野 (上下各留 10%)
+    plot_min -= range * 0.1;
+    plot_max += range * 0.1;
+
+    auto get_y = [&](double v) {
+        double ratio = (v - plot_min) / (plot_max - plot_min);
+        // 上下留出足够的边距用于显示文字 (Top: ~60px, Bottom: ~40px)
+        return roi.y + roi.height - (int)(ratio * (roi.height - 100)) - 40; 
+    };
 
     // 绘制散点
     for (size_t i = 0; i < values.size(); ++i) {
-        double val = values[i];
-        // 归一化 Y 轴 (数值越大，Y坐标越小，因为图像原点在左上)
-        // 留出上下 25 像素的 margin
-        int plot_h = roi.height - 50;
-        int y = roi.y + roi.height - 25 - (int)((val - plot_min) / (plot_max - plot_min) * plot_h);
-        
-        // X 轴均匀分布
-        int x = roi.x + 10 + (int)(i * (double)(roi.width - 20) / values.size()); 
-        
-        cv::circle(canvas, cv::Point(x, y), 2, color, -1);
+        int y = get_y(values[i]);
+        // X轴均匀分布，左右留边
+        int x = roi.x + 25 + (i * (double)(roi.width - 50) / values.size());
+        cv::circle(canvas, cv::Point(x, y), pointSize, color, -1);
     }
-    
-    // 绘制推荐线 (Min - 0.05, Max + 0.05)
-    auto calc_y = [&](double v) {
-        return roi.y + roi.height - 25 - (int)((v - plot_min) / (plot_max - plot_min) * (roi.height - 50));
-    };
 
-    int y_rec_min = calc_y(min_v - 0.05);
-    int y_rec_max = calc_y(max_v + 0.05);
-    
-    // 限制绘制范围在 ROI 内
-    y_rec_min = std::clamp(y_rec_min, roi.y, roi.y + roi.height);
-    y_rec_max = std::clamp(y_rec_max, roi.y, roi.y + roi.height);
+    // 绘制推荐线 (绿线Min, 红线Max)
+    int y_min = get_y(rr.rec_min);
+    int y_max = get_y(rr.rec_max);
 
-    cv::line(canvas, cv::Point(roi.x, y_rec_min), cv::Point(roi.x+roi.width, y_rec_min), cv::Scalar(0, 180, 0), 1); // 下限绿线
-    cv::line(canvas, cv::Point(roi.x, y_rec_max), cv::Point(roi.x+roi.width, y_rec_max), cv::Scalar(0, 0, 200), 1); // 上限红线
+    // Min Line & Text
+    cv::line(canvas, cv::Point(roi.x, y_min), cv::Point(roi.x+roi.width, y_min), cv::Scalar(0,200,0), lineThickness);
+    sprintf(buf, "Min: %.2f", rr.rec_min);
+    // 文字位置调整到线沿上方
+    cv::putText(canvas, buf, cv::Point(roi.x+roi.width-180, y_min-8), 
+                cv::FONT_HERSHEY_SIMPLEX, fontScale*0.7, cv::Scalar(0,180,0), 2);
+
+    // Max Line & Text
+    cv::line(canvas, cv::Point(roi.x, y_max), cv::Point(roi.x+roi.width, y_max), cv::Scalar(0,0,255), lineThickness);
+    sprintf(buf, "Max: %.2f", rr.rec_max);
+    // 文字位置调整到线沿上方
+    cv::putText(canvas, buf, cv::Point(roi.x+roi.width-180, y_max-8), 
+                cv::FONT_HERSHEY_SIMPLEX, fontScale*0.7, cv::Scalar(0,0,200), 2);
 }
 
+// --- Main ---
+
 int main() {
-    Cfg cfg; // 确保命名空间正确
+    Cfg cfg;
 
-    string output_folder = cfg["collect_glint"]["output_folder"].as<string>(); // 注意：原代码通常是 test_glint
-    string csv_path = output_folder + "\\glint_data.csv"; // 读取脚本一生成的文件
+    // 1. 读取配置参数
+    string output_folder = cfg["collect_glint"]["output_folder"].as<string>();
+    string csv_path = output_folder + "\\glint_data.csv";
 
-    ifstream file(csv_path);
-    if (!file.is_open()) {
-        cerr << "Could not open " << csv_path << endl;
-        return -1;
+    // 扩展参数 (Side2Side)
+    auto relaxed = cfg["relaxed_glint_hyperparameter"];
+    double ext_x_min = relaxed["horizontal_pair"]["extention_x_min"].as<double>();
+    double ext_x_max = relaxed["horizontal_pair"]["extention_x_max"].as<double>();
+    double ext_y_min = relaxed["horizontal_pair"]["extention_y_min"].as<double>();
+    double ext_y_max = relaxed["horizontal_pair"]["extention_y_max"].as<double>();
+
+    // 扩展参数 (Side2Mid)
+    double ext_lmx_min = relaxed["middle_point"]["extention_lm_x/lr_x_min"].as<double>();
+    double ext_lmx_max = relaxed["middle_point"]["extention_lm_x/lr_x_max"].as<double>();
+    double ext_lmy_min = relaxed["middle_point"]["extention_lm_y/lr_x_min"].as<double>();
+    double ext_lmy_max = relaxed["middle_point"]["extention_lm_y/lr_x_max"].as<double>();
+    double ext_rmx_min = relaxed["middle_point"]["extention_rm_x/lr_x_min"].as<double>();
+    double ext_rmx_max = relaxed["middle_point"]["extention_rm_x/lr_x_max"].as<double>();
+    double ext_rmy_min = relaxed["middle_point"]["extention_rm_y/lr_x_min"].as<double>();
+    double ext_rmy_max = relaxed["middle_point"]["extention_rm_y/lr_x_max"].as<double>();
+
+    // 获取条件区间列表
+    auto raw_conditions = relaxed["middle_point"]["conditions"].as<vector<vector<double>>>();
+    int num_categories = raw_conditions.size();
+    
+    vector<pair<double, double>> ranges;
+    for(const auto& row : raw_conditions) {
+        if(row.size() >= 2) ranges.push_back({row[0], row[1]});
     }
 
-    string line;
-    getline(file, line); // 跳过表头
-
-    // 存储 Side2Mid 的比率数据 (按类别)
+    // 2. 准备数据容器
+    vector<double> all_lr_x, all_lr_y;
     map<int, vector<double>> lmx_stats, lmy_stats, rmx_stats, rmy_stats;
-    
-    // 存储 Side2Side 的绝对距离数据 (全局)
-    vector<double> global_lr_x, global_lr_y;
+
+    // 3. 读取 CSV
+    ifstream file(csv_path);
+    if (!file.is_open()) {
+        cerr << "Cannot open CSV: " << csv_path << endl;
+        return -1;
+    }
+    string line;
+    getline(file, line); // header
 
     while (getline(file, line)) {
         if (line.empty()) continue;
@@ -116,119 +191,116 @@ int main() {
         if (tokens.size() < 8) continue;
 
         Record rec;
-        rec.lx = stod(tokens[2]); rec.ly = stod(tokens[3]);
-        rec.rx = stod(tokens[4]); rec.ry = stod(tokens[5]);
-        rec.mx = stod(tokens[6]); rec.my = stod(tokens[7]);
+        try {
+            rec.lx = stod(tokens[2]); rec.ly = stod(tokens[3]);
+            rec.rx = stod(tokens[4]); rec.ry = stod(tokens[5]);
+            rec.mx = stod(tokens[6]); rec.my = stod(tokens[7]);
+        } catch (...) { continue; }
 
-        // 1. 计算 Side2Side 基础距离
         double lr_x = std::abs(rec.lx - rec.rx);
         double lr_y = std::abs(rec.ly - rec.ry);
+        
+        all_lr_x.push_back(lr_x);
+        all_lr_y.push_back(lr_y);
 
-        // 收集全局 Side2Side 数据
-        global_lr_x.push_back(lr_x);
-        global_lr_y.push_back(lr_y);
-
-        // 2. 计算 Side2Mid 相对数据
         double lm_x = rec.mx - rec.lx;
         double lm_y = rec.my - rec.ly;
         double rm_x = rec.rx - rec.mx;
         double rm_y = rec.my - rec.ry;
 
-        // "for simplicity, we only consider the case where left is lower than right"
         if (rec.ly < rec.ry) {
-            double temp_lm_x = lm_x;
-            double temp_lm_y = lm_y;
-            lm_x = rm_x;
-            lm_y = rm_y;
-            rm_x = temp_lm_x;
-            rm_y = temp_lm_y;
+            std::swap(lm_x, rm_x);
+            std::swap(lm_y, rm_y);
         }
 
-        // 分类
+        // 动态分类逻辑
         int category = -1;
-        if (lr_y < 2) category = 0;
-        else if (lr_y >= 2 && lr_y < 3) category = 1;
-        else if (lr_y >= 3 && lr_y <= 5) category = 2;
-        // 注意：如果你的样本里 lr_y > 5，这里 category 为 -1，不会计入 side2mid 统计，但会计入 global_lr_y 统计
+        for (int i = 0; i < ranges.size(); ++i) {
+            double r_min = ranges[i].first;
+            double r_max = ranges[i].second;
+            bool match = false;
+            // 最后一组包含上界
+            if (i == ranges.size() - 1) {
+                if (lr_y >= r_min && lr_y <= r_max) match = true;
+            } else {
+                if (lr_y >= r_min && lr_y < r_max) match = true;
+            }
+            if (match) {
+                category = i;
+                break;
+            }
+        }
 
-        if (category != -1 && lr_x > 0) {
+        if (category != -1 && lr_x > 1e-3) {
             lmx_stats[category].push_back(lm_x / lr_x);
             lmy_stats[category].push_back(lm_y / lr_x);
             rmx_stats[category].push_back(rm_x / lr_x);
             rmy_stats[category].push_back(rm_y / lr_x);
         }
     }
+    file.close();
 
-    // ========= 可视化与输出 =========
-    // 创建画布: 4行 (1行全局 + 3行类别), 4列 (params)
-    int row_h = 220; 
-    int col_w = 320;
-    cv::Mat viz = cv::Mat::zeros(row_h * 4, col_w * 4, CV_8UC3);
+    // 4. 计算与可视化准备 (恢复到高清分辨率)
+    int row_h = 500; // 更高的高度
+    int col_w = 600; // 更宽的宽度
+    cv::Mat viz = cv::Mat::zeros(row_h * (num_categories + 1), col_w * 4, CV_8UC3);
     cv::bitwise_not(viz, viz); // 白底
 
-    cout << std::fixed << std::setprecision(4);
-    cout << "========================================================" << endl;
-    cout << "           Recommended Hyperparameters Result           " << endl;
-    cout << "          (Logic: Min - 0.05, Max + 0.05)               " << endl;
-    cout << "========================================================" << endl << endl;
+    cout << "Processing " << num_categories << " categories with HD visualization..." << endl;
 
-    // --- 1. 处理 Side2Side (第 0 行) ---
-    cout << "[Global] Side2Side Parameters (Horizontal Pair):" << endl;
+    // --- Step A: Side2Side (Global) ---
+    RangeResult rr_lr_x = processData(all_lr_x, ext_x_min, ext_x_max, false);
+    RangeResult rr_lr_y = processData(all_lr_y, ext_y_min, ext_y_max, false);
     
-    // 辅助 Lambda：处理并绘制
-    auto process_and_draw = [&](vector<double>& vec, string name, int row, int col, cv::Scalar color) {
-        if (vec.empty()) return;
-        double min_v = *min_element(vec.begin(), vec.end());
-        double max_v = *max_element(vec.begin(), vec.end());
+    // 绘制 Global (占用第0行，前两列，宽度拉伸)
+    visualize(viz, all_lr_x, "Global lr_x (Absolute Distance)", cv::Rect(0, 0, col_w*2, row_h), cv::Scalar(180,130,70), rr_lr_x);
+    visualize(viz, all_lr_y, "Global lr_y (Absolute Distance)", cv::Rect(col_w*2, 0, col_w*2, row_h), cv::Scalar(180,130,70), rr_lr_y);
+
+    // --- Step B: Side2Mid (Per Category) ---
+    vector<vector<double>> output_conditions;
+
+    for (int i = 0; i < num_categories; ++i) {
+        RangeResult lmx = processData(lmx_stats[i], ext_lmx_min, ext_lmx_max, true);
+        RangeResult lmy = processData(lmy_stats[i], ext_lmy_min, ext_lmy_max, true);
+        RangeResult rmx = processData(rmx_stats[i], ext_rmx_min, ext_rmx_max, true);
+        RangeResult rmy = processData(rmy_stats[i], ext_rmy_min, ext_rmy_max, true);
+
+        output_conditions.push_back({
+            ranges[i].first, ranges[i].second,
+            lmx.rec_min, lmx.rec_max,
+            lmy.rec_min, lmy.rec_max,
+            rmx.rec_min, rmx.rec_max,
+            rmy.rec_min, rmy.rec_max
+        });
+
+        // 可视化
+        int r = i + 1;
+        string suffix = " [Range: " + to_string((int)ranges[i].first) + "-" + to_string((int)ranges[i].second) + "]";
         
-        cout << "  " << name << ": [" << (min_v - 0.05) << ", " << (max_v + 0.05) << "]" 
-             << " (Raw: " << min_v << " ~ " << max_v << ")" << endl;
-
-        cv::Rect roi(col * col_w, row * row_h, col_w - 10, row_h - 10);
-        drawDistribution(viz, vec, name, roi, color);
-    };
-
-    // 绘制 lr_x (放在第0行，第1列)
-    process_and_draw(global_lr_x, "lr_x (Dist)", 0, 1, cv::Scalar(0, 100, 0));
-    // 绘制 lr_y (放在第0行，第2列)
-    process_and_draw(global_lr_y, "lr_y (Dist)", 0, 2, cv::Scalar(0, 100, 0));
-    
-    cout << endl;
-
-    // --- 2. 处理 Side2Mid (第 1-3 行) ---
-    string cat_names[] = {"lr_y < 2", "2 <= lr_y < 3", "3 <= lr_y <= 5"};
-
-    for (int i = 0; i < 3; i++) {
-        if (lmx_stats[i].empty()) continue;
-
-        cout << "[Category] " << cat_names[i] << " :" << endl;
-
-        // 绘制在 i+1 行 (因为第0行被占用了)
-        int current_row = i + 1;
-        cv::Scalar color(200, 0, 0); // 蓝色
-
-        process_and_draw(lmx_stats[i], "lm_x / lr_x", current_row, 0, color);
-        process_and_draw(lmy_stats[i], "lm_y / lr_x", current_row, 1, color);
-        process_and_draw(rmx_stats[i], "rm_x / lr_x", current_row, 2, color);
-        process_and_draw(rmy_stats[i], "rm_y / lr_x", current_row, 3, color);
-
-        cout << endl;
+        visualize(viz, lmx_stats[i], "lm_x/lr_x" + suffix, cv::Rect(0*col_w, r*row_h, col_w, row_h), cv::Scalar(200,100,0), lmx);
+        visualize(viz, lmy_stats[i], "lm_y/lr_x" + suffix, cv::Rect(1*col_w, r*row_h, col_w, row_h), cv::Scalar(200,100,0), lmy);
+        visualize(viz, rmx_stats[i], "rm_x/lr_x" + suffix, cv::Rect(2*col_w, r*row_h, col_w, row_h), cv::Scalar(200,100,0), rmx);
+        visualize(viz, rmy_stats[i], "rm_y/lr_x" + suffix, cv::Rect(3*col_w, r*row_h, col_w, row_h), cv::Scalar(200,100,0), rmy);
     }
 
-    // 保存结果
-    // 确保 output_folder 存在，否则保存到当前目录
-    string save_path = "hyperparameter_distribution.png";
-    if (!output_folder.empty()) {
-         save_path = output_folder + "\\hyperparameter_distribution.png";
-    }
-    
-    cv::imwrite(save_path, viz);
-    cout << "Chart saved to: " << save_path << endl;
+    // 5. 保存结果
+    string img_path = output_folder + "\\hyperparameter_distribution_hd.png";
+    cv::imwrite(img_path, viz);
+    cout << "HD Visualization saved to: " << img_path << endl;
 
-    // 显示 (可选)
-    cv::namedWindow("Distributions", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Distributions", 1200, 800);
-    cv::imshow("Distributions", viz);
+    // 写入 YAML
+    cfg.setScalar("glint_hyperparameter.horizontal_pair.lr_x_min", rr_lr_x.rec_min);
+    cfg.setScalar("glint_hyperparameter.horizontal_pair.lr_x_max", rr_lr_x.rec_max);
+    cfg.setScalar("glint_hyperparameter.horizontal_pair.lr_y_min", rr_lr_y.rec_min);
+    cfg.setScalar("glint_hyperparameter.horizontal_pair.lr_y_max", rr_lr_y.rec_max);
+    cfg.setVector2D("glint_hyperparameter.middle_point.conditions", output_conditions);
+    cfg.save();
+    cout << "YAML updated successfully." << endl;
+
+    // 预览 (缩放显示)
+    cv::Mat preview;
+    cv::resize(viz, preview, cv::Size(), 0.5, 0.5); // 缩小4倍预览
+    cv::imshow("HD Results Preview", preview);
     cv::waitKey(0);
 
     return 0;
