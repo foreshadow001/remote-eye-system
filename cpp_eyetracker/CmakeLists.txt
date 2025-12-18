@@ -3,9 +3,18 @@
 # cmake minimum version
 cmake_minimum_required(VERSION 3.15)
 
-# set vcpkg toolchain file, which will be used to find dependencies
-set(CMAKE_TOOLCHAIN_FILE "D:/lib/vcpkg/scripts/buildsystems/vcpkg.cmake"
-    CACHE STRING "")
+if(NOT DEFINED ENV{VCPKG_ROOT})
+    message(WARNING "VCPKG_ROOT not set, please specify path to vcpkg, e.g.:")
+    message(WARNING "cmake -D VCPKG_ROOT=C:/vcpkg [...]")
+endif()
+
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    message(FATAL_ERROR
+        "CMAKE_TOOLCHAIN_FILE is not set.\n"
+        "Please configure with:\n"
+        "  -DCMAKE_TOOLCHAIN_FILE=D:/apps/vcpkg/scripts/buildsystems/vcpkg.cmake"
+    )
+endif()
 
 # project name (https://cmake.com.cn/cmake/help/latest/command/project.html)
 # ⚠️ do not set more than one project under the premier directory,

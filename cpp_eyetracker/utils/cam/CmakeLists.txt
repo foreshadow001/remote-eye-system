@@ -12,26 +12,26 @@ target_include_directories(cam PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
-set(PYLON_ROOT "D:/apps/pylon/Development")
-
-if(NOT DEFINED PYLON_ROOT)
-    message(WARNING "⚠️  PYLON_ROOT not set. Please specify path to Pylon SDK, e.g.:")
-    message(WARNING "    cmake -DPYLON_ROOT=\"C:/Program Files/Basler/pylon 7\" ..")
+if(NOT DEFINED ENV{PYLON_DEV_DIR})
+    message(WARNING "⚠️  PYLON_DEV_DIR not set. Please specify path to Pylon SDK, e.g.:")
+    message(WARNING "    cmake -D PYLON_DEV_DIR=\"C:/Program Files/Basler/pylon 7\" ..")
 endif()
 
-if(PYLON_ROOT)
+set(PYLON_DEV_DIR $ENV{PYLON_DEV_DIR})
+
+if(PYLON_DEV_DIR)
     target_include_directories(cam PUBLIC
-        "${PYLON_ROOT}/include"
+        "${PYLON_DEV_DIR}/include"
     )
 
     if(WIN32)
-        if(EXISTS "${PYLON_ROOT}/lib/x64")
-            target_link_directories(cam PUBLIC "${PYLON_ROOT}/lib/x64")
-        elseif(EXISTS "${PYLON_ROOT}/lib")
-            target_link_directories(cam PUBLIC "${PYLON_ROOT}/lib")
+        if(EXISTS "${PYLON_DEV_DIR}/lib/x64")
+            target_link_directories(cam PUBLIC "${PYLON_DEV_DIR}/lib/x64")
+        elseif(EXISTS "${PYLON_DEV_DIR}/lib")
+            target_link_directories(cam PUBLIC "${PYLON_DEV_DIR}/lib")
         endif()
     else()
-        target_link_directories(cam PUBLIC "${PYLON_ROOT}/lib64")
+        target_link_directories(cam PUBLIC "${PYLON_DEV_DIR}/lib64")
     endif()
 endif()
 
