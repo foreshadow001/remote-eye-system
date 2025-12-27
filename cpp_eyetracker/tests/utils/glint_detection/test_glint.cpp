@@ -69,7 +69,7 @@ int main() {
 
             // 保存输出
             std::string output_path = output_folder + "\\" + filename;
-            cv::imwrite(output_path, viz);
+            cv::imwrite(output_path, debug_img);
 
             std::cout << "Saved to: " << output_path
                       << " | num of glints: " << leftEyeGlints.size() + rightEyeGlints.size() << std::endl;
