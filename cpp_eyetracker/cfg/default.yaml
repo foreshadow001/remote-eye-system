@@ -82,8 +82,8 @@ test_multi_cam:
     - 40061061
     - 40061280
     - 40109652
-  save_dir: "D:/ylx/test_multi_cam_75mm"
-  fps: 90
+  save_dir: "D:/hitsz/projects/new_dataset/glass"
+  fps: 200
   gain: 0.0
   gamma: 1.0
   exposure_time: 10000.0
@@ -93,19 +93,20 @@ test_multi_cam:
 # Test glint
 test_glint:
   local_debug: false
-  num_images: 100
-  input_folder: "D:/ylx/glint_input/front/3_3"
-  output_folder: "D:/ylx/glint_input/front/3_3/viz"
+  debug_time: true
+  num_images: 10
+  input_folder: "D:/hitsz/projects/new_dataset/glint_input/front/3_3"
+  output_folder: "D:/hitsz/projects/new_dataset/glint_input/front/3_3/viz"
   gaussion_kernel_size: 3
   laplician_kernel_size: 1
   threshold: 125.0
 
 collect_glint:
-  is_collecting: true
+  is_collecting: false
   local_debug: false
   num_images: 100
-  input_folder: "D:/ylx/glint_input/collect_input"
-  output_folder: "D:/ylx/glint_input/collect_output"
+  input_folder: "D:/hitsz/projects/new_dataset/glint_input/collect_input"
+  output_folder: "D:/hitsz/projects/new_dataset/glint_input/collect_output"
 
 relaxed_glint_hyperparameter:
   horizontal_pair:
@@ -149,15 +150,3 @@ glint_hyperparameter:
       - [0, 2, 0.337097, 0.646154, 0.0928571, 0.322727, 0.353846, 0.662903, 0.142308, 0.357692]
       - [2, 3, 0.459804, 0.688889, 0.0676471, 0.244444, 0.311111, 0.540196, 0.228689, 0.511538]
       - [3, 5, 0.49, 0.887838, 0.0310811, 0.175, 0.112162, 0.51, 0.29, 0.644595]
-test_glint_hyperparameter:
-  horizontal_pair:
-    lr_y_min: 1.000000
-    lr_y_max: 5
-    lr_x_min: 7
-    lr_x_max: 16
-
-  middle_point:
-    conditions:
-      - [-1, 2, 0.2, 0.8, 0.05, 0.55, 0.2, 0.8, 0.05, 0.55]
-      - [2, 3, 0.45, 0.7, 0.05, 0.25, 0.3, 0.55, 0.25, 0.5]
-      - [3, 5, 0.45, 0.85, 0.04, 0.25, 0.15, 0.55, 0.3, 0.65]

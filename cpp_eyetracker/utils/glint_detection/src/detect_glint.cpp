@@ -12,7 +12,8 @@ namespace glintdetection {
 
 Cfg cfg;
 
-bool local_debug = cfg["test_glint"]["local_debug"].as<bool>() || cfg["collect_glint"]["local_debug"].as<bool>();
+bool local_debug = cfg["test_glint"]["local_debug"].as<bool>() || cfg["collect_glint"]["local_debug"].as<bool>();\
+bool debug_time = cfg["test_glint"]["debug_time"].as<bool>();
 
 // TODO:
 // ✅ 1. optimaize side2mid function (add delta y of left and right point as a parameter, and adjust the range accordingly).
@@ -230,36 +231,57 @@ searchForGlints(cv::Mat src, const Cfg& cfg)
 	// Remove noise by blurring with a Gaussian filter
 	// Blurring also generates wider range for finding contours
 	cv::Mat gaussed;
+    double t1 = cv::getTickCount();
 	cv::GaussianBlur(gray, gaussed,
 					 cv::Size(cfg["test_glint"]["gaussion_kernel_size"].as<int>(),
 					 		  cfg["test_glint"]["gaussion_kernel_size"].as<int>()),
 					 0, 0, cv::BORDER_DEFAULT); // better results in extreme cases
+    double t2 = cv::getTickCount();
+    if (debug_time)
+    {
+        std::cout << "[1] Gaussion blur time: " << (t2 - t1) / cv::getTickFrequency() * 1000 << "ms" << std::endl;
+    }
 
 	// 2 Laplace
 	// Apply Laplace function
 	// Laplace Functino generates edges
 	cv::Mat laplaced;
-	// time the laplacian function
-	// cv::TickMeter tm;
-	// tm.start();
 	cv::Laplacian(gaussed, laplaced, ddepth, kernel_size, scale, delta, cv::BORDER_DEFAULT);
-	// tm.stop();
-	// std::cout << "Laplace function took " << tm.getTimeMilli() << " ms" << std::endl;
+    double t3 = cv::getTickCount();
+    if (debug_time)
+    {
+        std::cout << "[2] Laplace time: " << (t3 - t2) / cv::getTickFrequency() * 1000 << "ms" << std::endl;
+    }
 	
 	// CHANGED
 	cv::Mat abs_dst;
 	cv::convertScaleAbs(laplaced, abs_dst);
 	// convertScaleAbs(laplaced, abs_dst, (sigma + 1)*0.25);
+    double t4 = cv::getTickCount();
+    if (debug_time)
+    {
+        std::cout << "[3] convertScaleAbs time: " << (t4 - t3) / cv::getTickFrequency() * 1000 << "ms" << std::endl;
+    }
 
 	// 3 Find Contours
 	// Detect edges using Threshold
 	cv::Mat threshold_output;
 	cv::threshold(abs_dst, threshold_output, firstEyeThresh, 255, cv::THRESH_BINARY);
+    double t5 = cv::getTickCount();
+    if (debug_time)
+    {
+        std::cout << "[4] Threshold time: " << (t5 - t4) / cv::getTickFrequency() * 1000 << "ms" << std::endl;
+    }
 
 	// FOR SPEED UP
 	std::vector<cv::Vec4i> hierarchy;
 	std::vector<std::vector<cv::Point>> contours;
 	cv::findContours(threshold_output, contours, hierarchy, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE, cv::Point(0, 0));
+    double t6 = cv::getTickCount();
+    if (debug_time)
+    {
+        std::cout << "[5] FindContours time: " << (t6 - t5) / cv::getTickFrequency() * 1000 << "ms" << std::endl;
+    }
 
 	// 4 Approximate contours to polygons + get bounding rects and circles
 	std::vector<cv::RotatedRect> minRect(contours.size());
@@ -284,6 +306,11 @@ searchForGlints(cv::Mat src, const Cfg& cfg)
 	// auto [glintCandidates, img_rm] = removeFalseGlints(contourCenter, src);
 
 	auto [leftEyeGlintsCandidates, rightEyeGlintsCandidates] = splitGlintsByEye(contourCenter);
+    double t7 = cv::getTickCount();
+    if (debug_time)
+    {
+        std::cout << "[6] SplitGlintsByEye time: " << (t7 - t6) / cv::getTickFrequency() * 1000 << "ms" << std::endl;
+    }
 
 	if (local_debug)
 	{
@@ -293,12 +320,22 @@ searchForGlints(cv::Mat src, const Cfg& cfg)
 	}
 
 	auto leftEyeGlints  = findGeometry(leftEyeGlintsCandidates, cfg);
+    double t8 = cv::getTickCount();
+    if (debug_time)
+    {
+        std::cout << "[7] FindGeometry time: " << (t8 - t7) / cv::getTickFrequency() * 1000 << "ms" << std::endl;
+    }
 	if (local_debug)
 	{
 		std::cout << "Left eye glints found: " << leftEyeGlints.size() << std::endl;
 		std::cout << "\nStart right eye glint geometry finding..." << std::endl;
 	}
 	auto rightEyeGlints = findGeometry(rightEyeGlintsCandidates, cfg);
+    double t9 = cv::getTickCount();
+    if (debug_time)
+    {
+        std::cout << "[8] FindGeometry time: " << (t9 - t8) / cv::getTickFrequency() * 1000 << "ms" << std::endl;
+    }
 	if (local_debug)
 	{
 		std::cout << "Right eye glints found: " << rightEyeGlints.size() << std::endl;

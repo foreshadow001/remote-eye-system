@@ -48,7 +48,14 @@ int main() {
             }
 
             // 调用 glint 检测
+            double t1 = cv::getTickCount();
             auto [leftEyeGlintsList, rightEyeGlintsList, debug_img] = searchForGlints(img, cfg);
+            double t2 = cv::getTickCount();
+            double time_elapsed = (t2 - t1) / cv::getTickFrequency() * 1000;
+            if (cfg["test_glint"]["debug_time"].as<bool>())
+            {
+                std::cout << "Processed " << filepath << " in " << time_elapsed << " ms" << std::endl;
+            }
 
             std::vector<cv::Point2f> leftEyeGlints, rightEyeGlints;
 
