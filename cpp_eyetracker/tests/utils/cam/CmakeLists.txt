@@ -14,10 +14,6 @@ target_link_libraries(test_cam
         eyetracker::cam
 )
 
-set_target_properties(test_cam PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-)
-
 message(STATUS "✅ test_cam will be built and linked with eyetracker::cam")
 
 
@@ -33,8 +29,18 @@ target_link_libraries(test_multi_cam
         eyetracker::cam
 )
 
-set_target_properties(test_cam PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+message(STATUS "✅ test_multi_cam will be built and linked with eyetracker::cam")
+
+set(TEST_CAM_SOURCES
+    test_multi_cam_bmp.cpp
 )
 
-message(STATUS "✅ test_multi_cam will be built and linked with eyetracker::cam")
+add_executable(test_multi_cam_bmp ${TEST_CAM_SOURCES})
+
+target_link_libraries(test_multi_cam_bmp
+    PRIVATE
+        eyetracker::cfg
+        eyetracker::cam
+)
+
+message(STATUS "✅ test_multi_cam_bmp will be built and linked with eyetracker::cam")

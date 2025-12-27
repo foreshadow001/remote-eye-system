@@ -68,11 +68,11 @@ viz_output_dir: "D:/ylx/calib_viz"
 # Test one cam
 test_one_cam:
   cam_index: 40061061
-  save_dir: "D:/ylx/test_one_cam"
-  fps: 90
+  save_dir: "D:/hitsz/projects/new_dataset/test_one_cam"
+  fps: 200
   gain: 0.0
   gamma: 1.0
-  exposure_time: 10000.0
+  exposure_time: 4000.0
   frame_width: 720
   frame_height: 540
 
@@ -82,25 +82,25 @@ test_multi_cam:
     - 40061061
     - 40061280
     - 40109652
-  save_dir: "D:/hitsz/projects/new_dataset/glass"
-  fps: 200
+  save_dir: "D:/ylx/test_multi_cam_75mm"
+  fps: 90
   gain: 0.0
   gamma: 1.0
-  exposure_time: 10000.0
+  exposure_time: 4000.0
   window_width: 1440
   window_height: 1080
 
-# Test glint
+# Test inference of searching glints
 test_glint:
   local_debug: false
-  debug_time: true
-  num_images: 10
-  input_folder: "D:/hitsz/projects/new_dataset/glint_input/front/3_3"
-  output_folder: "D:/hitsz/projects/new_dataset/glint_input/front/3_3/viz"
+  num_images: 100
+  input_folder: "D:/ylx/glint_input/front/3_3"
+  output_folder: "D:/ylx/glint_input/front/3_3/viz"
   gaussion_kernel_size: 3
   laplician_kernel_size: 1
   threshold: 125.0
 
+# Collect Potential Glint Triangles
 collect_glint:
   is_collecting: false
   local_debug: false
@@ -108,6 +108,7 @@ collect_glint:
   input_folder: "D:/hitsz/projects/new_dataset/glint_input/collect_input"
   output_folder: "D:/hitsz/projects/new_dataset/glint_input/collect_output"
 
+# Relaxed Glint Hyperparameter
 relaxed_glint_hyperparameter:
   horizontal_pair:
     lr_y_min: 0
@@ -137,7 +138,7 @@ relaxed_glint_hyperparameter:
     extention_rm_y/lr_x_min: 0.05
     extention_rm_y/lr_x_max: 0.05
     
-  
+# Constrained Glint Hyperparameter
 glint_hyperparameter:
   horizontal_pair:
     lr_y_min: 0.000000

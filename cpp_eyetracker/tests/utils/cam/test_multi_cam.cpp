@@ -18,6 +18,7 @@ namespace fs = std::filesystem;
 using namespace std;
 using namespace gazeestimation;
 
+// 函数声明
 int getNextCalibCounter(const std::string& save_dir);
 
 // 辅助函数：获取当前时间字符串
@@ -29,12 +30,11 @@ std::string getCurrentTimeString() {
 }
 
 int main() {
-    cout << "=== [TEST] Multi-Basler Camera Tool ===" << endl;
+    cout << "=== [TEST] Multi-Basler Camera Tool (Optimized) ===" << endl;
 
     Cfg cfg;
     
-    // 1. 读取序列号列表 (假设配置中存储为 int 数组，如果是 string 数组请相应修改)
-    // 这里兼容处理：先读成 int，转 string。如果你的 config 库直接支持 string vector 更好。
+    // 1. 读取序列号列表
     std::vector<std::string> cam_serials = cfg["test_multi_cam"]["cam_indices"].as<std::vector<std::string>>();
 
     if (cam_serials.empty()) {
@@ -49,7 +49,7 @@ int main() {
     std::vector<std::unique_ptr<BaslerCamera>> cameras;
     
     // 读取通用参数
-    double fps = cfg["test_multi_cam"]["fps"].as<double>();
+    double target_fps = cfg["test_multi_cam"]["fps"].as<double>(); // 目标帧率
     double gain = cfg["test_multi_cam"]["gain"].as<double>();
     double gamma = cfg["test_multi_cam"]["gamma"].as<double>();
     double exposure = cfg["test_multi_cam"]["exposure_time"].as<double>();
@@ -57,7 +57,7 @@ int main() {
 
     // 创建保存目录
     try {
-        fs::create_directories(save_dir);
+        if (!fs::exists(save_dir)) fs::create_directories(save_dir);
     } catch (const std::exception& e) {
         cerr << "[MultiCam] Failed to create directory: " << e.what() << endl;
         return -1;
@@ -67,7 +67,7 @@ int main() {
     for (const auto& sn : cam_serials) {
         auto cam = std::make_unique<BaslerCamera>(sn);
         if (cam->open()) {
-            cam->setFrameRate(fps);
+            cam->setFrameRate(target_fps);
             cam->setGain(gain);
             cam->setGamma(gamma);
             cam->setExposureTime(exposure);
@@ -82,19 +82,14 @@ int main() {
         return -1;
     }
 
-    // 更新实际可用的相机数量
     num_cams = cameras.size();
 
     // 3. 计算布局 (智能网格)
-    // 目标总窗口大小
     const int WIN_WIDTH = cfg["test_multi_cam"]["window_width"].as<int>();
     const int WIN_HEIGHT = cfg["test_multi_cam"]["window_height"].as<int>();
     
-    // 计算行列数: ceil(sqrt(N))
     int cols = (int)std::ceil(std::sqrt(num_cams));
     int rows = (int)std::ceil((double)num_cams / cols);
-    
-    // 计算每个子画面的大小
     int cell_w = WIN_WIDTH / cols;
     int cell_h = WIN_HEIGHT / rows;
 
@@ -106,115 +101,140 @@ int main() {
 
     bool recording = false;
     bool running = true;
-
     int calib_counter = 0;
+
+    // --- 性能优化变量 ---
+    // 关键设置：每隔 20 帧才刷新一次界面
+    // 如果你在 200FPS 运行，界面每 0.1s 刷新一次，非常流畅且节省大量 CPU
+    const int DISPLAY_INTERVAL = 40; 
+    long long frame_loop_count = 0;
+
+    // FPS 统计
+    auto last_time = std::chrono::high_resolution_clock::now();
+    int fps_counter = 0;
 
     // 主循环
     while (running) {
-        // 创建画布 (黑色背景)
-        cv::Mat canvas = cv::Mat::zeros(WIN_HEIGHT, WIN_WIDTH, CV_8UC3);
+        // 创建画布 (只在需要显示的时候才创建，这里为了逻辑简单，我们每次循环都声明，但只在显示帧操作)
+        // 为了性能，我们将 canvas 的绘制逻辑放入 if 块中
         
+        bool do_update_ui = (frame_loop_count % DISPLAY_INTERVAL == 0);
+        cv::Mat canvas;
+        if (do_update_ui) {
+            canvas = cv::Mat::zeros(WIN_HEIGHT, WIN_WIDTH, CV_8UC3);
+        }
+
         // 遍历所有相机
         for (int i = 0; i < num_cams; ++i) {
-            // 1. 获取原始帧
+            // A. 获取原始帧 (必须每帧都做，最优先)
             cv::Mat frame = cameras[i]->grabFrame();
             
-            // 2. 处理录制 (使用原始帧，保证录像质量不被缩放影响)
+            // B. 处理录制 (必须每帧都做，第二优先)
             if (recording) {
                 cameras[i]->writeFrame(frame);
             }
 
-            // 3. 准备显示
-            if (!frame.empty()) {
-                // 计算当前相机在网格中的位置
+            // C. 准备显示 (仅在 UI 刷新帧进行)
+            if (do_update_ui && !frame.empty()) {
                 int r = i / cols;
                 int c = i % cols;
                 
-                // 定义画布上的 ROI (Region of Interest)
+                // 定义 ROI
                 cv::Rect roi(c * cell_w, r * cell_h, cell_w, cell_h);
                 
-                // 缩放并拷贝到画布
+                // 缩放
                 cv::Mat resized_frame;
                 cv::resize(frame, resized_frame, cv::Size(cell_w, cell_h));
                 
-                // 防止最后一行可能出现的像素越界 (简单保护)
+                // 边界保护
                 if (roi.x + roi.width > canvas.cols) roi.width = canvas.cols - roi.x;
                 if (roi.y + roi.height > canvas.rows) roi.height = canvas.rows - roi.y;
                 
                 resized_frame.copyTo(canvas(roi));
 
-                // 绘制序列号文字 (左上角)
+                // 绘制文字
                 std::string label = "SN: " + cameras[i]->getSerialNumber();
-                // 黑色描边，白色字体，确保可见
-                cv::putText(canvas(roi), label, cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 0), 4);
-                cv::putText(canvas(roi), label, cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+                cv::putText(canvas(roi), label, cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 0), 4);
+                cv::putText(canvas(roi), label, cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
                 
-                // 如果正在录制，加个红点提示
                 if (recording) {
                      cv::circle(canvas(roi), cv::Point(canvas(roi).cols - 30, 30), 10, cv::Scalar(0, 0, 255), -1);
                 }
             }
         }
 
-        cv::imshow("Multi-Camera Preview", canvas);
+        // D. 统计 FPS
+        fps_counter++;
+        auto now = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> diff = now - last_time;
+        if (diff.count() >= 1.0) {
+            // 在控制台刷新显示真实帧率
+            std::cout << "\r[MultiCam] Real FPS: " << fps_counter 
+                      << " | Target: " << target_fps 
+                      << " | Rec: " << (recording ? "ON " : "OFF") << "   " << std::flush;
+            fps_counter = 0;
+            last_time = now;
+        }
 
-        // 按键处理
-        char key = (char)cv::waitKey(1);
-        
-        // --- 拍照 (SPACE) ---
-        if (key == ' ') {
-            calib_counter = getNextCalibCounter(save_dir);
-            string timeStr = getCurrentTimeString();
-            cout << "[MultiCam] 📸 Snapshot at " << timeStr << endl;
-            for (int i = 0; i < num_cams; ++i) {
-                // 为了获得高质量图片，我们这里重新 grab 一帧，或者在循环里缓存上一帧均可。
-                // 简单起见，我们利用Basler对象的buffer机制，或者在显示逻辑里缓存。
-                // 但为了代码简洁，我们在 grabFrame 时并没有保存原始大图到 vector。
-                // 修正策略：在上面的循环中，我们已经 grab 过了。因为 grab 是破坏性的（流式），
-                // 我们无法再次 grab 同一时刻。
-                // 实际工程中应该把上面循环里的 frame 存到一个 vector<Mat> 中，然后再画图。
-                // 下面为了演示逻辑，我们做一次“同步触发抓拍”（虽然会有微小延时，但逻辑最简单）
-                // 注意：这会导致预览卡顿一帧。
-                cv::Mat shot = cameras[i]->grabFrame(); 
-                if (!shot.empty()) {
-                    // 创建一个stringstream来格式化calib_counter
-                    std::stringstream ss;
-                    ss << std::setw(2) << std::setfill('0') << calib_counter;
-                    std::string calib_str = ss.str();  // 将格式化后的结果转换为字符串
+        // E. 界面刷新与按键响应 (低频执行)
+        if (do_update_ui) {
+            cv::imshow("Multi-Camera Preview", canvas);
 
-                    // 拼接字符串
-                    std::string fn = save_dir + "/calib_cam_" + std::to_string(i) + "_" + calib_str + ".jpg";
-                    cv::imwrite(fn, shot);
-                    cout << "  -> Saved: " << fn << endl;
+            // 按键检测放在这里，减少阻塞
+            char key = (char)cv::waitKey(1);
+            
+            // --- 拍照 (SPACE) ---
+            if (key == ' ') {
+                calib_counter = getNextCalibCounter(save_dir);
+                string timeStr = getCurrentTimeString();
+                cout << "\n[MultiCam] 📸 Snapshot at " << timeStr << endl;
+                
+                // 注意：这里为了逻辑简单，再次调用 grabFrame 可能会导致极短的卡顿。
+                // 如果需要极其严格的同步，建议缓存上面的 frame 变量。
+                // 这里沿用你的逻辑，重新抓一帧专门用于保存高质量图片。
+                for (int i = 0; i < num_cams; ++i) {
+                    cv::Mat shot = cameras[i]->grabFrame(); 
+                    if (!shot.empty()) {
+                        std::stringstream ss;
+                        ss << std::setw(2) << std::setfill('0') << calib_counter;
+                        std::string calib_str = ss.str();
+                        std::string fn = save_dir + "/calib_cam_" + std::to_string(i) + "_" + calib_str + ".jpg";
+                        cv::imwrite(fn, shot);
+                        cout << "  -> Saved: " << fn << endl;
+                    }
                 }
             }
-        }
-        
-        // --- 开始录像 (r) ---
-        else if (key == 'r' && !recording) {
-            string timeStr = getCurrentTimeString();
-            cout << "[MultiCam] 🎬 Start Recording..." << endl;
-            for (int i = 0; i < num_cams; ++i) {
-                string fn = save_dir + "/video_" + timeStr + "_cam_" + cameras[i]->getSerialNumber(); 
-                // 后缀 .avi 会在 startRecording 内部自动添加或检查
-                cameras[i]->startRecording(fn, fps);
+            
+            // --- 开始录像 (r) ---
+            else if (key == 'r' && !recording) {
+                string timeStr = getCurrentTimeString();
+                cout << "\n[MultiCam] 🎬 Start Recording..." << endl;
+                for (int i = 0; i < num_cams; ++i) {
+                    string fn = save_dir + "/video_" + timeStr + "_cam_" + cameras[i]->getSerialNumber(); 
+                    // 【注意】这里传入的是 target_fps。
+                    // 如果 Real FPS 只有 50，但这里传入 200，播放时就会快进。
+                    // 如果你希望播放速度正常，可以将 target_fps 改为 fps_counter (上一秒的真实帧率)
+                    cameras[i]->startRecording(fn, target_fps);
+                }
+                recording = true;
             }
-            recording = true;
-        }
-        
-        // --- 停止录像 (s) ---
-        else if (key == 's' && recording) {
-            cout << "[MultiCam] ⏹️ Stop Recording." << endl;
-            for (auto& cam : cameras) {
-                cam->stopRecording();
+            
+            // --- 停止录像 (s) ---
+            else if (key == 's' && recording) {
+                cout << "\n[MultiCam] ⏹️ Stop Recording." << endl;
+                for (auto& cam : cameras) {
+                    cam->stopRecording();
+                }
+                recording = false;
             }
-            recording = false;
+            
+            // --- 退出 (q / ESC) ---
+            else if (key == 'q' || key == 27) {
+                running = false;
+            }
         }
-        
-        // --- 退出 (q / ESC) ---
-        else if (key == 'q' || key == 27) {
-            running = false;
-        }
+
+        frame_loop_count++;
     }
 
     // 清理资源
@@ -227,44 +247,33 @@ int main() {
     }
     
     cv::destroyAllWindows();
-    cout << "[MultiCam] Program ended.\n";
+    cout << "\n[MultiCam] Program ended.\n";
     return 0;
 }
 
+// 辅助函数实现保持不变
 int getNextCalibCounter(const std::string& save_dir) {
-    int max_counter = -1;  // 如果没有找到任何文件，计数器应该从 0 开始
+    int max_counter = -1;
+    if (!fs::exists(save_dir)) return 0; // 目录不存在则从0开始
 
-    // 遍历文件夹中的所有文件
     for (const auto& entry : fs::directory_iterator(save_dir)) {
         const auto& path = entry.path();
-        
-        // 只处理以 "calib_cam_" 开头且以 ".jpg" 结尾的文件
         if (path.extension() == ".jpg" && path.stem().string().find("calib_cam_") == 0) {
-            std::string filename = path.stem().string();  // 获取文件名，不包含扩展名
-
-            // 使用正则表达式从文件名中提取计数值
+            std::string filename = path.stem().string();
             std::string prefix = "calib_cam_";
             size_t pos1 = filename.find(prefix);
             if (pos1 != std::string::npos) {
-                std::string suffix = filename.substr(pos1 + prefix.length());  // 获取计数部分
-                
-                // 提取计数的数字部分
+                std::string suffix = filename.substr(pos1 + prefix.length());
                 size_t pos2 = suffix.find('_');
                 if (pos2 != std::string::npos) {
-                    std::string counter_str = suffix.substr(pos2 + 1);  // 获取后缀部分
+                    std::string counter_str = suffix.substr(pos2 + 1);
                     try {
-                        int counter = std::stoi(counter_str);  // 转换为整数
-                        if (counter > max_counter) {
-                            max_counter = counter;
-                        }
-                    } catch (const std::invalid_argument&) {
-                        // 如果提取过程中出错，则跳过该文件
-                        continue;
-                    }
+                        int counter = std::stoi(counter_str);
+                        if (counter > max_counter) max_counter = counter;
+                    } catch (...) { continue; }
                 }
             }
         }
     }
-
-    return max_counter + 1;  // 返回下一个计数值
+    return max_counter + 1;
 }
