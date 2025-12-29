@@ -1,3 +1,12 @@
+# Camera calibration
+cam_calib:
+  input_folder: "D:/hitsz/projects/new_dataset/calib/calib_three_cam/"
+  calib_plane: "D:/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
+  output_folder: "D:/hitsz/projects/new_dataset/calib/cams/"
+  focus: 0.012 # m
+  pixel_size_x: 3.45e-6 # m
+  pixel_size_y: 3.45e-6 # m
+
 # Calibration Offline Settings
 input_dir: "D:/ylx/calib_records"
 output_dir: "D:/ylx/calib_results"
@@ -67,23 +76,23 @@ viz_output_dir: "D:/ylx/calib_viz"
 
 # Test one cam
 test_one_cam:
-  cam_index: 40061061
+  cam_index: 40061061 # 24944888
   save_dir: "D:/hitsz/projects/new_dataset/test_one_cam"
   fps: 200
   gain: 0.0
   gamma: 1.0
   exposure_time: 4000.0
-  frame_width: 720
-  frame_height: 540
+  window_width: 720
+  window_height: 540
 
 # Test multi cam
 test_multi_cam:
   cam_indices:
     - 40061061
-    - 40061280
+    - 24944888
     - 40109652
-  save_dir: "D:/ylx/test_multi_cam_75mm"
-  fps: 90
+  save_dir: "D:/hitsz/projects/new_dataset/debug_multi_cam"
+  fps: 200
   gain: 0.0
   gamma: 1.0
   exposure_time: 4000.0
@@ -94,8 +103,8 @@ test_multi_cam:
 test_glint:
   local_debug: false
   num_images: 100
-  input_folder: "D:/ylx/glint_input/front/3_3"
-  output_folder: "D:/ylx/glint_input/front/3_3/viz"
+  input_folder: "D:/hitsz/projects/new_dataset/glint_input/collect_input"
+  output_folder: "D:/hitsz/projects/new_dataset/glint_input/collect_output"
   gaussion_kernel_size: 3
   laplician_kernel_size: 1
   threshold: 125.0

@@ -20,7 +20,7 @@ public:
     void setGamma(double gamma);
     void setExposureTime(double microseconds);
 
-    cv::Mat grabFrame();
+    bool grabFrame(cv::Mat& out_frame);
 
     // 录像相关
     void startRecording(const std::string& filename, double fps = 30.0);
@@ -33,7 +33,10 @@ private:
     Pylon::PylonAutoInitTerm autoInit_;
     Pylon::CInstantCamera camera_;
     std::string serialNumber_;
-    bool isOpen_;
+    bool isOpen_ = false;
+    bool isMono_ = false;
+
+    Pylon::CImageFormatConverter converter_;
     
     // 录像控制变量 (为延迟初始化添加)
     bool recording_;          // 整体录像状态
@@ -42,5 +45,12 @@ private:
     double videoFps_;           // 暂存帧率
     cv::VideoWriter writer_;
 };
+
+static inline double ms(
+    const std::chrono::steady_clock::time_point& a,
+    const std::chrono::steady_clock::time_point& b)
+{
+    return std::chrono::duration<double, std::milli>(b - a).count();
+}
 
 } // namespace gazeestimation

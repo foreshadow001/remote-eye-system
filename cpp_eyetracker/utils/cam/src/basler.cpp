@@ -1,11 +1,14 @@
 #include "cam/basler.hpp" // 请确保路径与你的项目结构一致
 #include <iostream>
+#include <chrono>
 
 // 推荐在 cpp 中使用命名空间，不要在 hpp 中污染全局命名空间
 using namespace std;
 using namespace Pylon;
 using namespace cv;
 using namespace GenApi;
+
+bool local_debug = false;
 
 namespace gazeestimation {
 
@@ -58,15 +61,55 @@ bool BaslerCamera::open() {
 
     try {
         camera_.Open();
+        GenApi::INodeMap& nodemap = camera_.GetNodeMap();
+
+        // ---- PixelFormat 枚举节点 ----
+        GenApi::CEnumerationPtr pixelFormat =
+            nodemap.GetNode("PixelFormat");
+
+        if (!pixelFormat || !GenApi::IsWritable(pixelFormat)) {
+            throw std::runtime_error("PixelFormat not writable");
+        }
+
+        // ---- 判断是否支持 BayerRG8 ----
+        auto bayerRG8Entry = pixelFormat->GetEntryByName("BayerRG8");
+
+        if (GenApi::IsAvailable(bayerRG8Entry)) {
+            // ========= 彩色相机 =========
+            pixelFormat->FromString("BayerRG8");
+            converter_.OutputPixelFormat = PixelType_BGR8packed;
+            isMono_ = false;
+
+            std::cout << "[BaslerCamera] Color camera detected, "
+                      << "PixelFormat set to BayerRG8" << std::endl;
+        }
+        else {
+            // ========= 黑白相机 =========
+            auto mono8Entry = pixelFormat->GetEntryByName("Mono8");
+            if (!GenApi::IsAvailable(mono8Entry)) {
+                throw std::runtime_error(
+                    "Camera supports neither BayerRG8 nor Mono8");
+            }
+
+            pixelFormat->FromString("Mono8");
+            converter_.OutputPixelFormat = PixelType_Mono8;
+            isMono_ = true;
+
+            std::cout << "[BaslerCamera] Mono camera detected, "
+                      << "PixelFormat set to Mono8" << std::endl;
+        }
+
+        // 初始化转换器，强制不进行对齐（OpenCV 默认也是连续内存）
+        converter_.OutputBitAlignment = OutputBitAlignment_MsbAligned;
+
+        // ---- 开始采集 ----
+        camera_.StartGrabbing(GrabStrategy_LatestImageOnly);
         isOpen_ = true;
-        std::cout << "[BaslerCamera] Camera opened: "
-                  << camera_.GetDeviceInfo().GetModelName() 
-                  << " [SN: " << serialNumber_ << "]" << std::endl;
         return true;
-    } catch (const GenericException& e) {
-        std::cerr << "[BaslerCamera] Failed to open camera (SN " << serialNumber_ << "): "
-                  << e.GetDescription() << std::endl;
-        isOpen_ = false;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "[BaslerCamera] open() failed: "
+                  << e.what() << std::endl;
         return false;
     }
 }
@@ -134,40 +177,61 @@ void BaslerCamera::setExposureTime(double microseconds) {
     }
 }
 
-cv::Mat BaslerCamera::grabFrame() {
-    cv::Mat image;
-    if (!isOpen_) return image;
+bool BaslerCamera::grabFrame(cv::Mat& out_frame) {
+    if (!camera_.IsGrabbing()) return false;
 
-    try {
-        if (!camera_.IsGrabbing())
-            camera_.StartGrabbing(Pylon::GrabStrategy_LatestImageOnly);
-
-        CGrabResultPtr ptrGrabResult;
-        // 超时时间设为 5000ms
-        camera_.RetrieveResult(5000, ptrGrabResult, TimeoutHandling_ThrowException);
-
-        if (ptrGrabResult->GrabSucceeded()) {
-            static CImageFormatConverter converter;
-            converter.OutputPixelFormat = PixelType_BGR8packed;
-            CPylonImage pylonImage;
-            converter.Convert(pylonImage, ptrGrabResult);
-            
-            // 深度拷贝
-            image = cv::Mat(ptrGrabResult->GetHeight(), ptrGrabResult->GetWidth(),
-                            CV_8UC3, (uint8_t*)pylonImage.GetBuffer()).clone();
-        } else {
-            cerr << "[BaslerCamera] Grab Failed. Error: " 
-                 << ptrGrabResult->GetErrorCode() << " " 
-                 << ptrGrabResult->GetErrorDescription() << endl;
-        }
-    } catch (const GenericException& e) {
-        std::cerr << "[BaslerCamera] grabFrame error (SN " << serialNumber_ << "): "
-                  << e.GetDescription() << std::endl;
+    CGrabResultPtr ptrGrabResult;
+    // 超时时间不要太长，防止阻塞 UI
+    auto tg0 = chrono::steady_clock::now();
+    camera_.RetrieveResult(20, ptrGrabResult, TimeoutHandling_ThrowException);
+    auto tg1 = chrono::steady_clock::now();
+    if (local_debug) {
+        std::cout << "RetrieveResult time: " << ms(tg0, tg1) << " ms" << std::endl;
     }
 
-    return image;
+    if (ptrGrabResult->GrabSucceeded()) {
+        int width = ptrGrabResult->GetWidth();
+        int height = ptrGrabResult->GetHeight();
+        
+        // 获取抓取到的原始 buffer 指针
+        const uint8_t* pBuffer = (uint8_t*)ptrGrabResult->GetBuffer();
+
+        if (isMono_) {
+            out_frame.create(height, width, CV_8UC1);
+            if (local_debug) {
+                std::cout << "is_mono = true" << std::endl;
+            }
+            EPixelType type = ptrGrabResult->GetPixelType();
+            auto t0 = chrono::steady_clock::now();
+            if (type == PixelType_Mono8) {
+                memcpy(out_frame.data, pBuffer, width * height);
+            } else {
+                converter_.Convert(out_frame.ptr(), width * height, ptrGrabResult);
+            }
+            auto t1 = chrono::steady_clock::now();
+            if (local_debug) {
+                std::cout << "Copy time: " << ms(t0, t1) << " ms" << std::endl;
+            }
+        } 
+        else {
+            // === 常规模式 (Color) ===
+            if (local_debug) {
+                std::cout << "is_color = true" << std::endl;
+            }
+            out_frame.create(height, width, CV_8UC3);
+
+            // 使用 converter 直接写入 Mat 的数据区
+            auto tc2 = chrono::steady_clock::now();
+            converter_.Convert(out_frame.ptr(), width * height * 3, ptrGrabResult);
+            auto tc3 = chrono::steady_clock::now();
+            if (local_debug) {
+                std::cout << "Converter time: " << ms(tc2, tc3) << " ms" << std::endl;
+            }
+        }
+        return true;
+    }
+    return false;
 }
-// --- 录像功能使用延迟初始化 ---
 
 void BaslerCamera::startRecording(const std::string& filename, double fps)
 {
@@ -221,7 +285,14 @@ void BaslerCamera::writeFrame(const cv::Mat& frame) {
 
     // 3. 写入帧
     if (writerInitialized_) {
-        writer_.write(frame);
+        if (frame.channels() == 1) {
+            // 仅在写入这一刻转换，不影响采集
+            cv::Mat temp_color;
+            cv::cvtColor(frame, temp_color, cv::COLOR_GRAY2BGR);
+            writer_.write(temp_color);
+        } else {
+            writer_.write(frame);
+        }
     }
 }
 
