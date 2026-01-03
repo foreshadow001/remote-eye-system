@@ -3,6 +3,10 @@
 
 namespace glintdetection {
 
+class GlintDetector {
+public:
+}
+
 bool side2side(
     const cv::Point2f& l_pt,
     const cv::Point2f& r_pt,

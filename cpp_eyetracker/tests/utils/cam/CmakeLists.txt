@@ -1,22 +1,3 @@
-find_package(OpenCV REQUIRED)
-
-cmake_minimum_required(VERSION 3.14)
-
-set(TEST_CAM_SOURCES
-    test_cam.cpp
-)
-
-add_executable(test_cam ${TEST_CAM_SOURCES})
-
-target_link_libraries(test_cam
-    PRIVATE
-        eyetracker::cfg
-        eyetracker::cam
-)
-
-message(STATUS "✅ test_cam will be built and linked with eyetracker::cam")
-
-
 set(TEST_CAM_SOURCES
     test_multi_cam.cpp
 )
@@ -30,17 +11,3 @@ target_link_libraries(test_multi_cam
 )
 
 message(STATUS "✅ test_multi_cam will be built and linked with eyetracker::cam")
-
-set(TEST_CAM_SOURCES
-    debug_multi_cam.cpp
-)
-
-add_executable(debug_multi_cam ${TEST_CAM_SOURCES})
-
-target_link_libraries(debug_multi_cam
-    PRIVATE
-        eyetracker::cfg
-        eyetracker::cam
-)
-
-message(STATUS "✅ debug_multi_cam will be built and linked with eyetracker::cam")

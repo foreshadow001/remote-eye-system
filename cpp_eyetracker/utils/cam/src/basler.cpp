@@ -1,6 +1,4 @@
 #include "cam/basler.hpp" // 请确保路径与你的项目结构一致
-#include <iostream>
-#include <chrono>
 
 // 推荐在 cpp 中使用命名空间，不要在 hpp 中污染全局命名空间
 using namespace std;
@@ -51,65 +49,84 @@ BaslerCamera::~BaslerCamera() {
     // Pylon::CInstantCamera 会在析构时自动清理资源
 }
 
-bool BaslerCamera::open() {
-    // 检查是否有设备绑定
-    if (!camera_.IsPylonDeviceAttached()) {
-        std::cerr << "[BaslerCamera] Cannot open: No device attached. (Check if SN " 
-                  << serialNumber_ << " is correct/connected)" << std::endl;
-        return false;
-    }
+// === 修改后的 open 函数 ===
+bool BaslerCamera::open(TriggerMode mode) {
+    if (!camera_.IsPylonDeviceAttached()) return false;
 
     try {
         camera_.Open();
-        GenApi::INodeMap& nodemap = camera_.GetNodeMap();
+        currentMode_ = mode;
+        INodeMap& nodemap = camera_.GetNodeMap();
 
-        // ---- PixelFormat 枚举节点 ----
-        GenApi::CEnumerationPtr pixelFormat =
-            nodemap.GetNode("PixelFormat");
+        // 1. 重置为默认配置 (可选，视情况而定)
+        // CCommandPtr(nodemap.GetNode("UserSetSelector"))->SetValue("Default");
+        // CCommandPtr(nodemap.GetNode("UserSetLoad"))->Execute();
 
-        if (!pixelFormat || !GenApi::IsWritable(pixelFormat)) {
-            throw std::runtime_error("PixelFormat not writable");
+        // 2. 配置触发模式
+        if (mode == TriggerMode::Hardware) {
+            // 设置 Line1 为输入 (部分相机需要显式设置 LineMode)
+            CEnumerationPtr(nodemap.GetNode("LineSelector"))->FromString("Line1");
+            CEnumerationPtr(nodemap.GetNode("LineMode"))->FromString("Input");
+
+            // 启用触发
+            CEnumerationPtr triggerSelector(nodemap.GetNode("TriggerSelector"));
+            triggerSelector->FromString("FrameStart");
+
+            CEnumerationPtr triggerMode(nodemap.GetNode("TriggerMode"));
+            triggerMode->FromString("On");
+
+            CEnumerationPtr triggerSource(nodemap.GetNode("TriggerSource"));
+            triggerSource->FromString("Line1"); // 硬件触发源
+
+            CEnumerationPtr triggerActivation(nodemap.GetNode("TriggerActivation"));
+            triggerActivation->FromString("RisingEdge"); // 上升沿
+
+            // 关闭自动帧率 (由外部信号决定)
+            // 注意：Basler 相机在 TriggerMode=On 时，AcquisitionFrameRateEnable 通常被忽略，但为了保险起见设为 false
+            CBooleanPtr frameRateEnable(nodemap.GetNode("AcquisitionFrameRateEnable"));
+            if (IsWritable(frameRateEnable)) {
+                frameRateEnable->SetValue(false);
+            }
+
+            cout << "[Basler] " << serialNumber_ << " set to HARDWARE Trigger (Line1, RisingEdge)." << endl;
+        } else {
+            // 软件/连续模式
+            CEnumerationPtr triggerMode(nodemap.GetNode("TriggerMode"));
+            triggerMode->FromString("Off");
+            
+            cout << "[Basler] " << serialNumber_ << " set to CONTINUOUS/SOFTWARE mode." << endl;
         }
 
-        // ---- 判断是否支持 BayerRG8 ----
-        auto bayerRG8Entry = pixelFormat->GetEntryByName("BayerRG8");
-
-        if (GenApi::IsAvailable(bayerRG8Entry)) {
-            // ========= 彩色相机 =========
+        // 3. 配置图像格式 (保持原有逻辑)
+        CEnumerationPtr pixelFormat = nodemap.GetNode("PixelFormat");
+        if (IsAvailable(pixelFormat->GetEntryByName("BayerRG8"))) {
             pixelFormat->FromString("BayerRG8");
             converter_.OutputPixelFormat = PixelType_BGR8packed;
             isMono_ = false;
-
-            std::cout << "[BaslerCamera] Color camera detected, "
-                      << "PixelFormat set to BayerRG8" << std::endl;
-        }
-        else {
-            // ========= 黑白相机 =========
-            auto mono8Entry = pixelFormat->GetEntryByName("Mono8");
-            if (!GenApi::IsAvailable(mono8Entry)) {
-                throw std::runtime_error(
-                    "Camera supports neither BayerRG8 nor Mono8");
-            }
-
+        } else {
             pixelFormat->FromString("Mono8");
             converter_.OutputPixelFormat = PixelType_Mono8;
             isMono_ = true;
-
-            std::cout << "[BaslerCamera] Mono camera detected, "
-                      << "PixelFormat set to Mono8" << std::endl;
         }
-
-        // 初始化转换器，强制不进行对齐（OpenCV 默认也是连续内存）
         converter_.OutputBitAlignment = OutputBitAlignment_MsbAligned;
 
-        // ---- 开始采集 ----
-        camera_.StartGrabbing(GrabStrategy_LatestImageOnly);
         isOpen_ = true;
         return true;
+    } catch (const std::exception& e) {
+        cerr << "[Basler] open() failed: " << e.what() << endl;
+        return false;
     }
-    catch (const std::exception& e) {
-        std::cerr << "[BaslerCamera] open() failed: "
-                  << e.what() << std::endl;
+}
+
+bool BaslerCamera::start() {
+    try {
+        if (!camera_.IsOpen()) return false;
+        
+        // 这里的策略必须是 GrabLoop_ProvidedByUser，配合你自己的线程循环
+        camera_.StartGrabbing(GrabStrategy_OneByOne, GrabLoop_ProvidedByUser);
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[Basler Start Error] " << e.what() << std::endl;
         return false;
     }
 }
@@ -177,60 +194,55 @@ void BaslerCamera::setExposureTime(double microseconds) {
     }
 }
 
-bool BaslerCamera::grabFrame(cv::Mat& out_frame) {
-    if (!camera_.IsGrabbing()) return false;
+GrabResult BaslerCamera::grabFrame(cv::Mat& out_frame, FrameMeta& out_meta) {
+    if (!camera_.IsGrabbing()) {
+        return GrabResult::ERROR_;
+    }
 
     CGrabResultPtr ptrGrabResult;
-    // 超时时间不要太长，防止阻塞 UI
-    auto tg0 = chrono::steady_clock::now();
-    camera_.RetrieveResult(20, ptrGrabResult, TimeoutHandling_ThrowException);
-    auto tg1 = chrono::steady_clock::now();
-    if (local_debug) {
-        std::cout << "RetrieveResult time: " << ms(tg0, tg1) << " ms" << std::endl;
+
+    // ⚠️ 硬触发下：短 timeout + 轮询
+    int timeout_ms = (currentMode_ == TriggerMode::Hardware) ? 50 : 100;
+
+    try {
+        // ❗ 不要 ThrowException
+        camera_.RetrieveResult(timeout_ms, ptrGrabResult, TimeoutHandling_Return);
+    }
+    catch (const GenericException& e) {
+        cerr << "[Basler ERROR] (SN " << serialNumber_ << ")" << e.GetDescription() << endl;
+        return GrabResult::ERROR_;
     }
 
-    if (ptrGrabResult->GrabSucceeded()) {
-        int width = ptrGrabResult->GetWidth();
-        int height = ptrGrabResult->GetHeight();
-        
-        // 获取抓取到的原始 buffer 指针
-        const uint8_t* pBuffer = (uint8_t*)ptrGrabResult->GetBuffer();
-
-        if (isMono_) {
-            out_frame.create(height, width, CV_8UC1);
-            if (local_debug) {
-                std::cout << "is_mono = true" << std::endl;
-            }
-            EPixelType type = ptrGrabResult->GetPixelType();
-            auto t0 = chrono::steady_clock::now();
-            if (type == PixelType_Mono8) {
-                memcpy(out_frame.data, pBuffer, width * height);
-            } else {
-                converter_.Convert(out_frame.ptr(), width * height, ptrGrabResult);
-            }
-            auto t1 = chrono::steady_clock::now();
-            if (local_debug) {
-                std::cout << "Copy time: " << ms(t0, t1) << " ms" << std::endl;
-            }
-        } 
-        else {
-            // === 常规模式 (Color) ===
-            if (local_debug) {
-                std::cout << "is_color = true" << std::endl;
-            }
-            out_frame.create(height, width, CV_8UC3);
-
-            // 使用 converter 直接写入 Mat 的数据区
-            auto tc2 = chrono::steady_clock::now();
-            converter_.Convert(out_frame.ptr(), width * height * 3, ptrGrabResult);
-            auto tc3 = chrono::steady_clock::now();
-            if (local_debug) {
-                std::cout << "Converter time: " << ms(tc2, tc3) << " ms" << std::endl;
-            }
-        }
-        return true;
+    // === 关键：超时但没异常 ===
+    if (!ptrGrabResult) {
+        return GrabResult::TIMEOUT;  // 等待触发
     }
-    return false;
+
+    if (!ptrGrabResult->GrabSucceeded()) {
+        cerr << "[Basler] Grab failed (SN " << serialNumber_ << ")" << endl;
+        return GrabResult::ERROR_;
+    }
+
+    // === 成功帧 ===
+    out_meta.blockID   = ptrGrabResult->GetBlockID();
+    out_meta.timestamp = ptrGrabResult->GetTimeStamp();
+    out_meta.sys_time_ms =
+        (double)cv::getTickCount() / cv::getTickFrequency() * 1000.0;
+
+    int width  = ptrGrabResult->GetWidth();
+    int height = ptrGrabResult->GetHeight();
+    const uint8_t* pBuffer =
+        reinterpret_cast<const uint8_t*>(ptrGrabResult->GetBuffer());
+
+    if (isMono_) {
+        out_frame.create(height, width, CV_8UC1);
+        memcpy(out_frame.data, pBuffer, width * height);
+    } else {
+        out_frame.create(height, width, CV_8UC3);
+        converter_.Convert(out_frame.ptr(), width * height * 3, ptrGrabResult);
+    }
+
+    return GrabResult::OK;
 }
 
 void BaslerCamera::startRecording(const std::string& filename, double fps)

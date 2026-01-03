@@ -11,6 +11,7 @@
 #include <cmath>
 #include <functional>
 #include <atomic>
+#include <pylon/PylonIncludes.h>
 
 #include "cam/basler.hpp"
 #include "cfg/config.hpp"
@@ -40,6 +41,27 @@ int getNextCalibCounter(const std::string& save_dir) {
     return max_counter + 1;
 }
 
+enum class CamStatus {
+    INIT,
+    OPENED,
+    WAITING_TRIGGER,
+    STREAMING,
+    ERROR_
+};
+
+// ================== 辅助结构 ==================
+struct FrameTask {
+    string filename;
+    cv::Mat image;
+    FrameMeta meta; // 携带元数据
+};
+
+struct LogEntry {
+    string filename;
+    int64_t blockID;
+    int64_t timestamp;
+};
+
 // ================== 相机工作上下文 ==================
 struct CameraContext {
     int index;
@@ -54,28 +76,45 @@ struct CameraContext {
 
     // 数据交互
     cv::Mat latest_frame;
-    mutex frame_mtx; // 保护 latest_frame
+    FrameMeta latest_meta;
+    mutex frame_mtx; 
     
     // 录制相关 (Temp存储)
     string temp_dir;
-    queue<pair<string, cv::Mat>> write_queue; // 文件名, 图像
+    string log_file_path; // txt 文件路径
+    ofstream log_stream;  // 文件流
+
+    queue<FrameTask> write_queue; 
     mutex queue_mtx;
     condition_variable queue_cv;
     
-    // 统计
     atomic<int> captured_frames{0};
+
+    atomic<CamStatus> status{CamStatus::INIT};
+    string status_msg = "Cam is initializing";
+
+    int64_t frame_offset = 0;
+    bool offset_initialized = false;
+    static atomic<int64_t> master_first_id; // 静态变量，记录第一台准备好的相机的ID
+    static atomic<bool> master_set;
+
+    // 新增：用于视频写入的追踪
+    int64_t last_recorded_aligned_id = -1;
 
     CameraContext(int idx, string cam_id) : index(idx), id(cam_id) {}
 };
+
+atomic<int64_t> CameraContext::master_first_id(-1);
+atomic<bool> CameraContext::master_set(false);
 
 // ================== 全局变量 ==================
 vector<shared_ptr<CameraContext>> cam_ctxs;
 
 // ================== 写入线程逻辑 ==================
-// 从队列取图写入磁盘 (temp文件夹)
+// 职责：写图片 + 写TXT日志
 void writerWorker(shared_ptr<CameraContext> ctx) {
     while (ctx->running) {
-        pair<string, cv::Mat> task;
+        FrameTask task;
         {
             unique_lock<mutex> lock(ctx->queue_mtx);
             ctx->queue_cv.wait(lock, [&] { return !ctx->write_queue.empty() || !ctx->running; });
@@ -90,127 +129,225 @@ void writerWorker(shared_ptr<CameraContext> ctx) {
             }
         }
         
-        // 写入磁盘
-        if (!task.second.empty()) {
-            cv::imwrite(task.first, task.second);
+        // 1. 写入图片
+        if (!task.image.empty()) {
+            cv::imwrite(task.filename, task.image);
+        }
+
+        // 2. 写入日志 (追加模式)
+        // 格式: filename, blockID, timestamp
+        int64_t aligned_id = task.meta.blockID - ctx->frame_offset;
+        if (ctx->log_stream.is_open()) {
+            ctx->log_stream << fs::path(task.filename).filename().string() << "," 
+                            << aligned_id << "," 
+                            << task.meta.timestamp << ","
+                            << task.meta.blockID << "\n";
+
         }
     }
 }
 
 // ================== 采集线程逻辑 ==================
-void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time) {
-    // 初始化相机
+void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time, bool use_hw_trigger) {
+    // 1. 根据配置决定触发模式
+    TriggerMode mode = use_hw_trigger ? TriggerMode::Hardware : TriggerMode::Software;
+    
     ctx->cam = new BaslerCamera(ctx->id);
-    if (!ctx->cam->open()) {
-        cerr << "[Error] Cam " << ctx->index << " (" << ctx->id << ") failed to open.\n";
+    if (!ctx->cam->open(mode)) {
+        ctx->status = CamStatus::ERROR_;
+        ctx->status_msg = "OPEN FAILED";
         return;
     }
+
+    cout << "[Step 2] Setting Params Cam " << ctx->index << "..." << endl;
+    try {
+        // 只有软触发才设置FPS，硬触发通常由外部信号决定，强行设置可能会报错
+        if (!use_hw_trigger) {
+            ctx->cam->setFrameRate(fps);
+        }
+        ctx->cam->setGain(gain);
+        ctx->cam->setGamma(gamma);
+        ctx->cam->setExposureTime(exp_time);
+    } catch (const std::exception& e) {
+        cerr << "[Param Error] " << e.what() << endl;
+        // 参数设置失败不一定要退出，可以继续尝试
+    }
     
-    ctx->cam->setFrameRate(fps);
-    ctx->cam->setGain(gain);
-    ctx->cam->setGamma(gamma);
-    ctx->cam->setExposureTime(exp_time);
-    
-    cout << "[Info] Cam " << ctx->index << " started.\n";
+    cout << "[Step 3] Starting Grab Stream Cam " << ctx->index << "..." << endl;
+    if (!ctx->cam->start()) {
+        cerr << "[Error] Cam " << ctx->index << " failed to start grabbing." << endl;
+        return;
+    }
+
+    ctx->status = CamStatus::OPENED;
+    ctx->status_msg = use_hw_trigger ? "HW WAITING" : "STREAMING";
+
+    cout << "[Step 4] Entering Loop Cam " << ctx->index << endl;
 
     int frame_seq = 0;
+    int64_t frame_counter = 0;
 
     while (ctx->running) {
         cv::Mat frame;
-        ctx->cam->grabFrame(frame);
+        FrameMeta meta;
+        
+        try{
+            auto ret = ctx->cam->grabFrame(frame, meta);
 
-        if (frame.empty()) continue;
+            // 使用新的 grabFrame 获取元数据
+            if (ret == GrabResult::OK) {
+                frame_counter++;
+                ctx->status = CamStatus::STREAMING;
 
-        // 1. 更新 UI 显示用的帧
-        {
-            lock_guard<mutex> lock(ctx->frame_mtx);
-            frame.copyTo(ctx->latest_frame);
-        }
-        ctx->captured_frames++;
+                if (!ctx->offset_initialized && frame_counter > 1) {
+                    // 尝试成为 Master
+                    if (!CameraContext::master_set.exchange(true)) {
+                        // 我抢到了 Master 位置
+                        CameraContext::master_first_id = meta.blockID;
+                        ctx->frame_offset = 0;
+                        ctx->offset_initialized = true;
+                        cout << "[Sync] Cam " << ctx->index << " is Master. Base ID: " << meta.blockID << endl;
+                    } else {
+                        // 我是 Slave，我需要等待 Master 把基准 ID 写进去
+                        // 虽然 exchange 保证了 master_set 为 true，但写 ID 可能慢几微秒
+                        int retry = 0;
+                        while (CameraContext::master_first_id == -1 && retry < 100) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                            retry++;
+                        }
 
-        // 2. 如果正在录制，加入写入队列
-        if (ctx->recording) {
-            // 生成临时文件名: temp/cam_0/00001.jpg
-            std::stringstream ss;
-            ss << ctx->temp_dir << "/" << std::setw(6) << std::setfill('0') << frame_seq++ << ".jpg";
-            
-            {
-                lock_guard<mutex> lock(ctx->queue_mtx);
-                // clone 是必须的，因为 frame 在下一次循环会被覆盖
-                ctx->write_queue.push({ss.str(), frame.clone()}); 
+                        if (CameraContext::master_first_id != -1) {
+                            ctx->frame_offset = meta.blockID - CameraContext::master_first_id.load();
+                            ctx->offset_initialized = true;
+                            cout << "[Sync] Cam " << ctx->index << " Linked. Offset: " << ctx->frame_offset << endl;
+                        }
+                    }
+                }
+
+                // 3. 最终对齐逻辑
+                if (ctx->offset_initialized) {
+                    int64_t aligned_id = meta.blockID - ctx->frame_offset;
+                    
+                    // 将对齐后的 ID 存入 metadata，方便后续存图或处理
+                    meta.blockID = aligned_id; 
+
+                    lock_guard<mutex> lock(ctx->frame_mtx);
+                    frame.copyTo(ctx->latest_frame);
+                    ctx->latest_meta = meta;
+                    ctx->captured_frames++;
+                }
+
+                // 录制逻辑
+                if (ctx->recording) {
+                    // 如果是新的一次录制开始，frame_seq 会在主线程置零，这里累加
+                    // 生成文件名
+                    std::stringstream ss;
+                    ss << ctx->temp_dir << "/" << std::setw(6) << std::setfill('0') << frame_seq++ << ".jpg";
+                    
+                    {
+                        lock_guard<mutex> lock(ctx->queue_mtx);
+                        ctx->write_queue.push({ss.str(), frame.clone(), meta});
+                    }
+                    ctx->queue_cv.notify_one();
+                } else {
+                    frame_seq = 0; 
+                }
             }
-            ctx->queue_cv.notify_one();
-        } else {
-            frame_seq = 0; // 重置序列号
+            else if (ret == GrabResult::TIMEOUT) {
+                ctx->status = CamStatus::WAITING_TRIGGER;
+                ctx->status_msg = "HW TRIGGER - WAITING FOR TTL";
+                std::this_thread::sleep_for(std::chrono::milliseconds(10)); // 稍微长一点防止CPU占满
+                continue;  // ⚠️ 重要：不要 break
+            }
+            else {
+                ctx->status = CamStatus::ERROR_;
+                ctx->status_msg = "GRAB ERROR";
+                break;
+            }
+        }
+        catch (const std::exception& e) {
+            cerr << "!!! [CRASH] Thread " << ctx->index << " died with exception: " << e.what() << endl;
+        }
+        catch (...) {
+            cerr << "!!! [CRASH] Thread " << ctx->index << " died with UNKNOWN exception." << endl;
         }
     }
 
-    ctx->cam->close();
-    delete ctx->cam;
+    // 清理
+    if (ctx->cam) {
+        // 确保停止采集
+        // ctx->cam->stop(); // 如果你有 stop 函数
+        ctx->cam->close();
+        delete ctx->cam;
+        ctx->cam = nullptr;
+    }
+    cout << "[End] Thread " << ctx->index << " exited." << endl;
 }
 
-// ================== 视频合成逻辑 (并行版本) ==================
-void compileVideo(shared_ptr<CameraContext> ctx, string final_video_path, double fps,
-                  std::atomic<int>& global_processed) {  // 移除 total_frames_this_cam 参数
-    // 获取所有 temp 图片
-    vector<string> images;
-    try {
-        for (const auto& entry : fs::directory_iterator(ctx->temp_dir)) {
-            if (entry.path().extension() == ".jpg") {
-                images.push_back(entry.path().string());
-            }
+// ================== 同步与视频合成逻辑 ==================
+
+// 解析日志文件
+vector<LogEntry> parseLogFile(const string& log_path) {
+    vector<LogEntry> entries;
+    ifstream infile(log_path);
+    string line;
+    while (getline(infile, line)) {
+        stringstream ss(line);
+        string segment;
+        vector<string> parts;
+        while (getline(ss, segment, ',')) parts.push_back(segment);
+        
+        if (parts.size() >= 3) {
+            LogEntry entry;
+            entry.filename = parts[0];
+            entry.blockID = stoll(parts[1]);
+            entry.timestamp = stoll(parts[2]);
+            entries.push_back(entry);
         }
-    } catch (...) {
-        cerr << "[Error] Failed to read directory: " << ctx->temp_dir << endl;
-        return;
     }
-    
-    // 排序保证帧顺序
-    sort(images.begin(), images.end());
-    
-    if (images.empty()) {
-        cerr << "[Warning] No frames captured for Cam " << ctx->index << endl;
-        return;
-    }
-    
-    // 读取第一帧获取尺寸
-    cv::Mat first = cv::imread(images[0]);
-    if (first.empty()) {
-        cerr << "[Error] Failed to read first image: " << images[0] << endl;
-        return;
-    }
-    
+    return entries;
+}
+
+// 视频合成线程函数 (现在接收过滤后的文件列表)
+void compileVideoWorker(string temp_dir, vector<string> valid_files, string final_video_path, double fps, atomic<int>& global_processed) {
+    if (valid_files.empty()) return;
+
+    // 读取第一帧确定尺寸
+    string first_path = temp_dir + "/" + valid_files[0];
+    cv::Mat first = cv::imread(first_path);
+    if (first.empty()) return;
+
     cv::VideoWriter writer(final_video_path, cv::VideoWriter::fourcc('M','J','P','G'), fps, first.size());
-    
     if (!writer.isOpened()) {
-        cerr << "[Error] Could not open video writer for " << final_video_path << endl;
+        cerr << "[Error] Cannot open writer: " << final_video_path << endl;
         return;
     }
-    
-    // 逐帧写入
-    for (size_t i = 0; i < images.size(); ++i) {
-        cv::Mat img = cv::imread(images[i]);
+
+    for (const auto& fn : valid_files) {
+        string full_path = temp_dir + "/" + fn;
+        cv::Mat img = cv::imread(full_path);
         if (!img.empty()) {
             writer.write(img);
         }
-        
-        // 更新全局进度 (原子操作)
         global_processed++;
     }
-    
     writer.release();
-    cout << "[Done] Saved " << final_video_path << " (" << images.size() << " frames)" << endl;
+    cout << "[Done] Saved " << final_video_path << " (" << valid_files.size() << " frames)" << endl;
 }
 
 int main() {
     cout << "=== [TEST] Multi-Basler Camera Tool (Optimized) ===" << endl;
     
     Cfg cfg;
+    Pylon::PylonInitialize();
     
     // --- 0. 配置读取 (假设 Config 中有相机列表，这里为了演示手动构建或从 string 读取) ---
     // 假设 cfg["cameras"] 是一个包含相机ID的数组，或者我们在代码里指定
     // 这里为了通用，假设我们读取一个字符串列表，或者你可以修改此处
     vector<string> camera_ids = cfg["test_multi_cam"]["cam_indices"].as<vector<string>>();
+
+    // !!! 新增：是否使用硬件触发 !!!
+    bool use_hw_trigger = cfg["test_multi_cam"]["hardware_trigger"].as<bool>();
 
     double target_fps = cfg["test_multi_cam"]["fps"].as<double>();
     double gain = cfg["test_multi_cam"]["gain"].as<double>();
@@ -229,7 +366,7 @@ int main() {
         // 启动写入线程
         ctx->writer_thread = thread(writerWorker, ctx);
         // 启动采集线程
-        ctx->capture_thread = thread(captureWorker, ctx, target_fps, gain, gamma, exp_time);
+        ctx->capture_thread = thread(captureWorker, ctx, target_fps, gain, gamma, exp_time, use_hw_trigger);
     }
 
     // --- 2. 准备显示窗口 ---
@@ -268,7 +405,14 @@ int main() {
                 }
             }
 
-            if (!img.empty()) {
+            if (img.empty()) {
+                img = cv::Mat::zeros(cell_h, cell_w, CV_8UC3);
+
+                int baseline = 0;
+                cv::Size textSize = cv::getTextSize(cam_ctxs[i]->status_msg, cv::FONT_HERSHEY_SIMPLEX, 0.7, 2, &baseline);
+                cv::Point textOrg((cell_w - textSize.width) / 2, (cell_h + textSize.height) / 2);
+                cv::putText(img, cam_ctxs[i]->status_msg, textOrg, cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
+            } else {
                 if (img.type() == CV_8UC1) cv::cvtColor(img, img, cv::COLOR_GRAY2BGR);
 
                 // --- 新增：如果是录制状态，在右上角画红点 ---
@@ -284,15 +428,15 @@ int main() {
                     cv::putText(img, "REC", cv::Point(img.cols - radius * 7, radius * 2.5), 
                                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
                 }
-
-                int r = i / grid_cols;
-                int c = i % grid_cols;
-                
-                // 将带红点的图片拷贝到画布
-                img.copyTo(canvas(cv::Rect(c * cell_w, r * cell_h, cell_w, cell_h)));
-                
-                if (r + 1 > valid_rows) valid_rows = r + 1;
             }
+
+            int r = i / grid_cols;
+            int c = i % grid_cols;
+            
+            // 将带红点的图片拷贝到画布
+            img.copyTo(canvas(cv::Rect(c * cell_w, r * cell_h, cell_w, cell_h)));
+            
+            if (r + 1 > valid_rows) valid_rows = r + 1;
         }
 
         // --- B. 裁剪空行 (规则2) ---
@@ -314,6 +458,7 @@ int main() {
         }
         else if (key == 'r') {
             if (!is_recording) {
+                // 开始录制
                 auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
                 char buf[64];
                 strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", localtime(&t));
@@ -322,11 +467,15 @@ int main() {
                 cout << "\n[Info] Start Recording Batch: " << current_record_timestr << endl;
 
                 for (auto& ctx : cam_ctxs) {
-                    // 准备 temp 目录: save_dir/temp_2023.../cam_0
                     string batch_temp = save_base_dir + "/temp_" + current_record_timestr + "/cam_" + to_string(ctx->index);
                     fs::create_directories(batch_temp);
-                    
                     ctx->temp_dir = batch_temp;
+                    
+                    // 打开日志文件
+                    ctx->log_file_path = save_base_dir + "/record_" + current_record_timestr + "_cam_" + to_string(ctx->index) + ".txt";
+                    ctx->log_stream.open(ctx->log_file_path);
+                    if(!ctx->log_stream.is_open()) cerr << "Failed to create log: " << ctx->log_file_path << endl;
+
                     ctx->recording = true; 
                 }
                 is_recording = true;
@@ -334,32 +483,86 @@ int main() {
         }
         else if (key == 's') {
             if (is_recording) {
-                cout << "\n[Info] Stopping recording... waiting for buffers to flush." << endl;
+                cout << "\n[Info] Stopping recording... waiting for queue flush." << endl;
                 is_recording = false;
-                
-                // 1. 停止采集标志
+
+                // 1. 停止标志
                 for (auto& ctx : cam_ctxs) ctx->recording = false;
-                
+
                 // 2. 等待队列写完
                 cv::Mat wait_img = cv::Mat::zeros(400, 600, CV_8UC3);
                 cv::putText(wait_img, "Flushing Write Queue...", cv::Point(50, 200),
                             cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
                 cv::imshow("Multi-Cam Preview", wait_img);
                 cv::waitKey(1);
-                
+
+                // 2. 等待队列清空 & 关闭日志
                 for (auto& ctx : cam_ctxs) {
-                    unique_lock<mutex> lk(ctx->queue_mtx);
-                    ctx->queue_cv.wait(lk, [&]{ return ctx->write_queue.empty(); });
+                    {
+                        unique_lock<mutex> lk(ctx->queue_mtx);
+                        ctx->queue_cv.wait(lk, [&]{ return ctx->write_queue.empty(); });
+                    }
+                    if (ctx->log_stream.is_open()) ctx->log_stream.close();
                 }
+
+                // ================== 核心同步逻辑 ==================
+                cout << "[Info] Analyzing timestamps for synchronization..." << endl;
                 
-                // 3. 计算总帧数 (用于进度条)
-                int total_frames_all_cams = 0;
+                // 3. 读取所有日志
+                vector<vector<LogEntry>> all_logs;
                 for (auto& ctx : cam_ctxs) {
-                    try {
-                        for (auto& p : fs::directory_iterator(ctx->temp_dir)) {
-                            if (p.path().extension() == ".jpg") total_frames_all_cams++;
+                    all_logs.push_back(parseLogFile(ctx->log_file_path));
+                }
+
+                // 4. 计算时间窗口交集 (Intersection)
+                // 假设硬件触发下，BlockID 是相对可靠的，或者使用 Timestamp
+                // 这里使用 Timestamp 寻找最大开始时间和最小结束时间
+                int64_t max_start_time = -1;
+                int64_t min_end_time = -1;
+                
+                // 注意：Basler Timestamp 是开机计时的 tick。不同相机之间如果不是 PTP 同步，基准不同。
+                // 如果是硬件触发，BlockID 更加可靠（假设所有相机同时收到触发信号并开始计数）。
+                // 这里我们提供两种策略，优先使用 BlockID 进行对齐（因为硬件触发保证了帧的一一对应）。
+                
+                bool use_block_id_sync = true; // 硬件触发推荐 true
+                
+                int64_t global_start_idx = 0;
+                int64_t global_end_idx = 9999999999; // 找最小的结束ID
+
+                if (use_block_id_sync) {
+                    // 找到所有相机中记录到的 *最大* 的起始 BlockID (作为公共起跑线)
+                    for (auto& logs : all_logs) {
+                        if (logs.empty()) continue;
+                        if (logs.front().blockID > global_start_idx) global_start_idx = logs.front().blockID;
+                    }
+                    // 找到所有相机中记录到的 *最小* 的结束 BlockID (作为公共终点线)
+                    for (auto& logs : all_logs) {
+                        if (logs.empty()) continue;
+                        if (logs.back().blockID < global_end_idx) global_end_idx = logs.back().blockID;
+                    }
+                }
+
+                cout << "Sync Range (BlockID): " << global_start_idx << " to " << global_end_idx << endl;
+
+                // 5. 生成过滤后的文件列表
+                vector<vector<string>> final_file_lists(cam_ctxs.size());
+                int total_frames_all_cams = 0;
+
+                for (int i = 0; i < cam_ctxs.size(); ++i) {
+                    for (const auto& entry : all_logs[i]) {
+                        bool keep = false;
+                        if (use_block_id_sync) {
+                            if (entry.blockID >= global_start_idx && entry.blockID <= global_end_idx) keep = true;
+                        } else {
+                            // Timestamp 逻辑类似，略
                         }
-                    } catch (...) {}
+
+                        if (keep) {
+                            final_file_lists[i].push_back(entry.filename);
+                        }
+                    }
+                    total_frames_all_cams += final_file_lists[i].size();
+                    cout << "Cam " << i << ": Raw=" << all_logs[i].size() << ", Valid=" << final_file_lists[i].size() << endl;
                 }
                 
                 // 4. 创建原子计数器用于进度跟踪
@@ -402,11 +605,15 @@ int main() {
                 
                 // 6. 并行启动所有视频合成线程
                 vector<thread> compile_threads;
-                for (auto& ctx : cam_ctxs) {
-                    string video_fn = save_base_dir + "/record_" + current_record_timestr + "_cam_" + to_string(ctx->index) + ".avi";
-                    
+
+                for (int i = 0; i < cam_ctxs.size(); ++i) {
+                    string video_fn = save_base_dir + "/record_" + current_record_timestr + "_cam_" + to_string(cam_ctxs[i]->index) + ".avi";
                     compile_threads.emplace_back(
-                        compileVideo, ctx, video_fn, target_fps,
+                        compileVideoWorker, 
+                        cam_ctxs[i]->temp_dir, 
+                        final_file_lists[i], 
+                        video_fn, 
+                        target_fps, 
                         std::ref(global_processed)
                     );
                 }
@@ -504,5 +711,6 @@ int main() {
     }
     
     cv::destroyAllWindows();
+    Pylon::PylonTerminate();
     return 0;
 }

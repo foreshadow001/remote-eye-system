@@ -3,15 +3,37 @@
 #include <pylon/PylonIncludes.h>
 #include <opencv2/opencv.hpp>
 #include <string>
+#include <iostream>
+#include <chrono>
 
 namespace gazeestimation {
+
+// 定义触发模式枚举
+enum class TriggerMode {
+    Software,   // 自由采集 / 软触发
+    Hardware    // 外部硬件触发 (Line1)
+};
+
+enum class GrabResult {
+    OK,             // 拿到一帧
+    TIMEOUT,        // 等待触发（正常）
+    ERROR_          // 真正错误
+};
+
+// 定义帧元数据结构
+struct FrameMeta {
+    int64_t blockID = 0;      // 相机内部帧计数器
+    int64_t timestamp = 0;    // 相机内部时间戳 (ns)
+    double sys_time_ms = 0.0; // 系统接收时间 (辅助调试)
+};
 
 class BaslerCamera {
 public:
     explicit BaslerCamera(const std::string& serialNumber);
     ~BaslerCamera();
 
-    bool open();
+    bool open(TriggerMode mode = TriggerMode::Software);
+    bool start();
     void close();
 
     // 相机参数设置
@@ -20,7 +42,7 @@ public:
     void setGamma(double gamma);
     void setExposureTime(double microseconds);
 
-    bool grabFrame(cv::Mat& out_frame);
+    GrabResult grabFrame(cv::Mat& out_frame, FrameMeta& out_meta);
 
     // 录像相关
     void startRecording(const std::string& filename, double fps = 30.0);
@@ -35,6 +57,7 @@ private:
     std::string serialNumber_;
     bool isOpen_ = false;
     bool isMono_ = false;
+    TriggerMode currentMode_ = TriggerMode::Software;
 
     Pylon::CImageFormatConverter converter_;
     

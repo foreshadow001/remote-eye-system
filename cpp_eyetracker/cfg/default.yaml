@@ -89,8 +89,9 @@ test_one_cam:
 test_multi_cam:
   cam_indices:
     - 40061061
-    - 24944888
+    - 40061280
     - 40109652
+  hardware_trigger: true
   save_dir: "D:/hitsz/projects/new_dataset/debug_multi_cam"
   fps: 200
   gain: 0.0
