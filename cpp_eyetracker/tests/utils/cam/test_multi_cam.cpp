@@ -358,6 +358,9 @@ int main() {
     int win_w = cfg["test_multi_cam"]["window_width"].as<int>();
     int win_h = cfg["test_multi_cam"]["window_height"].as<int>();
 
+    std::filesystem::path save_folder_path(save_base_dir);
+    std::filesystem::create_directories(save_folder_path);
+
     // --- 1. 启动线程 ---
     for (int i = 0; i < camera_ids.size(); ++i) {
         auto ctx = make_shared<CameraContext>(i, camera_ids[i]);

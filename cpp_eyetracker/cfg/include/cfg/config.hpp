@@ -6,7 +6,8 @@
 #include <iostream>
 #include <filesystem>
 
-#include "core/math_types.hpp"   // make_vec3, Vec3, Vec2
+#include "core/math_types.hpp"
+#include "logger/logger.hpp"
 
 using namespace gazeestimation;
 
@@ -85,7 +86,7 @@ private:
 template<>
 inline Vec3 CfgNode::as<Vec3>() const {
     if (!node_.IsSequence() || node_.size() != 3) {
-        std::cerr << "[Cfg ERROR] Expect Vec3 at " << path_ << std::endl;
+        Logger::error() << "[Cfg] Expect Vec3 at " << path_;
         return make_vec3(0, 0, 0);
     }
 
@@ -99,7 +100,7 @@ inline Vec3 CfgNode::as<Vec3>() const {
 template<>
 inline std::vector<Vec3> CfgNode::as<std::vector<Vec3>>() const {
     if (!node_.IsSequence()) {
-        std::cerr << "[Cfg ERROR] Expect [Vec3...] at " << path_ << std::endl;
+        Logger::error() << "[Cfg] Expect [std::vector<Vec3>] at " << path_;
         return {};
     }
 
@@ -116,7 +117,7 @@ inline std::vector<Vec3> CfgNode::as<std::vector<Vec3>>() const {
 template<>
 inline Vec2 CfgNode::as<Vec2>() const {
     if (!node_.IsSequence() || node_.size() != 2) {
-        std::cerr << "[Cfg ERROR] Expect Vec2 at " << path_ << std::endl;
+        Logger::error() << "[Cfg] Expect Vec2 at " << path_;
         return make_vec2(0, 0);
     }
 
@@ -129,7 +130,7 @@ inline Vec2 CfgNode::as<Vec2>() const {
 template<>
 inline std::vector<Vec2> CfgNode::as<std::vector<Vec2>>() const {
     if (!node_.IsSequence()) {
-        std::cerr << "[Cfg ERROR] Expect [Vec2...] at " << path_ << std::endl;
+        Logger::error() << "[Cfg] Expect [std::vector<Vec2>] at " << path_;
         return {};
     }
 
@@ -146,7 +147,7 @@ inline std::vector<Vec2> CfgNode::as<std::vector<Vec2>>() const {
 template<>
 inline std::vector<std::string> CfgNode::as<std::vector<std::string>>() const {
     if (!node_.IsSequence()) {
-        std::cerr << "[Cfg ERROR] Expect [string...] at " << path_ << std::endl;
+        Logger::error() << "[Cfg] Expect [std::vector<std::string>] at " << path_;
         return {};
     }
 
@@ -162,7 +163,7 @@ inline std::vector<std::string> CfgNode::as<std::vector<std::string>>() const {
 template<>
 inline std::vector<std::vector<double>> CfgNode::as<std::vector<std::vector<double>>>() const {
     if (!node_.IsSequence()) {
-        std::cerr << "[Cfg ERROR] Expect [[double...], ...] at " << path_ << std::endl;
+        Logger::error() << "[Cfg] Expect [std::vector<std::vector<double>] at " << path_;
         return {};
     }
 
@@ -171,7 +172,7 @@ inline std::vector<std::vector<double>> CfgNode::as<std::vector<std::vector<doub
 
     for (const auto& row : node_) {
         if (!row.IsSequence()) {
-            std::cerr << "[Cfg ERROR] Expect inner list for " << path_ << std::endl;
+            Logger::error() << "[Cfg] Expect inner list for " << path_;
             return {};
         }
 
@@ -190,7 +191,7 @@ inline std::vector<std::vector<double>> CfgNode::as<std::vector<std::vector<doub
 template<>
 inline std::vector<double> CfgNode::as<std::vector<double>>() const {
     if (!node_.IsSequence()) {
-        std::cerr << "[Cfg ERROR] Expect [double...] at " << path_ << std::endl;
+        Logger::error() << "[Cfg ERROR] Expect [std::vector<double>] at " << path_;
         return {};
     }
 

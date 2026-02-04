@@ -1,10 +1,4 @@
-#include <windows.h>
-#include <string>
 #include <regex>
-#include <iostream>
-#include <filesystem>
-#include <opencv2/opencv.hpp>
-#include <fstream>
 #include <iomanip>
 
 #include "cfg/config.hpp"

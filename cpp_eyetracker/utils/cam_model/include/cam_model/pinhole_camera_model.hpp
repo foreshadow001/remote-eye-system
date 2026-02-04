@@ -9,6 +9,16 @@
 
 namespace gazeestimation {
 
+inline double deg_to_rad(double a)
+{
+	return a * 3.141592653589793 / 180.;
+}
+
+inline double rad_to_deg(double a)
+{
+	return (a * 180.) / 3.141592653589793;
+}
+
 class PinholeCameraModel
 {
 /*
@@ -89,7 +99,11 @@ public:
 
         
 
-        this->set_camera_angles(deg_to_rad(alpha), deg_to_rad(beta), deg_to_rad(gamma));
+        this->set_camera_angles(
+            deg_to_rad(alpha), 
+            deg_to_rad(beta), 
+            deg_to_rad(gamma)
+        );
     }
 
     void set_camera_angles(double x, double y, double z) {

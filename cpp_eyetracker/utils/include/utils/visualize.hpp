@@ -19,4 +19,10 @@ visualizeGlints(
     const std::vector<cv::Point2d>& glints
 );
 
+cv::Mat
+visualizeGlintList(
+    const cv::Mat& frame,
+    const std::vector<std::vector<cv::Point2d>>& glintList
+);
+
 }

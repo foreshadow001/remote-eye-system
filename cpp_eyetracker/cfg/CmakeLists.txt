@@ -15,6 +15,7 @@ find_package(yaml-cpp CONFIG REQUIRED)
 
 target_link_libraries(cfg PUBLIC
     eyetracker::core
+    eyetracker::logger
     yaml-cpp::yaml-cpp
 )
 

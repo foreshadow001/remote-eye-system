@@ -1,7 +1,4 @@
-#include <windows.h>
-#include <string>
-#include <iostream>
-#include <opencv2/opencv.hpp>
+#include <filesystem>
 
 #include "glint_detection/detect_glint.hpp"
 #include "cfg/config.hpp"
@@ -10,21 +7,28 @@
 using namespace glintdetection;
 using namespace visualization;
 
-Cfg cfg;
-
-bool local_debug = cfg["collect_glint"]["local_debug"].as<bool>();
-
 int main() {
+    Cfg cfg;
+    GlintDetector glint_detector("collect");
+
     std::string input_folder = cfg["collect_glint"]["input_folder"].as<std::string>();
     std::string output_folder = cfg["collect_glint"]["output_folder"].as<std::string>();
     std::string threshold_folder = cfg["collect_glint"]["output_folder"].as<std::string>() + "\\threshold_output";
 
     // 创建输出文件夹
-    CreateDirectory(output_folder.c_str(), NULL);
-    CreateDirectory(threshold_folder.c_str(), NULL);
+    std::filesystem::path output_folder_path(output_folder);
+    if (!std::filesystem::exists(output_folder_path)) {
+        std::filesystem::create_directory(output_folder_path);
+    }
 
-    // 1. 准备 CSV 文件
+    // 创建输出文件夹
+    std::filesystem::path threshold_folder_path(threshold_folder);
+    if (!std::filesystem::exists(threshold_folder_path)) {
+        std::filesystem::create_directory(threshold_folder_path);
+    }
+
     std::string csv_path = output_folder + "\\" + "glint_data.csv";
+
     std::ofstream csv_file(csv_path);
     if (!csv_file.is_open()) {
         std::cerr << "Failed to open CSV file for writing: " << csv_path << std::endl;
@@ -54,14 +58,15 @@ int main() {
 				filename.erase(pos);
 			}
 
-            cv::Mat img = cv::imread(filepath, cv::IMREAD_COLOR);
+            cv::Mat img = cv::imread(filepath, cv::IMREAD_GRAYSCALE);
+            cv::Mat img_bgr = cv::imread(filepath, cv::IMREAD_COLOR);
             if (img.empty()) {
                 std::cerr << "Failed to read image: " << filepath << std::endl;
                 continue;
             }
 
             // 2. 调用宽松搜索，获取所有候选组合和Debug图
-            auto [leftTriList, rightTriList, debug_img] = searchForGlints(img, cfg);
+            auto [leftTriList, rightTriList] = glint_detector.detect(img);
 
             // 3. 写入 CSV 数据
             // Left Eyes
@@ -78,7 +83,7 @@ int main() {
 				left_glints.emplace_back(r.x, r.y);
 				left_glints.emplace_back(m.x, m.y);
 
-				cv::Mat src_copy_left = img.clone();
+				cv::Mat src_copy_left = img_bgr.clone();
 				cv::Mat left_viz = visualizeGlints(src_copy_left, left_glints);
 				std::string output_filename = filename + "_" + std::to_string(counter) + "_left.png";
 				std::string output_path = threshold_folder + "\\" + output_filename;
@@ -87,7 +92,8 @@ int main() {
                 csv_file << output_filename << ",left," 
                          << l.x << "," << l.y << "," 
                          << r.x << "," << r.y << "," 
-                         << m.x << "," << m.y << "\n";
+                         << m.x << "," << m.y << ","
+                         << filepath << "\n";
 
 				counter++;
             }
@@ -104,7 +110,7 @@ int main() {
 				right_glints.emplace_back(r.x, r.y);
 				right_glints.emplace_back(m.x, m.y);
 
-				cv::Mat src_copy_right = img.clone();
+				cv::Mat src_copy_right = img_bgr.clone();
 				cv::Mat right_viz = visualizeGlints(src_copy_right, right_glints);
 				std::string output_filename = filename + "_" + std::to_string(counter) + "_right.png";
 				std::string output_path = threshold_folder + "\\" + output_filename;
@@ -113,7 +119,8 @@ int main() {
                 csv_file << output_filename << ",right," 
                          << l.x << "," << l.y << "," 
                          << r.x << "," << r.y << "," 
-                         << m.x << "," << m.y << "\n";
+                         << m.x << "," << m.y << ","
+                         << filepath << "\n";
 
 				counter++;
             }

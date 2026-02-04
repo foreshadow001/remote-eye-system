@@ -2,16 +2,6 @@
 #include <sstream> // 必须包含，否则 split 和 istringstream 会报错
 #include <algorithm> // for trim
 
-// --- 辅助工具 ---
-
-static inline void yellow(const std::string& msg) {
-    std::cerr << "\033[33m" << msg << "\033[0m" << std::endl;
-}
-
-static inline void red(const std::string& msg) {
-    std::cerr << "\033[31m" << msg << "\033[0m" << std::endl;
-}
-
 // 简单的 trim 函数，去除首尾空白（包括 \r）
 static std::string trim(const std::string& str) {
     const std::string whitespace = " \t\r\n";
@@ -82,7 +72,7 @@ CfgNode CfgNode::operator[](size_t idx) const {
 }
 YAML::Node::const_iterator CfgNode::begin() const { return node_.begin(); }
 YAML::Node::const_iterator CfgNode::end() const { return node_.end(); }
-void CfgNode::printWarning() const { yellow("[Cfg WARNING] Missing key: " + path_); }
+void CfgNode::printWarning() const { Logger::warn() << "[Cfg] Missing key: " << path_; }
 
 
 // ... Cfg 的部分实现 ...
@@ -96,7 +86,7 @@ Cfg::Cfg(const std::string& filepath) {
     filepath_ = filepath.empty() ? getConfigPath() : filepath;
 
     if (!fileExists(filepath_)) {
-        red("[Cfg ERROR] Cannot find config file: " + filepath_);
+        Logger::error() << "[Cfg] Cannot find config file: " << filepath_;
         return;
     }
 
@@ -110,9 +100,9 @@ Cfg::Cfg(const std::string& filepath) {
     // 加载 YAML 对象
     try {
         root_ = YAML::LoadFile(filepath_);
-        std::cout << "[Cfg] Loaded config: " << filepath_ << std::endl;
+        Logger::info() << "[Cfg] Loaded config: " << filepath_;
     } catch (const std::exception& e) {
-        red("[Cfg ERROR] YAML Load Failed: " + std::string(e.what()));
+        Logger::error() << "[Cfg] YAML Load Failed: " << std::string(e.what());
     }
 }
 
@@ -143,7 +133,7 @@ void Cfg::setScalar(const std::string& path, double v)
     int line_no = findLineByFullPath(lines, keys);
 
     if (line_no == -1) {
-        red("[Cfg ERROR] setScalar failed! Full path not found: " + path);
+        Logger::error() << "[Cfg] setScalar failed! Full path not found: " << path;
         return;
     }
 
@@ -174,7 +164,7 @@ void Cfg::setVector2D(const std::string& path, const std::vector<std::vector<dou
     int line_no = findLineByFullPath(lines, keys);
 
     if (line_no == -1) {
-        red("[Cfg ERROR] setVector2D failed! Full path not found: " + path);
+        Logger::error() << "[Cfg] setVector2D failed! Full path not found: " << path;
         return;
     }
 
@@ -230,10 +220,10 @@ void Cfg::save() const
 {
     std::ofstream fout(filepath_);
     if (!fout.is_open()) {
-        red("[Cfg ERROR] Could not open file for writing: " + filepath_);
+        Logger::error() << "[Cfg] Could not open file for writing: " << filepath_;
         return;
     }
     fout << original_text_;
     fout.close();
-    std::cout << "[Cfg] Saved to " << filepath_ << std::endl;
+    Logger::info() << "[Cfg] Saved to " << filepath_;
 }

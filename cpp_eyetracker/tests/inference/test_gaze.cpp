@@ -1,8 +1,3 @@
-#include <windows.h>
-#include <string>
-#include <iostream>
-#include <opencv2/opencv.hpp>
-
 #include "utils/gaze_estimation_types.hpp"
 #include "core/math_types.hpp"
 #include "glint_detection/detect_glint.hpp"

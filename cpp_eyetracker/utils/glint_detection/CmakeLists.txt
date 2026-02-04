@@ -17,5 +17,6 @@ target_include_directories(glint_detection
 target_link_libraries(glint_detection
     PUBLIC
         eyetracker::cfg
+        eyetracker::utils
         ${OpenCV_LIBS}
 )

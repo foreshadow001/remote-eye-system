@@ -1,8 +1,3 @@
-#include <windows.h>
-#include <string>
-#include <iostream>
-#include <opencv2/opencv.hpp>
-
 #include "glint_detection/detect_glint.hpp"
 #include "pupil_center/localize_pupil.hpp"
 

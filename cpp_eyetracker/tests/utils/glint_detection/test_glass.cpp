@@ -22,17 +22,11 @@ int main() {
 
     std::string input_folder = cfg["test_glint"]["input_folder"].as<std::string>();
     std::string threshold_output_folder = input_folder + "\\threshold_output";
-    std::string viz_output_folder = input_folder + "\\viz";
     std::string debug_img_output_folder = input_folder + "\\debug_img";
 
     std::filesystem::path threshold_folder_path(threshold_output_folder);
     if (!std::filesystem::exists(threshold_folder_path)) {
         std::filesystem::create_directories(threshold_folder_path);
-    }
-
-    std::filesystem::path viz_folder_path(viz_output_folder);
-    if (!std::filesystem::exists(viz_folder_path)) {
-        std::filesystem::create_directories(viz_folder_path);
     }
 
     std::filesystem::path debug_img_folder_path(debug_img_output_folder);
@@ -72,39 +66,40 @@ int main() {
             }
 
             // 调用 glint 检测
-            auto [leftEyeGlintsList, rightEyeGlintsList] = glint_detector.detect(img);
+            auto [leftEyeGlintsList, rightEyeGlintsList] = glint_detector.detectFullImage(img);
 
-            std::vector<cv::Point2f> leftEyeGlints, rightEyeGlints;
-
-            if (!leftEyeGlintsList.empty())
-                leftEyeGlints = leftEyeGlintsList[0];
-            if (!rightEyeGlintsList.empty())
-                rightEyeGlints = rightEyeGlintsList[0];
-
-            std::vector<cv::Point2d> left_glints, right_glints;
-            for (const auto& g : leftEyeGlints)
-                left_glints.emplace_back(g.x, g.y);
-            for (const auto& g : rightEyeGlints)
-                right_glints.emplace_back(g.x, g.y);
-
-            // 可视化 glints
-            cv::Mat img_bgr;
-            cv::cvtColor(img, img_bgr, cv::COLOR_GRAY2BGR);
-            cv::Mat left_viz = visualizeGlints(img_bgr, left_glints);
-            cv::Mat viz = visualizeGlints(left_viz, right_glints);
+            std::vector<std::vector<cv::Point2d>> left_glints_list, right_glints_list;
+            for (const auto& leftGlints : leftEyeGlintsList)
+            {
+                std::vector<cv::Point2d> glints;
+                for (const auto& g : leftGlints)
+                    glints.emplace_back(g.x, g.y);
+                left_glints_list.emplace_back(glints);
+            }
+            for (const auto& rightGlints : rightEyeGlintsList)
+            {
+                std::vector<cv::Point2d> glints;
+                for (const auto& g : rightGlints)
+                    glints.emplace_back(g.x, g.y);
+                right_glints_list.emplace_back(glints);
+            }
 
             // 保存输出
             cv::Mat threshold_output = glint_detector.threshold_output_.clone();
             if (!glint_detector.debug_imgs_.empty())
             {
-                cv::Mat debug_img = glint_detector.debug_imgs_[0].clone();
-                cv::imwrite(debug_img_output_folder + "\\" + filename, debug_img);
+                for (int i = 0; i < glint_detector.debug_imgs_.size(); i++)
+                {
+                    cv::imwrite(
+                        debug_img_output_folder + "\\" + "viz_" + std::to_string(i) + "_" + filename, 
+                        glint_detector.debug_imgs_[i]
+                    );
+                }
             }
             cv::imwrite(threshold_output_folder + "\\" + filename, threshold_output);
-            cv::imwrite(viz_output_folder + "\\" + filename, viz);
 
-            Logger::info() << "Saved to: " << viz_output_folder + "\\" + filename
-                            << " | num of glints: " << leftEyeGlints.size() + rightEyeGlints.size();
+            Logger::info() << "Saved to: " << threshold_output_folder + "\\" + filename
+                            << " | num of glints: " << left_glints_list.size() << " | " << right_glints_list.size();
 
             idx++;
             if (idx >= max_images)

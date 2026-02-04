@@ -8,6 +8,7 @@ add_subdirectory(cam)
 
 add_library(utils STATIC
     src/gaze_estimation_types.cpp
+    src/shared_calculations.cpp
     src/intersection.cpp
     src/visualize.cpp
 )

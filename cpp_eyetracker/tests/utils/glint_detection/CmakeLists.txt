@@ -11,6 +11,15 @@ target_link_libraries(test_glint
         ${OpenCV_LIBS}
 )
 
+add_executable(test_glass test_glass.cpp)
+target_link_libraries(test_glass
+    PRIVATE
+        eyetracker::cfg
+        eyetracker::utils
+        eyetracker::glint_detection
+        ${OpenCV_LIBS}
+)
+
 add_executable(collect_glint collect_glint.cpp)
 target_link_libraries(collect_glint
     PRIVATE
@@ -23,5 +32,6 @@ add_executable(calculate_hyperparameter calculate_hyperparameter.cpp)
 target_link_libraries(calculate_hyperparameter
     PRIVATE
         eyetracker::cfg
+        eyetracker::utils
         ${OpenCV_LIBS}
 )
