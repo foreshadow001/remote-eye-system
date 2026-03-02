@@ -81,7 +81,7 @@ test_multi_cam:
     - 40061280
     - 40109652
   hardware_trigger: false
-  save_dir: "D:/hitsz/projects/new_dataset/glass"
+  save_dir: "D:/hitsz/projects/new_dataset/test_cam"
   fps: 200
   gain: 0.0
   gamma: 1.0
