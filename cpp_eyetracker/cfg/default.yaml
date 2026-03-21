@@ -81,6 +81,8 @@ test_multi_cam:
     - 40061280
     - 40109652
   hardware_trigger: false
+  write_video: false
+  debug_time: true
   save_dir: "D:/hitsz/projects/new_dataset/test_cam"
   fps: 200
   gain: 0.0
@@ -88,6 +90,8 @@ test_multi_cam:
   exposure_time: 4000.0
   window_width: 1440
   window_height: 1080
+  cam_width: 1440
+  cam_height: 1080
 
 # Test Glint Detection
 test_glint:

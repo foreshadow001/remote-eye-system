@@ -1,4 +1,5 @@
 #include "cam/basler.hpp" // 请确保路径与你的项目结构一致
+#include <filesystem>
 
 // 推荐在 cpp 中使用命名空间，不要在 hpp 中污染全局命名空间
 using namespace std;
@@ -62,6 +63,15 @@ bool BaslerCamera::open(TriggerMode mode) {
         // CCommandPtr(nodemap.GetNode("UserSetSelector"))->SetValue("Default");
         // CCommandPtr(nodemap.GetNode("UserSetLoad"))->Execute();
 
+        /*
+        try {
+            // 将底层循环缓冲区增加到 100 甚至 200（只要你的系统内存够用）
+            camera_.MaxNumBuffer.SetValue(2000); 
+        } catch (const GenericException& e) {
+            std::cerr << "Failed to set MaxNumBuffer: " << e.GetDescription() << std::endl;
+        }
+        */
+
         // 2. 配置触发模式
         if (mode == TriggerMode::Hardware) {
             // 设置 Line1 为输入 (部分相机需要显式设置 LineMode)
@@ -99,6 +109,10 @@ bool BaslerCamera::open(TriggerMode mode) {
 
         // 3. 配置图像格式 (保持原有逻辑)
         CEnumerationPtr pixelFormat = nodemap.GetNode("PixelFormat");
+        pixelFormat->FromString("Mono8");
+        converter_.OutputPixelFormat = PixelType_Mono8;
+        isMono_ = true;
+        /*
         if (IsAvailable(pixelFormat->GetEntryByName("BayerRG8"))) {
             pixelFormat->FromString("BayerRG8");
             converter_.OutputPixelFormat = PixelType_BGR8packed;
@@ -108,7 +122,8 @@ bool BaslerCamera::open(TriggerMode mode) {
             converter_.OutputPixelFormat = PixelType_Mono8;
             isMono_ = true;
         }
-        converter_.OutputBitAlignment = OutputBitAlignment_MsbAligned;
+        */
+        // converter_.OutputBitAlignment = OutputBitAlignment_MsbAligned;
 
         isOpen_ = true;
         return true;
@@ -118,12 +133,31 @@ bool BaslerCamera::open(TriggerMode mode) {
     }
 }
 
+/*
 bool BaslerCamera::start() {
     try {
         if (!camera_.IsOpen()) return false;
         
         // 这里的策略必须是 GrabLoop_ProvidedByUser，配合你自己的线程循环
         camera_.StartGrabbing(GrabStrategy_OneByOne, GrabLoop_ProvidedByUser);
+        // camera_.StartGrabbing(1000);
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[Basler Start Error] " << e.what() << std::endl;
+        return false;
+    }
+}
+*/
+
+// === 关键修改点 1：start 函数 ===
+bool BaslerCamera::start() {
+    try {
+        if (!camera_.IsOpen()) return false;
+        // 显式设置底层 Buffer 数量 (与官方代码保持一致或略大)
+        camera_.MaxNumBuffer.SetValue(10); 
+
+        camera_.RegisterImageEventHandler(this, RegistrationMode_ReplaceAll, Cleanup_None);
+        camera_.StartGrabbing(GrabStrategy_OneByOne, Pylon::GrabLoop_ProvidedByInstantCamera);
         return true;
     } catch (const std::exception& e) {
         std::cerr << "[Basler Start Error] " << e.what() << std::endl;
@@ -194,6 +228,82 @@ void BaslerCamera::setExposureTime(double microseconds) {
     }
 }
 
+// === 关键修改点 2：实现回调函数 (替代原先的 grabFrame) ===
+void BaslerCamera::OnImageGrabbed(CBaslerUniversalInstantCamera& /*camera*/, const CBaslerUniversalGrabResultPtr& ptrGrabResult) {
+    try {
+        if (!ptrGrabResult->GrabSucceeded()) {
+            // 如果是超时（硬件触发等待中），在回调模式下不会报错，只会静默等待。
+            // 发生错误才是真错误
+            cerr << "[Basler] Grab failed (SN " << serialNumber_ << "): " << ptrGrabResult->GetErrorDescription() << endl;
+            return;
+        }
+        
+        // cv::Mat out_frame;
+        FrameMeta out_meta;
+
+        out_meta.blockID   = ptrGrabResult->GetBlockID();
+        out_meta.timestamp = ptrGrabResult->GetTimeStamp();
+        out_meta.sys_time_ms = (double)cv::getTickCount() / cv::getTickFrequency() * 1000.0;
+
+        int width  = ptrGrabResult->GetWidth();
+        int height = ptrGrabResult->GetHeight();
+        
+        
+        /*
+        // 区分 Mono8 与 Color/Bayer 格式
+        if (ptrGrabResult->GetPixelType() == PixelType_Mono8) {
+            const uint8_t* pBuffer = reinterpret_cast<const uint8_t*>(ptrGrabResult->GetBuffer());
+            out_frame.create(height, width, CV_8UC1);
+            memcpy(out_frame.data, pBuffer, width * height);
+        } 
+        else {
+            // 彩色相机进行 RGB 转换 (Bayer -> BGR)
+            CPylonImage pylonImage;
+            converter_.OutputPixelFormat = PixelType_BGR8packed;
+            converter_.Convert(pylonImage, ptrGrabResult);
+            out_frame.create(height, width, CV_8UC3);
+            memcpy(out_frame.data, pylonImage.GetBuffer(), width * height * 3);
+        }
+        */
+
+        /*
+        std::string save_folder = "D:/test_cam/" + serialNumber_;
+        std::string save_path = save_folder + "/" + std::to_string(ptrGrabResult->GetBlockID()) + ".png";
+
+        std::filesystem::path save_folder_path(save_folder);
+        if (!std::filesystem::exists(save_folder_path)) {
+            std::filesystem::create_directories(save_folder_path);
+        }
+
+        CImagePersistence::Save(ImageFileFormat_Png, save_path.c_str(), ptrGrabResult);
+        */
+
+        /*
+        // 我们直接按 CV_8UC1 内存硬拷贝，绝不在此处做任何像素格式转换！
+        cv::Mat out_frame(height, width, CV_8UC1);
+        const uint8_t* pBuffer = reinterpret_cast<const uint8_t*>(ptrGrabResult->GetBuffer());
+        
+        // memcpy 是极快的内存操作，耗时通常在零点几毫秒
+        memcpy(out_frame.data, pBuffer, width * height);
+        */
+
+        
+        // 【核心修改】：不申请内存！仅仅创建一个指向 Pylon 底层 Buffer 的 Mat 头 (O(1) 耗时)
+        void* pBuffer = ptrGrabResult->GetBuffer();
+        cv::Mat wrapped_frame(height, width, CV_8UC1, pBuffer);
+
+        // 调用通过 setFrameCallback 传进来的外部逻辑
+        if (callback_) {
+            callback_(wrapped_frame, out_meta);
+        }
+        
+        
+    } catch (GenICam::GenericException &e) {
+        cerr << "[Basler ERROR] (SN " << serialNumber_ << ") " << e.GetDescription() << endl;
+    }
+}
+
+/*
 GrabResult BaslerCamera::grabFrame(cv::Mat& out_frame, FrameMeta& out_meta) {
     if (!camera_.IsGrabbing()) {
         return GrabResult::ERROR_;
@@ -231,19 +341,37 @@ GrabResult BaslerCamera::grabFrame(cv::Mat& out_frame, FrameMeta& out_meta) {
 
     int width  = ptrGrabResult->GetWidth();
     int height = ptrGrabResult->GetHeight();
-    const uint8_t* pBuffer =
-        reinterpret_cast<const uint8_t*>(ptrGrabResult->GetBuffer());
 
     if (isMono_) {
+        const uint8_t* pBuffer =
+            reinterpret_cast<const uint8_t*>(ptrGrabResult->GetBuffer());
         out_frame.create(height, width, CV_8UC1);
         memcpy(out_frame.data, pBuffer, width * height);
     } else {
+        CPylonImage pylonImage;
+        converter_.Convert(pylonImage, ptrGrabResult);
         out_frame.create(height, width, CV_8UC3);
-        converter_.Convert(out_frame.ptr(), width * height * 3, ptrGrabResult);
+        memcpy(out_frame.data, pylonImage.GetBuffer(), width * height * 3);
+        // out_frame.create(height, width, CV_8UC3);
+        // converter_.Convert(out_frame.ptr(), width * height * 3, ptrGrabResult);
     }
+
+    std::string save_path = "D:/test_cam/" + serialNumber_ + "/" + std::to_string(ptrGrabResult->GetBlockID()) + ".png";
+    std::string save_folder = "D:/test_cam/" + serialNumber_;
+    std::filesystem::path save_folder_path(save_folder);
+    if (!std::filesystem::exists(save_folder_path)) {
+        std::filesystem::create_directories(save_folder_path);
+    }
+    if (!ptrGrabResult->GrabSucceeded()) {
+        cerr << "[Basler] Grab failed (SN " << serialNumber_ << ")" << endl;
+        return GrabResult::ERROR_;
+    }
+    // CImagePersistence::Save( ImageFileFormat_Png, save_path.c_str(), ptrGrabResult );
+    cv::imwrite(save_path, out_frame);
 
     return GrabResult::OK;
 }
+*/
 
 void BaslerCamera::startRecording(const std::string& filename, double fps)
 {

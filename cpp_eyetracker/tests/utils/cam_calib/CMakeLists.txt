@@ -1,7 +1,7 @@
 # utils/cam_calib/CMakeLists.txt
 
 add_executable(cam_calib
-    src/calib_cam.cpp
+    calib_cam.cpp
 )
 
 if(NOT DEFINED ENV{HALCONROOT})

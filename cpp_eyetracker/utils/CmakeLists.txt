@@ -1,6 +1,5 @@
 # /utils/CmakeLists.txt
 
-# add_subdirectory(cam_calib)
 add_subdirectory(cam_model)
 add_subdirectory(glint_detection)
 add_subdirectory(pupil_center)

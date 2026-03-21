@@ -39,8 +39,8 @@ find_package(OpenCV REQUIRED)
 
 target_link_libraries(cam PUBLIC
     ${OpenCV_LIBS}
-    PylonBase_v10
-    GCBase_MD_VC141_v3_1_Basler_pylon_v3.lib
-    GenApi_MD_VC141_v3_1_Basler_pylon_v3.lib
-    PylonUtility_v10.lib
+    PylonBase_v11.lib # PylonBase_v10.lib
+    GCBase_MD_VC142_v3_5_Basler_pylon_v1.lib # GCBase_MD_VC141_v3_1_Basler_pylon_v3.lib
+    GenApi_MD_VC142_v3_5_Basler_pylon_v1.lib # GenApi_MD_VC141_v3_1_Basler_pylon_v3.lib
+    PylonUtility_v11.lib # PylonUtility_v10.lib
 )
