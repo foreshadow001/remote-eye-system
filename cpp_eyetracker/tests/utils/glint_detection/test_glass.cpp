@@ -34,6 +34,13 @@ int main() {
         std::filesystem::create_directories(debug_img_folder_path);
     }
 
+    std::vector<std::string> sub_dirs = {
+        "\\0_glass_reflection",
+        "\\1_frame_reflection",
+        "\\2_exclusion_mask",
+        "\\3_res"
+    };
+
     std::string search_path = input_folder + "\\*.*";
     WIN32_FIND_DATA fd;
     HANDLE hFind = FindFirstFile(search_path.c_str(), &fd);
@@ -90,8 +97,14 @@ int main() {
             {
                 for (int i = 0; i < glint_detector.debug_imgs_.size(); i++)
                 {
+                    std::string save_path = debug_img_output_folder + sub_dirs[i];
+                    std::filesystem::path save_folder_path(save_path);
+                    if (!std::filesystem::exists(save_folder_path)) {
+                        std::filesystem::create_directories(save_folder_path);
+                    }
+
                     cv::imwrite(
-                        debug_img_output_folder + "\\" + "viz_" + std::to_string(i) + "_" + filename, 
+                        save_path + "\\" + filename, 
                         glint_detector.debug_imgs_[i]
                     );
                 }

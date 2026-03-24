@@ -16,13 +16,19 @@
 TODO:
 ✅ 1. optimaize side2mid function (add delta y of left and right point as a parameter, and adjust the range accordingly)
 ✅ 2. handle two glints case
-   2.1 side and mid
-       2.2.1 find possible side and mid pair
-             ⚠️ handle one glint case
-       2.2.2 search for the last side
-   2.2 side and side: serach for the mid
-3. collect all the possible glint combinations, and choose the best one according to some criteria
-4. add temporal filter
+        ✅ 2.1 side and mid
+            2.2.1 find possible side and mid pair
+                ⚠️ handle one glint case
+            2.2.2 search for the last side
+    ✅ 2.2 side and side: serach for the mid
+4. unify glass and non-glass logic
+    5.1 determine ROI
+        5.1.1 remove noisy points
+        5.1.2 expand the ROI
+    5.2 find pupil center
+    5.3 find best glint pair
+    5.4 automate the calculation of hyperparameters
+5. add temporal filter
 */
 
 namespace glintdetection {
@@ -518,7 +524,7 @@ void GlintDetector::searchGlassReflections()
     {
         cv::Mat viz;
         cv::cvtColor(gray_, viz, cv::COLOR_GRAY2BGR);
-        debug_imgs_.push_back(viz);
+        debug_imgs_.push_back(viz); // glass reflection viz
     }
 
     // 2. Iterate through candidate contours
@@ -1113,7 +1119,7 @@ void GlintDetector::searchFrameReflections()
         // ---- 可视化底图 ----
         cv::Mat viz;
         cv::cvtColor(gray_, viz, cv::COLOR_GRAY2BGR);
-        debug_imgs_.push_back(viz);
+        debug_imgs_.push_back(viz); // frame reflection viz
     }
 
     // 1. Threshold
@@ -1312,7 +1318,7 @@ void GlintDetector::buildExclusionMask()
         }
     }
     
-    if (viz_) debug_imgs_.push_back(exclusion_mask_);
+    if (viz_) debug_imgs_.push_back(exclusion_mask_); // exclusion mask viz
 }
 
 bool GlintDetector::isInsideExclusionRegion(const cv::Point2f& pt) const
@@ -1566,21 +1572,6 @@ std::vector<cv::Rect> GlintDetector::determineCornealReflectionROI()
             }
             for (const auto& piece : current_pieces) final_rois.push_back(piece);
         }
-    }
-
-    if (viz_)
-    {
-        // Final visualization
-        cv::Mat viz_final = gray_.clone();
-        if (viz_final.channels() == 1) cv::cvtColor(viz_final, viz_final, cv::COLOR_GRAY2BGR);
-
-        cv::Mat mask_viz;
-        cv::cvtColor(exclusion_mask_, mask_viz, cv::COLOR_GRAY2BGR);
-        cv::addWeighted(viz_final, 0.7, mask_viz, 0.3, 0, viz_final);
-        for (size_t i = 0; i < final_rois.size(); ++i) {
-            cv::rectangle(viz_final, final_rois[i], cv::Scalar(0, 255, 0), 1);
-        }
-        debug_imgs_.push_back(viz_final);
     }
 
     return final_rois;

@@ -99,7 +99,7 @@ test_glint:
   debug_time: false
   viz: true
   num_images: 200
-  input_folder: "D:/hitsz/projects/new_dataset/glass"
+  input_folder: "D:/hitsz/projects/new_dataset/glint_input/front/3_3"
   gaussian_kernel_size: 3
   laplacian_kernel_size: 1
   init_threshold_value: 125.0
