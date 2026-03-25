@@ -4,6 +4,22 @@
 #include "cfg/config.hpp"
 #include "logger/logger.hpp"
 
+/*
+================================================================================
+[Hyperparameters List for detect_glint.hpp]
+维护说明：以下为类成员变量中定义的全局默认超参数。
+================================================================================[Global Thresholds & Flags]
+- glass_reflection_threshold_ = 200.0; // 镜片反光二值化基础阈值
+- frame_reflection_threshold_ = 200.0; // 镜框反光二值化基础阈值
+- threshold_step_             = 25.0;  // 阈值递减/搜索步长
+- laplacian_scale_            = 1;     // 拉普拉斯边缘检测的缩放因子
+- laplacian_delta_            = 0;     // 拉普拉斯边缘检测的偏移量
+- local_debug_                = false; // 局部调试标志
+- viz_                        = false; // 可视化标志
+
+================================================================================
+*/
+
 namespace glintdetection {
 
 class GlintDetector {
@@ -13,9 +29,6 @@ public:
 
     std::tuple<std::vector<std::vector<cv::Point2f>>, std::vector<std::vector<cv::Point2f>>>
     detect(cv::Mat gray);
-
-    std::tuple<std::vector<std::vector<cv::Point2f>>, std::vector<std::vector<cv::Point2f>>>
-    detectFullImage(cv::Mat gray);
 
     std::string img_name_;
     cv::Mat threshold_output_;
@@ -31,12 +44,6 @@ private:
         float major_axis;
         float minor_axis;
         double darkness; // 保留 darkness 用于在 searchPupilInROI 中排序
-        
-        // 判定点是否在瞳孔附近 (2.5倍长轴)
-        bool isNearby(const cv::Point2f& pt) const {
-            float dist = cv::norm(pt - rr.center);
-            return dist < (major_axis * 2.5f);
-        }
     };
 
     struct GlassReflection
@@ -146,13 +153,6 @@ private:
     bool side2mid(const cv::Point2f& l_pt, const cv::Point2f& r_pt, const cv::Point2f& m_pt);
     bool side2mid(const cv::Point2f& s_pt, const cv::Point2f& m_pt);
 
-    std::tuple<std::vector<cv::Point2f>, std::vector<cv::Point2f>>
-    splitGlintsByEye(
-        std::vector<cv::Point2f> contour_centers, 
-        double distance_threshold_x = 100.0, 
-        double outlier_distance_threshold = 200.0
-    );
-
     std::tuple<cv::Mat, cv::Point2f>
     getSearchRegionSideAndMid(
         const cv::Point2f& s_pt, 
@@ -163,14 +163,6 @@ private:
     getSearchRegionSideAndSide(
         const cv::Point2f& l_pt,
         const cv::Point2f& r_pt
-    );
-
-    std::tuple<cv::Mat, cv::Point2f>
-    makeEyeROI(EyeType eye) const;
-
-    bool isGlintValid(
-        const cv::Point2f& glint_center,
-        bool reverse = false    
     );
 
     void searchGlassReflections();
@@ -246,23 +238,9 @@ private:
         const double threshold_value,
         const std::string& debug_tag
     );
-    
-    std::tuple<std::vector<cv::Point2f>, std::vector<cv::Point2f>>
-    findGlintsSecond(
-        std::vector<cv::Point2f> left_glints_candidates,
-        std::vector<cv::Point2f> right_glints_candidates
-    );
-
-    std::tuple<std::vector<cv::Point2f>, std::vector<cv::Point2f>>
-    findGlints();
 
     std::tuple<std::vector<std::vector<cv::Point2f>>, std::vector<std::vector<cv::Point2f>>>
-    splitGlintsGeometry(
-        std::vector<std::vector<cv::Point2f>> glint_geometry_list, 
-        double distance_threshold_x = 100.0
-    );
-
-    void removeOutliersByMedian(std::vector<cv::Point2f>& pts, double outlier_distance_threshold = 200.0);
+    splitGlintsGeometry(std::vector<std::vector<cv::Point2f>> glint_geometry_list);
 
     std::vector<GlintGeometry>
     findGeometry(std::vector<cv::Point2f> glint_candidates);
@@ -280,8 +258,7 @@ private:
     void checkAndPushGlintGeometry(
         const cv::Point2f& l_pt,
         const cv::Point2f& r_pt,
-        const cv::Point2f& m_pt,
-        double brightness_threshold = 25.0
+        const cv::Point2f& m_pt
     );
 
     std::vector<std::vector<cv::Point2f>>

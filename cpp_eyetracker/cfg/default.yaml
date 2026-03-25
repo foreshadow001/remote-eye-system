@@ -111,6 +111,7 @@ test_glint:
 
 # Collect Potential Glint Triangles
 collect_glint:
+  is_collecting: false
   local_debug: false
   num_images: 100
   input_folder: "D:/hitsz/projects/new_dataset/glint_input/collect_input"
