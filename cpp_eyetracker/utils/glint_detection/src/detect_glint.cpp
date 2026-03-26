@@ -37,16 +37,16 @@ TODO:
 修改此类参数通常会影响该函数特定步骤的检测灵敏度与过滤严格度。
 ================================================================================
 
-[searchGlassReflections] - 镜片反光检测
-⚠️- kMinContourArea               = 50.0;  // 反光轮廓面积最小值
-⚠️- kMaxContourArea               = 500.0; // 反光轮廓面积最大值
-⚠️- kRoiPadding                   = 10;    // 提取霍夫圆检测 ROI 时的边界扩展量 (像素)
-⚠️- kHoughDp                      = 1.0;   // 霍夫圆累加器分辨率
-⚠️- kHoughMinDistDivisor          = 3.0;   // 霍夫圆最小圆心距的除数 (基于ROI高度)
+❌[searchGlassReflections] - 镜片反光检测
+- kMinContourArea               = 50.0;  // 反光轮廓面积最小值
+- kMaxContourArea               = 500.0; // 反光轮廓面积最大值
+- kRoiPadding                   = 10;    // 提取霍夫圆检测 ROI 时的边界扩展量 (像素)
+- kHoughDp                      = 1.0;   // 霍夫圆累加器分辨率
+- kHoughMinDistDivisor          = 3.0;   // 霍夫圆最小圆心距的除数 (基于ROI高度)
 - kHoughParam1                  = 100.0; // 霍夫圆 Canny边缘检测高阈值
 - kHoughParam2                  = 5.0;   // 霍夫圆 累加器阈值(投票数)
-⚠️- kHoughMinRadius               = 3;     // 霍夫圆 最小检测半径
-⚠️- kHoughMaxRadius               = 25;    // 霍夫圆 最大检测半径
+- kHoughMinRadius               = 3;     // 霍夫圆 最小检测半径
+- kHoughMaxRadius               = 25;    // 霍夫圆 最大检测半径
 - kDistTransformMaskSize        = 5;     // 距离变换掩膜尺寸
 - kMinDtRadius                  = 1.0f;  // 极细碎噪点过滤的最小距离变换峰值
 - kDtRadiusCentroidThresh       = 3.0f;  // 使用质心替代峰值的DT半径阈值
@@ -60,25 +60,25 @@ TODO:
 - kExclusionRadiusRatio         = 2.5f;  // 瞳孔排除区域的显示半径系数 (基于长轴)
 
 [searchPupilInROI] - ROI内寻找瞳孔种子
-⚠️- kAdaptiveThreshOffset         = 10.0;  // 自适应阈值计算偏移量
-⚠️- kAdaptiveThreshMax            = 15.0;  // 自适应阈值最大限制
+⚠️- kAdaptiveThreshOffset         = 10.0;  // 自适应阈值计算偏移量 [计算方法：亮度统计；需要存储：瞳孔的亮度]
+⚠️- kAdaptiveThreshMax            = 15.0;  // 自适应阈值最大限制   [计算方法：亮度统计；需要存储：瞳孔的亮度]
 - kMorphKernelSize              = 5;     // 形态学操作核大小
 - kMorphCloseIterations         = 2;     // 形态学闭操作迭代次数
-⚠️- kMinPupilArea                 = 50.0;  // 瞳孔轮廓过滤的面积下限
-⚠️- kMaxPupilArea                 = 800.0; // 瞳孔轮廓过滤的面积上限
-⚠️- kMinPupilContourPoints        = 5;     // 瞳孔轮廓最小点数
-⚠️- kMaxPupilAxis                 = 50.0f; // 瞳孔长轴最大限制
-⚠️- kMaxAxisRatio                 = 2.0f;  // 瞳孔长宽比最大限制
-⚠️- kMinSolidity                  = 0.60;  // 凸包面积比 (Solidity) 最小值
-⚠️- kMinFitRatio                  = 0.65;  // 椭圆拟合面积比最小值
-⚠️- kValidResidualRatio           = 0.60f; // 残差计算有效点比例
-⚠️- kMaxAvgResidual               = 0.40f; // 平均残差最大值
-⚠️- kMaxDarkness               = 15.0;  // 暗度上限
+⚠️- kMinPupilArea                 = 50.0;  // 瞳孔轮廓过滤的面积下限 [计算方法：面积统计；需要存储：瞳孔的面积]
+⚠️- kMaxPupilArea                 = 800.0; // 瞳孔轮廓过滤的面积上限 [计算方法：面积统计；需要存储：瞳孔的面积]
+⚠️- kMinPupilContourPoints        = 5;     // 瞳孔轮廓最小点数 [计算方法：轮廓点数统计；需要存储：瞳孔的轮廓点数]
+⚠️- kMaxPupilAxis                 = 50.0f; // 瞳孔长轴最大限制 [计算方法：长轴统计；需要存储：瞳孔的长轴]
+⚠️- kMaxAxisRatio                 = 2.0f;  // 瞳孔长宽比最大限制 [计算方法：长宽比统计；需要存储：瞳孔的长宽比]
+⚠️- kMinSolidity                  = 0.60;  // 凸包面积比 (Solidity) 最小值 [计算方法：凸包面积比统计；需要存储：瞳孔的凸包面积比]
+⚠️- kMinFitRatio                  = 0.65;  // 椭圆拟合面积比最小值 [计算方法：椭圆拟合面积比；需要存储：瞳孔的椭圆拟合面积比]
+- kValidResidualRatio           = 0.60f; // 残差计算有效点比例
+⚠️- kMaxAvgResidual               = 0.40f; // 平均残差最大值 [计算方法：残差计算；需要存储：瞳孔的残差]
+⚠️- kMaxDarkness               = 15.0;  // 暗度上限 [计算方法：亮度统计；需要存储：瞳孔的亮度]
 
 [isPupilNearby] - 瞳孔附近判定
-⚠️- kExclusionRadiusRatio         = 2.5f;  // 距离阈值系数 (相对于瞳孔长轴)
+⚠️- kExclusionRadiusRatio         = 2.5f;  // 距离阈值系数 (相对于瞳孔长轴) [计算方法：距离计算；需要存储：glints到瞳孔的距离]
 
-[findNeighborInDirection] - 方向性寻找相邻反光点
+❌[findNeighborInDirection] - 方向性寻找相邻反光点
 - kDefaultSearchScaleLenRatio   = 3.0f;  // 默认搜索区域扩展系数 (相对当前节点的长度)
 - kDefaultSearchScaleWidRatio   = 2.0f;  // 默认搜索区域扩展系数 (相对当前节点的宽度)
 - kMinContourArea               = 2.0;   // 过滤噪点的最小面积
@@ -87,13 +87,13 @@ TODO:
 - kAngleSwapMin                 = 45.0f; // 需要交换长宽的角度范围下限
 - kAngleSwapMax                 = 135.0f;// 需要交换长宽的角度范围上限
 
-[searchReflectionChains] - 搜索反光链
+❌[searchReflectionChains] - 搜索反光链
 - kMinNormEpsilon               = 0.1f;  // 向量更新的最小模长，防跳变
 - kMaxChainLength               = 20;    // 反光链的最大节点数
 
-[searchFrameReflections] - 搜索镜框反光
-⚠️- kMinArea                      = 10.0;  // 初始镜框反光种子的面积下限
-⚠️- kMaxArea                      = 50.0;  // 初始镜框反光种子的面积上限
+❌[searchFrameReflections] - 搜索镜框反光
+- kMinArea                      = 10.0;  // 初始镜框反光种子的面积下限
+- kMaxArea                      = 50.0;  // 初始镜框反光种子的面积上限
 - kMinLengthWidthRatio          = 2.0f;  // 初始镜框反光种子的长宽比最小限制 (长条状)
 - kSearchScaleLenRatio          = 3.0f;  // 搜索区域长向缩放系数
 - kSearchScaleWidRatio          = 2.0f;  // 搜索区域宽向缩放系数
@@ -101,35 +101,29 @@ TODO:
 - kAngleSwapMax                 = 135.0f;// 需要交换搜索区域长宽的角度范围上限
 - kMinChainSizeToDraw           = 3;     // 绘制链条时要求的最短链长度
 
-[buildExclusionMask] - 构建排除掩膜
+❌[buildExclusionMask] - 构建排除掩膜
 - kGlassExclusionScale          = 1.2f;  // 镜片反光排除区域的放大倍数
 - kFrameExclusionScale          = 1.5f;  // 单个镜框反光排除区域的放大倍数
 - kChainExclusionScale          = 1.5f;  // 镜框反光链之间连线排除区域的放大倍数
 
-[isInsideExclusionRegion] - 排除区域内部判定
-- kMaskThreshold                = 128;   // 掩膜二值化的判定阈值
-
-[shrinkRoiToValidGlints] - 缩小至有效光斑ROI
-⚠️- kMaxNoiseArea                 = 5.0;   // 噪点最大像素数/面积
-⚠️- kClusterDistThresh            = 80.0;  // 聚集距离阈值
-⚠️- kMinClusterSize               = 2;     // 有效聚集的最小数量
-⚠️- padding_y                     = 60;    // 扩展边界 (上下方向)
+❌[shrinkRoiToValidGlints] - 缩小至有效光斑ROI
+- kMaxNoiseArea                 = 5.0;   // 噪点最大像素数/面积
+- kClusterDistThresh            = 80.0;  // 聚集距离阈值
+- kMinClusterSize               = 2;     // 有效聚集的最小数量
+- padding_y                     = 60;    // 扩展边界 (上下方向)
 - kDefaultLowSensitivityThresh  = 25.0;  // 默认极低敏感度阈值
-⚠️- kPaddingXRatio                = 0.2f;  // 缩小后 ROI 的宽向外扩展比例
+- kPaddingXRatio                = 0.2f;  // 缩小后 ROI 的宽向外扩展比例
 
 [determineCornealReflectionROI] - 确定角膜反光ROI
 ⚠️- kConstraintRadiusRatio        = 2.5f;  // 瞳孔种子约束区域半径放大系数 (基于长轴)
 - kRatioH                       = 3;     // 扩展步长循环控制 (水平)
 - kRatioV                       = 1;     // 扩展步长循环控制 (垂直)
-⚠️- kMinExpandedRoiArea           = 50;    // 候选区域最小有效面积
+- kMinExpandedRoiArea           = 50;    // 候选区域最小有效面积
 - kShrinkRatio                  = 0.05f; // 边界收缩比例 (去除极边缘部分)
 - kMinRemainderArea             = 10;    // 差集操作后保留的最小碎片面积
 
-[clusterROIs] - ROI 聚类
-- kClusterMargin                = 1;     // 两个矩形扩充交集判定的像素大小
-
 [splitGlintsGeometry] - 左右眼光斑分离
-⚠️- kDistanceThresholdX           = 100.0; // 将两眼斑点分为左右眼的X轴距离阈值
+- kDistanceThresholdX           = 100.0; // 将两眼斑点分为左右眼的X轴距离阈值
 
 [selectBestGlintsPerCluster] - 选择每组最优光斑
 - kDistTolerance                = 5.0;   // 距离容差 (像素)
@@ -143,13 +137,13 @@ TODO:
 - kMaxMissingPointsToFind       = 2;     // 寻找缺失中点或侧边点的最大数量限制
 
 [isGlintRepeated] - 光斑重复判定
-⚠️- kMinGlintDist                 = 1.0;   // 判定两个 glint 是否为同一个的最短欧氏距离阈值
+- kMinGlintDist                 = 1.0;   // 判定两个 glint 是否为同一个的最短欧氏距离阈值
 
 [isGlintGeometryRepeated] - 几何体重复判定
 - kPointMatchTolerance          = 0.5;   // 判定两个 Glint 几何点位置相同的容差距离
 
 [checkAndPushGlintGeometry] - 校验并推入光斑结构
-⚠️- brightness_threshold          = 25.0;  // 亮斑的背景亮度判定阈值
+⚠️- kBrightnessThreshold          = 25.0;  // 亮斑的背景亮度判定阈值 [计算方法：亮度统计；需要存储：glint的背景亮度]
 - kMinPadding                   = 5;     // ROI扩展的最小像素数
 - kPaddingRatio                 = 0.20f; // 按比例扩展的系数
 ⚠️- kDangerMaskThresh             = 50.0;  // 寻找高亮斑(污染区)的二值化阈值
@@ -166,20 +160,28 @@ namespace glintdetection {
 GlintDetector::GlintDetector(const std::string& mode)
     : mode_(mode) 
 {
-	horizontal_pair_cfg_ = (mode == "collect")
-        ? cfg_["relaxed_glint_hyperparameter"]["horizontal_pair"]
-	    : cfg_["glint_hyperparameter"]["horizontal_pair"];
+    // 根据收集模式加载对应的特异型参数根节点
+    std::string spec_key = (cfg_["collect_glint"]["is_collecting"].as<bool>()) 
+        ? "relaxed_specific_hyperparameter" 
+        : "recommended_specific_hyperparameter";
 
-	middle_point_cfg_ = (mode == "collect")
-        ? cfg_["relaxed_glint_hyperparameter"]["middle_point"]
-		: cfg_["glint_hyperparameter"]["middle_point"];
+    spec_pupil_cfg_ = cfg_[spec_key]["pupil"];
+    spec_glint_cfg_ = cfg_[spec_key]["glint"];
+    emp_cfg_ = cfg_["empirical_hyperparameter"];
+
+    horizontal_pair_cfg_ = spec_glint_cfg_["horizontal_pair"];
+    middle_point_cfg_ = spec_glint_cfg_["middle_point"];
 
     gaussian_kernel_size_ = cfg_["test_glint"]["gaussian_kernel_size"].as<int>();
 	laplacian_kernel_size_ = cfg_["test_glint"]["laplacian_kernel_size"].as<int>();
-
 	init_threshold_value_ = cfg_["test_glint"]["init_threshold_value"].as<double>();
     threshold_step_ = cfg_["test_glint"]["threshold_step"].as<double>();
     viz_ = cfg_["test_glint"]["viz"].as<bool>();
+
+    if (cfg_["collect_glint"]["is_collecting"].as<bool>())
+    {
+        viz_ = false;
+    }
 }
 
 bool GlintDetector::side2side(
@@ -452,26 +454,31 @@ GlintDetector::getSearchRegionSideAndSide(
 
 void GlintDetector::searchGlassReflections()
 {
+    CfgNode emp = emp_cfg_["searchGlassReflections"];
+
     // --- 超参数声明 (Hyperparameters) ---
     // 反光轮廓面积的最小和最大值，过滤过小噪点或过大反光
-    const double kMinContourArea = 50.0;
-    const double kMaxContourArea = 500.0;
+    const double kMinContourArea = emp["kMinContourArea"].as<double>();
+    const double kMaxContourArea = emp["kMaxContourArea"].as<double>();
+
     // 提取霍夫圆检测 ROI 时的边界扩展量 (像素)
-    const int kRoiPadding = 10;
+    const int kRoiPadding = emp["kRoiPadding"].as<int>();
     // 霍夫圆变换参数
-    const double kHoughDp = 1.0;                  // 累加器分辨率
-    const double kHoughMinDistDivisor = 3.0;      // 最小圆心距的除数 (基于ROI高度)
-    const double kHoughParam1 = 100.0;            // Canny边缘检测高阈值
-    const double kHoughParam2 = 5.0;              // 累加器阈值(投票数)，决定检测灵敏度
-    const int kHoughMinRadius = 3;                // 最小检测半径
-    const int kHoughMaxRadius = 25;               // 最大检测半径
+    const double kHoughDp = emp["kHoughDp"].as<double>();                           // 累加器分辨率
+    const double kHoughMinDistDivisor = emp["kHoughMinDistDivisor"].as<double>();   // 最小圆心距的除数 (基于ROI高度)
+    const double kHoughParam1 = emp["kHoughParam1"].as<double>();                   // Canny边缘检测高阈值
+    const double kHoughParam2 = emp["kHoughParam2"].as<double>();                   // 累加器阈值(投票数)，决定检测灵敏度
+    const int kHoughMinRadius = emp["kHoughMinRadius"].as<int>();                   // 最小检测半径
+    const int kHoughMaxRadius = emp["kHoughMaxRadius"].as<int>();                   // 最大检测半径
+
     // 距离变换参数
-    const int kDistTransformMaskSize = 5;         // 距离变换掩膜尺寸
-    const float kMinDtRadius = 1.0f;              // 极细碎噪点过滤的最小距离变换峰值
-    const float kDtRadiusCentroidThresh = 3.0f;   // 使用质心替代峰值的DT半径阈值
+    const int kDistTransformMaskSize = emp["kDistTransformMaskSize"].as<int>();         // 距离变换掩膜尺寸
+    const float kMinDtRadius = emp["kMinDtRadius"].as<float>();                         // 极细碎噪点过滤的最小距离变换峰值
+    const float kDtRadiusCentroidThresh = emp["kDtRadiusCentroidThresh"].as<float>();   // 使用质心替代峰值的DT半径阈值
+
     // 镜框与镜片反光判定比值阈值 (霍夫半径 / DT峰值)
-    const float kFrameReflectionRatioThresh = 3.0f;
-    const float kMagEpsilon = 1e-3f;              // 向量模长极小值保护
+    const float kFrameReflectionRatioThresh = emp["kFrameReflectionRatioThresh"].as<float>();
+    const float kMagEpsilon = emp["kMagEpsilon"].as<float>();       // 向量模长极小值保护
 
     glass_reflections_.clear();
     frame_reflections_.clear();
@@ -684,7 +691,7 @@ void GlintDetector::searchGlassReflections()
 bool GlintDetector::isInsideGlassExclusion(const cv::Point2f& pt) const {
     // --- 超参数声明 (Hyperparameters) ---
     // 镜片反光排除区域半径的放大系数
-    const float kExclusionRadiusRatio = 1.2f;
+    const float kExclusionRadiusRatio = emp_cfg_["isInsideGlassExclusion"]["kExclusionRadiusRatio"].as<float>();
 
     for (const auto& gr : glass_reflections_) {
         float dist = cv::norm(pt - gr.center);
@@ -699,7 +706,7 @@ void GlintDetector::visualizePupilAndExclusion()
 {
     // --- 超参数声明 (Hyperparameters) ---
     // 瞳孔排除区域的显示半径系数 (基于长轴)
-    const float kExclusionRadiusRatio = 2.5f;
+    const float kExclusionRadiusRatio = spec_glint_cfg_["isPupilNearby"]["kExclusionRadiusRatio"].as<float>();
 
     if (debug_imgs_.empty()) return;
 
@@ -726,43 +733,35 @@ void GlintDetector::visualizePupilAndExclusion()
 std::vector<GlintDetector::Pupil> 
 GlintDetector::searchPupilInROI(cv::Rect roi_rect)
 {
-    // --- 超参数声明 (Hyperparameters) ---
-    // 自适应阈值计算偏移量与最大限制
-    const double kAdaptiveThreshOffset = 10.0;
-    const double kAdaptiveThreshMax = 15.0;
-    // 形态学操作核大小与闭操作迭代次数
-    const int kMorphKernelSize = 5;
-    const int kMorphCloseIterations = 2;
-    // 瞳孔轮廓过滤的面积上下限
-    const double kMinPupilArea = 50.0;
-    const double kMaxPupilArea = 800.0;
-    // 瞳孔轮廓最小点数
-    const size_t kMinPupilContourPoints = 5;
-    // 瞳孔长轴与长宽比限制
-    const float kMaxPupilAxis = 50.0f;
-    const float kMaxAxisRatio = 2.0f;
-    // 凸包面积比 (Solidity) 最小值
-    const double kMinSolidity = 0.60;
-    // 椭圆拟合面积比最小值
-    const double kMinFitRatio = 0.65;
-    // 残差计算有效点比例与平均残差最大值
-    const float kValidResidualRatio = 0.60f;
-    const float kMaxAvgResidual = 0.40f;
-    // 暗度上限
-    const double kMaxDarkness = 15.0;
+    // 从 Cfg 读取超参数
+    auto spec = spec_pupil_cfg_["searchPupilInROI"];
+    auto emp = emp_cfg_["searchPupilInROI"];
+
+    const double kAdaptiveThreshOffset = spec["kAdaptiveThreshOffset"].as<double>();
+    const double kAdaptiveThreshMax = spec["kAdaptiveThreshMax"].as<double>();
+    const double kMinPupilArea = spec["kMinPupilArea"].as<double>();
+    const double kMaxPupilArea = spec["kMaxPupilArea"].as<double>();
+    const size_t kMinPupilContourPoints = spec["kMinPupilContourPoints"].as<size_t>();
+    const float kMaxPupilAxis = spec["kMaxPupilAxis"].as<float>();
+    const float kMaxAxisRatio = spec["kMaxAxisRatio"].as<float>();
+    const double kMinSolidity = spec["kMinSolidity"].as<double>();
+    const double kMinFitRatio = spec["kMinFitRatio"].as<double>();
+    const float kMaxAvgResidual = spec["kMaxAvgResidual"].as<float>();
+    const double kMaxDarkness = spec["kMaxDarkness"].as<double>();
+
+    const int kMorphKernelSize = emp["kMorphKernelSize"].as<int>();
+    const int kMorphCloseIterations = emp["kMorphCloseIterations"].as<int>();
+    const float kValidResidualRatio = emp["kValidResidualRatio"].as<float>();
 
     std::vector<Pupil> pupils; 
 
-    // 1. 准备 ROI 图像
     cv::Mat roi_img_raw = gray_(roi_rect); 
     cv::Mat roi_img = roi_img_raw.clone(); 
 
-    // 2. 自适应阈值计算 (简化逻辑)
     double min_val;
     cv::minMaxLoc(roi_img, &min_val, nullptr, nullptr, nullptr);
     double adaptive_thresh = std::min(min_val + kAdaptiveThreshOffset, kAdaptiveThreshMax); 
 
-    // 3. 二值化 & 形态学
     cv::Mat binary_pupil;
     cv::threshold(roi_img, binary_pupil, adaptive_thresh, 255, cv::THRESH_BINARY_INV);
 
@@ -770,7 +769,6 @@ GlintDetector::searchPupilInROI(cv::Rect roi_rect)
     cv::morphologyEx(binary_pupil, binary_pupil, cv::MORPH_OPEN, kernel);
     cv::morphologyEx(binary_pupil, binary_pupil, cv::MORPH_CLOSE, kernel, cv::Point(-1,-1), kMorphCloseIterations);
 
-    // 4. 轮廓查找
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(binary_pupil, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
@@ -784,22 +782,22 @@ GlintDetector::searchPupilInROI(cv::Rect roi_rect)
         float major = std::max(rr.size.width, rr.size.height);
         float minor = std::min(rr.size.width, rr.size.height);
         double ellipse_area = (CV_PI * major * minor) / 4.0;
+        
+        float axis_ratio = minor > 0 ? (major / minor) : 0.0f;
 
         if (major > kMaxPupilAxis) continue;
-        if (major / minor > kMaxAxisRatio) continue;
+        if (axis_ratio > kMaxAxisRatio) continue;
         
-        // Solidity
         std::vector<cv::Point> hull;
         cv::convexHull(contours[i], hull);
         double hull_area = cv::contourArea(hull);
         double solidity = contour_area / hull_area;
         if (solidity < kMinSolidity) continue;
 
-        // Fit Ratio
         double fit_ratio = contour_area / ellipse_area;
         if (fit_ratio < kMinFitRatio) continue;
 
-        // Residual
+        // --- 残差计算 ---
         float a = major / 2.0f;
         float b = minor / 2.0f;
         float theta = rr.angle * (CV_PI / 180.0f);
@@ -829,7 +827,6 @@ GlintDetector::searchPupilInROI(cv::Rect roi_rect)
 
         if (avg_residual > kMaxAvgResidual) continue;
 
-        // Darkness (保留用于排序)
         cv::Mat mask = cv::Mat::zeros(binary_pupil.size(), CV_8UC1);
         cv::drawContours(mask, contours, static_cast<int>(i), cv::Scalar(255), cv::FILLED);
         cv::Scalar mean_val = cv::mean(roi_img_raw, mask);
@@ -837,18 +834,26 @@ GlintDetector::searchPupilInROI(cv::Rect roi_rect)
 
         if (darkness > kMaxDarkness) continue;
 
-        // 构造 Pupil 对象
+        // --- 构造 Pupil 对象并记录所有参数 ---
         Pupil p;
         p.rr = rr;
-        p.rr.center += cv::Point2f(roi_rect.tl()); // 转为全局坐标
+        p.rr.center += cv::Point2f(roi_rect.tl()); 
         p.major_axis = major;
         p.minor_axis = minor;
+        
+        // 保存特异型特征，用于统计计算
+        p.roi_min_val = min_val;
+        p.area = contour_area;
+        p.contour_points = contours[i].size();
+        p.axis_ratio = axis_ratio;
+        p.solidity = solidity;
+        p.fit_ratio = fit_ratio;
+        p.avg_residual = avg_residual;
         p.darkness = darkness;
         
         pupils.push_back(p);
     }
     
-    // 按暗度排序 (越黑越好)，供后续优先使用
     std::sort(pupils.begin(), pupils.end(),[](const Pupil& a, const Pupil& b){
         return a.darkness < b.darkness;
     });
@@ -858,7 +863,7 @@ GlintDetector::searchPupilInROI(cv::Rect roi_rect)
 
 bool GlintDetector::isPupilNearby(const cv::Point2f& glint_pt)
 {
-    const float kExclusionRadiusRatio = 2.5f; // 距离阈值
+    const float kExclusionRadiusRatio = spec_glint_cfg_["isPupilNearby"]["kExclusionRadiusRatio"].as<float>(); // 距离阈值
 
     // 直接遍历缓存的 seeds
     for (const auto& pupil : init_pupil_seeds_)
@@ -884,19 +889,21 @@ bool GlintDetector::findNeighborInDirection(
     FrameReflection& out_new_fr    // 输出找到的新节点
 )
 {
+    CfgNode emp = emp_cfg_["findNeighborInDirection"];
+
     // --- 超参数声明 (Hyperparameters) ---
     // 默认搜索区域扩展系数 (相对当前节点的长度)
-    const float kDefaultSearchScaleLenRatio = 3.0f;
-    const float kDefaultSearchScaleWidRatio = 2.0f;
+    const float kDefaultSearchScaleLenRatio = emp["kDefaultSearchScaleLenRatio"].as<float>();
+    const float kDefaultSearchScaleWidRatio = emp["kDefaultSearchScaleWidRatio"].as<float>();
     // 过滤噪点的最小面积
-    const double kMinContourArea = 2.0;
+    const double kMinContourArea = emp["kMinContourArea"].as<double>();
     // 节点间最小距离系数 (避免检测到自身)
-    const float kMinDistRatio = 0.5f;
+    const float kMinDistRatio = emp["kMinDistRatio"].as<float>();
     // 新节点可靠尺度继承的最小长度比例
-    const float kMinReliableLenRatio = 0.6f;
+    const float kMinReliableLenRatio = emp["kMinReliableLenRatio"].as<float>();
     // 需要交换长宽的角度范围
-    const float kAngleSwapMin = 45.0f;
-    const float kAngleSwapMax = 135.0f;
+    const float kAngleSwapMin = emp["kAngleSwapMin"].as<float>();
+    const float kAngleSwapMax = emp["kAngleSwapMax"].as<float>();
 
     // ---- ROI 尺度：优先使用 search_scale ----
     float roi_len, roi_wid;
@@ -1041,11 +1048,13 @@ std::vector<GlintDetector::FrameReflectionChain>
 GlintDetector::searchReflectionChains(
     std::vector<FrameReflection>& initial_seeds)
 {
+    CfgNode emp = emp_cfg_["searchReflectionChains"];
+
     // --- 超参数声明 (Hyperparameters) ---
     // 向量更新的最小模长，防止除以零或由于距离太近导致方向剧烈跳变
-    const float kMinNormEpsilon = 0.1f;
+    const float kMinNormEpsilon = emp["kMinNormEpsilon"].as<float>();
     // 反光链的最大节点数，防止无限循环或过度延伸
-    const size_t kMaxChainLength = 20;
+    const size_t kMaxChainLength = emp["kMaxChainLength"].as<size_t>();
 
     std::vector<FrameReflectionChain> all_chains;
 
@@ -1124,20 +1133,22 @@ GlintDetector::searchReflectionChains(
 
 void GlintDetector::searchFrameReflections()
 {
+    CfgNode emp = emp_cfg_["searchFrameReflections"];
+
     // --- 超参数声明 (Hyperparameters) ---
     // 初始镜框反光种子的面积限制
-    const double kMinArea = 10.0;
-    const double kMaxArea = 50.0;
+    const double kMinArea = emp["kMinArea"].as<double>();
+    const double kMaxArea = emp["kMaxArea"].as<double>();
     // 初始镜框反光种子的长宽比最小限制 (长条状)
-    const float kMinLengthWidthRatio = 2.0f;
+    const float kMinLengthWidthRatio = emp["kMinLengthWidthRatio"].as<float>();
     // ROI 搜索区域的宽、高缩放系数 (相对于反光斑长边)
-    const float kSearchScaleLenRatio = 3.0f;
-    const float kSearchScaleWidRatio = 2.0f;
+    const float kSearchScaleLenRatio = emp["kSearchScaleLenRatio"].as<float>();
+    const float kSearchScaleWidRatio = emp["kSearchScaleWidRatio"].as<float>();
     // 需要交换搜索区域长宽的角度范围
-    const float kAngleSwapMin = 45.0f;
-    const float kAngleSwapMax = 135.0f;
+    const float kAngleSwapMin = emp["kAngleSwapMin"].as<float>();
+    const float kAngleSwapMax = emp["kAngleSwapMax"].as<float>();
     // 绘制链条时要求的最短链长度
-    const size_t kMinChainSizeToDraw = 3;
+    const size_t kMinChainSizeToDraw = emp["kMinChainSizeToDraw"].as<size_t>();
 
     if (viz_)
     {
@@ -1283,13 +1294,15 @@ void GlintDetector::drawRotatedRectMask(cv::Mat& mask, const cv::RotatedRect& rr
 
 void GlintDetector::buildExclusionMask()
 {
+    CfgNode emp = emp_cfg_["buildExclusionMask"];
+
     // --- 超参数声明 (Hyperparameters) ---
     // 镜片反光排除区域的放大倍数
-    const float kGlassExclusionScale = 1.2f;
+    const float kGlassExclusionScale = emp["kGlassExclusionScale"].as<float>();
     // 单个镜框反光排除区域的放大倍数
-    const float kFrameExclusionScale = 1.5f;
+    const float kFrameExclusionScale = emp["kFrameExclusionScale"].as<float>();
     // 镜框反光链之间连线排除区域的放大倍数
-    const float kChainExclusionScale = 1.5f;
+    const float kChainExclusionScale = emp["kChainExclusionScale"].as<float>();
 
     // 初始化全黑掩膜
     exclusion_mask_ = cv::Mat::zeros(gray_.size(), CV_8UC1);
@@ -1356,10 +1369,6 @@ void GlintDetector::buildExclusionMask()
 
 bool GlintDetector::isInsideExclusionRegion(const cv::Point2f& pt) const
 {
-    // --- 超参数声明 (Hyperparameters) ---
-    // 掩膜二值化的判定阈值
-    const uchar kMaskThreshold = 128;
-
     // 边界检查
     if (pt.x < 0 || pt.x >= exclusion_mask_.cols || 
         pt.y < 0 || pt.y >= exclusion_mask_.rows) {
@@ -1367,7 +1376,7 @@ bool GlintDetector::isInsideExclusionRegion(const cv::Point2f& pt) const
     }
 
     // 查表：如果掩膜值大于阈值，则在排除区域内
-    return exclusion_mask_.at<uchar>(cv::Point(pt)) > kMaskThreshold;
+    return exclusion_mask_.at<uchar>(cv::Point(pt)) > 128;
 }
 
 // 辅助函数：尝试向某个方向扩张矩形，增加了 limit_rect 限制
@@ -1423,6 +1432,7 @@ bool GlintDetector::expandRect(cv::Rect& rect, const cv::Mat& mask, const cv::Re
 
 cv::Rect GlintDetector::shrinkRoiToValidGlints(const cv::Rect& coarse_roi)
 {
+    CfgNode emp = emp_cfg_["shrinkRoiToValidGlints"];
     // =========================================================================
     // 超参数声明 (Hyperparameters for Noise Filtering)
     // 适配不同分辨率时，请按图像比例放大/缩小以下参数。
@@ -1431,24 +1441,24 @@ cv::Rect GlintDetector::shrinkRoiToValidGlints(const cv::Rect& coarse_roi)
     
     // 1. 噪点最大像素数/面积 (对应特征1：一般在5个pixel以下)
     // 如果一个亮斑的面积 <= 此值，它被视作“潜在噪点”，需进一步结合聚集情况判断。
-    const double kMaxNoiseArea = 5.0;       
+    const double kMaxNoiseArea = emp["kMaxNoiseArea"].as<double>();       
     
     // 2. 聚集距离阈值 (对应特征2：判定几个亮斑是否属于同一个“眼部聚集区”)
     // 两个连通域中心距离小于此值，则归为同一聚类 (Cluster)。
-    const double kClusterDistThresh = 80.0; 
+    const double kClusterDistThresh = emp["kClusterDistThresh"].as<double>();       
     
     // 3. 有效聚集的最小数量 (对应特征2：双眼区域glints聚集一般在3个及以上)
     // 如果一个聚类中全是微小斑点，且数量 < 此值，则整个聚类被视为孤立噪点剔除。
-    const int kMinClusterSize = 2;          
+    const int kMinClusterSize = emp["kMinClusterSize"].as<int>();          
 
     // 4. 扩展边界 (上下方向)
-    const int padding_y = 60;
+    const int padding_y = emp["padding_y"].as<int>();       
     
     // 5. 默认极低敏感度阈值 (当 threshold_step_ 无效时)
-    const double kDefaultLowSensitivityThresh = 25.0;
+    const double kDefaultLowSensitivityThresh = emp["kDefaultLowSensitivityThresh"].as<double>();       
 
     // 6. 缩小后 ROI 的宽向外扩展比例 (左右各占)
-    const float kPaddingXRatio = 0.2f;
+    const float kPaddingXRatio = emp["kPaddingXRatio"].as<float>();       
     // =========================================================================
 
     // 1. 边界保护与 ROI 提取
@@ -1558,18 +1568,20 @@ cv::Rect GlintDetector::shrinkRoiToValidGlints(const cv::Rect& coarse_roi)
 
 std::vector<cv::Rect> GlintDetector::determineCornealReflectionROI()
 {
+    CfgNode emp = emp_cfg_["determineCornealReflectionROI"];
+
     // --- 超参数声明 (Hyperparameters) ---
     // 瞳孔种子约束区域半径放大系数 (基于长轴)
-    const float kConstraintRadiusRatio = 2.5f;
+    const float kConstraintRadiusRatio = spec_glint_cfg_["isPupilNearby"]["kExclusionRadiusRatio"].as<float>();
     // 扩展步长循环控制
-    const int kRatioH = 3;
-    const int kRatioV = 1;
+    const int kRatioH = emp["kRatioH"].as<int>();
+    const int kRatioV = emp["kRatioV"].as<int>();
     // 候选区域最小有效面积
-    const int kMinExpandedRoiArea = 50;
+    const int kMinExpandedRoiArea = emp["kMinExpandedRoiArea"].as<int>();
     // 边界收缩比例 (去除极边缘部分)
-    const float kShrinkRatio = 0.05f;
+    const float kShrinkRatio = emp["kShrinkRatio"].as<float>();
     // 差集操作后保留的最小碎片面积
-    const int kMinRemainderArea = 10;
+    const int kMinRemainderArea = emp["kMinRemainderArea"].as<int>();
 
     std::vector<cv::Rect> final_rois;
     std::vector<cv::Point> debug_pupil_centers;
@@ -1848,7 +1860,7 @@ std::tuple<
 GlintDetector::splitGlintsGeometry(std::vector<std::vector<cv::Point2f>> glint_geometry_list)
 {
     std::vector<std::vector<cv::Point2f>> left_eye_geometries, right_eye_geometries;
-    const double kDistanceThresholdX = 100.0;  // 将两眼斑点分为左右眼的阈值
+    const double kDistanceThresholdX = emp_cfg_["splitGlintsGeometry"]["kDistanceThresholdX"].as<double>();  // 将两眼斑点分为左右眼的阈值
 
     if (glint_geometry_list.empty()) {
         return { left_eye_geometries, right_eye_geometries };
@@ -1904,23 +1916,17 @@ GlintDetector::Pupil
 GlintDetector::findBestPupilForCluster(const std::vector<cv::Rect>& cluster_rois)
 {
     Pupil best_pupil;
-    // 初始化为一个无效/空的瞳孔，避免后续使用出错
-    best_pupil.rr = cv::RotatedRect(); 
+    // 初始化为一个无效/空的瞳孔，确保任何找到的第一个合法瞳孔都会被选中
     best_pupil.major_axis = -1.0f;
-    best_pupil.minor_axis = -1.0f;
-    best_pupil.darkness = 255.0;
 
     if (init_pupil_seeds_.empty() || cluster_rois.empty()) {
         return best_pupil;
     }
 
-    bool found = false;
-
-    // 遍历所有初始种子瞳孔 (init_pupil_seeds_ 是在 getROI 中填充的成员变量)
+    // 遍历所有初始瞳孔种子，寻找属于当前 Cluster 且长轴最大的那一个
     for (const auto& pupil : init_pupil_seeds_)
     {
-        // 检查该瞳孔是否属于当前 Cluster
-        // 判定标准：瞳孔中心点落在了 Cluster 包含的任意一个 ROI 内
+        // 检查该瞳孔中心点是否落在了 Cluster 包含的任意一个 ROI 内
         bool belongs_to_cluster = false;
         for (const auto& roi : cluster_rois) {
             if (roi.contains(pupil.rr.center)) {
@@ -1933,13 +1939,16 @@ GlintDetector::findBestPupilForCluster(const std::vector<cv::Rect>& cluster_rois
             // 择优标准：长轴最长 (major_axis)
             if (pupil.major_axis > best_pupil.major_axis) {
                 best_pupil = pupil;
-                found = true;
             }
         }
     }
     
-    if (found) {
-        Logger::debug() << "[ClusterPupil] Selected pupil with major axis: " << best_pupil.major_axis;
+    // [修改] 移除 found 标志位，直接通过 best_pupil 的状态判断
+    if (best_pupil.major_axis > 0) {
+        Logger::debug() << "[ClusterPupil] Selected pupil for cluster. Center: (" 
+                        << static_cast<int>(best_pupil.rr.center.x) << ", " 
+                        << static_cast<int>(best_pupil.rr.center.y) 
+                        << "), Major Axis: " << best_pupil.major_axis;
     } else {
         Logger::debug() << "[ClusterPupil] No matching pupil found for this cluster.";
     }
@@ -1950,11 +1959,10 @@ GlintDetector::findBestPupilForCluster(const std::vector<cv::Rect>& cluster_rois
 std::vector<GlintDetector::GlintGeometry> 
 GlintDetector::selectBestGlintsPerCluster(const std::vector<GlintGeometry>& all_candidates)
 {
+    CfgNode emp = emp_cfg_["selectBestGlintsPerCluster"];
     // --- 超参数声明 (Hyperparameters) ---
-    // 距离容差 (像素)，用于判断两个 Glint 距离瞳孔是否同样优秀
-    const double kDistTolerance = 5.0; 
-    // 亮度容差 (0-255)，用于在距离相当时比较背景暗度
-    const double kBrightTolerance = 5.0; 
+    const double kDistTolerance = emp["kDistTolerance"].as<double>(); 
+    const double kBrightTolerance = emp["kBrightTolerance"].as<double>(); 
 
     if (all_candidates.empty()) return {};
 
@@ -1973,57 +1981,66 @@ GlintDetector::selectBestGlintsPerCluster(const std::vector<GlintGeometry>& all_
     {
         if (candidates.empty()) continue;
 
-        // 定义多级比较器 Lambda
-        // 返回 true 表示 a 比 b "更好"
-        auto comparator = [kDistTolerance, kBrightTolerance](const GlintGeometry& a, const GlintGeometry& b) -> bool {
-            
-            // --- [Tier 0]: 瞳孔有效性检查 ---
+        // 使用手写循环替代 std::min_element，避免容差比较打破 C++ STL 的严格弱序原则导致崩溃
+        GlintGeometry best_geo = candidates[0];
+
+        for (size_t i = 1; i < candidates.size(); ++i) {
+            const auto& a = candidates[i];
+            const auto& b = best_geo; // b 始终代表当前选出的"最优解"
+
             bool has_pupil_a = (a.linked_pupil.major_axis > 0);
             bool has_pupil_b = (b.linked_pupil.major_axis > 0);
             
-            if (has_pupil_a != has_pupil_b) return has_pupil_a; // 优先选有瞳孔关联的
-            if (!has_pupil_a) {
+            bool a_is_better = false;
+
+            // --- [Tier 0]: 瞳孔有效性检查 ---
+            if (has_pupil_a != has_pupil_b) {
+                a_is_better = has_pupil_a; // 谁有瞳孔谁就更好
+            } 
+            else if (!has_pupil_a) {
                 // 如果都没有瞳孔，回退到只比亮度
-                return a.bg_brightness < b.bg_brightness;
+                a_is_better = (a.bg_brightness < b.bg_brightness);
+            } 
+            else {
+                // --- [Tier 1]: 距离判据 ---
+                double dist_a = cv::norm(a.center() - a.linked_pupil.rr.center);
+                double dist_b = cv::norm(b.center() - b.linked_pupil.rr.center);
+                double dist_diff = std::abs(dist_a - dist_b);
+
+                if (dist_diff > kDistTolerance) {
+                    a_is_better = (dist_a < dist_b);
+                } 
+                else {
+                    // ---[Tier 2]: 暗度判据 (当距离相近时) ---
+                    double bri_diff = std::abs(a.bg_brightness - b.bg_brightness);
+                    if (bri_diff > kBrightTolerance) {
+                        a_is_better = (a.bg_brightness < b.bg_brightness);
+                    } 
+                    else {
+                        // --- [Tier 3]: 阈值判据 (当暗度也相近时) ---
+                        a_is_better = (a.found_threshold > b.found_threshold);
+                    }
+                }
             }
 
-            // --- [Tier 1]: 距离判据 ---
-            double dist_a = cv::norm(a.center() - a.linked_pupil.rr.center);
-            double dist_b = cv::norm(b.center() - b.linked_pupil.rr.center);
-            
-            double dist_diff = std::abs(dist_a - dist_b);
-
-            // 如果距离差异显著，距离短者胜出
-            if (dist_diff > kDistTolerance) {
-                return dist_a < dist_b;
+            // 更新最优解
+            if (a_is_better) {
+                best_geo = a;
             }
-
-            // ---[Tier 2]: 暗度判据 (当距离相近时) ---
-            // 距离都在容差范围内，视为"位置一样好"，此时比背景纯净度
-            double bri_diff = std::abs(a.bg_brightness - b.bg_brightness);
-
-            // 如果暗度差异显著，暗度低者胜出 (角膜背景 < 皮肤背景)
-            if (bri_diff > kBrightTolerance) {
-                return a.bg_brightness < b.bg_brightness;
-            }
-
-            // --- [Tier 3]: 阈值判据 (当暗度也相近时) ---
-            // 距离和暗度都差不多，比谁的信号更强
-            // 阈值越高，说明 Glint 越亮越显著，不易受噪点干扰
-            return a.found_threshold > b.found_threshold; 
-        };
-
-        // 3. 取最优
-        auto best_it = std::min_element(candidates.begin(), candidates.end(), comparator);
-        
-        if (best_it != candidates.end()) {
-            final_results.push_back(*best_it);
-            
-            Logger::debug() << "[SelectBest] Cluster " << id << " selected:"
-                            << " Dist=" << cv::norm(best_it->center() - best_it->linked_pupil.rr.center)
-                            << " Bri=" << best_it->bg_brightness
-                            << " Thr=" << best_it->found_threshold;
         }
+        
+        // 记录并输出日志
+        final_results.push_back(best_geo);
+        
+        // 【安全打印】避免 best_geo 没有 pupil 时，用 (0,0) 算出离谱的距离误导 Debug
+        double print_dist = (best_geo.linked_pupil.major_axis > 0) 
+            ? cv::norm(best_geo.center() - best_geo.linked_pupil.rr.center) 
+            : -1.0;
+
+        Logger::debug() << "[SelectBest] Cluster " << id << " selected:"
+                        << " Dist=" << print_dist
+                        << " Bri=" << best_geo.bg_brightness
+                        << " Thr=" << best_geo.found_threshold;
     }
 
     return final_results;
@@ -2036,11 +2053,12 @@ GlintDetector::detectCluster(
     const Pupil& best_pupil // <--- 接收参数
 )
 {
+    CfgNode emp = emp_cfg_["detectCluster"];
     // --- 超参数声明 (Hyperparameters) ---
     // 判定新光斑是否属于已存在的几何光斑的最短距离阈值
-    const double kMinUniqueGlintDist = 2.0;
+    const double kMinUniqueGlintDist = emp["kMinUniqueGlintDist"].as<double>();
     // 提前退出搜索的目标数量
-    const size_t kMaxClusterResults = 3;
+    const size_t kMaxClusterResults = emp["kMaxClusterResults"].as<size_t>();
 
     std::vector<GlintGeometry> cluster_results;
     double thr = init_threshold_value_;
@@ -2098,6 +2116,7 @@ GlintDetector::detect(cv::Mat gray)
 {
     Logger::ScopedTimer timer("[GlintDetector::detectFullImage]");
     debug_imgs_.clear();
+    final_geometries_.clear();
 
     gray_ = gray.clone();
 
@@ -2168,6 +2187,7 @@ GlintDetector::detect(cv::Mat gray)
     if (cfg_["collect_glint"]["is_collecting"].as<bool>())
     {
         glint_geometry_list = glintGeometryListToGlintVectors(all_geometries);
+        final_geometries_ = all_geometries;
     } else {
         glint_geometry_list = glintGeometryListToGlintVectors(best_geometries);
     }
@@ -2191,7 +2211,7 @@ GlintDetector::findGeometry(std::vector<cv::Point2f> glint_candidates)
 {
     // --- 超参数声明 (Hyperparameters) ---
     // 寻找缺失中点或侧边点的最大数量限制
-    const int kMaxMissingPointsToFind = 2;
+    const int kMaxMissingPointsToFind = emp_cfg_["findGeometry"]["kMaxMissingPointsToFind"].as<int>();
 
     glint_geometry_list_.clear();
 
@@ -2382,7 +2402,7 @@ bool GlintDetector::isGlintRepeated(
 {
     // --- 超参数声明 (Hyperparameters) ---
     // 判定两个 glint 是否为同一个的最短欧氏距离阈值
-    const double kMinGlintDist = 1.0;
+    const double kMinGlintDist = emp_cfg_["isGlintRepeated"]["kMinGlintDist"].as<double>();
 
     if (roi_glints.empty()) return false;
 
@@ -2409,7 +2429,7 @@ bool GlintDetector::isGlintGeometryRepeated(
 {
     // --- 超参数声明 (Hyperparameters) ---
     // 判定两个 Glint 几何点位置相同的容差距离
-    const double kPointMatchTolerance = 0.5;
+    const double kPointMatchTolerance = emp_cfg_["isGlintGeometryRepeated"]["kPointMatchTolerance"].as<double>();
 
     if (glint_geometry_list_.empty()) return false;
 
@@ -2433,23 +2453,18 @@ void GlintDetector::checkAndPushGlintGeometry(
     const cv::Point2f& m_pt
 )
 {
-    // --- 超参数声明 (Hyperparameters) ---
-    // 亮斑的背景亮度阈值
-    const double brightness_threshold = 25.0;
-    // ROI扩展的最小像素数和按比例扩展的系数
-    const int kMinPadding = 5;
-    const float kPaddingRatio = 0.20f;
-    // 寻找高亮斑(污染区)的二值化阈值
-    const double kDangerMaskThresh = 50.0;
-    // 膨胀核尺寸与迭代次数(建立隔离带)
-    const int kDilateKernelSize = 3;
-    const int kDilateIterations = 1;
-    // 进行截断平均所需的最少有效像素数
-    const size_t kMinValidPixels = 5;
-    // 截断平均的剪裁比例(上下各剔除的百分比)
-    const float kTrimRatio = 0.10f;
+    auto spec = spec_glint_cfg_["checkAndPushGlintGeometry"];
+    auto emp = emp_cfg_["checkAndPushGlintGeometry"];
 
-    // 构造对象
+    const double kBrightnessThreshold = spec["kBrightnessThreshold"].as<double>();
+    const int kMinPadding = emp["kMinPadding"].as<int>();
+    const float kPaddingRatio = emp["kPaddingRatio"].as<float>();
+    const double kDangerMaskThresh = emp["kDangerMaskThresh"].as<double>(); // 经验值修正
+    const int kDilateKernelSize = emp["kDilateKernelSize"].as<int>();
+    const int kDilateIterations = emp["kDilateIterations"].as<int>();
+    const size_t kMinValidPixels = emp["kMinValidPixels"].as<int>();
+    const float kTrimRatio = emp["kTrimRatio"].as<float>();
+
     GlintGeometry geo;
     geo.l_pt = l_pt;
     geo.r_pt = r_pt;
@@ -2457,9 +2472,6 @@ void GlintDetector::checkAndPushGlintGeometry(
     
     std::vector<cv::Point2f> pts = {l_pt, r_pt, m_pt};
 
-    // =========================================================
-    // 第一步：获取 Bounding Rect 并按比例扩展 (保持不变)
-    // =========================================================
     cv::Rect roi = cv::boundingRect(pts);
     int pad_x = std::max(kMinPadding, static_cast<int>(roi.width * kPaddingRatio));
     int pad_y = std::max(kMinPadding, static_cast<int>(roi.height * kPaddingRatio));
@@ -2472,28 +2484,14 @@ void GlintDetector::checkAndPushGlintGeometry(
     roi &= cv::Rect(0, 0, gray_.cols, gray_.rows);
     if (roi.area() <= 0) return;
 
-    // =========================================================
-    // 第二步：构建“污染区”掩膜 (High Brightness Mask)
-    // =========================================================
     cv::Mat roi_img = gray_(roi);
     cv::Mat danger_mask;
 
-    // 1. 初始标记：找出所有大于阈值的亮像素
-    // thresh_binary: src > thresh ? 255 : 0
-    // 结果：亮斑区域为白色(255)，背景为黑色(0)
     cv::threshold(roi_img, danger_mask, kDangerMaskThresh, 255, cv::THRESH_BINARY);
 
-    // =========================================================
-    // 第三步：建立“隔离带” (Dilation)
-    // =========================================================
-    // 2. 膨胀：将亮斑区域向外扩展一圈
-    // 指定核大小，膨胀迭代次数，意味着向四周扩充像素
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(kDilateKernelSize, kDilateKernelSize));
     cv::dilate(danger_mask, danger_mask, kernel, cv::Point(-1, -1), kDilateIterations);
 
-    // =========================================================
-    // 第四步：安全采样
-    // =========================================================
     std::vector<uchar> valid_pixels;
     valid_pixels.reserve(roi.area());
 
@@ -2501,17 +2499,12 @@ void GlintDetector::checkAndPushGlintGeometry(
         const uchar* img_ptr = roi_img.ptr<uchar>(y);
         const uchar* mask_ptr = danger_mask.ptr<uchar>(y);
         for (int x = 0; x < roi_img.cols; ++x) {
-            // 只有 Mask 为 0 (黑色) 的地方才是绝对安全的背景
-            // 既不是亮斑本身，也不是亮斑紧邻的一圈
             if (mask_ptr[x] == 0) {
                 valid_pixels.push_back(img_ptr[x]);
             }
         }
     }
 
-    // =========================================================
-    // 第五步：统计 (截断平均值) (保持不变)
-    // =========================================================
     if (valid_pixels.empty()) {
         geo.bg_brightness = 255.0;
         geo.on_cornea = false;
@@ -2520,7 +2513,7 @@ void GlintDetector::checkAndPushGlintGeometry(
         double sum = 0;
         for (auto v : valid_pixels) sum += v;
         geo.bg_brightness = sum / valid_pixels.size();
-        geo.on_cornea = (geo.bg_brightness <= brightness_threshold);
+        geo.on_cornea = (geo.bg_brightness <= kBrightnessThreshold);
     }
     else {
         std::sort(valid_pixels.begin(), valid_pixels.end());
@@ -2533,7 +2526,7 @@ void GlintDetector::checkAndPushGlintGeometry(
             sum += valid_pixels[k];
         }
         geo.bg_brightness = sum / static_cast<double>(n - trim_count * 2);
-        geo.on_cornea = (geo.bg_brightness <= brightness_threshold);
+        geo.on_cornea = (geo.bg_brightness <= kBrightnessThreshold);
     }
 
     if (geo.on_cornea) glint_geometry_list_.push_back(geo);

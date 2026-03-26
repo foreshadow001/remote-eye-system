@@ -24,6 +24,8 @@ namespace glintdetection {
 
 class GlintDetector {
 public:
+    struct Pupil;
+    struct GlintGeometry;
     explicit GlintDetector(const std::string& mode = "inference");
     ~GlintDetector() = default;
 
@@ -35,6 +37,13 @@ public:
     std::vector<cv::Mat> debug_imgs_;
     bool local_debug_ = false;
     bool viz_ = false;
+    // 获取所有候选瞳孔
+    const std::vector<Pupil>& getPupils() const { return init_pupil_seeds_; }
+    
+    // 注意：为了获取完整的 GlintGeometry 参数，你需要将 detect() 函数中局部收集的 
+    // all_geometries 保存为类的成员变量，例如添加一个 std::vector<GlintGeometry> final_geometries_;
+    // 并在 detect() 返回前赋值。然后提供获取接口：
+    const std::vector<GlintGeometry>& getGlintGeometries() const { return final_geometries_; }
 
 private:
     enum class EyeType { Left, Right };
@@ -43,7 +52,15 @@ private:
         cv::RotatedRect rr;
         float major_axis;
         float minor_axis;
-        double darkness; // 保留 darkness 用于在 searchPupilInROI 中排序
+
+        double roi_min_val;    // ROI 中的最低亮度 (对应 kAdaptiveThreshOffset / kAdaptiveThreshMax)
+        double area;           // 面积
+        int contour_points;    // 轮廓点数
+        float axis_ratio;      // 长宽比
+        double solidity;       // 凸包面积比
+        double fit_ratio;      // 椭圆拟合面积比
+        float avg_residual;    // 平均残差
+        double darkness;       // 瞳孔的亮度
     };
 
     struct GlassReflection
@@ -114,6 +131,9 @@ private:
 
     std::string mode_;
     Cfg cfg_;
+    CfgNode spec_pupil_cfg_;
+    CfgNode spec_glint_cfg_;
+    CfgNode emp_cfg_;
     CfgNode horizontal_pair_cfg_;
     CfgNode middle_point_cfg_;
 
@@ -148,6 +168,7 @@ private:
     double init_right_glints_x_min_, init_right_glints_x_max_;
 
     std::vector<GlintGeometry> glint_geometry_list_;
+    std::vector<GlintGeometry> final_geometries_;
 
     bool side2side(const cv::Point2f& l_pt, const cv::Point2f& r_pt);
     bool side2mid(const cv::Point2f& l_pt, const cv::Point2f& r_pt, const cv::Point2f& m_pt);

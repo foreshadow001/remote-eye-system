@@ -99,7 +99,7 @@ test_glint:
   debug_time: false
   viz: true
   num_images: 200
-  input_folder: "D:/hitsz/projects/new_dataset/glint_input/front/3_3"
+  input_folder: "D:/hitsz/projects/new_dataset/glint_input/front/3_3/debug"
   gaussian_kernel_size: 3
   laplacian_kernel_size: 1
   init_threshold_value: 125.0
@@ -111,11 +111,11 @@ test_glint:
 
 # Collect Potential Glint Triangles
 collect_glint:
-  is_collecting: false
+  is_collecting: true
   local_debug: false
   num_images: 100
-  input_folder: "D:/hitsz/projects/new_dataset/glint_input/collect_input"
-  output_folder: "D:/hitsz/projects/new_dataset/glint_input/collect_output"
+  input_folder: "D:/hitsz/projects/new_dataset/glint_input/front/3_3/debug"
+  output_folder: "D:/hitsz/projects/new_dataset/glint_input/front/3_3/debug/collect_output"
 
 # Relaxed Glint Hyperparameter
 relaxed_glint_hyperparameter:
@@ -146,14 +146,6 @@ relaxed_glint_hyperparameter:
 
     extension_rm_y/lr_x_min: 0.05
     extension_rm_y/lr_x_max: 0.05
-
-  glint_filter:
-    outline_2_value_average_max: 100
-    outline_3_value_average_max: 80
-    outline_4_value_average_mxn: 255
-    extension_outline_2_value_average_max: 25
-    extension_outline_3_value_average_max: 25
-    extension_outline_4_value_average_max: 25
     
 # Constrained Glint Hyperparameter
 glint_hyperparameter:
@@ -168,7 +160,233 @@ glint_hyperparameter:
       - [0, 2, 0.363793, 0.646154, 0.087931, 0.322727, 0.353846, 0.636207, 0.0928571, 0.43]
       - [2, 3, 0.459804, 0.688889, 0.0676471, 0.244444, 0.311111, 0.540196, 0.228689, 0.511538]
       - [3, 5, 0.49, 0.887838, 0.0310811, 0.189535, 0.112162, 0.51, 0.29, 0.644595]
-  glint_filter:
-    outline_2_value_average_max: 255.000000
-    outline_3_value_average_max: 252.777778
-    outline_4_value_average_max: 195.368421
+
+original_specific_hyperparameter:
+  pupil:
+    searchPupilInROI:
+      kAdaptiveThreshOffset: 10.0
+      kAdaptiveThreshMax: 15.0
+      kMinPupilArea: 50.0
+      kMaxPupilArea: 800.0
+      kMinPupilContourPoints: 5
+      kMaxPupilAxis: 50.0
+      kMaxAxisRatio: 2.0
+      kMinSolidity: 0.60
+      kMinFitRatio: 0.65
+      kMaxAvgResidual: 0.40
+      kMaxDarkness: 15.0
+  
+  glint:
+    isPupilNearby:
+      kExclusionRadiusRatio: 2.5
+      
+    checkAndPushGlintGeometry:
+      kBrightnessThreshold: 25.0
+
+    horizontal_pair:
+      lr_y_min: 0.000000
+      lr_y_max: 6.750000
+      lr_x_min: 7.000000
+      lr_x_max: 17.250000
+
+    middle_point:
+      conditions:
+        - [0, 2, 0.363793, 0.646154, 0.087931, 0.322727, 0.353846, 0.636207, 0.0928571, 0.43]
+        - [2, 3, 0.459804, 0.688889, 0.0676471, 0.244444, 0.311111, 0.540196, 0.228689, 0.511538]
+        - [3, 5, 0.49, 0.887838, 0.0310811, 0.189535, 0.112162, 0.51, 0.29, 0.644595]
+
+
+recommended_specific_hyperparameter:
+  pupil:
+    searchPupilInROI:
+      kAdaptiveThreshOffset: 10.0
+      kAdaptiveThreshMax: 11.090909
+      kMinPupilArea: 0.000000
+      kMaxPupilArea: 516.500000
+      kMinPupilContourPoints: 15.000000
+      kMaxPupilAxis: 28.508112
+      kMaxAxisRatio: 1.286609
+      kMinSolidity: 0.918680
+      kMinFitRatio: 0.904885
+      kMaxAvgResidual: 0.109286
+      kMaxDarkness: 9.090909
+  
+  glint:
+    isPupilNearby:
+      kExclusionRadiusRatio: 1.269068
+      
+    checkAndPushGlintGeometry:
+      kBrightnessThreshold: 26.121053
+
+    horizontal_pair:
+      lr_y_min: 0.000000
+      lr_y_max: 1.000000
+      lr_x_min: 9.500000
+      lr_x_max: 13.000000
+
+  ext:
+    pupil:
+      ext_area: 300.0
+      ext_points: 10.0
+      ext_axis: 10.0
+      ext_ratio: 0.1
+      ext_solidity: 0.05
+      ext_fit_ratio: 0.05
+      ext_residual: 0.05
+      ext_darkness: 5.0
+
+    glint:
+      ext_lr_x: 1.5
+      ext_lr_y: 0.5
+      ext_bg_bright: 5.0
+      ext_exclusion: 0.2
+      ext_ratio_xy: 0.05
+
+    middle_point:
+      conditions:
+        - [0, 2, 0.471739, 0.595455, 0.21087, 0.322727, 0.404545, 0.528261, 0.222727, 0.354348]
+        - [2, 3, 0, 0, 0, 0, 0, 0, 0, 0]
+        - [3, 5, 0, 0, 0, 0, 0, 0, 0, 0]
+relaxed_specific_hyperparameter:
+  pupil:
+    searchPupilInROI:
+      kAdaptiveThreshOffset: 10.0
+      kAdaptiveThreshMax: 15.0
+      kMinPupilArea: 50.0
+      kMaxPupilArea: 800.0
+      kMinPupilContourPoints: 5
+      kMaxPupilAxis: 50.0
+      kMaxAxisRatio: 2.0
+      kMinSolidity: 0.60
+      kMinFitRatio: 0.65
+      kMaxAvgResidual: 0.40
+      kMaxDarkness: 15.0
+  
+  glint:
+    isPupilNearby:
+      kExclusionRadiusRatio: 2.5
+
+    checkAndPushGlintGeometry:
+      kBrightnessThreshold: 25.0
+
+    horizontal_pair:
+      lr_y_min: 0
+      lr_y_max: 7
+      lr_x_min: 5
+      lr_x_max: 20
+
+      extension_x_min: 2
+      extension_x_max: 2
+      extension_y_min: 2
+      extension_y_max: 2
+
+    middle_point:
+      conditions:
+        - [0, 2, 0.2, 0.8, 0.05, 0.55, 0.2, 0.8, 0.05, 0.55]
+        - [2, 3, 0.45, 0.7, 0.05, 0.25, 0.3, 0.55, 0.25, 0.5]
+        - [3, 5, 0.45, 0.85, 0.04, 0.25, 0.15, 0.55, 0.3, 0.65]
+      extension_lm_x/lr_x_min: 0.05
+      extension_lm_x/lr_x_max: 0.05
+
+      extension_lm_y/lr_x_min: 0.05
+      extension_lm_y/lr_x_max: 0.05
+
+      extension_rm_x/lr_x_min: 0.05
+      extension_rm_x/lr_x_max: 0.05
+
+      extension_rm_y/lr_x_min: 0.05
+      extension_rm_y/lr_x_max: 0.05
+
+empirical_hyperparameter:
+  searchPupilInROI:
+    kMorphKernelSize: 5
+    kMorphCloseIterations: 2
+    kValidResidualRatio: 0.60
+
+  searchGlassReflections:
+    kMinContourArea: 50.0
+    kMaxContourArea: 500.0
+    kRoiPadding: 10
+    kHoughDp: 1.0
+    kHoughMinDistDivisor: 3.0
+    kHoughParam1: 100.0
+    kHoughParam2: 5.0
+    kHoughMinRadius: 3
+    kHoughMaxRadius: 25
+    kDistTransformMaskSize: 5
+    kMinDtRadius: 1.0
+    kDtRadiusCentroidThresh: 3.0
+    kFrameReflectionRatioThresh: 3.0
+    kMagEpsilon: 1e-3
+  isInsideGlassExclusion:
+    kExclusionRadiusRatio: 1.2
+
+  findNeighborInDirection:
+    kDefaultSearchScaleLenRatio: 3.0
+    kDefaultSearchScaleWidRatio: 2.0
+    kMinContourArea: 2.0
+    kMinDistRatio: 0.5
+    kMinReliableLenRatio: 0.6
+    kAngleSwapMin: 45.0
+    kAngleSwapMax: 135.0
+  searchReflectionChains:
+    kMinNormEpsilon: 0.1
+    kMaxChainLength: 20
+  searchFrameReflections:
+    kMinArea: 10.0
+    kMaxArea: 50.0
+    kMinLengthWidthRatio: 2.0
+    kSearchScaleLenRatio: 3.0
+    kSearchScaleWidRatio: 2.0
+    kAngleSwapMin: 45.0
+    kAngleSwapMax: 135.0
+    kMinChainSizeToDraw: 3
+
+  buildExclusionMask:
+    kGlassExclusionScale: 1.2
+    kFrameExclusionScale: 1.5
+    kChainExclusionScale: 1.5
+
+  shrinkRoiToValidGlints:
+    kMaxNoiseArea: 5.0
+    kClusterDistThresh: 80.0
+    kMinClusterSize: 2
+    padding_y: 60
+    kDefaultLowSensitivityThresh: 25.0
+    kPaddingXRatio: 0.2
+
+  determineCornealReflectionROI:
+    kRatioH: 3
+    kRatioV: 1
+    kMinExpandedRoiArea: 50
+    kShrinkRatio: 0.05
+    kMinRemainderArea: 10
+
+  splitGlintsGeometry:
+    kDistanceThresholdX: 100.0
+
+  selectBestGlintsPerCluster:
+    kDistTolerance: 5.0
+    kBrightTolerance: 5.0
+
+  detectCluster:
+    kMinUniqueGlintDist: 2.0
+    kMaxClusterResults: 3
+
+  findGeometry:
+    kMaxMissingPointsToFind: 2
+
+  isGlintRepeated:
+    kMinGlintDist: 1.0
+
+  isGlintGeometryRepeated:
+    kPointMatchTolerance: 0.5
+
+  checkAndPushGlintGeometry:
+    kDangerMaskThresh: 50.0
+    kMinPadding: 5
+    kPaddingRatio: 0.20
+    kDilateKernelSize: 3
+    kDilateIterations: 1
+    kMinValidPixels: 5
+    kTrimRatio: 0.10
