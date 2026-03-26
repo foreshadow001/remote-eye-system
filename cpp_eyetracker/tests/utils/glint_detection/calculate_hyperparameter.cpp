@@ -107,23 +107,25 @@ int main() {
     // ==========================================
     // 1. 硬编码扩展容差 (Extensions) - 代替从 YAML 读取
     // ==========================================
-    CfgNode ext = cfg["recommended_specific_hyperparameter"]["ext"];
     // Pupil
-    const double ext_area       = ext["pupil"]["ext_area"].as<double>();
-    const double ext_points     = ext["pupil"]["ext_points"].as<double>();
-    const double ext_axis       = ext["pupil"]["ext_axis"].as<double>();
-    const double ext_ratio      = ext["pupil"]["ext_ratio"].as<double>();
-    const double ext_solidity   = ext["pupil"]["ext_solidity"].as<double>();
-    const double ext_fit_ratio  = ext["pupil"]["ext_fit_ratio"].as<double>();
-    const double ext_residual   = ext["pupil"]["ext_residual"].as<double>();
-    const double ext_darkness   = ext["pupil"]["ext_darkness"].as<double>();
+    const double ext_area       = 10.0;
+    const double ext_points     = 0.0;
+    const double ext_axis       = 2.0;
+    const double ext_ratio      = 0.1;
+    const double ext_solidity   = 0.05;
+    const double ext_fit_ratio  = 0.05;
+    const double ext_residual   = 0.05;
+    const double ext_darkness   = 5.0;
+    const double ext_offset     = 5.0; // 新增：自适应阈值偏移量的容差
 
     // Glint Global
-    const double ext_lr_x       = ext["glint"]["ext_lr_x"].as<double>();
-    const double ext_lr_y       = ext["glint"]["ext_lr_y"].as<double>();
-    const double ext_bg_bright  = ext["glint"]["ext_bg_bright"].as<double>();
-    const double ext_exclusion  = ext["glint"]["ext_exclusion"].as<double>();
-    const double ext_ratio_xy   = ext["glint"]["ext_ratio_xy"].as<double>(); 
+    const double ext_lr_x       = 1.5;
+    const double ext_lr_y       = 0.5;
+    const double ext_bg_bright  = 5.0;
+    const double ext_exclusion  = 0.2;
+
+    // Glint Ratio (Middle point)
+    const double ext_ratio_xy   = 0.05; 
 
     // 获取分组边界条件 (保持原逻辑：通过 lr_y 进行分段)
     auto raw_conditions = cfg["relaxed_specific_hyperparameter"]["glint"]["middle_point"]["conditions"].as<vector<vector<double>>>();
@@ -135,7 +137,7 @@ int main() {
     // ==========================================
     // 2. 数据容器
     // ==========================================
-    vector<double> p_areas, p_points, p_axes, p_ratios, p_solidities, p_fits, p_residuals, p_darknesses;
+    vector<double> p_areas, p_points, p_axes, p_ratios, p_solidities, p_fits, p_residuals, p_darknesses, p_offsets;
     vector<double> g_lr_xs, g_lr_ys, g_brights, g_exclusions;
     
     map<int, vector<double>> lmx_stats, lmy_stats, rmx_stats, rmy_stats;
@@ -161,7 +163,12 @@ int main() {
                 p_solidities.push_back((double)(*it)["solidity"]);
                 p_fits.push_back((double)(*it)["fit_ratio"]);
                 p_residuals.push_back((double)(float)(*it)["avg_residual"]);
-                p_darknesses.push_back((double)(*it)["darkness"]);
+                
+                double darkness = (double)(*it)["darkness"];
+                double roi_min_val = (double)(*it)["roi_min_val"];
+                p_darknesses.push_back(darkness);
+                // 新增：计算当前瞳孔所需的真实 Offset
+                p_offsets.push_back(darkness - roi_min_val); 
             }
         }
 
@@ -205,29 +212,34 @@ int main() {
     // ==========================================
     int row_h = 400, col_w = 400;
 
-    // --- A. Pupil 统计 ---
-    cv::Mat canvas_pupil(row_h * 2, col_w * 4, CV_8UC3, cv::Scalar(255, 255, 255));
-    auto rr_area = processData(p_areas, ext_area, ext_area, 0.0);
-    auto rr_pts  = processData(p_points, ext_points, 999, 5.0); // 最小轮廓点保底5
-    auto rr_axis = processData(p_axes, 0, ext_axis, 0.0);       // 长轴只关心最大值
-    auto rr_rat  = processData(p_ratios, 0, ext_ratio, 0.0);
-    auto rr_sol  = processData(p_solidities, ext_solidity, 0, 0.0, 1.0);
-    auto rr_fit  = processData(p_fits, ext_fit_ratio, 0, 0.0, 1.0);
-    auto rr_res  = processData(p_residuals, 0, ext_residual, 0.0);
-    auto rr_dark = processData(p_darknesses, 0, ext_darkness, 0.0, 255.0);
+    // --- A. Pupil 统计 (增加至 3 行，容纳 Offset) ---
+    cv::Mat canvas_pupil(row_h * 3, col_w * 4, CV_8UC3, cv::Scalar(255, 255, 255));
+    auto rr_area   = processData(p_areas, ext_area, ext_area, 0.0);
+    auto rr_pts    = processData(p_points, ext_points, 999, 5.0); // 最小轮廓点保底5
+    auto rr_axis   = processData(p_axes, 0, ext_axis, 0.0);       // 长轴只关心最大值
+    auto rr_rat    = processData(p_ratios, 0, ext_ratio, 0.0);
+    auto rr_sol    = processData(p_solidities, ext_solidity, 0, 0.0, 1.0);
+    auto rr_fit    = processData(p_fits, ext_fit_ratio, 0, 0.0, 1.0);
+    auto rr_res    = processData(p_residuals, 0, ext_residual, 0.0);
+    auto rr_dark   = processData(p_darknesses, 0, ext_darkness, 0.0, 255.0);
+    auto rr_offset = processData(p_offsets, 0, ext_offset, 0.0); // 新增：计算 Offset 边界
 
     visualize(canvas_pupil, p_areas, "Area", cv::Rect(0*col_w, 0, col_w, row_h), cv::Scalar(200, 100, 100), rr_area);
     visualize(canvas_pupil, p_points, "Contour Pts", cv::Rect(1*col_w, 0, col_w, row_h), cv::Scalar(100, 200, 100), rr_pts);
     visualize(canvas_pupil, p_axes, "Major Axis", cv::Rect(2*col_w, 0, col_w, row_h), cv::Scalar(100, 100, 200), rr_axis);
     visualize(canvas_pupil, p_ratios, "Axis Ratio", cv::Rect(3*col_w, 0, col_w, row_h), cv::Scalar(150, 150, 50), rr_rat);
+    
     visualize(canvas_pupil, p_solidities, "Solidity", cv::Rect(0*col_w, row_h, col_w, row_h), cv::Scalar(50, 150, 150), rr_sol);
     visualize(canvas_pupil, p_fits, "Fit Ratio", cv::Rect(1*col_w, row_h, col_w, row_h), cv::Scalar(150, 50, 150), rr_fit);
     visualize(canvas_pupil, p_residuals, "Avg Residual", cv::Rect(2*col_w, row_h, col_w, row_h), cv::Scalar(200, 150, 100), rr_res);
     visualize(canvas_pupil, p_darknesses, "Darkness", cv::Rect(3*col_w, row_h, col_w, row_h), cv::Scalar(100, 150, 200), rr_dark);
 
+    // 新增：绘制 Offset 分布（放在第 3 行第 1 列）
+    visualize(canvas_pupil, p_offsets, "Thresh Offset", cv::Rect(0*col_w, row_h*2, col_w, row_h), cv::Scalar(180, 120, 220), rr_offset);
+
     cv::imwrite(output_folder + "\\pupil_stats.png", canvas_pupil);
 
-    // --- B. Glint Global 统计 ---
+    // --- B. Glint Global 统计 (保持不变) ---
     cv::Mat canvas_g_global(row_h, col_w * 4, CV_8UC3, cv::Scalar(255, 255, 255));
     auto rr_lr_y = processData(g_lr_ys, ext_lr_y, ext_lr_y, 0.0);
     auto rr_lr_x = processData(g_lr_xs, ext_lr_x, ext_lr_x, 0.0);
@@ -241,7 +253,7 @@ int main() {
 
     cv::imwrite(output_folder + "\\glint_global_stats.png", canvas_g_global);
 
-    // --- C. Glint Ratio 分组统计 ---
+    // --- C. Glint Ratio 分组统计 (保持不变) ---
     int num_categories = ranges.size();
     cv::Mat canvas_g_ratio(num_categories * row_h, col_w * 4, CV_8UC3, cv::Scalar(255, 255, 255));
     vector<vector<double>> output_conditions;
@@ -283,7 +295,9 @@ int main() {
     cfg.setScalar(prefix_pupil + "kMinFitRatio", rr_fit.rec_min);
     cfg.setScalar(prefix_pupil + "kMaxAvgResidual", rr_res.rec_max);
     cfg.setScalar(prefix_pupil + "kMaxDarkness", rr_dark.rec_max);
-    // 更新 Threshold Max (使用 darkness 作为基准并提供一定偏移)
+    
+    // 新增：更新 kAdaptiveThreshOffset 和 kAdaptiveThreshMax
+    cfg.setScalar(prefix_pupil + "kAdaptiveThreshOffset", rr_offset.rec_max);
     cfg.setScalar(prefix_pupil + "kAdaptiveThreshMax", rr_dark.rec_max + 2.0);
 
     string prefix_glint = "recommended_specific_hyperparameter.glint.";
