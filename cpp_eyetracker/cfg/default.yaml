@@ -125,9 +125,15 @@ collect_glint:
   use_record: true
   record_dir: "D:/hitsz/projects/new_dataset/test_record"
   num_images: 100
+<<<<<<< HEAD
   input_folder: "D:/hitsz/projects/new_dataset/test_record/debug/collect_input"
   output_folder: "D:/hitsz/projects/new_dataset/test_record/collect_output"
 
+=======
+  input_folder: "D:/hitsz/projects/new_dataset/glint_input/front/3_3/debug"
+  output_folder: "D:/hitsz/projects/new_dataset/glint_input/front/3_3/debug/collect_output"
+    
+>>>>>>> f96c68e62c4864c0279ef70ab8238e1f473fd4ad
 original_specific_hyperparameter:
   pupil:
     searchPupilInROI:
@@ -186,6 +192,7 @@ recommended_specific_hyperparameter:
 
     horizontal_pair:
       lr_y_min: 0.000000
+<<<<<<< HEAD
       lr_y_max: 6.500000
       lr_x_min: 7.000000
       lr_x_max: 14.749939
@@ -195,6 +202,36 @@ recommended_specific_hyperparameter:
         - [0, 2, 0.366667, 0.615217, 0.11, 0.322727, 0.384783, 0.633333, 0.158333, 0.341667]
         - [2, 3, 0.45, 0.65, 0.05, 0.216667, 0.35, 0.55, 0.283333, 0.5]
         - [3, 5, 0.476316, 0.686364, 0.00263158, 0.186364, 0.313636, 0.523684, 0.404545, 0.605556]
+=======
+      lr_y_max: 1.000000
+      lr_x_min: 9.500000
+      lr_x_max: 13.000000
+
+  ext:
+    pupil:
+      ext_area: 300.0
+      ext_points: 10.0
+      ext_axis: 10.0
+      ext_ratio: 0.1
+      ext_solidity: 0.05
+      ext_fit_ratio: 0.05
+      ext_residual: 0.05
+      ext_darkness: 5.0
+
+    glint:
+      ext_lr_x: 2.0
+      ext_lr_y: 2.0
+      ext_bg_bright: 5.0
+      ext_exclusion: 0.2
+      ext_ratio_xy: 0.05
+
+    middle_point:
+      conditions:
+        - [0, 2, 0.471739, 0.595455, 0.21087, 0.322727, 0.404545, 0.528261, 0.222727, 0.354348]
+        - [2, 3, 0, 0, 0, 0, 0, 0, 0, 0]
+        - [3, 5, 0, 0, 0, 0, 0, 0, 0, 0]
+
+>>>>>>> f96c68e62c4864c0279ef70ab8238e1f473fd4ad
 relaxed_specific_hyperparameter:
   pupil:
     searchPupilInROI:
@@ -219,15 +256,22 @@ relaxed_specific_hyperparameter:
 
     horizontal_pair:
       lr_y_min: 0
+<<<<<<< HEAD
       lr_y_max: 10
       lr_x_min: 3
       lr_x_max: 25
+=======
+      lr_y_max: 7
+      lr_x_min: 5
+      lr_x_max: 20
+>>>>>>> f96c68e62c4864c0279ef70ab8238e1f473fd4ad
 
     middle_point:
       conditions:
         - [0, 2, 0.2, 0.8, 0.05, 0.55, 0.2, 0.8, 0.05, 0.55]
         - [2, 3, 0.45, 0.7, 0.05, 0.25, 0.3, 0.55, 0.25, 0.5]
         - [3, 5, 0.45, 0.85, 0.04, 0.25, 0.15, 0.55, 0.3, 0.65]
+<<<<<<< HEAD
 
   ext:
     pupil:
@@ -246,6 +290,8 @@ relaxed_specific_hyperparameter:
       ext_bg_bright: 3.0
       ext_exclusion: 0.5
       ext_ratio_xy: 0.05
+=======
+>>>>>>> f96c68e62c4864c0279ef70ab8238e1f473fd4ad
 
 empirical_hyperparameter:
   searchPupilInROI:
@@ -308,8 +354,6 @@ empirical_hyperparameter:
     kPaddingXRatio: 0.2
 
   determineCornealReflectionROI:
-    kRatioH: 3
-    kRatioV: 1
     kMinExpandedRoiArea: 50
     kShrinkRatio: 0.05
     kMinRemainderArea: 10

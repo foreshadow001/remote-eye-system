@@ -120,8 +120,6 @@ TODO:
 
 [determineCornealReflectionROI] - 确定角膜反光ROI
 ⚠️- kConstraintRadiusRatio        = 2.5f;  // 瞳孔种子约束区域半径放大系数 (基于长轴)
-- kRatioH                       = 3;     // 扩展步长循环控制 (水平)
-- kRatioV                       = 1;     // 扩展步长循环控制 (垂直)
 - kMinExpandedRoiArea           = 50;    // 候选区域最小有效面积
 - kShrinkRatio                  = 0.05f; // 边界收缩比例 (去除极边缘部分)
 - kMinRemainderArea             = 10;    // 差集操作后保留的最小碎片面积
@@ -1634,8 +1632,8 @@ std::vector<cv::Rect> GlintDetector::determineCornealReflectionROI()
     // 瞳孔种子约束区域半径放大系数 (基于长轴)
     const float kConstraintRadiusRatio = spec_glint_cfg_["isPupilNearby"]["kExclusionRadiusRatio"].as<float>();
     // 扩展步长循环控制
-    const int kRatioH = emp["kRatioH"].as<int>();
-    const int kRatioV = emp["kRatioV"].as<int>();
+    const int kRatioH = 3;
+    const int kRatioV = 1;
     // 候选区域最小有效面积
     const int kMinExpandedRoiArea = emp["kMinExpandedRoiArea"].as<int>();
     // 边界收缩比例 (去除极边缘部分)
