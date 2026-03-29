@@ -17,18 +17,22 @@ TODO:
 ✅ 1. optimaize side2mid function (add delta y of left and right point as a parameter, and adjust the range accordingly)
 ✅ 2. handle two glints case
         ✅ 2.1 side and mid
-            2.2.1 find possible side and mid pair
-                ⚠️ handle one glint case
+            ✅ 2.2.1 find possible side and mid pair
             ✅ 2.2.2 search for the last side
     ✅ 2.2 side and side: serach for the mid
 4. unify glass and non-glass logic
-    ✅ 5.1 determine ROI
-        ✅ 5.1.1 remove noisy points
-        ✅ 5.1.2 expand the ROI
-    5.2 find pupil center
-    5.3 find best glint pair
-    5.4 automate the calculation of hyperparameters
-5. add temporal filter
+    ✅ 4.1 determine ROI
+        ✅ 4.1.1 remove noisy points
+        ✅ 4.1.2 expand the ROI
+    4.2 find pupil center
+        ⚠️ 4.2.1 remove upper eyelid
+    4.3 find best glint pair
+        4.3.1 within cluster
+        4.3.2 between clusters
+    ✅ 4.4 automate the calculation of hyperparameters
+5. repair the cfg
+    5.1 type transform
+    5.2 error handling
 */
 
 /*
@@ -160,10 +164,17 @@ namespace glintdetection {
 GlintDetector::GlintDetector(const std::string& mode)
     : mode_(mode) 
 {
-    // 根据收集模式加载对应的特异型参数根节点
-    std::string spec_key = (cfg_["collect_glint"]["is_collecting"].as<bool>()) 
+    if (mode_ == "collecting") is_collecting_ = true;
+    
+    std::string spec_key = (is_collecting_) 
         ? "relaxed_specific_hyperparameter" 
         : "recommended_specific_hyperparameter";
+
+    if (is_collecting_) {
+        Logger::info() << "Using relaxed specific hyperparameters.";
+    } else {
+        Logger::info() << "Using recommended specific hyperparameters.";
+    }
 
     spec_pupil_cfg_ = cfg_[spec_key]["pupil"];
     spec_glint_cfg_ = cfg_[spec_key]["glint"];
@@ -176,12 +187,6 @@ GlintDetector::GlintDetector(const std::string& mode)
 	laplacian_kernel_size_ = cfg_["test_glint"]["laplacian_kernel_size"].as<int>();
 	init_threshold_value_ = cfg_["test_glint"]["init_threshold_value"].as<double>();
     threshold_step_ = cfg_["test_glint"]["threshold_step"].as<double>();
-    viz_ = cfg_["test_glint"]["viz"].as<bool>();
-
-    if (cfg_["collect_glint"]["is_collecting"].as<bool>())
-    {
-        viz_ = false;
-    }
 }
 
 bool GlintDetector::side2side(
@@ -645,7 +650,7 @@ void GlintDetector::searchGlassReflections()
                 // 可视化：紫色矩形
                 for (int i = 0; i < 4; i++)
                 {
-                    cv::line(debug_imgs_[0], fr.points[i], fr.points[(i+1)%4], cv::Scalar(255, 0, 255), 2);
+                    cv::line(debug_imgs_[1], fr.points[i], fr.points[(i+1)%4], cv::Scalar(255, 0, 255), 2);
                 }
             }
         }
@@ -654,29 +659,29 @@ void GlintDetector::searchGlassReflections()
         {
             // --- Visualization Logic ---
             // 青色细线：原始的、混乱的轮廓
-            cv::drawContours(debug_imgs_[0], std::vector<std::vector<cv::Point>>{contour}, -1, cv::Scalar(255, 255, 0), 1);
+            cv::drawContours(debug_imgs_[1], std::vector<std::vector<cv::Point>>{contour}, -1, cv::Scalar(255, 255, 0), 1);
             
             // 红色细圆：霍夫变换“投票”出的最可能的完整圆
-            cv::circle(debug_imgs_[0], global_hc_center, static_cast<int>(hc_radius), cv::Scalar(0, 0, 255), 1);
+            cv::circle(debug_imgs_[1], global_hc_center, static_cast<int>(hc_radius), cv::Scalar(0, 0, 255), 1);
             
             // 红色中心点
-            cv::circle(debug_imgs_[0], global_hc_center, 2, cv::Scalar(0, 0, 255), -1);
+            cv::circle(debug_imgs_[1], global_hc_center, 2, cv::Scalar(0, 0, 255), -1);
             
             // 画出 ROI 框方便调试观察
-            cv::rectangle(debug_imgs_[0], roiRect, cv::Scalar(255, 0, 0), 1);
+            cv::rectangle(debug_imgs_[1], roiRect, cv::Scalar(255, 0, 0), 1);
 
             // 蓝色空心圆：算法检测到的镜片反光主体 (Inscribed Circle)
             // 这就是去除了镜框干扰后的结果
-            cv::circle(debug_imgs_[0], dt_center, static_cast<int>(dt_radius), cv::Scalar(255, 0, 0), 1);
+            cv::circle(debug_imgs_[1], dt_center, static_cast<int>(dt_radius), cv::Scalar(255, 0, 0), 1);
             
             // 红色中心点
-            cv::circle(debug_imgs_[0], dt_center, 1, cv::Scalar(255, 0, 0), -1);
+            cv::circle(debug_imgs_[1], dt_center, 1, cv::Scalar(255, 0, 0), -1);
 
             // 标出比值，以便对比
             std::ostringstream oss;
             oss << std::fixed << std::setprecision(1) << ratio;
             cv::putText(
-                debug_imgs_[0], 
+                debug_imgs_[1], 
                 oss.str(), 
                 dt_center + cv::Point2f(dt_radius * 3.0f, - dt_radius * 1.0f), 
                 cv::FONT_HERSHEY_PLAIN, 
@@ -714,13 +719,13 @@ void GlintDetector::visualizePupilAndExclusion()
     for (const auto& pupil : init_pupil_seeds_)
     {
         // 1. Draw pupil ellipse (Green)
-        cv::ellipse(debug_imgs_[1], pupil.rr, cv::Scalar(0, 255, 0), 1);
-        cv::circle(debug_imgs_[1], pupil.rr.center, 2, cv::Scalar(0, 255, 0), -1);
+        cv::ellipse(debug_imgs_[2], pupil.rr, cv::Scalar(0, 255, 0), 1);
+        cv::circle(debug_imgs_[2], pupil.rr.center, 2, cv::Scalar(0, 255, 0), -1);
 
         // 2. Draw exclusion radius (Cyan/Yellow dashed equivalent)
-        float exclusion_radius = pupil.major_axis * kExclusionRadiusRatio;
+        float exclusion_radius = pupil.major_axis * 0.5 * kExclusionRadiusRatio;
         cv::circle(
-            debug_imgs_[1],
+            debug_imgs_[2],
             pupil.rr.center,
             static_cast<int>(exclusion_radius),
             cv::Scalar(0, 200, 255),
@@ -741,7 +746,7 @@ GlintDetector::searchPupilInROI(cv::Rect roi_rect)
     const double kAdaptiveThreshMax = spec["kAdaptiveThreshMax"].as<double>();
     const double kMinPupilArea = spec["kMinPupilArea"].as<double>();
     const double kMaxPupilArea = spec["kMaxPupilArea"].as<double>();
-    const size_t kMinPupilContourPoints = spec["kMinPupilContourPoints"].as<size_t>();
+    const size_t kMinPupilContourPoints = spec["kMinPupilContourPoints"].as<double>();
     const float kMaxPupilAxis = spec["kMaxPupilAxis"].as<float>();
     const float kMaxAxisRatio = spec["kMaxAxisRatio"].as<float>();
     const double kMinSolidity = spec["kMinSolidity"].as<double>();
@@ -752,6 +757,8 @@ GlintDetector::searchPupilInROI(cv::Rect roi_rect)
     const int kMorphKernelSize = emp["kMorphKernelSize"].as<int>();
     const int kMorphCloseIterations = emp["kMorphCloseIterations"].as<int>();
     const float kValidResidualRatio = emp["kValidResidualRatio"].as<float>();
+    const double kAxisRatioTorlerance = emp["kAxisRatioTolerance"].as<double>();
+    const double kMaxAngleAbs = emp["kMaxAngleAbs"].as<double>();
 
     std::vector<Pupil> pupils; 
 
@@ -761,9 +768,15 @@ GlintDetector::searchPupilInROI(cv::Rect roi_rect)
     double min_val;
     cv::minMaxLoc(roi_img, &min_val, nullptr, nullptr, nullptr);
     double adaptive_thresh = std::min(min_val + kAdaptiveThreshOffset, kAdaptiveThreshMax); 
+    Logger::debug() << "[searchPupilInROI] Adaptive threshold: " << adaptive_thresh;
 
     cv::Mat binary_pupil;
     cv::threshold(roi_img, binary_pupil, adaptive_thresh, 255, cv::THRESH_BINARY_INV);
+    if (viz_) {
+        cv::Mat viz = binary_pupil.clone();
+        cv::cvtColor(viz, viz, cv::COLOR_GRAY2BGR);
+        debug_imgs_.push_back(viz);
+    }
 
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(kMorphKernelSize, kMorphKernelSize));
     cv::morphologyEx(binary_pupil, binary_pupil, cv::MORPH_OPEN, kernel);
@@ -775,27 +788,60 @@ GlintDetector::searchPupilInROI(cv::Rect roi_rect)
     for (size_t i = 0; i < contours.size(); ++i)
     {
         double contour_area = cv::contourArea(contours[i]);
-        if (contour_area < kMinPupilArea || contour_area > kMaxPupilArea) continue;
-        if (contours[i].size() < kMinPupilContourPoints) continue;
+        Logger::debug() << "[searchPupilInROI] Checking pupil: (" << contours[i][0].x << ", " << contours[i][0].y << ")";
+        if (contour_area < kMinPupilArea || contour_area > kMaxPupilArea) {
+            Logger::debug() << "[searchPupilInROI] Pupil contour area is out of range: " << contour_area << " | expected: [" << kMinPupilArea << ", " << kMaxPupilArea << "]";
+            continue;
+        }
+        if (contours[i].size() < kMinPupilContourPoints) {
+            Logger::debug() << "[searchPupilInROI] Pupil contour has too few points: " << contours[i].size() << " | expected: >" << kMinPupilContourPoints;
+            continue;
+        }
 
         cv::RotatedRect rr = cv::fitEllipse(contours[i]);
         float major = std::max(rr.size.width, rr.size.height);
         float minor = std::min(rr.size.width, rr.size.height);
         double ellipse_area = (CV_PI * major * minor) / 4.0;
-        
         float axis_ratio = minor > 0 ? (major / minor) : 0.0f;
+        float pupil_angle = rr.angle; 
+        if (pupil_angle > 90.0f) pupil_angle -= 180.0f; 
 
-        if (major > kMaxPupilAxis) continue;
-        if (axis_ratio > kMaxAxisRatio) continue;
-        
+        if (viz_) {
+            // 可视化原始轮廓
+            cv::ellipse(debug_imgs_[0], rr, cv::Scalar(0, 0, 255), 1);
+        }
+
+        if (axis_ratio > kMaxAxisRatio) {
+            Logger::debug() << "[searchPupilInROI] Pupil axis ratio is too large: " << axis_ratio << " | expected: <" << kMaxAxisRatio;
+            continue;       
+        }
+        if ((axis_ratio > kAxisRatioTorlerance) && (std::abs(pupil_angle) > kMaxAngleAbs)) {
+            Logger::debug() << "[searchPupilInROI] Pupil angle is too horizontal: " << pupil_angle 
+                            << " | expected: [-" <<  kMaxAngleAbs << ", " << kMaxAngleAbs << "], axis_ratio: " << axis_ratio;
+            continue;
+        } else {
+            Logger::debug() << "[searchPupilInROI] Pupil angle is within range: " << pupil_angle 
+                            << " | expected: [-" <<  kMaxAngleAbs << ", " << kMaxAngleAbs << "], axis_ratio: " << axis_ratio;
+        }
+        if (major > kMaxPupilAxis) {
+            Logger::debug() << "[searchPupilInROI] Pupil major axis is too large: " << major << " | expected: <" << kMaxPupilAxis;
+            continue;
+        }
+
         std::vector<cv::Point> hull;
         cv::convexHull(contours[i], hull);
         double hull_area = cv::contourArea(hull);
         double solidity = contour_area / hull_area;
-        if (solidity < kMinSolidity) continue;
+        if (solidity < kMinSolidity) {
+            Logger::debug() << "[searchPupilInROI] Pupil solidity is too low: " << solidity << " | expected: >" << kMinSolidity;
+            // continue;
+        }
 
         double fit_ratio = contour_area / ellipse_area;
-        if (fit_ratio < kMinFitRatio) continue;
+        if (fit_ratio < kMinFitRatio) {
+            Logger::debug() << "[searchPupilInROI] Pupil fit ratio is too low: " << fit_ratio << " | expected: >" << kMinFitRatio;
+            // continue;
+        }
 
         // --- 残差计算 ---
         float a = major / 2.0f;
@@ -825,14 +871,28 @@ GlintDetector::searchPupilInROI(cv::Rect roi_rect)
         for (size_t k = 0; k < valid_count; ++k) sum_residual += point_residuals[k];
         float avg_residual = sum_residual / valid_count;
 
-        if (avg_residual > kMaxAvgResidual) continue;
+        if (avg_residual > kMaxAvgResidual) {
+            Logger::debug() << "[searchPupilInROI] Pupil average residual is too high: " << avg_residual << " | expected: <" << kMaxAvgResidual;
+            // continue;
+        }
 
         cv::Mat mask = cv::Mat::zeros(binary_pupil.size(), CV_8UC1);
         cv::drawContours(mask, contours, static_cast<int>(i), cv::Scalar(255), cv::FILLED);
         cv::Scalar mean_val = cv::mean(roi_img_raw, mask);
         double darkness = mean_val[0];
 
-        if (darkness > kMaxDarkness) continue;
+        if (darkness > kMaxDarkness) {
+            Logger::debug() << "[searchPupilInROI] Pupil darkness is too high: " << darkness << " | expected: <" << kMaxDarkness;
+            continue;
+        }
+
+        Logger::debug() << "[searchPupilInROI] pupil accepted";
+
+        if (viz_)
+        {
+            // 可视化pupil
+            cv::ellipse(debug_imgs_[0], rr, cv::Scalar(0, 255, 0), 2);
+        }
 
         // --- 构造 Pupil 对象并记录所有参数 ---
         Pupil p;
@@ -869,7 +929,7 @@ bool GlintDetector::isPupilNearby(const cv::Point2f& glint_pt)
     for (const auto& pupil : init_pupil_seeds_)
     {
         // 只有纯几何距离判断，没有任何暗度/分数计算
-        if ((cv::norm(glint_pt - pupil.rr.center) < (pupil.major_axis * kExclusionRadiusRatio))) {
+        if ((cv::norm(glint_pt - pupil.rr.center) < (pupil.major_axis * 0.5 * kExclusionRadiusRatio))) {
             return true;
         }
     }
@@ -939,7 +999,7 @@ bool GlintDetector::findNeighborInDirection(
     roi &= cv::Rect(0, 0, abs_dst_.cols, abs_dst_.rows);
     if (roi.area() <= 0) return false;
 
-    if (viz_) cv::rectangle(debug_imgs_[1], roi, cv::Scalar(255, 0, 0), 1);
+    if (viz_) cv::rectangle(debug_imgs_[2], roi, cv::Scalar(255, 0, 0), 1);
 
     // 获取 ROI 图像
     cv::Mat roi_img = abs_dst_(roi);
@@ -1032,7 +1092,7 @@ bool GlintDetector::findNeighborInDirection(
             
             // 可视化：画出新发现的这个 Glint
             if (viz_) {
-                cv::circle(debug_imgs_[1], candidate.center, 2, cv::Scalar(255, 255, 0), -1); // 青色点
+                cv::circle(debug_imgs_[2], candidate.center, 2, cv::Scalar(255, 255, 0), -1); // 青色点
             }
         }
         
@@ -1227,7 +1287,7 @@ void GlintDetector::searchFrameReflections()
             for (int i = 0; i < 4; ++i)
             {
                 cv::line(
-                    debug_imgs_[1],
+                    debug_imgs_[2],
                     fr.points[i],
                     fr.points[(i + 1) % 4],
                     cv::Scalar(0, 0, 255), 
@@ -1237,7 +1297,7 @@ void GlintDetector::searchFrameReflections()
 
             // 标出角度
             cv::Point2f angle_pt = fr.center + cv::Point2f(0.75f * fr.length, - 1.5f * fr.width);
-            cv::putText(debug_imgs_[1],
+            cv::putText(debug_imgs_[2],
                         std::to_string(static_cast<int>(fr.angle_deg)) + "deg",
                         angle_pt,
                         cv::FONT_HERSHEY_PLAIN,
@@ -1266,12 +1326,12 @@ void GlintDetector::searchFrameReflections()
 
                     // 1. 画连接线 (连成一条龙)
                     if (i > 0) {
-                        cv::line(debug_imgs_[1], chain[i-1].center, fr.center, 
+                        cv::line(debug_imgs_[2], chain[i-1].center, fr.center, 
                                 cv::Scalar(255, 255, 0), 1); // 蓝色连线
                     }
 
                     // 2. 标序号
-                    cv::putText(debug_imgs_[1], std::to_string(i), fr.center + cv::Point2f(0, -10), 
+                    cv::putText(debug_imgs_[2], std::to_string(i), fr.center + cv::Point2f(0, -10), 
                                 cv::FONT_HERSHEY_PLAIN, 1.0, cv::Scalar(0, 255, 0), 1);
                 }
             }
@@ -1612,7 +1672,7 @@ std::vector<cv::Rect> GlintDetector::determineCornealReflectionROI()
         debug_pupil_centers.push_back(seed_pt);
 
         // Dynamic constraint based on pupil size
-        float constraint_radius = pupil.major_axis * kConstraintRadiusRatio;
+        float constraint_radius = pupil.major_axis * 0.5 * kConstraintRadiusRatio;
         
         cv::Rect pupil_constraint_rect(
             static_cast<int>(seed_pt.x - constraint_radius),
@@ -1917,7 +1977,7 @@ GlintDetector::findBestPupilForCluster(const std::vector<cv::Rect>& cluster_rois
 {
     Pupil best_pupil;
     // 初始化为一个无效/空的瞳孔，确保任何找到的第一个合法瞳孔都会被选中
-    best_pupil.major_axis = -1.0f;
+    best_pupil.area = -1.0f;
 
     if (init_pupil_seeds_.empty() || cluster_rois.empty()) {
         return best_pupil;
@@ -1937,18 +1997,18 @@ GlintDetector::findBestPupilForCluster(const std::vector<cv::Rect>& cluster_rois
 
         if (belongs_to_cluster) {
             // 择优标准：长轴最长 (major_axis)
-            if (pupil.major_axis > best_pupil.major_axis) {
+            if (pupil.area > best_pupil.area) {
                 best_pupil = pupil;
             }
         }
     }
     
     // [修改] 移除 found 标志位，直接通过 best_pupil 的状态判断
-    if (best_pupil.major_axis > 0) {
+    if (best_pupil.area > 0) {
         Logger::debug() << "[ClusterPupil] Selected pupil for cluster. Center: (" 
                         << static_cast<int>(best_pupil.rr.center.x) << ", " 
                         << static_cast<int>(best_pupil.rr.center.y) 
-                        << "), Major Axis: " << best_pupil.major_axis;
+                        << "), Area: " << best_pupil.area;
     } else {
         Logger::debug() << "[ClusterPupil] No matching pupil found for this cluster.";
     }
@@ -2114,7 +2174,11 @@ std::tuple<
 >
 GlintDetector::detect(cv::Mat gray)
 {
+    if (local_debug_) Logger::setLevel(Logger::Level::DEBUG);
+    if (!local_debug_ && debug_time_) Logger::setLevel(Logger::Level::TIME);
+    if (!local_debug_ && !debug_time_) Logger::setLevel(Logger::Level::INFO);
     Logger::ScopedTimer timer("[GlintDetector::detectFullImage]");
+    
     debug_imgs_.clear();
     final_geometries_.clear();
 
@@ -2124,7 +2188,7 @@ GlintDetector::detect(cv::Mat gray)
     cv::GaussianBlur(gray, gaussed_, cv::Size(gaussian_kernel_size_, gaussian_kernel_size_), 0, 0, cv::BORDER_DEFAULT);
     cv::Laplacian(gaussed_, laplaced_, CV_16S, laplacian_kernel_size_, laplacian_scale_, laplacian_delta_, cv::BORDER_DEFAULT);
     cv::convertScaleAbs(laplaced_, abs_dst_);
-    cv::threshold(abs_dst_, threshold_output_, cfg_["test_glint"]["debug_threshold_value"].as<double>(), 255, cv::THRESH_BINARY);
+    cv::threshold(abs_dst_, threshold_output_, threshold_step_, 255, cv::THRESH_BINARY);
 
     // 4 Get ROI (Populates init_pupil_seeds_)
     auto rois = getROI();
@@ -2134,6 +2198,8 @@ GlintDetector::detect(cv::Mat gray)
     auto clusters = clusterROIs(rois);
     
     std::vector<GlintGeometry> all_geometries;
+
+    if (!cfg_["test_glint"]["debug_geometry"].as<bool>()) Logger::setLevel(Logger::Level::TIME);
 
     // 5.2 对每个区域独立处理
     for (int i = 0; i < clusters.size(); ++i)
@@ -2157,34 +2223,31 @@ GlintDetector::detect(cv::Mat gray)
     timer.lap("[6] Select Best Glints Per Cluster");
 
     // viz
-    if (viz_)
-    {
+    if (viz_) {
         std::vector<GlintGeometry> viz_geometries;
-        if (cfg_["collect_glint"]["is_collecting"].as<bool>())
-        {
+        if (is_collecting_) {
             viz_geometries = all_geometries;
         } else {
             viz_geometries = best_geometries;
         }
 
-        for (const auto& geo : viz_geometries)
-        {
+        for (const auto& geo : viz_geometries) {
             // 6. Debug 可视化 (更新：绘制被排除的区域)
             cv::Scalar color;
             color = geo.on_cornea ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255);
 
-            cv::line(debug_imgs_[3], geo.l_pt, geo.r_pt, color, 1, cv::LINE_AA);
-            cv::line(debug_imgs_[3], geo.l_pt, geo.m_pt, color, 1, cv::LINE_AA);
-            cv::line(debug_imgs_[3], geo.r_pt, geo.m_pt, color, 1, cv::LINE_AA);
+            cv::line(debug_imgs_[4], geo.l_pt, geo.r_pt, color, 1, cv::LINE_AA);
+            cv::line(debug_imgs_[4], geo.l_pt, geo.m_pt, color, 1, cv::LINE_AA);
+            cv::line(debug_imgs_[4], geo.r_pt, geo.m_pt, color, 1, cv::LINE_AA);
             
-            cv::putText(debug_imgs_[3], std::to_string((int)geo.bg_brightness), 
+            cv::putText(debug_imgs_[4], std::to_string((int)geo.bg_brightness), 
                         geo.center() + cv::Point2f(10, -10), cv::FONT_HERSHEY_PLAIN, 0.8, color, 1);
         }
     }
 
     // 7. Split
     std::vector<std::vector<cv::Point2f>> glint_geometry_list;
-    if (cfg_["collect_glint"]["is_collecting"].as<bool>())
+    if (is_collecting_)
     {
         glint_geometry_list = glintGeometryListToGlintVectors(all_geometries);
         final_geometries_ = all_geometries;

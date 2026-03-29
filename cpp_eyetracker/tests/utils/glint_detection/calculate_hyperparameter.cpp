@@ -107,7 +107,7 @@ int main() {
     // ==========================================
     // 1. 硬编码扩展容差 (Extensions) - 代替从 YAML 读取
     // ==========================================
-    CfgNode ext = cfg["recommended_specific_hyperparameter"]["ext"];
+    CfgNode ext = cfg["relaxed_specific_hyperparameter"]["ext"];
     // Pupil
     const double ext_area       = ext["pupil"]["ext_area"].as<double>();
     const double ext_points     = ext["pupil"]["ext_points"].as<double>();
@@ -135,7 +135,7 @@ int main() {
     // ==========================================
     // 2. 数据容器
     // ==========================================
-    vector<double> p_areas, p_points, p_axes, p_ratios, p_solidities, p_fits, p_residuals, p_darknesses;
+    vector<double> p_areas, p_points, p_axes, p_ratios, p_solidities, p_fits, p_residuals, p_darknesses, p_offsets;
     vector<double> g_lr_xs, g_lr_ys, g_brights, g_exclusions;
     
     map<int, vector<double>> lmx_stats, lmy_stats, rmx_stats, rmy_stats;
@@ -161,7 +161,12 @@ int main() {
                 p_solidities.push_back((double)(*it)["solidity"]);
                 p_fits.push_back((double)(*it)["fit_ratio"]);
                 p_residuals.push_back((double)(float)(*it)["avg_residual"]);
-                p_darknesses.push_back((double)(*it)["darkness"]);
+
+                double darkness = (double)(*it)["darkness"];
+                double roi_min_val = (double)(*it)["roi_min_val"];
+                p_darknesses.push_back(darkness);
+                // 新增：计算当前瞳孔所需的真实 Offset
+                p_offsets.push_back(darkness - roi_min_val);
             }
         }
 
@@ -215,6 +220,7 @@ int main() {
     auto rr_fit  = processData(p_fits, ext_fit_ratio, 0, 0.0, 1.0);
     auto rr_res  = processData(p_residuals, 0, ext_residual, 0.0);
     auto rr_dark = processData(p_darknesses, 0, ext_darkness, 0.0, 255.0);
+    auto rr_offset = processData(p_offsets, 0, ext_darkness, 0.0);
 
     visualize(canvas_pupil, p_areas, "Area", cv::Rect(0*col_w, 0, col_w, row_h), cv::Scalar(200, 100, 100), rr_area);
     visualize(canvas_pupil, p_points, "Contour Pts", cv::Rect(1*col_w, 0, col_w, row_h), cv::Scalar(100, 200, 100), rr_pts);
@@ -224,6 +230,7 @@ int main() {
     visualize(canvas_pupil, p_fits, "Fit Ratio", cv::Rect(1*col_w, row_h, col_w, row_h), cv::Scalar(150, 50, 150), rr_fit);
     visualize(canvas_pupil, p_residuals, "Avg Residual", cv::Rect(2*col_w, row_h, col_w, row_h), cv::Scalar(200, 150, 100), rr_res);
     visualize(canvas_pupil, p_darknesses, "Darkness", cv::Rect(3*col_w, row_h, col_w, row_h), cv::Scalar(100, 150, 200), rr_dark);
+    visualize(canvas_pupil, p_offsets, "Thresh Offset", cv::Rect(0*col_w, row_h*2, col_w, row_h), cv::Scalar(180, 120, 220), rr_offset);
 
     cv::imwrite(output_folder + "\\pupil_stats.png", canvas_pupil);
 
@@ -283,8 +290,8 @@ int main() {
     cfg.setScalar(prefix_pupil + "kMinFitRatio", rr_fit.rec_min);
     cfg.setScalar(prefix_pupil + "kMaxAvgResidual", rr_res.rec_max);
     cfg.setScalar(prefix_pupil + "kMaxDarkness", rr_dark.rec_max);
-    // 更新 Threshold Max (使用 darkness 作为基准并提供一定偏移)
-    cfg.setScalar(prefix_pupil + "kAdaptiveThreshMax", rr_dark.rec_max + 2.0);
+    // cfg.setScalar(prefix_pupil + "kAdaptiveThreshOffset", rr_offset.rec_max);
+    // cfg.setScalar(prefix_pupil + "kAdaptiveThreshMax", rr_dark.rec_max);
 
     string prefix_glint = "recommended_specific_hyperparameter.glint.";
     cfg.setScalar(prefix_glint + "isPupilNearby.kExclusionRadiusRatio", rr_excl.rec_max);

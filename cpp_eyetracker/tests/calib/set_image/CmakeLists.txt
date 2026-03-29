@@ -4,14 +4,12 @@ find_package(OpenCV CONFIG REQUIRED)
 
 set(TEST_IMAGE_SOURCES
     test_image.cpp
-    
-    ${CMAKE_SOURCE_DIR}/calib/set_image/src/create_image.cpp
 )
 
 add_executable(test_image ${TEST_IMAGE_SOURCES})
 
 target_link_libraries(test_image
     PRIVATE
-        eyetracker::set_image
+        eyetracker::cfg
         ${OpenCV_LIBS}
 )

@@ -8,17 +8,11 @@ using namespace visualization;
 
 int main() {
     Cfg cfg;
-    GlintDetector glint_detector("inference");
-    if (cfg["test_glint"]["debug_time"].as<bool>())
-    {
-        Logger::setLevel(Logger::Level::TIME);
-    }
-
-    if (cfg["test_glint"]["local_debug"].as<bool>())
-    {
-        Logger::setLevel(Logger::Level::DEBUG);
-        glint_detector.local_debug_ = true;
-    }
+    std::string mode = cfg["test_glint"]["mode"].as<std::string>();
+    GlintDetector glint_detector(mode);
+    glint_detector.setLocalDebug(cfg["test_glint"]["local_debug"].as<bool>());
+    glint_detector.setDebugTime(cfg["test_glint"]["debug_time"].as<bool>());
+    glint_detector.setViz(cfg["test_glint"]["viz"].as<bool>());
 
     std::string input_folder = cfg["test_glint"]["input_folder"].as<std::string>();
     std::string threshold_output_folder = input_folder + "\\threshold_output";
@@ -35,10 +29,11 @@ int main() {
     }
 
     std::vector<std::string> sub_dirs = {
-        "\\0_glass_reflection",
-        "\\1_frame_reflection",
-        "\\2_exclusion_mask",
-        "\\3_res"
+        "\\0_binary_pupil",
+        "\\1_glass_reflection",
+        "\\2_frame_reflection",
+        "\\3_exclusion_mask",
+        "\\4_res"
     };
 
     std::string search_path = input_folder + "\\*.*";
@@ -51,6 +46,8 @@ int main() {
 
     int idx = 0;
     int max_images = cfg["test_glint"]["num_images"].as<int>();
+
+    Logger::info() << "Start processing images...";
 
     do {
         std::string filename = fd.cFileName;
@@ -72,8 +69,10 @@ int main() {
                 continue;
             }
 
+            Logger::debug() << "Entering detect()...";
             // 调用 glint 检测
             auto [leftEyeGlintsList, rightEyeGlintsList] = glint_detector.detect(img);
+            Logger::debug() << "Exiting detect()...";
 
             std::vector<std::vector<cv::Point2d>> left_glints_list, right_glints_list;
             for (const auto& leftGlints : leftEyeGlintsList)

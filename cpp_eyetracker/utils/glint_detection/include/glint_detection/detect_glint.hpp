@@ -36,14 +36,16 @@ public:
     cv::Mat threshold_output_;
     std::vector<cv::Mat> debug_imgs_;
     bool local_debug_ = false;
+    bool debug_time_ = false;
     bool viz_ = false;
-    // 获取所有候选瞳孔
-    const std::vector<Pupil>& getPupils() const { return init_pupil_seeds_; }
+    bool is_collecting_ = false;
     
-    // 注意：为了获取完整的 GlintGeometry 参数，你需要将 detect() 函数中局部收集的 
-    // all_geometries 保存为类的成员变量，例如添加一个 std::vector<GlintGeometry> final_geometries_;
-    // 并在 detect() 返回前赋值。然后提供获取接口：
+    const std::vector<Pupil>& getPupils() const { return init_pupil_seeds_; }
     const std::vector<GlintGeometry>& getGlintGeometries() const { return final_geometries_; }
+
+    void setViz(bool viz) { viz_ = viz; }
+    void setLocalDebug(bool local_debug) { local_debug_ = local_debug; }
+    void setDebugTime(bool debug_time) { debug_time_ = debug_time; }
 
 private:
     enum class EyeType { Left, Right };

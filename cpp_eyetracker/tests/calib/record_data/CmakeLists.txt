@@ -3,22 +3,16 @@
 find_package(OpenCV REQUIRED)
 
 set(TEST_RECORD_CALIB_SOURCES
-    test_record_calib.cpp
-    ${CMAKE_SOURCE_DIR}/utils/cam/src/basler.cpp
-    ${CMAKE_SOURCE_DIR}/calib/set_image/src/create_image.cpp
+    test_record.cpp
 )
 
-add_executable(test_record_calib ${TEST_RECORD_CALIB_SOURCES})
+add_executable(test_record ${TEST_RECORD_CALIB_SOURCES})
 
-target_link_libraries(test_record_calib
+target_link_libraries(test_record
     PRIVATE
         eyetracker::cam
-        eyetracker::set_image
+        eyetracker::cfg
         ${OpenCV_LIBS}
 )
 
-set_target_properties(test_record_calib PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-)
-
-message(STATUS "✅ test_record_calib will be built and linked with eyetracker::cam")
+message(STATUS "✅ test_record_calib will be built")

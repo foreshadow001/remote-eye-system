@@ -1,3 +1,7 @@
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
 #include "glint_detection/detect_glint.hpp"
 #include "cfg/config.hpp"
 #include "utils/visualize.hpp"
@@ -6,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <algorithm>
 
 using namespace glintdetection;
 namespace fs = std::filesystem;
@@ -75,12 +80,69 @@ void saveMetaData(const std::string& filepath, const std::vector<PupilMeta>& pup
     fs.release();
 }
 
-// 第一阶段：处理图像，提取特征并保存可视化图
-void processAndSaveData(Cfg& cfg) {
-    GlintDetector glint_detector("inference");
+// ================== 从录制文件提取中值帧 ==================
+void prepareRecordData(const std::string& save_dir, const std::string& collect_input_dir) {
+    if (!fs::exists(save_dir)) {
+        Logger::error() << "Source save_dir does not exist: " << save_dir;
+        return;
+    }
 
-    std::string input_folder = cfg["collect_glint"]["input_folder"].as<std::string>();
-    std::string output_folder = cfg["collect_glint"]["output_folder"].as<std::string>();
+    if (fs::exists(collect_input_dir)) return;
+
+    if (!fs::exists(collect_input_dir)) {
+        fs::create_directories(collect_input_dir);
+    }
+
+    for (const auto& entry : fs::directory_iterator(save_dir)) {
+        if (!entry.is_directory()) continue;
+        
+        std::string rec_name = entry.path().filename().string();
+        if (rec_name.find("record_") != 0) continue; 
+        
+        std::string timestamp = rec_name.substr(7); 
+
+        for (const auto& cam_entry : fs::directory_iterator(entry.path())) {
+            if (!cam_entry.is_directory()) continue;
+            
+            std::string cam_name = cam_entry.path().filename().string();
+            if (cam_name.find("cam_") != 0) continue;
+
+            std::vector<fs::path> jpg_files;
+            for (const auto& file_entry : fs::directory_iterator(cam_entry.path())) {
+                if (file_entry.is_regular_file() && file_entry.path().extension() == ".jpg") {
+                    jpg_files.push_back(file_entry.path());
+                }
+            }
+
+            if (jpg_files.empty()) continue;
+
+            std::sort(jpg_files.begin(), jpg_files.end());
+
+            size_t mid_idx = jpg_files.size() / 2;
+            fs::path mid_file = jpg_files[mid_idx];
+            std::string frame_str = mid_file.stem().string();
+
+            std::string new_filename = timestamp + "_" + cam_name + "_" + frame_str + ".jpg";
+            fs::path dest_path = fs::path(collect_input_dir) / new_filename;
+
+            if (!fs::exists(dest_path)) {
+                try {
+                    fs::copy_file(mid_file, dest_path, fs::copy_options::overwrite_existing);
+                    // Logger::info() << "Extracted middle frame: " << new_filename;
+                } catch (const fs::filesystem_error& e) {
+                    Logger::error() << "Failed to copy file: " << e.what();
+                }
+            }
+        }
+    }
+}
+// ===============================================================
+
+// 第一阶段：处理图像，提取特征并保存可视化图
+void processAndSaveData(const std::string& input_folder, const std::string& output_folder, int max_images) {
+    GlintDetector glint_detector("collecting");
+    glint_detector.setViz(false);
+    glint_detector.setLocalDebug(false);
 
     if (!fs::exists(output_folder)) fs::create_directories(output_folder);
 
@@ -89,12 +151,11 @@ void processAndSaveData(Cfg& cfg) {
     HANDLE hFind = FindFirstFile(search_path.c_str(), &fd);
     
     if (hFind == INVALID_HANDLE_VALUE) {
-        Logger::error() << "Input folder does not exist: " << input_folder;
+        Logger::error() << "Input folder does not exist or empty: " << input_folder;
         return;
     }
 
     int count = 0;
-    int max_images = cfg["collect_glint"]["num_images"].as<int>();
 
     do {
         std::string filename = fd.cFileName;
@@ -107,7 +168,6 @@ void processAndSaveData(Cfg& cfg) {
         std::string current_img_out_dir = output_folder + "\\" + filename_no_ext;
         std::string metadata_path = current_img_out_dir + "\\metadata.yml";
 
-        // 【新增逻辑】：如果 metadata.yml 已经存在，说明之前处理过，直接跳过提取阶段
         if (fs::exists(metadata_path)) {
             Logger::info() << "Metadata already exists, skipping extraction for: " << filename;
             if (++count >= max_images) break; 
@@ -117,10 +177,8 @@ void processAndSaveData(Cfg& cfg) {
         cv::Mat img = cv::imread(filepath, cv::IMREAD_GRAYSCALE);
         if (img.empty()) continue;
 
-        // 运行检测
         glint_detector.detect(img);
 
-        // 创建当前图像的专属目录
         std::string pupil_dir = current_img_out_dir + "\\pupil";
         std::string glint_dir = current_img_out_dir + "\\glint";
         fs::create_directories(pupil_dir);
@@ -168,7 +226,7 @@ void processAndSaveData(Cfg& cfg) {
                 double d1 = cv::norm(g.l_pt - g.linked_pupil.rr.center);
                 double d2 = cv::norm(g.r_pt - g.linked_pupil.rr.center);
                 double d3 = cv::norm(g.m_pt - g.linked_pupil.rr.center);
-                max_dist_ratio = std::max({d1, d2, d3}) / g.linked_pupil.major_axis;
+                max_dist_ratio = std::max({d1, d2, d3}) / (g.linked_pupil.major_axis * 0.5);
             }
 
             GlintMeta gm = {
@@ -180,18 +238,21 @@ void processAndSaveData(Cfg& cfg) {
             glint_metas.push_back(gm);
 
             cv::Mat viz = bgr_img.clone();
-            cv::line(viz, g.l_pt, g.r_pt, cv::Scalar(0, 255, 255), 2);
-            cv::line(viz, g.l_pt, g.m_pt, cv::Scalar(0, 255, 255), 2);
-            cv::line(viz, g.r_pt, g.m_pt, cv::Scalar(0, 255, 255), 2);
-            cv::circle(viz, g.l_pt, 3, cv::Scalar(0, 0, 255), -1);
-            cv::circle(viz, g.r_pt, 3, cv::Scalar(0, 0, 255), -1);
-            cv::circle(viz, g.m_pt, 3, cv::Scalar(255, 0, 0), -1);
+            // --- 修复：根据要求调整为绘制 1 个像素宽度的纯绿线，且不画点 ---
+            cv::line(viz, g.l_pt, g.r_pt, cv::Scalar(0, 255, 0), 1);
+            cv::line(viz, g.l_pt, g.m_pt, cv::Scalar(0, 255, 0), 1);
+            cv::line(viz, g.r_pt, g.m_pt, cv::Scalar(0, 255, 0), 1);
+
+            if (g.linked_pupil.major_axis > 0) {
+                cv::circle(viz, g.linked_pupil.rr.center, 3, cv::Scalar(0, 0, 255), -1);
+            }
+            
             cv::imwrite(glint_dir + "\\" + std::to_string(i) + ".png", viz);
         }
 
         saveMetaData(metadata_path, pupil_metas, glint_metas);
         
-        Logger::info() << "Processed and saved: " << filename;
+        // Logger::info() << "Processed and saved: " << filename;
         
         if (++count >= max_images) break;
 
@@ -200,21 +261,31 @@ void processAndSaveData(Cfg& cfg) {
 }
 
 // 第二阶段：交互式人工筛选
-void manualReviewData(Cfg& cfg) {
-    std::string output_folder = cfg["collect_glint"]["output_folder"].as<std::string>();
+void manualReviewData(const std::string& output_folder) {
     std::string win_name = "Data Collector Review";
     cv::namedWindow(win_name, cv::WINDOW_AUTOSIZE);
 
     bool exit_early = false;
 
+    // 先收集所有有效的检测目录以便计算总数展示进度
+    std::vector<fs::path> valid_directories;
     for (const auto& entry : fs::directory_iterator(output_folder)) {
         if (!entry.is_directory()) continue;
-        
-        std::string img_folder = entry.path().string();
-        std::string yml_path = img_folder + "\\metadata.yml";
-        if (!fs::exists(yml_path)) continue;
+        std::string yml_path = entry.path().string() + "\\metadata.yml";
+        if (fs::exists(yml_path)) {
+            valid_directories.push_back(entry.path());
+        }
+    }
 
-        // 1. 读取现有的 Metadata 到结构体中，同时提取已有的 is_valid 状态
+    int total_images = valid_directories.size();
+
+    for (int idx = 0; idx < total_images; ++idx) {
+        const auto& img_path = valid_directories[idx];
+        std::string img_folder = img_path.string();
+        std::string img_name = img_path.filename().string();
+        std::string yml_path = img_folder + "\\metadata.yml";
+
+        // 1. 读取现有的 Metadata
         cv::FileStorage fs_read(yml_path, cv::FileStorage::READ);
         cv::FileNode pupil_nodes = fs_read["Pupils"];
         cv::FileNode glint_nodes = fs_read["Glints"];
@@ -231,7 +302,7 @@ void manualReviewData(Cfg& cfg) {
             pm.solidity       = (double)(*it)["solidity"];
             pm.fit_ratio      = (double)(*it)["fit_ratio"];
             pm.avg_residual   = (float)(*it)["avg_residual"];
-            pm.is_valid       = (int)(*it)["is_valid"] != 0; // 加载原有状态
+            pm.is_valid       = (int)(*it)["is_valid"] != 0; 
             pupils.push_back(pm);
         }
 
@@ -246,12 +317,12 @@ void manualReviewData(Cfg& cfg) {
             gm.rm_y_ratio     = (double)(*it)["rm_y_ratio"];
             gm.max_exclusion_radius_ratio = (double)(*it)["max_exclusion_radius_ratio"];
             gm.bg_brightness  = (double)(*it)["bg_brightness"];
-            gm.is_valid       = (int)(*it)["is_valid"] != 0; // 加载原有状态
+            gm.is_valid       = (int)(*it)["is_valid"] != 0; 
             glints.push_back(gm);
         }
-        fs_read.release(); // 释放对 metadata.yml 的占用，允许后续重新写入
+        fs_read.release(); 
 
-        // 2. 加载图片路径（用序号强制对齐，修复 fs::directory_iterator 顺序错乱导致的选中错位）
+        // 2. 加载图片路径
         std::vector<std::string> pupil_imgs, glint_imgs;
         for (size_t i = 0; i < pupils.size(); ++i) {
             pupil_imgs.push_back(img_folder + "\\pupil\\" + std::to_string(i) + ".png");
@@ -280,71 +351,160 @@ void manualReviewData(Cfg& cfg) {
 
                 bool is_selected = (mode == 0) ? pupils[current_idx].is_valid : glints[current_idx].is_valid;
                 
-                // 绘制交互状态 UI
+                // --- 显示总体进度和文件名 ---
+                std::string progress_str = "Progress: " + std::to_string(idx + 1) + " / " + std::to_string(total_images) + " | File: " + img_name;
+                cv::putText(display_img, progress_str, cv::Point(20, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
+
+                // --- 显示类别内部状态 ---
                 std::string mode_str = (mode == 0) ? "MODE: PUPIL" : "MODE: GLINT";
                 cv::putText(display_img, mode_str + "[" + std::to_string(current_idx+1) + "/" + std::to_string(current_total) + "]", 
-                            cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(255, 255, 0), 2);
+                            cv::Point(20, 65), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 0), 2);
                 
                 if (is_selected) {
                     cv::rectangle(display_img, cv::Point(0,0), cv::Point(display_img.cols-1, display_img.rows-1), cv::Scalar(0, 255, 0), 10);
-                    cv::putText(display_img, "SELECTED", cv::Point(20, 90), cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0, 255, 0), 3);
+                    cv::putText(display_img, "SELECTED", cv::Point(20, 110), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 3);
                 } else {
-                    cv::putText(display_img, "REJECTED (Space to Keep)", cv::Point(20, 90), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
+                    cv::putText(display_img, "REJECTED (Space to Keep)", cv::Point(20, 110), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 255), 2);
                 }
             } else {
                 display_img = cv::Mat::zeros(600, 800, CV_8UC3);
+                cv::putText(display_img, "Progress: " + std::to_string(idx + 1) + " / " + std::to_string(total_images) + " | File: " + img_name, 
+                            cv::Point(20, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
                 cv::putText(display_img, "NO DATA IN THIS CATEGORY", cv::Point(50, 300), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(255, 255, 255), 2);
             }
 
-            cv::imshow(win_name, display_img);
-            int key = cv::waitKey(0);
+            // ========== 新增：右侧侧边栏参数显示逻辑 ==========
+            int panel_width = 350; // 右侧面板宽度
+            cv::Mat canvas = cv::Mat::zeros(display_img.rows, display_img.cols + panel_width, CV_8UC3);
+            display_img.copyTo(canvas(cv::Rect(0, 0, display_img.cols, display_img.rows)));
+
+            if (current_total > 0) {
+                int text_x = display_img.cols + 20;
+                int start_y = 50;
+                int step_y = 35;
+
+                cv::putText(canvas, "--- Parameters ---", cv::Point(text_x, start_y), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
+                start_y += step_y + 10;
+
+                auto putKV = [&](const std::string& k, double v) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "%s: %.3f", k.c_str(), v);
+                    cv::putText(canvas, buf, cv::Point(text_x, start_y), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 1);
+                    start_y += step_y;
+                };
+
+                if (mode == 0) {
+                    const auto& pm = pupils[current_idx];
+                    putKV("roi_min_val", pm.roi_min_val);
+                    putKV("darkness", pm.darkness);
+                    putKV("area", pm.area);
+                    putKV("contour_points", (double)pm.contour_points);
+                    putKV("major_axis", pm.major_axis);
+                    putKV("axis_ratio", pm.axis_ratio);
+                    putKV("solidity", pm.solidity);
+                    putKV("fit_ratio", pm.fit_ratio);
+                    putKV("avg_residual", pm.avg_residual);
+                } else {
+                    const auto& gm = glints[current_idx];
+                    putKV("lr_y", gm.lr_y);
+                    putKV("lr_x", gm.lr_x);
+                    // 排除要求外的 xy ratio
+                    putKV("max_excl_rad_ratio", gm.max_exclusion_radius_ratio);
+                    putKV("bg_brightness", gm.bg_brightness);
+                }
+            }
+
+            cv::imshow(win_name, canvas); // 替换原来的 cv::imshow(win_name, display_img);
+            // ===================================================
+
+            int key = cv::waitKeyEx(0);
 
             switch (key) {
-                case ' ': // Space: Toggle selection
+                case ' ': 
                     if (current_total > 0) {
                         if (mode == 0) pupils[current_idx].is_valid = !pupils[current_idx].is_valid;
                         else glints[current_idx].is_valid = !glints[current_idx].is_valid;
                     }
                     break;
-                case '\t': // Tab: Switch mode
+                // 2. 将 Tab 替换为 上/下 方向键
+                case 2490368: // Windows 上方向键
+                case 2621440: // Windows 下方向键
+                case 65362:   // Linux/Mac 上方向键
+                case 65364:   // Linux/Mac 下方向键
                     mode = 1 - mode;
                     break;
-                case 'a': // A / Left Arrow (Alternative to navigate inside category)
+                // 3. 将 'a' 替换为 左方向键
+                case 2424832: // Windows 左方向键
+                case 65361:   // Linux/Mac 左方向键
                     if (mode == 0 && p_idx > 0) p_idx--;
                     if (mode == 1 && g_idx > 0) g_idx--;
                     break;
-                case 'd': // D / Right Arrow
+                // 4. 将 'd' 替换为 右方向键
+                case 2555904: // Windows 右方向键
+                case 65363:   // Linux/Mac 右方向键
                     if (mode == 0 && p_idx < (int)pupil_imgs.size() - 1) p_idx++;
                     if (mode == 1 && g_idx < (int)glint_imgs.size() - 1) g_idx++;
                     break;
-                case 13: // Enter: Next Image
+                // ========== 新增：Backspace 退回上一张图片 ==========
+                case 8: // Backspace 键值
+                    next_image = true;
+                    if (idx > 0) {
+                        idx -= 2; // -1表示回退，再-1抵消for循环结尾的++idx
+                    } else {
+                        idx = -1; // 已经是第一张时，保持在第一张 (抵消++idx后为0)
+                    }
+                    break;
+                // ==================================================
+                case 13: // Enter
                     next_image = true;
                     break;
-                case 27: // Esc: Exit review early
+                case 27: // Esc
                     next_image = true;
                     exit_early = true;
                     break;
             }
         }
 
-        // 3. 复用现有的 saveMetaData 进行保存，替代原来复杂且容易格式损坏的节点重写
         saveMetaData(yml_path, pupils, glints);
-
         if (exit_early) return;
     }
 }
 
 int main() {
     Cfg cfg;
+
+    bool use_record = false;
+    try {
+        use_record = cfg["collect_glint"]["use_record"].as<bool>();
+    } catch (...) {
+        Logger::info() << "use_record not found in config. Defaulting to false.";
+    }
+
+    std::string input_folder = cfg["collect_glint"]["input_folder"].as<std::string>();
+    std::string output_folder = cfg["collect_glint"]["output_folder"].as<std::string>();
+    int max_images = cfg["collect_glint"]["num_images"].as<int>();
+
+    // 如果启用了从录制中抽取图片
+    if (use_record) {
+        Logger::info() << "use_record is enabled. Preparing data from test_multi_cam's save_dir...";
+        std::string save_dir = cfg["collect_glint"]["record_dir"].as<std::string>();
+        
+        // --- 修复：覆盖原本的输入和输出路径，将其重定向到提取文件夹中 ---
+        input_folder = save_dir + "\\collect_input";
+        output_folder = save_dir + "\\collect_output";
+        
+        // 执行自动拷贝和重命名过程
+        prepareRecordData(save_dir, input_folder);
+    }
     
     // 步骤 1：以宽松参数运行检测，生成可视化切片和包含原始特征的 YAML 元数据文件
-    Logger::info() << "Phase 1: Starting Data Collection and Visualization Generation...";
-    processAndSaveData(cfg);
+    Logger::info() << "Phase 1: Starting Data Collection and Visualization Generation from " << input_folder;
+    processAndSaveData(input_folder, output_folder, max_images);
     
     // 步骤 2：启动 OpenCV GUI 监听键盘，进行人工复核
     Logger::info() << "Phase 2: Starting Manual Review Interface...";
-    Logger::info() << "Controls: [Space] Toggle Selection | [Tab] Switch Category | [A/D] Prev/Next in Category | [Enter] Next Image";
-    manualReviewData(cfg);
+    Logger::info() << "Controls: [Space] Toggle Selection | [Up/Down] Switch Category | [Left/Right] Prev/Next in Category | [Enter] Next Image";
+    manualReviewData(output_folder);
     
     Logger::info() << "Data collection and review completed.";
     return 0;

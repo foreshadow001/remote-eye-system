@@ -1,7 +1,5 @@
 # /calib/CmakeLists.txt
 
-add_subdirectory(set_image)
-
 add_library(calib STATIC
     src/calibration.cpp
 )
