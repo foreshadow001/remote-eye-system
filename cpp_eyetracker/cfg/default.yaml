@@ -8,8 +8,10 @@ cam_calib:
   pixel_size_y: 3.45e-6 # m
 
 # Calibration Offline Settings
-input_dir: "D:/ylx/calib_records"
-output_dir: "D:/ylx/calib_results"
+test_calib:
+  record_dir: "D:/hitsz/projects/new_dataset/test_record"
+  num_images_per_folder: 20
+  output_dir: "D:/hitsz/projects/new_dataset/test_record"
 
 # Gaze Tracker Settings
 gaze_tracker:
@@ -24,22 +26,22 @@ gaze_tracker:
 # Camera Settings
 cam_pos: [29.0, -31.0, 17.0]
 cam_xml_path:
-  - "D:/ylx/calib/cams/Camera_Data.xml"
+  - "D:/hitsz/projects/new_dataset/calib/cams/Camera0_Data.xml"
 #  - "D:/ylx/calib/cams/Camera1_Data.xml"
 #  - "D:/ylx/calib/cams/Camera2_Data.xml"
 cam_angles: [-31.5, 0.0, 0.0]
 
 # Lights Settings
 lights_pos:
- - [-21.0, 0.0, 0.0] # [21, 3, 0]
- - [25.0, 0.0, 0.0] # [-25, 3, 1]
- - [0.0, 8.0, 5.0] # [0, -8, 6]
+ - [-21.7, 0.0, 0.0]
+ - [18.5, 0.0, 0.0]
+ - [0.0, 8.0, 5.0]
 
 # Calibration General Settings
 calib_init_values:
   left:
     alpha: 5
-    beta: 1.5
+    beta: -1.5
     R: 0.78
     K: 0.42
     n1: 1.3375
@@ -47,13 +49,13 @@ calib_init_values:
     D: 0.53
   right:
     alpha: -5
-    beta: 1.5
+    beta: -1.5
     R: 0.78
     K: 0.42
     n1: 1.3375
     n2: 1.0
     D: 0.53
-  eye_cam_dist_init: 40.0
+  eye_cam_dist_init: 70.0
 
 calib_values_bounds:
   alpha: [-5, 5]
@@ -62,13 +64,13 @@ calib_values_bounds:
   K: [0.1, 1.0]
 
 # Screen Settings
-screen_width_px: 2560
-screen_height_px: 1440
-screen_width_cm: 59.5
-screen_height_cm: 33.6
-screen_center: [-0.75, -20.99, -7.07]
+screen_width_px: 3840
+screen_height_px: 2160
+screen_width_cm: 59.6
+screen_height_cm: 33.7
+screen_center: [0.00, -18.14, -8.62]
 screen_horizontal_direction: [-1.0, 0.0, 0.0]
-screen_vertical_direction: [0.00, 0.85, -0.52]
+screen_vertical_direction: [0.00, 0.91, -0.42]
 
 # Visualization Settings
 viz: true
@@ -82,8 +84,9 @@ test_multi_cam:
     - 40109652
   hardware_trigger: false
   write_jpg: true
+  write_video: false
   debug_time: true
-  save_dir: "D:/hitsz/projects/new_dataset/test_cam"
+  save_dir: "D:/hitsz/projects/new_dataset/test_record"
   fps: 200
   gain: 0.0
   gamma: 1.0
@@ -103,22 +106,33 @@ calib_points:
   marker_scale: 3
   theme: "dark"
 
+# Test inference
+test_two_eye:
+  record_dir: "D:/hitsz/projects/new_dataset/debug_gaze"
+  output_dir: "D:/hitsz/projects/new_dataset/debug_gaze"
+  num_images_per_folder: 1
+
 # Test Glint Detection
 test_glint:
   local_debug: false
   debug_time: false
   debug_geometry: false
-  mode: collecting
+  param_type: "relaxed"
+  is_collecting: false
   viz: true
-  num_images: 200
-  input_folder: "D:/hitsz/projects/new_dataset/test_record/debug/glint"
+  viz_threshold: false
+  num_images: 200000
+  input_folder: "D:/hitsz/projects/new_dataset/test_record/collect_input"
+  use_record: true
+  record_dir: "D:/hitsz/projects/new_dataset/test_record"
   gaussian_kernel_size: 3
   laplacian_kernel_size: 1
-  init_threshold_value: 125.0
-  threshold_step: 12.5
+  init_threshold_value: 130.0
+  threshold_step: 30
+  mini_threshold: 10.0
   search_region_side_and_mid_offset_x: 1
   search_region_side_and_mid_offset_y: 1
-  search_region_side_and_side_offset_y: 1
+  search_region_side_and_side_offset_y: 0
 
 # Collect Potential Glint Triangles
 collect_glint:
@@ -165,36 +179,37 @@ original_specific_hyperparameter:
 recommended_specific_hyperparameter:
   pupil:
     searchPupilInROI:
-      kAdaptiveThreshOffset: 10.027100
-      kAdaptiveThreshMax: 10.027100
-      kMinPupilArea: 89.500000
-      kMaxPupilArea: 868.000000
+      kAdaptiveThreshOffset: 10.0
+      kAdaptiveThreshMax: 7.0
+      kMinPupilArea: 84.000000
+      kMaxPupilArea: 660.500000
       kMinPupilContourPoints: 5.000000
-      kMaxPupilAxis: 52.677296
-      kMaxAxisRatio: 2.873369
-      kMinSolidity: 0.663522
-      kMinFitRatio: 0.658251
-      kMaxAvgResidual: 0.628213
-      kMaxDarkness: 10.027100
+      kMaxPupilAxis: 41.170168
+      kMaxAxisRatio: 2.965951
+      kMinSolidity: 0.543367
+      kMinFitRatio: 0.597502
+      kMaxAvgResidual: 0.564495
+      kMaxDarkness: 13.330961
   
   glint:
     isPupilNearby:
-      kExclusionRadiusRatio: 6.919400
+      kExclusionRadiusRatio: 1.955589
       
     checkAndPushGlintGeometry:
-      kBrightnessThreshold: 16.349558
+      kBrightnessThreshold: 23.976471
 
     horizontal_pair:
       lr_y_min: 0.000000
       lr_y_max: 6.500000
       lr_x_min: 7.000000
-      lr_x_max: 14.749939
+      lr_x_max: 15.000000
 
     middle_point:
       conditions:
-        - [0, 2, 0.366667, 0.615217, 0.11, 0.322727, 0.384783, 0.633333, 0.158333, 0.341667]
-        - [2, 3, 0.45, 0.65, 0.05, 0.216667, 0.35, 0.55, 0.283333, 0.5]
-        - [3, 5, 0.476316, 0.686364, 0.00263158, 0.186364, 0.313636, 0.523684, 0.404545, 0.605556]
+        - [0, 2, 0.4, 0.811905, 0.0928571, 0.325006, 0.188095, 0.6, 0.0928571, 0.35]
+        - [2, 3, 0.495455, 0.7, 0.0409091, 0.2, 0.3, 0.504545, 0.313636, 0.5]
+        - [3, 5, 0.45, 0.716667, 0, 0.183335, 0.283333, 0.55, 0.327768, 0.661111]
+        - [5, 7, 0, 0, 0, 0, 0, 0, 0, 0]
 relaxed_specific_hyperparameter:
   pupil:
     searchPupilInROI:
@@ -208,7 +223,7 @@ relaxed_specific_hyperparameter:
       kMinSolidity: 0.50
       kMinFitRatio: 0.55
       kMaxAvgResidual: 0.50
-      kMaxDarkness: 20.0
+      kMaxDarkness: 15.0
   
   glint:
     isPupilNearby:
@@ -228,6 +243,7 @@ relaxed_specific_hyperparameter:
         - [0, 2, 0.2, 0.8, 0.05, 0.55, 0.2, 0.8, 0.05, 0.55]
         - [2, 3, 0.45, 0.7, 0.05, 0.25, 0.3, 0.55, 0.25, 0.5]
         - [3, 5, 0.45, 0.85, 0.04, 0.25, 0.15, 0.55, 0.3, 0.65]
+        - [5, 7, 0.45, 0.85, 0.04, 0.25, 0.15, 0.55, 0.3, 0.65]
 
   ext:
     pupil:
@@ -322,17 +338,16 @@ empirical_hyperparameter:
     kBrightTolerance: 5.0
 
   detectCluster:
-    kMinUniqueGlintDist: 2.0
-    kMaxClusterResults: 3
+    kMaxClusterResults: 2
 
   findGeometry:
     kMaxMissingPointsToFind: 2
 
   isGlintRepeated:
-    kMinGlintDist: 1.0
+    kMinGlintDist: 3.0
 
   isGlintGeometryRepeated:
-    kPointMatchTolerance: 0.5
+    kPointMatchTolerance: 3.0
 
   checkAndPushGlintGeometry:
     kDangerMaskThresh: 50.0

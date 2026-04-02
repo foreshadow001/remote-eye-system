@@ -7,16 +7,16 @@ import yaml
 import os
 
 # ==================== 路径配置 ====================
-BASE_DIR = "D:/ylx"
-CONFIG_PATH = "D:/ylx/remote-eye-system/cpp_eyetracker/cfg/default.yaml"
-LEFT_DATA_PATH = os.path.join(BASE_DIR, "calib_inference_result_left.txt")
-RIGHT_DATA_PATH = os.path.join(BASE_DIR, "calib_inference_result_right.txt")
+BASE_DIR = "D:/hitsz/projects/new_dataset/debug_gaze"
+CONFIG_PATH = "D:/hitsz/projects/new_dataset/remote-eye-system/cpp_eyetracker/cfg/default.yaml"
+LEFT_DATA_PATH = os.path.join(BASE_DIR, "calib_inference_result_left_single.txt")
+RIGHT_DATA_PATH = os.path.join(BASE_DIR, "calib_inference_result_right_single.txt")
 
 # ==================== 列索引常量 ====================
 # 对应 C++ 输出: cornea(3) opt(3) vis(3) gt(3) pred(3)
 IDX_CORNEA = 0
 IDX_OPT    = 3
-IDX_VIS    = 6  # <--- 这次我们会用到这个方向向量
+IDX_VIS    = 6  # 视轴方向向量
 IDX_GT     = 9
 IDX_PRED   = 12
 
@@ -26,23 +26,22 @@ class GazeVisualizer:
         self.left_data = self.load_data(left_file)
         self.right_data = self.load_data(right_file)
         
-        # 简单校验
-        if len(self.left_data) > 0:
-            print(f"[Debug] Frame 0 Vis Vector (Left): {self.left_data[0][IDX_VIS:IDX_VIS+3]}")
-
         self.num_frames = min(len(self.left_data), len(self.right_data))
         if self.num_frames == 0:
             raise ValueError("No data found.")
         print(f"Total Frames: {self.num_frames}")
 
+        # 启动时计算并打印总体平均误差
+        self.print_summary_stats()
+
         self.calc_screen_geometry()
 
         # 初始化绘图
-        self.fig = plt.figure(figsize=(14, 9))
+        self.fig = plt.figure(figsize=(15, 9))
         plt.subplots_adjust(bottom=0.15)
         self.ax = self.fig.add_subplot(111, projection='3d')
         
-        self.dynamic_artists = []
+        self.dynamic_artists =[]
         self.draw_static_scene()
         self.update_frame(0)
 
@@ -61,21 +60,89 @@ class GazeVisualizer:
             self.cfg = {
                 'screen_width_cm': 59.5, 'screen_height_cm': 33.6,
                 'screen_center': [0, 0, 0],
-                'screen_horizontal_direction': [-1, 0, 0], 'screen_vertical_direction': [0, 1, 0]
+                'screen_horizontal_direction': [-1, 0, 0], 'screen_vertical_direction':[0, 1, 0]
             }
 
     def load_data(self, path):
         if not os.path.exists(path):
-            return []
+            return[]
         try:
             return np.loadtxt(path, comments='#')
         except Exception as e:
             print(f"[ERR] Load failed {path}: {e}")
-            return []
+            return[]
 
     def normalize(self, v):
         n = np.linalg.norm(v)
         return v if n == 0 else v / n
+
+    def closest_points_on_two_lines(self, O1, D1, O2, D2):
+        """
+        计算两条3D射线之间最接近的两个点
+        """
+        W0 = O1 - O2
+        a = np.dot(D1, D1)
+        b = np.dot(D1, D2)
+        c = np.dot(D2, D2)
+        d = np.dot(D1, W0)
+        e = np.dot(D2, W0)
+        denom = a * c - b * b
+        
+        if denom < 1e-6:
+            # 视线几乎平行，直接返回原点
+            return O1, O2
+            
+        s = (b * e - c * d) / denom
+        t = (a * e - b * d) / denom
+        
+        P1 = O1 + s * D1
+        P2 = O2 + t * D2
+        return P1, P2
+
+    def calc_binocular_errors(self, row_l, row_r):
+        """
+        计算全局距离误差与双眼角度误差
+        """
+        cornea_l = row_l[IDX_CORNEA : IDX_CORNEA+3]
+        vis_l    = self.normalize(row_l[IDX_VIS : IDX_VIS+3])
+        gt       = row_l[IDX_GT : IDX_GT+3]  # 左眼右眼的 GT 是一致的
+        
+        cornea_r = row_r[IDX_CORNEA : IDX_CORNEA+3]
+        vis_r    = self.normalize(row_r[IDX_VIS : IDX_VIS+3])
+        
+        # 1. 计算双眼视线相交点(或最接近点)的中点，作为全局预测点 P_pred
+        P1, P2 = self.closest_points_on_two_lines(cornea_l, vis_l, cornea_r, vis_r)
+        P_pred = (P1 + P2) / 2.0
+        
+        # 2. 全局距离误差
+        dist_err = np.linalg.norm(gt - P_pred)
+        
+        # 3. 角度误差
+        gt_vec_l = self.normalize(gt - cornea_l)
+        ang_l = np.degrees(np.arccos(np.clip(np.dot(vis_l, gt_vec_l), -1.0, 1.0)))
+        
+        gt_vec_r = self.normalize(gt - cornea_r)
+        ang_r = np.degrees(np.arccos(np.clip(np.dot(vis_r, gt_vec_r), -1.0, 1.0)))
+        
+        return dist_err, ang_l, ang_r, P_pred
+
+    def print_summary_stats(self):
+        """打印全局平均误差数据"""
+        dist_list, ang_l_list, ang_r_list = [], [],[]
+
+        for i in range(self.num_frames):
+            dist_err, ang_l, ang_r, _ = self.calc_binocular_errors(self.left_data[i], self.right_data[i])
+            dist_list.append(dist_err)
+            ang_l_list.append(ang_l)
+            ang_r_list.append(ang_r)
+
+        print("\n" + "="*50)
+        print("          GLOBAL ERROR SUMMARY")
+        print("="*50)
+        print(f"Mean Global Dist Loss : {np.mean(dist_list):.2f} cm")
+        print(f"Mean Left Angular Loss: {np.mean(ang_l_list):.2f}°")
+        print(f"Mean Right Angular Loss:{np.mean(ang_r_list):.2f}°")
+        print("="*50 + "\n")
 
     def calc_screen_geometry(self):
         center = np.array(self.cfg['screen_center'])
@@ -89,7 +156,7 @@ class GazeVisualizer:
         
         half_w = 0.5 * w * vec_x
         half_h = 0.5 * h * vec_y
-        self.screen_corners = [
+        self.screen_corners =[
             center - half_w - half_h, center + half_w - half_h,
             center + half_w + half_h, center - half_w + half_h
         ]
@@ -103,7 +170,6 @@ class GazeVisualizer:
 
     def draw_static_scene(self):
         """绘制静态场景：屏幕 + 相机坐标轴"""
-        
         # 1. 画屏幕面
         verts = [self.screen_corners]
         poly = Poly3DCollection(verts, alpha=0.1, facecolors='gray', edgecolors='k')
@@ -133,7 +199,6 @@ class GazeVisualizer:
 
         # 设置显示范围和标签
         self.ax.set_xlabel('X (cm)'); self.ax.set_ylabel('Y (cm)'); self.ax.set_zlabel('Z (cm)')
-        self.ax.set_title("Gaze Visualization with Camera Axes")
         
         # 比例控制
         pts = np.vstack(self.screen_corners + [[0,0,0]])
@@ -149,52 +214,36 @@ class GazeVisualizer:
     def draw_ray(self, origin, direction, color, style, label=None):
         """通用射线绘制函数"""
         hit_pt = self.intersect_ray_plane(origin, direction)
-        arts = []
+        arts =[]
         if hit_pt is not None:
             # 画线到交点
             line, = self.ax.plot(
                 [origin[0], hit_pt[0]], [origin[1], hit_pt[1]], [origin[2], hit_pt[2]],
                 c=color, ls=style, lw=(2 if style=='-' else 1), label=label
             )
-            # 画交点(小点)
             pt = self.ax.scatter(*hit_pt, c=color, marker='.', s=20)
             arts.extend([line, pt])
         else:
             # 未击中屏幕，画一段
             end = origin + direction * 25.0
-            line, = self.ax.plot(
-                [origin[0], end[0]], [origin[1], end[1]], [origin[2], end[2]],
+            line, = self.ax.plot([origin[0], end[0]], [origin[1], end[1]], [origin[2], end[2]],
                 c=color, ls=style, lw=1, alpha=0.5, label=label
             )
             arts.append(line)
         return arts
 
     def draw_eye_data(self, row, c_vis, c_opt, lbl):
-        # 数据提取
+        # 提取当前眼数据
         cornea = row[IDX_CORNEA : IDX_CORNEA+3]
         opt_vec = self.normalize(row[IDX_OPT : IDX_OPT+3])
-        vis_vec = self.normalize(row[IDX_VIS : IDX_VIS+3]) # 视轴方向
-        gt = row[IDX_GT : IDX_GT+3]
-        pred_pt_file = row[IDX_PRED : IDX_PRED+3] # 文件中的预测点
+        vis_vec = self.normalize(row[IDX_VIS : IDX_VIS+3])
         
-        arts = []
-        
-        # 1. 画角膜
+        arts =[]
         arts.append(self.ax.scatter(*cornea, c=c_vis, s=15))
-
-        # 2. 画视轴 (射线求交逻辑) -> 实线
         arts.extend(self.draw_ray(cornea, vis_vec, c_vis, '-', f'{lbl} Vis Axis'))
-        
-        # 3. 画光轴 (射线求交逻辑) -> 虚线
         arts.extend(self.draw_ray(cornea, opt_vec, c_opt, '--', f'{lbl} Opt Axis'))
 
-        # 4. 单独画预测点 (大十字)
-        # 这就是文件中记录的 pred_x, pred_y, pred_z
-        # 如果射线算法正确且数据一致，这个十字应该正好位于视轴线的末端
-        pt_pred = self.ax.scatter(*pred_pt_file, c=c_vis, marker='+', s=120, lw=2, label=f'{lbl} Pred File')
-        arts.append(pt_pred)
-
-        return arts, gt
+        return arts
 
     def update_frame(self, val):
         idx = int(val)
@@ -204,21 +253,25 @@ class GazeVisualizer:
         row_l = self.left_data[idx]
         row_r = self.right_data[idx]
         
-        # 左眼: Blue(Vis), Cyan(Opt)
-        al, gtl = self.draw_eye_data(row_l, 'blue', 'cyan', 'L')
-        # 右眼: Red(Vis), Magenta(Opt)
-        ar, gtr = self.draw_eye_data(row_r, 'red', 'magenta', 'R')
-        
+        # 1. 绘制左右眼射线和角膜
+        al = self.draw_eye_data(row_l, 'blue', 'cyan', 'L')
+        ar = self.draw_eye_data(row_r, 'red', 'magenta', 'R')
         self.dynamic_artists.extend(al + ar)
         
-        # GT (Green)
-        pgt = self.ax.scatter(*gtl, c='green', s=60, marker='o', label='GT')
-        self.dynamic_artists.append(pgt)
+        # 2. 计算误差与双眼交点(预测点)
+        dist_err, ang_l, ang_r, P_pred = self.calc_binocular_errors(row_l, row_r)
         
-        # 标题显示文件预测点与GT的误差
-        err_l = np.linalg.norm(gtl - row_l[IDX_PRED:IDX_PRED+3])
-        err_r = np.linalg.norm(gtr - row_r[IDX_PRED:IDX_PRED+3])
-        self.ax.set_title(f"Frame {idx} | Pred Error: L={err_l:.1f}, R={err_r:.1f} cm")
+        # 3. 绘制 GT 与 Binocular Pred 点
+        gt = row_l[IDX_GT : IDX_GT+3]
+        pgt = self.ax.scatter(*gt, c='green', s=60, marker='o', label='GT')
+        ppred = self.ax.scatter(*P_pred, c='orange', marker='X', s=150, lw=2, label='Binocular Pred')
+        
+        self.dynamic_artists.extend([pgt, ppred])
+        
+        # 更新标题显示
+        title = (f"Frame {idx} | Global Dist Err: {dist_err:.2f} cm | "
+                 f"Ang Err (L: {ang_l:.2f}°, R: {ang_r:.2f}°)")
+        self.ax.set_title(title, fontsize=11)
         
         self.fig.canvas.draw_idle()
 
@@ -229,15 +282,15 @@ class GazeVisualizer:
             Line2D([0], [0], color='cyan', lw=1, ls='--', label='Left Opt Ray'),
             Line2D([0], [0], color='red', lw=2, label='Right Vis Ray'),
             Line2D([0], [0], color='magenta', lw=1, ls='--', label='Right Opt Ray'),
-            Line2D([0], [0], marker='+', color='k', ls='None', ms=10, label='Pred Point (File)'),
+            Line2D([0], [0], marker='X', color='orange', ls='None', ms=10, label='Binocular Pred'),
             Line2D([0], [0], marker='o', color='green', ls='None', label='GT')
         ]
         self.ax.legend(handles=legs, loc='upper right', fontsize='small')
         plt.show()
 
 if __name__ == "__main__":
-    if os.path.exists(LEFT_DATA_PATH):
+    if os.path.exists(LEFT_DATA_PATH) and os.path.exists(RIGHT_DATA_PATH):
         viz = GazeVisualizer(LEFT_DATA_PATH, RIGHT_DATA_PATH, CONFIG_PATH)
         viz.show()
     else:
-        print("Data file not found.")
+        print("Data file not found. Ensure both left and right data paths exist.")

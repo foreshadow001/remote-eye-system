@@ -3,18 +3,16 @@
 add_subdirectory(record_data)
 add_subdirectory(set_image)
 
-# set(TEST_CALIB_SOURCES
-#     test_calib.cpp
-# )
+set(TEST_CALIB_SOURCES
+    test_calib_single_eye.cpp
+)
 
-# add_executable(test_calib ${TEST_CALIB_SOURCES})
+add_executable(test_calib_single_eye ${TEST_CALIB_SOURCES})
 
-# target_link_libraries(test_calib
-#     PRIVATE
-#         eyetracker::inference
-#         eyetracker::glint_detection
-#         eyetracker::pupil_center
-#         eyetracker::utils
-#         eyetracker::calib
-#         eyetracker::cfg
-# )
+target_link_libraries(test_calib_single_eye
+    PRIVATE
+        eyetracker::inference
+        eyetracker::glint_detection
+        eyetracker::utils
+        eyetracker::calib
+)

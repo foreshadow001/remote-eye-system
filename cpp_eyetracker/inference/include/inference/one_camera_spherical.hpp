@@ -22,8 +22,7 @@ private:
 	unsigned int size;
 };
 
-class GazeTracker:
-public GazeEstimationMethod<EyeAndCameraParameters, PupilCenterGlintInputs, DefaultGazeEstimationResult>
+class GazeTracker
 {
 public:
     typedef std::function<Vec3(Vec3)> Vec3Filter;
@@ -33,7 +32,12 @@ public:
     DefaultGazeEstimationResult
     estimate(const PupilCenterGlintInputs& input,
              const EyeAndCameraParameters& eye_cam_params
-            ) const override;
+            ) const;
+
+    DefaultSingleEyeGazeEstimationResult
+    estimate(const SingleEyePupilCenterGlintInputs& input,
+             const SingleEyeAndCameraParameters& eye_cam_params
+            ) const;
 
     void setCorneaCenterFilter(Vec3Filter filter);
     void setPupilCenterFilter(Vec3Filter filter);

@@ -2,6 +2,7 @@
 
 #pragma once
 #include <vector>
+#include <string>
 
 #include "cfg/config.hpp"
 #include "core/math_types.hpp"
@@ -24,49 +25,47 @@ public:
 	GazeEstimationResult left;
 	GazeEstimationResult right;
 
-	bool is_valid;
-	bool is_error;
+	bool is_valid = false;
+	bool is_error = false;
 	Vec3 gaze_point;
 	std::string error;
 
 	static DefaultGazeEstimationResult make_error(std::string error);
 };
 
-
-template <class Parameters, class InputData, class GazeEstimationResult>
-class GazeEstimationMethod
+class DefaultSingleEyeGazeEstimationResult
 {
 public:
-	virtual ~GazeEstimationMethod();
-	virtual GazeEstimationResult estimate(const InputData& data,
-                                          const Parameters& parameters) const = 0;
+	DefaultSingleEyeGazeEstimationResult();
+
+	Vec3 cornea_center;
+	Vec3 visual_axis_unit;
+	Vec3 optical_axis_unit;
+
+	bool is_valid = false;
+	bool is_error = false;
+	std::string error;
+
+	static DefaultSingleEyeGazeEstimationResult make_error(std::string error);
 };
 
-template <class Parameters, class InputData, class GazeEstimationResult>
-GazeEstimationMethod<Parameters, InputData, GazeEstimationResult>::~GazeEstimationMethod() {}
-
-template <class CalibratedParameters>
-class CalibrationMethod
-{
-public:
-	virtual ~CalibrationMethod();
-};
-
-template <class CalibratedParameters>
-CalibrationMethod<CalibratedParameters>::~CalibrationMethod() {}
-
+// --- 以下为具体的输入输出数据结构 ---
 struct SingleEyePupilCenterGlintInput
 {
 	std::vector<Vec2> glints;
 	Vec2 pupil_center;
 };
 
-// the input data for the gaze estimation method
+struct SingleEyePupilCenterGlintInputs
+{
+	std::vector<SingleEyePupilCenterGlintInput> data;
+};
+
 struct PupilCenterGlintInput
 {
 	SingleEyePupilCenterGlintInput left;
 	SingleEyePupilCenterGlintInput right;
-    bool is_valid;
+    bool is_valid = false;
 };
 
 struct PupilCenterGlintInputs
@@ -78,7 +77,6 @@ class EyeAndCameraParameters {
 public:
     EyeAndCameraParameters();
 
-    // ---------- 左右眼参数 ----------
     struct EyeParams {
         double alpha = 0.0;
         double beta = 0.0;
@@ -89,8 +87,8 @@ public:
         double D = 0.0;
     };
 
-    EyeParams left;   // 左眼参数
-    EyeParams right;  // 右眼参数
+    EyeParams left;
+    EyeParams right;
 
     double eye_cam_dist_init = 0.0;
 
@@ -98,4 +96,22 @@ public:
     std::vector<Vec3> light_positions;
 };
 
-}
+class SingleEyeAndCameraParameters {
+public:
+    SingleEyeAndCameraParameters(std::string which_eye);
+
+	double alpha = 0.0;
+	double beta = 0.0;
+	double R = 0.0;
+	double K = 0.0;
+	double n1 = 0.0;
+	double n2 = 0.0;
+	double D = 0.0;
+
+    double eye_cam_dist_init = 0.0;
+
+    std::vector<PinholeCameraModel> cameras;
+    std::vector<Vec3> light_positions;
+};
+
+} // namespace gazeestimation

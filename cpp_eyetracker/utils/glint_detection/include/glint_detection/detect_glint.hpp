@@ -26,26 +26,23 @@ class GlintDetector {
 public:
     struct Pupil;
     struct GlintGeometry;
-    explicit GlintDetector(const std::string& mode = "inference");
+    explicit GlintDetector(const std::string& param_type = "default");
     ~GlintDetector() = default;
 
-    std::tuple<std::vector<std::vector<cv::Point2f>>, std::vector<std::vector<cv::Point2f>>>
+    std::tuple<std::vector<std::vector<cv::Point2f>>, std::vector<std::vector<cv::Point2f>>, cv::Point2f, cv::Point2f>
     detect(cv::Mat gray);
-
-    std::string img_name_;
-    cv::Mat threshold_output_;
-    std::vector<cv::Mat> debug_imgs_;
-    bool local_debug_ = false;
-    bool debug_time_ = false;
-    bool viz_ = false;
-    bool is_collecting_ = false;
     
     const std::vector<Pupil>& getPupils() const { return init_pupil_seeds_; }
     const std::vector<GlintGeometry>& getGlintGeometries() const { return final_geometries_; }
 
+    void setIsCollecting(bool is_collecting) { is_collecting_ = is_collecting; }
     void setViz(bool viz) { viz_ = viz; }
+    void setVizThreshold(bool viz_threshold) { viz_threshold_ = viz_threshold; }
     void setLocalDebug(bool local_debug) { local_debug_ = local_debug; }
     void setDebugTime(bool debug_time) { debug_time_ = debug_time; }
+    void setImageName(const std::string& img_name) { img_name_ = img_name; }
+    std::vector<cv::Mat> getDebugImgs() const { return debug_imgs_; }
+    cv::Mat getThresholdOutput() const { return threshold_output_; }
 
 private:
     enum class EyeType { Left, Right };
@@ -131,7 +128,16 @@ private:
         cv::Point2f center() const { return (l_pt + r_pt + m_pt) / 3.0f; }
     };
 
-    std::string mode_;
+    std::string img_name_;
+    cv::Mat threshold_output_;
+    std::vector<cv::Mat> debug_imgs_;
+    bool local_debug_ = false;
+    bool debug_time_ = false;
+    bool viz_ = false;
+    bool viz_threshold_ = false;
+    bool is_collecting_ = false;
+    std::string param_type_ = "default";
+
     Cfg cfg_;
     CfgNode spec_pupil_cfg_;
     CfgNode spec_glint_cfg_;
@@ -164,7 +170,8 @@ private:
     cv::Mat exclusion_mask_; 
 
     double init_threshold_value_;
-    double threshold_step_ = 25.0;
+    double threshold_step_;
+    double mini_threshold_;
 
     double init_left_glints_x_min_, init_left_glints_x_max_;
     double init_right_glints_x_min_, init_right_glints_x_max_;
@@ -262,8 +269,11 @@ private:
         const std::string& debug_tag
     );
 
-    std::tuple<std::vector<std::vector<cv::Point2f>>, std::vector<std::vector<cv::Point2f>>>
-    splitGlintsGeometry(std::vector<std::vector<cv::Point2f>> glint_geometry_list);
+    std::tuple<
+        std::vector<GlintDetector::GlintGeometry>, 
+        std::vector<GlintDetector::GlintGeometry>
+    >
+    GlintDetector::splitGlintsGeometry(std::vector<GlintDetector::GlintGeometry> glint_geometries);
 
     std::vector<GlintGeometry>
     findGeometry(std::vector<cv::Point2f> glint_candidates);
@@ -278,14 +288,19 @@ private:
         const cv::Point2f& m_pt
     );
 
-    void checkAndPushGlintGeometry(
+    bool isGlintGeometryRepeated(
+        const GlintGeometry& geo,
+        const std::vector<GlintGeometry>& existing
+    );
+
+    bool checkAndPushGlintGeometry(
         const cv::Point2f& l_pt,
         const cv::Point2f& r_pt,
         const cv::Point2f& m_pt
     );
 
     std::vector<std::vector<cv::Point2f>>
-    glintGeometryListToGlintVectors(const std::vector<GlintGeometry>& glint_geometry);
+    glintGeometryListToGlintVector(const std::vector<GlintGeometry>& glint_geometry);
     
 };
 

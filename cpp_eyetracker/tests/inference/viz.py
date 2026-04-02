@@ -7,8 +7,8 @@ import yaml
 import os
 
 # ==================== 路径配置 ====================
-BASE_DIR = "D:/ylx"
-CONFIG_PATH = "D:/ylx/remote-eye-system/cpp_eyetracker/cfg/default.yaml"
+BASE_DIR = "D:/hitsz/projects/new_dataset/debug_gaze"
+CONFIG_PATH = "D:/hitsz/projects/new_dataset/remote-eye-system/cpp_eyetracker/cfg/default.yaml"
 LEFT_DATA_PATH = os.path.join(BASE_DIR, "inference_result_left.txt")
 RIGHT_DATA_PATH = os.path.join(BASE_DIR, "inference_result_right.txt")
 

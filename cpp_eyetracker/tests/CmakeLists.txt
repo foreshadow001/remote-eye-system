@@ -1,6 +1,6 @@
 # /tests/CMakeLists.txt
 
 add_subdirectory(calib)
-# add_subdirectory(inference)
+add_subdirectory(inference)
 add_subdirectory(utils)
 # add_subdirectory(cfg)

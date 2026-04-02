@@ -299,6 +299,118 @@ Raises:
 
 } // estimate
 
+DefaultSingleEyeGazeEstimationResult
+GazeTracker::estimate(
+    const SingleEyePupilCenterGlintInputs& glints_pupil_center,
+    const SingleEyeAndCameraParameters& eye_cam_params
+) const
+/*
+Estimate gaze based on pupil center and glints.
+
+Args:
+    glints_pupil_center: a struct containing pupil center and glints information.
+    eye_cam_params: a struct containing eye and camera parameters,
+                    including light positions, camera intrinsics and extrinsics.
+
+Returns:
+    A struct containing gaze estimation result.
+
+Raises:
+    std::exception: if the input data is invalid or the method cannot handle the input.
+*/
+{
+    if (glints_pupil_center.data.size() != 1) {
+        throw std::exception("This method must have exactly one pair of pupil center/glint.");
+    }
+    
+    if (glints_pupil_center.data[0].glints.size() < 2) {
+        throw std::exception("This method must have at least two glints.");
+    }
+
+    if (eye_cam_params.cameras.size() != 1) {
+        throw std::exception("this method can only handle a single camera");
+    }
+
+    int valid_glints = 0;
+    for(const auto& glint : glints_pupil_center.data[0].glints)
+    {
+        if (isGlintValid(glint))
+            valid_glints++;
+    }
+
+    if (valid_glints < 2) throw std::exception("not enough valid glints to estimate gaze");
+
+    const PinholeCameraModel camera = eye_cam_params.cameras[0];
+    const SingleEyePupilCenterGlintInput glints_pupil_center_data = glints_pupil_center.data[0];
+
+    Vec3 cornea_center = solveCorneaCenter(
+        glints_pupil_center_data.glints,
+        eye_cam_params.cameras[0],
+        eye_cam_params.light_positions,
+        eye_cam_params.R,
+        eye_cam_params.eye_cam_dist_init
+    );
+
+    if (!std::isfinite(cornea_center[0])) {
+        std::cerr << "[NaN] solveCorneaCenter -> " << vec3_to_string(cornea_center) << "\n";
+        throw std::runtime_error("cornea_center is NaN");
+    }
+
+    if(cornea_center_filter) {
+        cornea_center = cornea_center_filter(cornea_center);
+    }
+
+    Vec3 pupil_image_wcs = camera.ics_to_wcs(glints_pupil_center_data.pupil_center);
+
+    if (!std::isfinite(pupil_image_wcs[0])) {
+        std::cerr << "[NaN] ics_to_wcs -> " << pupil_image_wcs
+                  << "  input=" << glints_pupil_center_data.pupil_center[0] << "\n";
+        throw std::runtime_error("pupil_image_wcs is NaN");
+    }
+
+    if(pupil_center_filter) {
+        pupil_image_wcs = pupil_center_filter(pupil_image_wcs);
+    }
+
+    const Vec3 optic_axis_unit = calculateOpticalAxisUnit(
+        pupil_image_wcs,
+        eye_cam_params.cameras[0].position,
+        cornea_center,
+        eye_cam_params.R,
+        eye_cam_params.K,
+        eye_cam_params.n1,
+        eye_cam_params.n2,
+        use_chen_noise_reduction
+    );
+
+    if (!std::isfinite(optic_axis_unit[0])) {
+        std::cerr << "[NaN] calculateOpticalAxisUnit\n";
+        throw std::runtime_error("optic_axis_unit is NaN");
+    }
+
+    const Vec3 visual_axis_unit = calculateVisualAxisUnit(
+        optic_axis_unit,
+        eye_cam_params.alpha,
+        eye_cam_params.beta
+    );
+
+    if (!std::isfinite(visual_axis_unit[0])) {
+        std::cerr << "[NaN] calculateVisualAxisUnit\n";
+        throw std::runtime_error("visual_axis_unit is NaN");
+    }
+
+    DefaultSingleEyeGazeEstimationResult result;
+    result.is_valid = true;
+    
+    result.cornea_center = cornea_center;
+    result.optical_axis_unit = optic_axis_unit;
+    result.visual_axis_unit = visual_axis_unit;
+
+    return result;
+
+} // estimate
+
+
 Vec3
 solveCorneaCenter(
     std::vector<Vec2> glints,

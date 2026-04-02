@@ -15,5 +15,6 @@ find_package(Ceres CONFIG REQUIRED)
 target_link_libraries(calib 
     PUBLIC
         eyetracker::utils
+        eyetracker::inference
         Ceres::ceres
 )

@@ -161,19 +161,14 @@ TODO:
 
 namespace glintdetection {
 
-GlintDetector::GlintDetector(const std::string& mode)
-    : mode_(mode) 
+GlintDetector::GlintDetector(const std::string& param_type)
+    : param_type_(param_type) 
 {
-    if (mode_ == "collecting") is_collecting_ = true;
-    
-    std::string spec_key = (is_collecting_) 
-        ? "relaxed_specific_hyperparameter" 
-        : "recommended_specific_hyperparameter";
-
-    if (is_collecting_) {
-        Logger::info() << "Using relaxed specific hyperparameters.";
-    } else {
-        Logger::info() << "Using recommended specific hyperparameters.";
+    std::string spec_key;
+    if (param_type_ == "default") {
+        spec_key = "recommended_specific_hyperparameter";
+    } else if (param_type_ == "relaxed") {
+        spec_key = "relaxed_specific_hyperparameter";
     }
 
     spec_pupil_cfg_ = cfg_[spec_key]["pupil"];
@@ -187,6 +182,7 @@ GlintDetector::GlintDetector(const std::string& mode)
 	laplacian_kernel_size_ = cfg_["test_glint"]["laplacian_kernel_size"].as<int>();
 	init_threshold_value_ = cfg_["test_glint"]["init_threshold_value"].as<double>();
     threshold_step_ = cfg_["test_glint"]["threshold_step"].as<double>();
+    mini_threshold_ = cfg_["test_glint"]["mini_threshold"].as<double>();
 }
 
 bool GlintDetector::side2side(
@@ -429,6 +425,9 @@ GlintDetector::getSearchRegionSideAndMid(
     roi &= cv::Rect(0, 0, abs_dst_.cols, abs_dst_.rows);
     cv::Mat search_region = abs_dst_(roi);
 
+    Logger::debug() << "[5 Find Geometry] [getSearchRegionSideAndMid]";
+    Logger::debug() << "\tsearch_region: (" << x_min << ", " << y_min << ") - (" << x_max << ", " << y_max << ")";
+
     return {search_region, cv::Point2f(x_min, y_min)};
 }
 
@@ -453,6 +452,9 @@ GlintDetector::getSearchRegionSideAndSide(
     cv::Rect roi(x_min, y_min, x_max - x_min, y_max - y_min);
     roi &= cv::Rect(0, 0, abs_dst_.cols, abs_dst_.rows);
     cv::Mat search_region = abs_dst_(roi);
+
+    Logger::debug() << "[5 Find Geometry] [getSearchRegionSideAndSide]";
+    Logger::debug() << "\tsearch_region: (" << x_min << ", " << y_min << ") - (" << x_max << ", " << y_max << ")";
 
     return {search_region, cv::Point2f(x_min, y_min)};
 }
@@ -886,7 +888,7 @@ GlintDetector::searchPupilInROI(cv::Rect roi_rect)
             continue;
         }
 
-        Logger::debug() << "[searchPupilInROI] pupil accepted";
+        Logger::debug() << "[searchPupilInROI] pupil accepted ===================================";
 
         if (viz_)
         {
@@ -1009,7 +1011,7 @@ bool GlintDetector::findNeighborInDirection(
     float min_dist_sq = FLT_MAX; // 找离当前节点最近的，还是最显著的？通常找最近的比较稳
 
     // ---- 动态降低阈值循环 ----
-    for (double thr = glass_reflection_threshold_; thr >= threshold_step_; thr -= threshold_step_)
+    for (double thr = glass_reflection_threshold_; thr >= mini_threshold_; thr -= threshold_step_)
     {
         cv::Mat thr_img;
         cv::threshold(roi_img, thr_img, thr, 255, cv::THRESH_BINARY);
@@ -1528,7 +1530,7 @@ cv::Rect GlintDetector::shrinkRoiToValidGlints(const cv::Rect& coarse_roi)
     cv::Mat roi_img = abs_dst_(valid_roi);
 
     // 2. 阈值处理 (保留原有的极低敏感度阈值)
-    double low_sensitivity_thresh = (threshold_step_ > 0.0) ? threshold_step_ : kDefaultLowSensitivityThresh;
+    double low_sensitivity_thresh = (mini_threshold_ > 0.0) ? mini_threshold_ : kDefaultLowSensitivityThresh;
     
     cv::Mat thr_img;
     cv::threshold(roi_img, thr_img, low_sensitivity_thresh, 255, cv::THRESH_BINARY);
@@ -1788,6 +1790,7 @@ std::vector<cv::Rect> GlintDetector::determineCornealReflectionROI()
 
 std::vector<cv::Rect> GlintDetector::getROI()
 {
+    std::vector<cv::Rect> rois;
     // 1. Cleanup
     init_pupil_seeds_.clear();
     final_pupils_.clear();
@@ -1808,6 +1811,7 @@ std::vector<cv::Rect> GlintDetector::getROI()
     else
     {
         Logger::debug() << "[getROI] No valid glint region found, skipping pupil search.";
+        return rois;
     }
 
     // 4. Search Reflections
@@ -1821,7 +1825,7 @@ std::vector<cv::Rect> GlintDetector::getROI()
     buildExclusionMask();
 
     // 6. Determine final ROIs (uses glint_rect_ and init_pupil_seeds_)
-    auto rois = determineCornealReflectionROI();
+    rois = determineCornealReflectionROI();
 
     return rois;
 }
@@ -1872,7 +1876,7 @@ GlintDetector::searchGlintsInROI(
         cv::THRESH_BINARY
     );
 
-    if (viz_ && debug_tag.size() > 0)
+    if (viz_threshold_ && debug_tag.size() > 0)
     {
         std::string threshold_output_folder = 
             cfg_["test_glint"]["input_folder"].as<std::string>() + "\\threshold_output\\" + img_name_ + "\\"
@@ -1904,6 +1908,9 @@ GlintDetector::searchGlintsInROI(
     for (size_t k = 0; k < contours.size(); ++k)
     {
         cv::RotatedRect rect = cv::minAreaRect(contours[k]);
+        if (threshold_value == 10) {
+            Logger::debug() << std::fixed << std::setprecision(2) << "Point: (" << rect.center.x << ", " << rect.center.y << ")";
+        }
         if (isGlintRepeated(glints, rect.center)) continue;
 
         min_rects.push_back(rect);
@@ -1914,30 +1921,27 @@ GlintDetector::searchGlintsInROI(
 }
 
 std::tuple<
-    std::vector<std::vector<cv::Point2f>>, 
-    std::vector<std::vector<cv::Point2f>>
+    std::vector<GlintDetector::GlintGeometry>, 
+    std::vector<GlintDetector::GlintGeometry>
 >
-GlintDetector::splitGlintsGeometry(std::vector<std::vector<cv::Point2f>> glint_geometry_list)
+GlintDetector::splitGlintsGeometry(std::vector<GlintDetector::GlintGeometry> glint_geometries)
 {
-    std::vector<std::vector<cv::Point2f>> left_eye_geometries, right_eye_geometries;
+    std::vector<GlintDetector::GlintGeometry> left_eye_geometries, right_eye_geometries;
     const double kDistanceThresholdX = emp_cfg_["splitGlintsGeometry"]["kDistanceThresholdX"].as<double>();  // 将两眼斑点分为左右眼的阈值
 
-    if (glint_geometry_list.empty()) {
+    if (glint_geometries.empty()) {
         return { left_eye_geometries, right_eye_geometries };
     }
 
     // 1. 计算每个 geometry 的平均 X 坐标并与其原始数据绑定
     struct IndexedGeometry {
         double avg_x;
-        std::vector<cv::Point2f> points;
+        GlintDetector::GlintGeometry geometry;
     };
     
     std::vector<IndexedGeometry> sorted_geometries;
-    for (const auto& geo : glint_geometry_list) {
-        if (geo.empty()) continue;
-        double sum_x = 0;
-        for (const auto& pt : geo) sum_x += pt.x;
-        sorted_geometries.push_back({ sum_x / geo.size(), geo });
+    for (const auto& geo : glint_geometries) {
+        sorted_geometries.push_back({ geo.center().x, geo });
     }
 
     // 2. 按照平均 X 坐标从小到大排序 (右眼 x 小，排在前面)
@@ -1947,7 +1951,7 @@ GlintDetector::splitGlintsGeometry(std::vector<std::vector<cv::Point2f>> glint_g
               });
 
     double right_x_mean = sorted_geometries.front().avg_x;
-    right_eye_geometries.push_back(sorted_geometries.front().points);
+    right_eye_geometries.push_back(sorted_geometries.front().geometry);
 
     for (size_t i = 1; i < sorted_geometries.size(); ++i)
     {
@@ -1956,7 +1960,7 @@ GlintDetector::splitGlintsGeometry(std::vector<std::vector<cv::Point2f>> glint_g
         // 判断当前几何体的平均 X 是否靠近当前“右眼组”的平均 X
         if (std::abs(current_geo.avg_x - right_x_mean) < kDistanceThresholdX)
         {
-            right_eye_geometries.push_back(current_geo.points);
+            right_eye_geometries.push_back(current_geo.geometry);
 
             // 增量更新右眼组的 X 平均值中心
             const size_t n = right_eye_geometries.size();
@@ -1965,7 +1969,7 @@ GlintDetector::splitGlintsGeometry(std::vector<std::vector<cv::Point2f>> glint_g
         else
         {
             // 距离较远，归入左眼
-            left_eye_geometries.push_back(current_geo.points);
+            left_eye_geometries.push_back(current_geo.geometry);
         }
     }
 
@@ -2115,15 +2119,15 @@ GlintDetector::detectCluster(
 {
     CfgNode emp = emp_cfg_["detectCluster"];
     // --- 超参数声明 (Hyperparameters) ---
-    // 判定新光斑是否属于已存在的几何光斑的最短距离阈值
-    const double kMinUniqueGlintDist = emp["kMinUniqueGlintDist"].as<double>();
     // 提前退出搜索的目标数量
     const size_t kMaxClusterResults = emp["kMaxClusterResults"].as<size_t>();
 
     std::vector<GlintGeometry> cluster_results;
     double thr = init_threshold_value_;
 
-    while (thr >= threshold_step_)
+    glint_geometry_list_.clear();
+
+    while (thr >= mini_threshold_)
     {
         std::vector<cv::Point2f> current_pass_points;
         for (const auto& roi : cluster_rois)
@@ -2140,14 +2144,9 @@ GlintDetector::detectCluster(
         bool found_new_unique = false;
         for (auto& geo : geometries_found)
         {
-            bool exists = false;
-            for (const auto& existing : cluster_results) {
-                if (cv::norm(geo.center() - existing.center()) < kMinUniqueGlintDist) { 
-                    exists = true; break; 
-                }
-            }
+            if (cluster_results.size() >= kMaxClusterResults) break;
 
-            if (!exists) {
+            if (!isGlintGeometryRepeated(geo, cluster_results)) {
                 // 记录元数据
                 geo.cluster_id = cluster_id;
                 geo.found_threshold = thr;
@@ -2170,7 +2169,9 @@ GlintDetector::detectCluster(
 
 std::tuple<
     std::vector<std::vector<cv::Point2f>>, 
-    std::vector<std::vector<cv::Point2f>>
+    std::vector<std::vector<cv::Point2f>>,
+    cv::Point2f,
+    cv::Point2f
 >
 GlintDetector::detect(cv::Mat gray)
 {
@@ -2188,18 +2189,24 @@ GlintDetector::detect(cv::Mat gray)
     cv::GaussianBlur(gray, gaussed_, cv::Size(gaussian_kernel_size_, gaussian_kernel_size_), 0, 0, cv::BORDER_DEFAULT);
     cv::Laplacian(gaussed_, laplaced_, CV_16S, laplacian_kernel_size_, laplacian_scale_, laplacian_delta_, cv::BORDER_DEFAULT);
     cv::convertScaleAbs(laplaced_, abs_dst_);
-    cv::threshold(abs_dst_, threshold_output_, threshold_step_, 255, cv::THRESH_BINARY);
+    cv::threshold(abs_dst_, threshold_output_, mini_threshold_, 255, cv::THRESH_BINARY);
 
     // 4 Get ROI (Populates init_pupil_seeds_)
     auto rois = getROI();
     timer.lap("[4] getROI()");
+
+    if (rois.empty()) {
+        std::vector<std::vector<cv::Point2f>> left_glint_geometries, right_glint_geometries;
+        cv::Point2f left_pupil_center, right_pupil_center;
+        return { left_glint_geometries, right_glint_geometries, left_pupil_center, right_pupil_center };
+    }
 
     // 5.1 ROI 聚类
     auto clusters = clusterROIs(rois);
     
     std::vector<GlintGeometry> all_geometries;
 
-    if (!cfg_["test_glint"]["debug_geometry"].as<bool>()) Logger::setLevel(Logger::Level::TIME);
+    if (!cfg_["test_glint"]["debug_geometry"].as<bool>()) Logger::setLevel(Logger::Level::INFO);
 
     // 5.2 对每个区域独立处理
     for (int i = 0; i < clusters.size(); ++i)
@@ -2246,16 +2253,36 @@ GlintDetector::detect(cv::Mat gray)
     }
 
     // 7. Split
-    std::vector<std::vector<cv::Point2f>> glint_geometry_list;
+    std::vector<GlintDetector::GlintGeometry> glint_geometry_list;
     if (is_collecting_)
     {
-        glint_geometry_list = glintGeometryListToGlintVectors(all_geometries);
+        glint_geometry_list = all_geometries;
         final_geometries_ = all_geometries;
     } else {
-        glint_geometry_list = glintGeometryListToGlintVectors(best_geometries);
+        glint_geometry_list = best_geometries;
     }
     auto [left_glint_geometries, right_glint_geometries] = splitGlintsGeometry(glint_geometry_list);
     timer.lap("[7] Split Glints");
+
+    // --- 新增逻辑 8. 数量校验与提取瞳孔坐标 ---
+    cv::Point2f left_pupil_center(0.0f, 0.0f);
+    cv::Point2f right_pupil_center(0.0f, 0.0f);
+
+    if (!is_collecting_)
+    {
+        // 只有两眼各自刚好检测到一个 glint geometry 才视为合法
+        if (left_glint_geometries.size() == 1 && right_glint_geometries.size() == 1)
+        {
+            left_pupil_center = left_glint_geometries[0].linked_pupil.rr.center;
+            right_pupil_center = right_glint_geometries[0].linked_pupil.rr.center;
+        }
+        else
+        {
+            // 数量异常：清空结果，返回空的 glint geometry
+            left_glint_geometries.clear();
+            right_glint_geometries.clear();
+        }
+    }
 
     Logger::debug() << "[GlintDetector::detectFullImage] Total Glints: " << all_geometries.size();
     for (const auto& geo : all_geometries)
@@ -2266,7 +2293,11 @@ GlintDetector::detect(cv::Mat gray)
                         << "(" << geo.m_pt.x << ", " << geo.m_pt.y << ") ";
     }
 
-    return { left_glint_geometries, right_glint_geometries };
+    auto left_glint_geometry_list = glintGeometryListToGlintVector(left_glint_geometries);
+    auto right_glint_geometry_list = glintGeometryListToGlintVector(right_glint_geometries);
+
+    // --- 修改返回值，一共返回四个值 ---
+    return { left_glint_geometry_list, right_glint_geometry_list, left_pupil_center, right_pupil_center };
 }
 
 std::vector<GlintDetector::GlintGeometry>
@@ -2275,8 +2306,6 @@ GlintDetector::findGeometry(std::vector<cv::Point2f> glint_candidates)
     // --- 超参数声明 (Hyperparameters) ---
     // 寻找缺失中点或侧边点的最大数量限制
     const int kMaxMissingPointsToFind = emp_cfg_["findGeometry"]["kMaxMissingPointsToFind"].as<int>();
-
-    glint_geometry_list_.clear();
 
     Logger::debug() << "\n";
 
@@ -2329,13 +2358,15 @@ GlintDetector::findGeometry(std::vector<cv::Point2f> glint_candidates)
                                     << "\tright: (" << r_pt.x << ", " << r_pt.y << ")";
 
                     std::ostringstream oss;
-                    oss << std::fixed << std::setprecision(1) << l_pt.x << "_" << l_pt.y
+                    oss << std::fixed << std::setprecision(1) << "side_and_side_" << l_pt.x << "_" << l_pt.y
                         << "_" << r_pt.x << "_" << r_pt.y;
                     std::string pt_str = oss.str();
 
                     auto [roi_img, roi_offset] = getSearchRegionSideAndSide(l_pt, r_pt);
                     double thr = init_threshold_value_;
                     std::vector<cv::Point2f> roi_glints;
+                    roi_glints.push_back(l_pt);
+                    roi_glints.push_back(r_pt);
                     int count = 0;
 
                     if (roi_img.empty()) continue;
@@ -2358,8 +2389,7 @@ GlintDetector::findGeometry(std::vector<cv::Point2f> glint_candidates)
                                                 << "(" << r_pt.x << ", " << r_pt.y << ") "
                                                 << "(" << contourCenters[i].x << ", " << contourCenters[i].y << ")";
 
-                                checkAndPushGlintGeometry(l_pt, r_pt, contourCenters[i]);
-                                count++;
+                                if (checkAndPushGlintGeometry(l_pt, r_pt, contourCenters[i])) count++;
                             }
                             else
                             {
@@ -2368,7 +2398,7 @@ GlintDetector::findGeometry(std::vector<cv::Point2f> glint_candidates)
                         }
 
                         thr -= threshold_step_;
-                    } while (thr >= threshold_step_ && count < kMaxMissingPointsToFind);
+                    } while (thr >= mini_threshold_ && count < kMaxMissingPointsToFind);
                 }
 			}
 		}
@@ -2396,13 +2426,15 @@ GlintDetector::findGeometry(std::vector<cv::Point2f> glint_candidates)
                                 << "mid: (" << m_pt.x << ", " << m_pt.y << ")";
 
                 std::ostringstream oss;
-                oss << std::fixed << std::setprecision(1) << s_pt.x << "_" << s_pt.y
+                oss << std::fixed << std::setprecision(1) << "side_and_mid_" << s_pt.x << "_" << s_pt.y
                     << "_" << m_pt.x << "_" << m_pt.y;
                 std::string pt_str = oss.str();
 
                 auto [roi_img, roi_offset] = getSearchRegionSideAndMid(s_pt, m_pt);
                 double thr = init_threshold_value_;
                 std::vector<cv::Point2f> roi_glints;
+                roi_glints.push_back(s_pt);
+                roi_glints.push_back(m_pt);
                 int count = 0;
 
                 if (roi_img.empty()) continue;
@@ -2428,8 +2460,7 @@ GlintDetector::findGeometry(std::vector<cv::Point2f> glint_candidates)
                                             << "(" << r_pt.x << ", " << r_pt.y << ") "
                                             << "(" << m_pt.x << ", " << m_pt.y << ")";
 
-                            checkAndPushGlintGeometry(l_pt, r_pt, m_pt);
-                            count++;
+                            if (checkAndPushGlintGeometry(l_pt, r_pt, m_pt)) count++;
                         }
                         else
                         {
@@ -2438,13 +2469,13 @@ GlintDetector::findGeometry(std::vector<cv::Point2f> glint_candidates)
                     }
 
                     thr -= threshold_step_;
-                } while (thr >= threshold_step_ && count < kMaxMissingPointsToFind);
+                } while (thr >= mini_threshold_ && count < kMaxMissingPointsToFind);
             }
         }
     }
 
     Logger::debug() << "[5 Find Geometry] Result: ";
-    auto glint_geometries = glintGeometryListToGlintVectors(glint_geometry_list_);
+    auto glint_geometries = glintGeometryListToGlintVector(glint_geometry_list_);
     for (const auto& glint_geometry : glint_geometries)
     {
         std::ostringstream oss;
@@ -2471,13 +2502,10 @@ bool GlintDetector::isGlintRepeated(
 
     for (const auto& roi_glint : roi_glints)
     {
-        if (roi_glint.x == glint.x && roi_glint.y == glint.y)
-        {
-            return true;
-        }
         // if distance between glints is less than kMinGlintDist, consider them as the same glint
         if (cv::norm(roi_glint - glint) < kMinGlintDist)
         {
+            Logger::debug() << "Glint repeated: (" << roi_glint.x << ", " << roi_glint.y << ") and (" << glint.x << ", " << glint.y << ")";
             return true;
         }
     }
@@ -2499,10 +2527,10 @@ bool GlintDetector::isGlintGeometryRepeated(
     for (const auto& geo : glint_geometry_list_)
     {
         // 检查 m_pt 是否相同
-        if (std::abs(geo.m_pt.x - m_pt.x) < kPointMatchTolerance && std::abs(geo.m_pt.y - m_pt.y) < kPointMatchTolerance) {
+        if (cv::norm(geo.m_pt - m_pt) <= kPointMatchTolerance) {
             // 检查 s_pt 是否是 l 或者 r
-            if ((std::abs(geo.l_pt.x - s_pt.x) < kPointMatchTolerance && std::abs(geo.l_pt.y - s_pt.y) < kPointMatchTolerance) ||
-                (std::abs(geo.r_pt.x - s_pt.x) < kPointMatchTolerance && std::abs(geo.r_pt.y - s_pt.y) < kPointMatchTolerance)) {
+            if ((cv::norm(geo.l_pt - s_pt) <= kPointMatchTolerance) ||
+                (cv::norm(geo.r_pt - s_pt) <= kPointMatchTolerance)) {
                 return true;
             }
         }
@@ -2510,7 +2538,32 @@ bool GlintDetector::isGlintGeometryRepeated(
     return false;
 }
 
-void GlintDetector::checkAndPushGlintGeometry(
+bool GlintDetector::isGlintGeometryRepeated(
+    const GlintGeometry& geo,
+    const std::vector<GlintGeometry>& existing
+)
+{
+    // --- 超参数声明 (Hyperparameters) ---
+    // 判定两个 Glint 几何点位置相同的容差距离
+    const double kPointMatchTolerance = emp_cfg_["isGlintGeometryRepeated"]["kPointMatchTolerance"].as<double>();
+
+    if (existing.empty()) return false;
+
+    for (const auto& existing_geo : existing)
+    {
+        if   (((cv::norm(geo.l_pt - existing_geo.l_pt) <= kPointMatchTolerance)
+             && (cv::norm(geo.r_pt - existing_geo.r_pt) <= kPointMatchTolerance)
+             && (cv::norm(geo.m_pt - existing_geo.m_pt) <= kPointMatchTolerance))
+
+             || ((cv::norm(geo.center() - existing_geo.center()) <= kPointMatchTolerance))) {
+                return true;
+            }
+    }
+    return false;
+}
+
+
+bool GlintDetector::checkAndPushGlintGeometry(
     const cv::Point2f& l_pt,
     const cv::Point2f& r_pt,
     const cv::Point2f& m_pt
@@ -2545,7 +2598,7 @@ void GlintDetector::checkAndPushGlintGeometry(
     roi.height += (pad_y * 2);
 
     roi &= cv::Rect(0, 0, gray_.cols, gray_.rows);
-    if (roi.area() <= 0) return;
+    if (roi.area() <= 0) return false;
 
     cv::Mat roi_img = gray_(roi);
     cv::Mat danger_mask;
@@ -2592,11 +2645,16 @@ void GlintDetector::checkAndPushGlintGeometry(
         geo.on_cornea = (geo.bg_brightness <= kBrightnessThreshold);
     }
 
-    if (geo.on_cornea) glint_geometry_list_.push_back(geo);
+    if (geo.on_cornea) {
+        glint_geometry_list_.push_back(geo);
+        return true;
+    }
+
+    return false;
 }
 
 std::vector<std::vector<cv::Point2f>>
-GlintDetector::glintGeometryListToGlintVectors(const std::vector<GlintDetector::GlintGeometry>& glint_geometry)
+GlintDetector::glintGeometryListToGlintVector(const std::vector<GlintDetector::GlintGeometry>& glint_geometry)
 {
     std::vector<std::vector<cv::Point2f>> glint_vectors;
     for (const auto& geo : glint_geometry) {
