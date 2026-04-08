@@ -1,13 +1,13 @@
-#include <regex>
 #include <iomanip>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <map>
+#include <filesystem>
 
 #include "cfg/config.hpp"
 #include "utils/gaze_estimation_types.hpp"
 #include "core/math_types.hpp"
-#include "utils/visualize.hpp"
-#include "utils/intersection.hpp"
-#include "glint_detection/detect_glint.hpp"
-#include "pupil_center/localize_pupil.hpp"
 #include "inference/one_camera_spherical.hpp"
 #include "utils/shared_calculations.hpp"
 #include "calib/calibration.hpp"
@@ -15,13 +15,7 @@
 #include "utils/intersection.hpp"
 
 using namespace gazeestimation;
-using namespace visualization;
 namespace fs = std::filesystem;
-
-using OurCalibrationType = GenericCalibration<
-    EyeAndCameraParameters,
-    PupilCenterGlintInputs,
-    DefaultGazeEstimationResult>;
 
 int main() {
     std::cout << "Loading config file..." << std::endl;
@@ -31,120 +25,155 @@ int main() {
 
     std::vector<std::pair<PupilCenterGlintInputs, Vec3>> calibrate_against;
 
-    std::regex re(R"((?:\\|/)?([^\\/_]+)_(\d+)_(\d+)_([\d]+)\.avi$)");
+    // 获取数据根目录 (优先采用 test_glint 中的 record_dir)
+    std::string record_dir = cfg["test_two_eye"]["record_dir"].as<std::string>();
+    std::string output_dir = cfg["test_two_eye"]["output_dir"].as<std::string>();
 
-    int counter = 0;
+    // 获取每个文件夹采样的图片数量，默认 10 张
+    int max_images_per_folder = cfg["test_two_eye"]["num_images_per_folder"].as<int>();
 
-    for (const auto& entry : fs::directory_iterator(cfg["input_dir"].as<std::string>())) {
-        if (entry.path().extension() != ".avi") continue;
+    // 1. 自动读取屏幕标定点映射 (video_point_mapping.csv)
+    std::map<std::string, Vec2> point_mapping;
+    std::string mapping_file = record_dir + "/video_point_mapping.csv";
+    std::ifstream map_in(mapping_file);
+    if (!map_in.is_open()) {
+        std::cerr << "[ERROR] Cannot open mapping file: " << mapping_file << std::endl;
+        return -1;
+    }
 
-        if (counter > 10) break;
+    std::string line;
+    while (std::getline(map_in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        
+        std::stringstream ss(line);
+        std::string batch_timestr, point_idx_str, x_str, y_str;
+        std::getline(ss, batch_timestr, ',');
+        std::getline(ss, point_idx_str, ',');
+        std::getline(ss, x_str, ',');
+        std::getline(ss, y_str, ',');
+        
+        if (!x_str.empty() && !y_str.empty()) {
+            double x = std::stod(x_str);
+            double y = std::stod(y_str);
+            point_mapping[batch_timestr] = make_vec2(x, y);
+        }
+    }
+    map_in.close();
+    std::cout << "[INFO] Loaded " << point_mapping.size() << " screen target mappings." << std::endl;
 
-        std::string video_path = entry.path().string();
-
-        std::smatch match;
-        if (!std::regex_search(video_path, match, re)) {
-            std::cerr << "[WARN] Filename format invalid: " << video_path << std::endl;
+    // 2. 遍历每个 record_xxx 文件夹，解析 glint_pupil_data.csv
+    for (const auto& entry : fs::directory_iterator(record_dir)) {
+        if (!entry.is_directory()) continue;
+        
+        std::string dirname = entry.path().filename().string();
+        
+        // 排除不符合命名规则的文件夹或 raw 文件夹
+        if (dirname.rfind("record_", 0) != 0 || dirname.find("raw") != std::string::npos) {
             continue;
         }
 
-        double pog_x = std::stod(match[3]);
-        double pog_y = std::stod(match[4]);
-        Vec2 true_pog = make_vec2(pog_x, pog_y);
-        // Vec3 target = PoGToWCS(true_pog, cfg);
+        // 提取 batch_timestr 并查找 target WCS
+        std::string timestr = dirname.substr(7); // "record_" 占前 7 个字符
+        if (point_mapping.find(timestr) == point_mapping.end()) {
+            std::cerr << "[WARN] No mapping found for folder: " << dirname << std::endl;
+            continue;
+        }
+
+        Vec2 true_pog = point_mapping[timestr];
         Vec3 target = screenToWCS(true_pog, cfg);
-        std::cout << "target WCS: " << target.transpose() << std::endl;
+        std::cout << "Folder: " << dirname << " -> target WCS: " << target.transpose() << std::endl;
 
-        cv::VideoCapture cap(video_path);
-        if (!cap.isOpened()) {
-            std::cerr << "[ERROR] Cannot open video: " << video_path << std::endl;
+        // 打开该目录下的数据记录表
+        std::string data_csv_path = (entry.path() / "glint_pupil_data.csv").string();
+        std::ifstream data_in(data_csv_path);
+        if (!data_in.is_open()) {
+            std::cerr << "[WARN] Cannot open data file: " << data_csv_path << std::endl;
             continue;
         }
 
-        int total_frames = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_COUNT));
-        int start_frame = total_frames * 0.20;
-        int end_frame = total_frames * 0.80;
+        // 跳过表头
+        std::getline(data_in, line);
 
-        std::cout << "Extracting from " << video_path << " ..." << std::endl;
+        int img_count = 0;
+        while (std::getline(data_in, line)) {
+            if (line.empty()) continue;
 
-        for (int i = start_frame; i < start_frame + 1; i++) {
-            cap.set(cv::CAP_PROP_POS_FRAMES, i);
-            cv::Mat frame;
-            if (!cap.read(frame) || frame.empty()) continue;
+            std::stringstream ss(line);
+            std::vector<std::string> tokens;
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                tokens.push_back(token);
+            }
 
-            cv::Mat gray;
-            cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+            if (tokens.size() < 17) continue;
 
-            auto [leftEyeGlints, rightEyeGlints, img_debug] =
-                glintdetection::searchForGlints(frame, 50.0);
-            if (leftEyeGlints.size() != 3) continue;
-            if (rightEyeGlints.size() != 3) continue;
+            std::string filepath = tokens[0];
 
-            auto [leftPupilCenter, leftEyeImage, leftRadius] =
-                pupilcenter::localizePupilCenter(gray, leftEyeGlints);
-            auto [rightPupilCenter, rightEyeImage, rightRadius] =
-                pupilcenter::localizePupilCenter(gray, rightEyeGlints);
+            // =========== REQUIREMENT 1: 仅采用 cam_0 ===========
+            if (filepath.find("cam_0") == std::string::npos) {
+                continue;
+            }
 
+            // 解析坐标
+            double lp_x = std::stod(tokens[1]);
+            double lp_y = std::stod(tokens[2]);
+            double rp_x = std::stod(tokens[3]);
+            double rp_y = std::stod(tokens[4]);
+
+            double lg_l_x = std::stod(tokens[5]);
+            double lg_l_y = std::stod(tokens[6]);
+            double lg_r_x = std::stod(tokens[7]);
+            double lg_r_y = std::stod(tokens[8]);
+            double lg_m_x = std::stod(tokens[9]);
+            double lg_m_y = std::stod(tokens[10]);
+
+            double rg_l_x = std::stod(tokens[11]);
+            double rg_l_y = std::stod(tokens[12]);
+            double rg_r_x = std::stod(tokens[13]);
+            double rg_r_y = std::stod(tokens[14]);
+            double rg_m_x = std::stod(tokens[15]);
+            double rg_m_y = std::stod(tokens[16]);
+
+            // =========== 剔除检测失败(填充0)的帧 ===========
+            if (lg_l_x == 0 && lg_l_y == 0 && lg_r_x == 0 && lg_r_y == 0) continue;
+            if (rg_l_x == 0 && rg_l_y == 0 && rg_r_x == 0 && rg_r_y == 0) continue;
+
+            // 构造网络推断所需输入
             PupilCenterGlintInputs inputs;
             PupilCenterGlintInput input;
-            for (const auto& g : leftEyeGlints)
-                input.left.glints.push_back(make_vec2(g.x, g.y));
-            input.left.pupil_center = make_vec2(leftPupilCenter.x, leftPupilCenter.y);
 
-            for (const auto& g : rightEyeGlints)
-                input.right.glints.push_back(make_vec2(g.x, g.y));
-            input.right.pupil_center = make_vec2(rightPupilCenter.x, rightPupilCenter.y);
+            // 左眼填充
+            input.left.pupil_center = make_vec2(lp_x, lp_y);
+            input.left.glints.push_back(make_vec2(lg_l_x, lg_l_y));
+            input.left.glints.push_back(make_vec2(lg_r_x, lg_r_y));
+            input.left.glints.push_back(make_vec2(lg_m_x, lg_m_y));
+
+            // 右眼填充
+            input.right.pupil_center = make_vec2(rp_x, rp_y);
+            input.right.glints.push_back(make_vec2(rg_l_x, rg_l_y));
+            input.right.glints.push_back(make_vec2(rg_r_x, rg_r_y));
+            input.right.glints.push_back(make_vec2(rg_m_x, rg_m_y));
 
             inputs.data.push_back(input);
             calibrate_against.push_back(std::make_pair(inputs, target));
 
-			// --- 将检测结果转换为 OpenCV 点 ----
-			std::vector<cv::Point2d> gl_pts;
-			gl_pts.reserve(leftEyeGlints.size() + rightEyeGlints.size());
-			for (const auto& g : leftEyeGlints) {
-				gl_pts.emplace_back(g.x, g.y);
-			}
-            for (const auto& g : rightEyeGlints) {
-                gl_pts.emplace_back(g.x, g.y);
-			}
-			cv::Point2d pupil_left(leftPupilCenter.x, leftPupilCenter.y);
-            cv::Point2d pupil_right(rightPupilCenter.x, rightPupilCenter.y);
+            img_count++;
 
-			// --- 生成可视化图像 ---
-			cv::Mat vis = visualizeGlintsAndPupil(frame, gl_pts, pupil_left, leftRadius);
-            vis = visualizeGlintsAndPupil(vis, gl_pts, pupil_right, rightRadius);
-
-			// --- 准备输出目录：父目录 / "<video_stem>_viz" ---
-			fs::path video_path_obj = entry.path(); // 你在外面有 entry
-			fs::path parent_dir = video_path_obj.parent_path();
-			std::string stem = video_path_obj.stem().string();
-			fs::path out_dir = parent_dir / (stem + "_viz");
-			if (!fs::exists(out_dir)) {
-				try {
-					fs::create_directories(out_dir);
-				} catch (const std::exception& e) {
-					std::cerr << "[WARN] 无法创建输出目录: " << out_dir << " , " << e.what() << std::endl;
-				}
-			}
-
-			// --- 保存图片，命名为 <video_stem>_frame_<frameIdx>.png ---
-			std::ostringstream fname;
-			fname << out_dir.string() << "/" << stem << "_frame_" << i << ".png";
-			if (!cv::imwrite(fname.str(), vis)) {
-				std::cerr << "[WARN] 保存可视化图片失败: " << fname.str() << std::endl;
-			}
-
+            // =========== REQUIREMENT 2: 达到指定读取数量后跳出当前文件夹 ===========
+            if (img_count >= max_images_per_folder) {
+                break;
+            }
         }
-        counter++;
+        data_in.close();
+        std::cout << "  -> Extracted " << img_count << " valid inputs from cam_0." << std::endl;
     }
 
-    std::cout << "\nTotal samples collected: "
-              << calibrate_against.size() << std::endl;
+    std::cout << "\nTotal samples collected: " << calibrate_against.size() << std::endl;
 
-
-    std::ofstream fout("D:/ylx/inference_result_left.txt");
+    // =========== 保持后续输出写入 txt 逻辑不变 ===========
+    std::ofstream fout(output_dir + "/inference_result_left.txt");
     if (!fout) {
-        std::cerr << "[ERROR] Cannot open file: calib_inference_result_left.txt\n";
+        std::cerr << "[ERROR] Cannot open file: " << output_dir << "/inference_result_left.txt\n";
         return -1;
     }
     // 表头
@@ -154,7 +183,7 @@ int main() {
          << "gt_x gt_y gt_z "
          << "pred_x pred_y pred_z\n";
 
-    for (const auto& [inputs, gt_wcs] : calibrate_against)
+    for (const auto&[inputs, gt_wcs] : calibrate_against)
     {
         try {
             DefaultGazeEstimationResult res = gazetracker.estimate(inputs, parameters);
@@ -175,11 +204,12 @@ int main() {
         }
     }
     fout.close();
-    std::cout << "\ninference result saved to calib_inference_result_left.txt\n";
+    std::cout << "\ninference result saved to " << output_dir << "/inference_result_left.txt\n";
 
-    std::ofstream fout_right("D:/ylx/inference_result_right.txt");
+
+    std::ofstream fout_right(output_dir + "/inference_result_right.txt");
     if (!fout_right) {
-        std::cerr << "[ERROR] Cannot open file: inference_result_right.txt\n";
+        std::cerr << "[ERROR] Cannot open file: " << output_dir <<"/inference_result_right.txt\n";
         return -1;
     }
     
@@ -208,7 +238,7 @@ int main() {
         }
     }
     fout_right.close();
-    std::cout << "\ninference result saved to inference_result_right.txt\n";
+    std::cout << "\ninference result saved to " << output_dir << "/inference_result_right.txt\n";
 
     return 0;
 }

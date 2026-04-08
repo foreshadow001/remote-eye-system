@@ -5,15 +5,46 @@
 #include <fstream>
 #include <iostream>
 #include <filesystem>
+#include <typeinfo> // for typeid
+#include <iomanip>     // for std::setprecision
+#include <type_traits> // for std::is_floating_point
 
 #include "core/math_types.hpp"
 #include "logger/logger.hpp"
 
 using namespace gazeestimation;
 
+// 告诉 yaml-cpp 如何解析自定义类型 Vec2 和 Vec3
+namespace YAML {
+    template<>
+    struct convert<Vec3> {
+        static bool decode(const Node& node, Vec3& rhs) {
+            if (!node.IsSequence() || node.size() != 3) {
+                return false; // 返回 false 会让 yaml-cpp 抛出 BadConversion 异常
+            }
+            rhs = make_vec3(node[0].as<double>(), node[1].as<double>(), node[2].as<double>());
+            return true;
+        }
+    };
+
+    template<>
+    struct convert<Vec2> {
+        static bool decode(const Node& node, Vec2& rhs) {
+            if (!node.IsSequence() || node.size() != 2) {
+                return false;
+            }
+            rhs = make_vec2(node[0].as<double>(), node[1].as<double>());
+            return true;
+        }
+    };
+}
+
 class CfgNode {
 public:
     CfgNode();
+    // 专门用于传递已失败状态的内部构造函数
+    CfgNode(bool valid, const std::string& path);
+    // 常规构造函数
     CfgNode(const YAML::Node& node, const std::string& path = "");
 
     // 访问子节点
@@ -24,42 +55,38 @@ public:
     YAML::Node::const_iterator begin() const;
     YAML::Node::const_iterator end() const;
 
-    // 模板接口（必须在头文件）
     template<typename T>
     T as() const {
-        if (!node_.IsDefined()) {
-            printWarning();
+        if (!is_valid_) return T{}; // 已经报错过了，直接返回空值，不再报坏转换的错
+        try {
+            return node_.as<T>();
+        } catch (const YAML::Exception& e) {
+            Logger::error() << "[Cfg ERROR] Type mismatch at path: '" << path_ 
+                            << "'. Expected: " << typeid(T).name() 
+                            << ". Details: " << e.what();
             return T{};
         }
-        return node_.as<T>();
     }
 
-    template<typename T>
-    std::vector<T> asVector() const {
-        if (!node_.IsDefined() || !node_.IsSequence()) {
-            printWarning();
-            return {};
-        }
-
-        std::vector<T> out;
-        out.reserve(node_.size());
-
-        for (const auto& it : node_) {
-            CfgNode child(it, path_);
-            out.push_back(child.as<T>());
-        }
-        return out;
-    }
-
-    bool isDefined() const { return node_.IsDefined(); }
+    bool isDefined() const { return is_valid_; }
 
 private:
     YAML::Node node_;
     std::string path_;
-
-    void printWarning() const;
+    bool is_valid_; // 核心标志：记录当前节点是否确实有效
 };
 
+// 帮助函数：将任意类型按指定精度转为字符串
+template <typename T>
+inline std::string formatValue(T val, int precision) {
+    std::ostringstream oss;
+    // 如果是浮点数且指定了精度，才设置 fixed 和 precision
+    if (std::is_floating_point<T>::value && precision >= 0) {
+        oss << std::fixed << std::setprecision(precision);
+    }
+    oss << val;
+    return oss.str();
+}
 
 class Cfg {
 public:
@@ -69,8 +96,40 @@ public:
 
     std::string path() const { return filepath_; }
 
-    void setScalar(const std::string& path, double v);
-    void setVector2D(const std::string& path, const std::vector<std::vector<double>>& v);
+    // 模板化：支持传入任意类型及精度设置 (precision = -1 表示使用默认格式)
+    template<typename T>
+    void setScalar(const std::string& path, T v, int precision = -1) {
+        internalSetScalar(path, formatValue(v, precision));
+    }
+
+    // 新增：支持一维数组写入 (写入单行，如 [1, 2, 3])
+    template<typename T>
+    void setVector(const std::string& path, const std::vector<T>& v, int precision = -1) {
+        std::string str = "[";
+        for (size_t i = 0; i < v.size(); i++) {
+            str += formatValue(v[i], precision);
+            if (i + 1 < v.size()) str += ", ";
+        }
+        str += "]";
+        internalSetScalar(path, str);
+    }
+
+    // 模板化：支持二维数组写入 (写入多行 block)
+    template<typename T>
+    void setVector2D(const std::string& path, const std::vector<std::vector<T>>& v, int precision = -1) {
+        std::vector<std::string> lines;
+        for (const auto& row : v) {
+            std::string line = "- [";
+            for (size_t i = 0; i < row.size(); i++) {
+                line += formatValue(row[i], precision);
+                if (i + 1 < row.size()) line += ", ";
+            }
+            line += "]";
+            lines.push_back(line);
+        }
+        internalSetBlock(path, lines);
+    }
+
     void save() const;
 
 private:
@@ -79,127 +138,9 @@ private:
     std::string original_text_;
 
     static bool fileExists(const std::string& p);
-
     std::string getConfigPath() const;
+
+    // 核心字符串替换逻辑
+    void internalSetScalar(const std::string& path, const std::string& val_str);
+    void internalSetBlock(const std::string& path, const std::vector<std::string>& block_lines);
 };
-
-template<>
-inline Vec3 CfgNode::as<Vec3>() const {
-    if (!node_.IsSequence() || node_.size() != 3) {
-        Logger::error() << "[Cfg] Expect Vec3 at " << path_;
-        return make_vec3(0, 0, 0);
-    }
-
-    return make_vec3(
-        node_[0].as<double>(),
-        node_[1].as<double>(),
-        node_[2].as<double>()
-    );
-}
-
-template<>
-inline std::vector<Vec3> CfgNode::as<std::vector<Vec3>>() const {
-    if (!node_.IsSequence()) {
-        Logger::error() << "[Cfg] Expect [std::vector<Vec3>] at " << path_;
-        return {};
-    }
-
-    std::vector<Vec3> out;
-    out.reserve(node_.size());
-
-    for (const auto& item : node_) {
-        CfgNode tmp(item, path_);
-        out.push_back(tmp.as<Vec3>());
-    }
-    return out;
-}
-
-template<>
-inline Vec2 CfgNode::as<Vec2>() const {
-    if (!node_.IsSequence() || node_.size() != 2) {
-        Logger::error() << "[Cfg] Expect Vec2 at " << path_;
-        return make_vec2(0, 0);
-    }
-
-    return make_vec2(
-        node_[0].as<double>(),
-        node_[1].as<double>()
-    );
-}
-
-template<>
-inline std::vector<Vec2> CfgNode::as<std::vector<Vec2>>() const {
-    if (!node_.IsSequence()) {
-        Logger::error() << "[Cfg] Expect [std::vector<Vec2>] at " << path_;
-        return {};
-    }
-
-    std::vector<Vec2> out;
-    out.reserve(node_.size());
-
-    for (const auto& item : node_) {
-        CfgNode tmp(item, path_);
-        out.push_back(tmp.as<Vec2>());
-    }
-    return out;
-}
-
-template<>
-inline std::vector<std::string> CfgNode::as<std::vector<std::string>>() const {
-    if (!node_.IsSequence()) {
-        Logger::error() << "[Cfg] Expect [std::vector<std::string>] at " << path_;
-        return {};
-    }
-
-    std::vector<std::string> out;
-    out.reserve(node_.size());
-
-    for (const auto& item : node_) {
-        out.push_back(item.as<std::string>());
-    }
-    return out;
-}
-
-template<>
-inline std::vector<std::vector<double>> CfgNode::as<std::vector<std::vector<double>>>() const {
-    if (!node_.IsSequence()) {
-        Logger::error() << "[Cfg] Expect [std::vector<std::vector<double>] at " << path_;
-        return {};
-    }
-
-    std::vector<std::vector<double>> out;
-    out.reserve(node_.size());
-
-    for (const auto& row : node_) {
-        if (!row.IsSequence()) {
-            Logger::error() << "[Cfg] Expect inner list for " << path_;
-            return {};
-        }
-
-        std::vector<double> inner;
-        inner.reserve(row.size());
-
-        for (const auto& elem : row) {
-            inner.push_back(elem.as<double>());
-        }
-        out.push_back(std::move(inner));
-    }
-
-    return out;
-}
-
-template<>
-inline std::vector<double> CfgNode::as<std::vector<double>>() const {
-    if (!node_.IsSequence()) {
-        Logger::error() << "[Cfg ERROR] Expect [std::vector<double>] at " << path_;
-        return {};
-    }
-
-    std::vector<double> out;
-    out.reserve(node_.size());
-
-    for (const auto& item : node_) {
-        out.push_back(item.as<double>());
-    }
-    return out;
-}

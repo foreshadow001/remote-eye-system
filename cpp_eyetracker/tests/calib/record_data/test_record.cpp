@@ -19,6 +19,8 @@
 #include <functional>
 #include <fstream>
 #include <algorithm>
+#include <sstream>
+#include <unordered_set> // 新增，用于存储有效时间戳
 #include <pylon/PylonIncludes.h>
 
 #include "cam/basler.hpp"
@@ -49,16 +51,16 @@ std::pair<int, int> getScreenResolution() {
 void drawMarkerPattern(cv::Mat& img, const cv::Point& center, const std::string& bg, int scale) {
     int cross_half = 10 * scale;     
     int circle_r   = 8 * scale;      
-    int dot_r      = 2 * scale;      
+    int dot_r      = 4 * scale;      
     int thick      = std::max(1, scale);
 
     cv::Scalar cross_color = (bg == "dark") ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 128, 0);
     cv::Scalar circle_color = (bg == "dark") ? cv::Scalar(255, 255, 0) : cv::Scalar(128, 128, 0); 
     cv::Scalar dot_color(0, 0, 255); 
 
-    cv::line(img, cv::Point(center.x - cross_half, center.y), cv::Point(center.x + cross_half, center.y), cross_color, thick, cv::LINE_AA);
-    cv::line(img, cv::Point(center.x, center.y - cross_half), cv::Point(center.x, center.y + cross_half), cross_color, thick, cv::LINE_AA);
-    cv::circle(img, center, circle_r, circle_color, thick, cv::LINE_AA);
+    // cv::line(img, cv::Point(center.x - cross_half, center.y), cv::Point(center.x + cross_half, center.y), cross_color, thick, cv::LINE_AA);
+    // cv::line(img, cv::Point(center.x, center.y - cross_half), cv::Point(center.x, center.y + cross_half), cross_color, thick, cv::LINE_AA);
+    // cv::circle(img, center, circle_r, circle_color, thick, cv::LINE_AA);
     cv::circle(img, center, dot_r, dot_color, cv::FILLED, cv::LINE_AA);
 }
 
@@ -126,6 +128,7 @@ struct CameraContext {
     thread writer_thread;
     atomic<bool> running{true};
     atomic<bool> recording{false};
+    atomic<int> target_frames{0}; 
 
     cv::Mat latest_frame;
     FrameMeta latest_meta;
@@ -157,6 +160,53 @@ struct CameraContext {
 atomic<int64_t> CameraContext::master_first_id(-1);
 atomic<bool> CameraContext::master_set(false);
 vector<shared_ptr<CameraContext>> cam_ctxs;
+
+// CSV 修改更新函数：如果已存在相同的点位ID，直接覆盖；否则追加。
+void updateMappingCSV(const string& filepath, const string& timestr, int point_idx, int x, int y) {
+    vector<string> lines;
+    ifstream in(filepath);
+    bool found = false;
+    if (in.is_open()) {
+        string line;
+        while (getline(in, line)) {
+            if (line.empty()) continue;
+            stringstream ss(line);
+            string t_str, idx_str;
+            getline(ss, t_str, ',');
+            getline(ss, idx_str, ',');
+            
+            if (idx_str.empty()) { 
+                lines.push_back(line); 
+                continue; 
+            }
+            try {
+                if (stoi(idx_str) == point_idx) {
+                    // 找到相同点位，替换行内容
+                    stringstream newline;
+                    newline << timestr << "," << point_idx << "," << x << "," << y;
+                    lines.push_back(newline.str());
+                    found = true;
+                } else {
+                    lines.push_back(line);
+                }
+            } catch(...) {
+                lines.push_back(line); 
+            }
+        }
+        in.close();
+    }
+    
+    if (!found) {
+        stringstream newline;
+        newline << timestr << "," << point_idx << "," << x << "," << y;
+        lines.push_back(newline.str());
+    }
+    
+    ofstream out(filepath, ios::trunc);
+    for (const auto& l : lines) {
+        out << l << "\n";
+    }
+}
 
 // ================== 相机工作线程与转码逻辑 ==================
 
@@ -245,17 +295,21 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
         }
 
         if (ctx->recording) {
-            ctx->recorded_frames = state->frame_seq; 
-            std::stringstream ss;
-            ss << ctx->temp_dir << "/" << std::setw(6) << std::setfill('0') << state->frame_seq++ << ".raw";
-            
-            {
-                lock_guard<mutex> lock(ctx->queue_mtx);
-                if (ctx->write_queue.size() < 800) {
-                    ctx->write_queue.push({ss.str(), frame.clone(), meta});
+            if (state->frame_seq < ctx->target_frames.load()) {
+                std::stringstream ss;
+                ss << ctx->temp_dir << "/" << std::setw(6) << std::setfill('0') << state->frame_seq << ".raw";
+                
+                {
+                    lock_guard<mutex> lock(ctx->queue_mtx);
+                    if (ctx->write_queue.size() < 800) {
+                        ctx->write_queue.push({ss.str(), frame.clone(), meta});
+                    }
                 }
+                ctx->queue_cv.notify_one();
+                
+                state->frame_seq++;
+                ctx->recorded_frames = state->frame_seq; 
             }
-            ctx->queue_cv.notify_one();
         } else {
             state->frame_seq = 0; 
             ctx->recorded_frames = 0;
@@ -297,10 +351,7 @@ vector<LogEntry> parseLogFile(const string& log_path) {
 // ============== RAW 转换存 JPG 逻辑 ==============
 void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEntry> valid_entries, atomic<int>& global_processed) {
     if (valid_entries.empty()) return;
-    
-    // 创建 JPG 目标目录
     fs::create_directories(out_jpg_dir);
-
     for (const auto& entry : valid_entries) {
         string raw_path = temp_raw_dir + "/" + entry.filename;
         cv::Mat raw_img(entry.height, entry.width, CV_8UC1);
@@ -309,7 +360,6 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
             in_raw.read(reinterpret_cast<char*>(raw_img.data), raw_img.total());
             in_raw.close();
             
-            // 替换扩展名 .raw 为 .jpg
             string jpg_filename = entry.filename;
             size_t dot_pos = jpg_filename.find_last_of('.');
             if (dot_pos != string::npos) {
@@ -318,7 +368,6 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
                 jpg_filename += ".jpg";
             }
             
-            // 写入 JPG
             string jpg_path = out_jpg_dir + "/" + jpg_filename;
             cv::imwrite(jpg_path, raw_img);
         }
@@ -344,10 +393,12 @@ int main() {
     double gain         = cfg["test_multi_cam"]["gain"].as<double>();
     double gamma        = cfg["test_multi_cam"]["gamma"].as<double>();
     double exp_time     = cfg["test_multi_cam"]["exposure_time"].as<double>();
-    string save_base_dir = cfg["test_multi_cam"]["save_dir"].as<std::string>();
+    string save_base_dir = cfg["test_record"]["save_dir"].as<std::string>();
     
-    // 读取新增的 write_jpg 配置
-    bool write_jpg = cfg["test_multi_cam"]["write_jpg"].as<bool>();
+    // 读取行为配置
+    bool write_jpg     = cfg["test_record"]["write_jpg"].as<bool>();
+    int target_frames  = cfg["test_record"]["target_frames"].as<int>(); 
+    bool remove_false  = cfg["test_record"]["remove_false"].as<bool>(); // 是否清理多余的文件
 
     // 读取标定点配置
     int rows = cfg["calib_points"]["rows"].as<int>();
@@ -368,7 +419,7 @@ int main() {
         return -1;
     }
 
-    // 解析出需要的标定点列表(匹配对应theme)
+    // 解析出需要的标定点列表
     std::vector<CalibPoint> calib_points;
     for (const auto& entry : fs::directory_iterator(calib_img_dir)) {
         if (!entry.is_regular_file()) continue;
@@ -381,7 +432,6 @@ int main() {
         }
     }
     
-    // 按索引排序
     std::sort(calib_points.begin(), calib_points.end(),[](const CalibPoint& a, const CalibPoint& b){
         return a.idx < b.idx;
     });
@@ -405,11 +455,10 @@ int main() {
     cv::setWindowProperty(win_name, cv::WND_PROP_FULLSCREEN, cv::WINDOW_FULLSCREEN);
 
     cout << "Ready. Controls:\n"
-         << "  [a] Previous Point\n"
-         << "  [d] Next Point\n"
-         << "[r] Start Record\n"
-         << "  [s] Stop & Save\n"
-         << "  [q] Quit\n";
+         << "  [Backspace] Previous Point\n"
+         << "  [Enter] Next Point\n"
+         << "  [Space] Start Record (Auto Stop at " << target_frames << " frames)\n"
+         << "  [q / ESC] Quit\n";
 
     bool is_recording = false;
     bool running = true;
@@ -417,12 +466,10 @@ int main() {
     string current_record_timestr;
     std::chrono::steady_clock::time_point record_start_time;
 
-    // 映射文件路径
     string mapping_file_path = save_base_dir + "/video_point_mapping.csv";
 
+    // ================== 主循环 ==================
     while (running) {
-        
-        // --- A. 加载并展示对应全屏点位 ---
         cv::Mat display_img = cv::imread(calib_points[current_img_idx].filepath);
         if (display_img.empty()) {
             display_img = cv::Mat::zeros(1080, 1920, CV_8UC3); 
@@ -430,8 +477,11 @@ int main() {
 
         if (is_recording) {
             double elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - record_start_time).count();
-            char time_buf[64];
-            snprintf(time_buf, sizeof(time_buf), "REC - %.1fs", elapsed_s);
+            int max_recorded = 0;
+            for (auto& ctx : cam_ctxs) max_recorded = std::max(max_recorded, ctx->recorded_frames.load());
+
+            char time_buf[128];
+            snprintf(time_buf, sizeof(time_buf), "REC - %.1fs [%d/%d]", elapsed_s, max_recorded, target_frames);
             cv::putText(display_img, time_buf, cv::Point(30, 50), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0,0,255), 2);
         } else {
             string info = "Point " + to_string(current_img_idx + 1) + " / " + to_string(calib_points.size()) + " | Ready";
@@ -440,53 +490,53 @@ int main() {
 
         cv::imshow(win_name, display_img);
 
-        // --- B. 按键响应 ---
         char key = (char)cv::waitKey(50); 
 
         if (key == 'q' || key == 27) {
             running = false;
         }
-        else if (key == 'a' && !is_recording) {
+        else if (key == 8 && !is_recording) { 
             if (current_img_idx > 0) current_img_idx--;
         }
-        else if (key == 'd' && !is_recording) {
+        else if ((key == 13 || key == 10) && !is_recording) {  
             if (current_img_idx < calib_points.size() - 1) current_img_idx++;
         }
-        else if (key == 'r') {
-            if (!is_recording) {
-                auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-                char buf[64];
-                strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", localtime(&t));
-                current_record_timestr = string(buf);
-                record_start_time = std::chrono::steady_clock::now(); 
+        else if (key == ' ' && !is_recording) { 
+            auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            char buf[64];
+            strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", localtime(&t));
+            current_record_timestr = string(buf);
+            record_start_time = std::chrono::steady_clock::now(); 
 
-                cout << "\n[Info] Start Recording Batch: " << current_record_timestr 
-                     << " for Point Index: " << calib_points[current_img_idx].idx << endl;
+            cout << "\n[Info] Start Recording Batch: " << current_record_timestr 
+                 << " for Point Index: " << calib_points[current_img_idx].idx << endl;
 
-                std::ofstream map_out(mapping_file_path, std::ios::app);
-                if (map_out.is_open()) {
-                    map_out << current_record_timestr << ","
-                            << calib_points[current_img_idx].idx << ","
-                            << calib_points[current_img_idx].x << ","
-                            << calib_points[current_img_idx].y << "\n";
-                }
-
-                for (auto& ctx : cam_ctxs) {
-                    string batch_raw = save_base_dir + "/temp_raw_" + current_record_timestr + "/cam_" + to_string(ctx->index);
-                    fs::create_directories(batch_raw);
-                    ctx->temp_dir = batch_raw;
-                    
-                    ctx->log_file_path = save_base_dir + "/record_" + current_record_timestr + "_cam_" + to_string(ctx->index) + ".txt";
-                    ctx->log_stream.open(ctx->log_file_path);
-                    
-                    ctx->recording = true; 
-                }
-                is_recording = true;
+            for (auto& ctx : cam_ctxs) {
+                string batch_raw = save_base_dir + "/temp_raw_" + current_record_timestr + "/cam_" + to_string(ctx->index);
+                fs::create_directories(batch_raw);
+                ctx->temp_dir = batch_raw;
+                
+                ctx->log_file_path = save_base_dir + "/record_" + current_record_timestr + "_cam_" + to_string(ctx->index) + ".txt";
+                ctx->log_stream.open(ctx->log_file_path);
+                
+                ctx->target_frames = target_frames; 
+                ctx->recording = true; 
             }
+            is_recording = true;
         }
-        else if (key == 's') {
-            if (is_recording) {
-                cout << "\n[Info] Stopping recording... waiting for queue flush." << endl;
+
+        // 自动停止检测
+        if (is_recording) {
+            bool all_finished = true;
+            for (auto& ctx : cam_ctxs) {
+                if (ctx->recorded_frames < target_frames) {
+                    all_finished = false; 
+                    break;
+                }
+            }
+
+            if (all_finished) {
+                cout << "\n[Info] Target frames reached. Stopping recording... waiting for queue flush." << endl;
                 is_recording = false;
 
                 for (auto& ctx : cam_ctxs) ctx->recording = false;
@@ -508,27 +558,16 @@ int main() {
                 for (int i = 0; i < cam_ctxs.size(); ++i) {
                     auto logs = parseLogFile(cam_ctxs[i]->log_file_path);
                     all_logs.push_back(logs);
-                    
-                    int total_saved = logs.size();
-                    int dropped_frames = 0;
-                    double actual_fps = 0.0, duration_s = 0.0;
-                    
-                    if (total_saved > 1) {
-                        for (size_t k = 1; k < logs.size(); ++k) {
-                            int64_t diff = logs[k].blockID - logs[k-1].blockID;
-                            if (diff > 1) dropped_frames += (diff - 1);
-                        }
-                        int64_t duration_ns = logs.back().timestamp - logs.front().timestamp;
-                        duration_s = static_cast<double>(duration_ns) / 10000000.0; 
-                        if (duration_s > 0) actual_fps = (total_saved - 1) / duration_s;
-                    }
-                    char report_buf[256];
-                    snprintf(report_buf, sizeof(report_buf), "[Cam %d] Saved: %4d | Drop: %d | Time: %.2fs | FPS: %.1f", 
-                             cam_ctxs[i]->index, total_saved, dropped_frames, duration_s, actual_fps);
-                    cout << report_buf << endl;
+                    // （日志打印省略细节）
+                    cout << "[Cam " << cam_ctxs[i]->index << "] Saved: " << logs.size() << endl;
                 }
 
-                // ================= 根据配置决定是否进行 RAW 到 JPG 转换 =================
+                // 更新映射文件（如果有重复录制直接覆盖）
+                updateMappingCSV(mapping_file_path, current_record_timestr, 
+                                 calib_points[current_img_idx].idx, 
+                                 calib_points[current_img_idx].x, 
+                                 calib_points[current_img_idx].y);
+
                 if (write_jpg) {
                     cout << "\n[Info] Analyzing timestamps for JPG synchronization..." << endl;
                     int64_t global_start_idx = 0;
@@ -579,7 +618,6 @@ int main() {
                         draw_progress_ui();
                         int current_processed = global_processed.load();
                         if (current_processed >= total_frames_all_cams) break;
-                        
                         if (current_processed == last_processed) {
                             if (++same_count > 100) break;
                         } else {
@@ -590,20 +628,16 @@ int main() {
                     }
                     
                     for (auto& t : compile_threads) if (t.joinable()) t.join();
-                    
                     global_processed = total_frames_all_cams;  
                     draw_progress_ui();
-                    cv::waitKey(200);
-                } else {
-                    cout << "\n[Info] write_jpg is disabled. Process complete without JPG conversion." << endl;
                     cv::waitKey(200);
                 }
             }
         }
     }
 
-    // 4. 清理资源退出
-    cout << "[System] Shutting down threads..." << endl;
+    // 4. 清理资源关闭线程
+    cout << "\n[System] Shutting down threads..." << endl;
     for (auto& ctx : cam_ctxs) {
         ctx->running = false;
         ctx->queue_cv.notify_all(); 
@@ -613,5 +647,57 @@ int main() {
     
     cv::destroyAllWindows();
     Pylon::PylonTerminate();
+
+    // =========================================================================
+    // 5. 根据 remove_false 策略，退出前清理因覆盖而产生的多余/废弃数据文件夹
+    // =========================================================================
+    if (remove_false) {
+        cout << "[System] Checking and cleaning up overwritten/obsolete records..." << endl;
+        
+        // 读取最终映射表，获取所有有效的 timestr
+        std::unordered_set<std::string> valid_timestrs;
+        ifstream in(mapping_file_path);
+        if (in.is_open()) {
+            string line;
+            while (getline(in, line)) {
+                if (line.empty()) continue;
+                stringstream ss(line);
+                string t_str;
+                getline(ss, t_str, ',');
+                if (!t_str.empty()) valid_timestrs.insert(t_str);
+            }
+            in.close();
+        }
+
+        // 遍历目录比对删除废弃文件
+        if (fs::exists(save_folder_path)) {
+            for (const auto& entry : fs::directory_iterator(save_folder_path)) {
+                string filename = entry.path().filename().string();
+                string t_str = "";
+
+                // 判断是否是我们生成的日志/图片目录
+                if (filename.rfind("temp_raw_", 0) == 0 && filename.length() >= 24) {
+                    t_str = filename.substr(9, 15); // 从 "temp_raw_YYYYMMDD_HHMMSS" 中提取
+                } else if (filename.rfind("record_", 0) == 0 && filename.length() >= 22) {
+                    t_str = filename.substr(7, 15); // 从 "record_YYYYMMDD_HHMMSS..." 中提取
+                }
+
+                // 校验提取出的字符串是否符合时间戳格式(长度15，中间带下划线)
+                if (!t_str.empty() && t_str.length() == 15 && t_str[8] == '_') {
+                    // 如果不在最终映射表里，说明是作废数据，删掉
+                    if (valid_timestrs.find(t_str) == valid_timestrs.end()) {
+                        try {
+                            fs::remove_all(entry.path());
+                            cout << "  Deleted unused record: " << filename << endl;
+                        } catch (const std::exception& e) {
+                            cerr << "  [Error] Failed to delete " << filename << ": " << e.what() << endl;
+                        }
+                    }
+                }
+            }
+        }
+        cout << "[System] Cleanup complete." << endl;
+    }
+
     return 0;
 }

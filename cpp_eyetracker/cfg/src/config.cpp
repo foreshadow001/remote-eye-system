@@ -60,20 +60,76 @@ static int findLineByFullPath(
 }
 
 
-// ... CfgNode 的实现保持不变 ...
-CfgNode::CfgNode() {}
-CfgNode::CfgNode(const YAML::Node& node, const std::string& path) : node_(node), path_(path) {}
+// --- CfgNode 实现 ---
+
+CfgNode::CfgNode() : is_valid_(false) {}
+
+CfgNode::CfgNode(bool valid, const std::string& path) 
+    : is_valid_(valid), path_(path) {}
+
+CfgNode::CfgNode(const YAML::Node& node, const std::string& path) 
+    : node_(node), path_(path), is_valid_(true) 
+{
+    // 【核心拦截 1】：构造时立刻检查节点是否存在或为空！
+    if (!node_.IsDefined() || node_.IsNull()) {
+        Logger::error() << "[Cfg ERROR] Missing key at path: '" << path_ << "'";
+        is_valid_ = false;
+    }
+}
+
 CfgNode CfgNode::operator[](const std::string& key) const {
     std::string new_path = path_.empty() ? key : path_ + "." + key;
+    
+    if (!is_valid_) return CfgNode(false, new_path); // 父节点已错，安静地传递错误
+    
+    // 【核心拦截 2】：如果当前不是字典却用字符串访问，当场报错
+    if (!node_.IsMap()) {
+        Logger::error() << "[Cfg ERROR] Node '" << path_ << "' is not a dictionary. Cannot access key: '" << key << "'";
+        return CfgNode(false, new_path);
+    }
+    
     return CfgNode(node_[key], new_path);
 }
-CfgNode CfgNode::operator[](size_t idx) const {
-    return CfgNode(node_[idx], path_ + "[" + std::to_string(idx) + "]");
-}
-YAML::Node::const_iterator CfgNode::begin() const { return node_.begin(); }
-YAML::Node::const_iterator CfgNode::end() const { return node_.end(); }
-void CfgNode::printWarning() const { Logger::warn() << "[Cfg] Missing key: " << path_; }
 
+CfgNode CfgNode::operator[](size_t idx) const {
+    std::string new_path = path_ + "[" + std::to_string(idx) + "]";
+    
+    if (!is_valid_) return CfgNode(false, new_path);
+    
+    // 【核心拦截 3】：检查数组访问权限及越界
+    if (!node_.IsSequence()) {
+        Logger::error() << "[Cfg ERROR] Node '" << path_ << "' is not a sequence. Cannot access index: " << idx;
+        return CfgNode(false, new_path);
+    }
+    if (idx >= node_.size()) {
+        Logger::error() << "[Cfg ERROR] Index out of bounds at '" << path_ << "'. Size is " << node_.size() << ", requested: " << idx;
+        return CfgNode(false, new_path);
+    }
+    
+    return CfgNode(node_[idx], new_path);
+}
+
+YAML::Node::const_iterator CfgNode::begin() const { 
+    if (!is_valid_) {
+        static const YAML::Node empty;
+        return empty.begin();
+    }
+    // 【核心拦截 4】：不可迭代对象报错
+    if (!node_.IsMap() && !node_.IsSequence()) {
+        Logger::error() << "[Cfg ERROR] Cannot iterate over node '" << path_ << "' (not a dict or list).";
+        static const YAML::Node empty;
+        return empty.begin();
+    }
+    return node_.begin(); 
+}
+
+YAML::Node::const_iterator CfgNode::end() const { 
+    if (!is_valid_ || (!node_.IsMap() && !node_.IsSequence())) {
+        static const YAML::Node empty;
+        return empty.end();
+    }
+    return node_.end(); 
+}
 
 // ... Cfg 的部分实现 ...
 
@@ -107,6 +163,10 @@ Cfg::Cfg(const std::string& filepath) {
 }
 
 CfgNode Cfg::operator[](const std::string& key) const {
+    if (!root_.IsDefined() || !root_.IsMap()) {
+        Logger::error() << "[Cfg ERROR] Root config is missing or not a dictionary.";
+        return CfgNode(false, key);
+    }
     return CfgNode(root_[key], key);
 }
 
@@ -115,66 +175,56 @@ std::string Cfg::getConfigPath() const {
     return (std::filesystem::path(current_file_path).parent_path().parent_path().parent_path() / "cfg" / "default.yaml").string();
 }
 
-void Cfg::setScalar(const std::string& path, double v)
+void Cfg::internalSetScalar(const std::string& path, const std::string& val_str)
 {
     auto keys = split(path);
     if (keys.empty()) return;
 
-    // 1. 拆路径
-    // keys = ["test_glint_hyperparameter", "horizontal_pair", "lr_y_min"]
-
-    // 2. 按行读原文
     std::vector<std::string> lines;
     std::istringstream iss(original_text_);
     std::string line;
     while (std::getline(iss, line)) lines.push_back(line);
 
-    // 3. 用完整路径查找
     int line_no = findLineByFullPath(lines, keys);
 
     if (line_no == -1) {
-        Logger::error() << "[Cfg] setScalar failed! Full path not found: " << path;
+        Logger::error() << "[Cfg ERROR] set failed! Path not found: " << path;
         return;
     }
 
-    // 4. 替换该行
     std::string& target_line = lines[line_no];
     size_t colon_pos = target_line.find(':');
 
-    target_line = target_line.substr(0, colon_pos + 1) + " " + std::to_string(v);
+    // 替换冒号后的内容为生成的字符串
+    target_line = target_line.substr(0, colon_pos + 1) + " " + val_str;
 
-    // 5. 重建原文缓存
     original_text_.clear();
     for (auto& l : lines) original_text_ += l + "\n";
 }
 
-
-void Cfg::setVector2D(const std::string& path, const std::vector<std::vector<double>>& vv)
+void Cfg::internalSetBlock(const std::string& path, const std::vector<std::string>& block_lines)
 {
     auto keys = split(path);
     if (keys.empty()) return;
 
-    // 1. 按行读取
     std::vector<std::string> lines;
     std::istringstream iss(original_text_);
     std::string line;
     while (std::getline(iss, line)) lines.push_back(line);
 
-    // 2. 找 conditions 行
     int line_no = findLineByFullPath(lines, keys);
 
     if (line_no == -1) {
-        Logger::error() << "[Cfg] setVector2D failed! Full path not found: " << path;
+        Logger::error() << "[Cfg ERROR] set failed! Path not found: " << path;
         return;
     }
 
-    // 3. 获取当前 indent
+    // 获取当前层缩进
     int indent = 0;
     while (indent < (int)lines[line_no].size() && lines[line_no][indent] == ' ') indent++;
-
     int child_indent = indent + 2;
 
-    // 4. 删除旧 block
+    // 删除旧 block
     int remove_start = line_no + 1;
     int remove_end = remove_start;
 
@@ -194,36 +244,27 @@ void Cfg::setVector2D(const std::string& path, const std::vector<std::vector<dou
     if (remove_end > remove_start)
         lines.erase(lines.begin() + remove_start, lines.begin() + remove_end);
 
-    // 5. 插入新 block
+    // 插入新 block 字符串
     int insert_pos = remove_start;
     std::string child_indent_str(child_indent, ' ');
 
-    for (const auto& row : vv) {
-        std::ostringstream oss;
-        oss << child_indent_str << "- [";
-        for (size_t i = 0; i < row.size(); i++) {
-            oss << row[i];
-            if (i + 1 < row.size()) oss << ", ";
-        }
-        oss << "]";
-        lines.insert(lines.begin() + insert_pos, oss.str());
+    for (const auto& row_str : block_lines) {
+        lines.insert(lines.begin() + insert_pos, child_indent_str + row_str);
         insert_pos++;
     }
 
-    // 6. 重建原文缓存
     original_text_.clear();
     for (auto& l : lines) original_text_ += l + "\n";
 }
-
 
 void Cfg::save() const
 {
     std::ofstream fout(filepath_);
     if (!fout.is_open()) {
-        Logger::error() << "[Cfg] Could not open file for writing: " << filepath_;
+        Logger::error() << "[Cfg ERROR] Could not open file for writing: " << filepath_;
         return;
     }
     fout << original_text_;
     fout.close();
-    Logger::info() << "[Cfg] Saved to " << filepath_;
+    Logger::info() << "[Cfg] Saved successfully to " << filepath_;
 }

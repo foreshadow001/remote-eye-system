@@ -140,9 +140,11 @@ void prepareRecordData(const std::string& save_dir, const std::string& collect_i
 
 // 第一阶段：处理图像，提取特征并保存可视化图
 void processAndSaveData(const std::string& input_folder, const std::string& output_folder, int max_images) {
-    GlintDetector glint_detector("collecting");
+    GlintDetector glint_detector("relaxed");
     glint_detector.setViz(false);
+    glint_detector.setVizThreshold(false);
     glint_detector.setLocalDebug(false);
+    glint_detector.setIsCollecting(true);
 
     if (!fs::exists(output_folder)) fs::create_directories(output_folder);
 
@@ -164,6 +166,7 @@ void processAndSaveData(const std::string& input_folder, const std::string& outp
 
         std::string filepath = input_folder + "\\" + filename;
         std::string filename_no_ext = filename.substr(0, filename.find_last_of('.'));
+        glint_detector.setImageName(filename_no_ext);
 
         std::string current_img_out_dir = output_folder + "\\" + filename_no_ext;
         std::string metadata_path = current_img_out_dir + "\\metadata.yml";

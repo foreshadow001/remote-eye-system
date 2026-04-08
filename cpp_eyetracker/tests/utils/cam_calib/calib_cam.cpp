@@ -108,6 +108,9 @@ void action()
     HTuple hv_CalibObjDescr = cfg["cam_calib"]["calib_plane"].as<std::string>().c_str();
     HTuple hv_OutputBaseDir = cfg["cam_calib"]["output_folder"].as<std::string>().c_str();
 
+    std::string output_folder= cfg["cam_calib"]["output_folder"].as<std::string>();
+    std::filesystem::create_directories(output_folder);
+
     HTuple hv_NumCameras; 
     HTuple hv_NumCalibImages;
 
