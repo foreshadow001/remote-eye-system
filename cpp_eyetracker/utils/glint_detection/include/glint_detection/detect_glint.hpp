@@ -128,6 +128,14 @@ private:
         cv::Point2f center() const { return (l_pt + r_pt + m_pt) / 3.0f; }
     };
 
+    struct RoiCluster {
+        int cluster_id = -1;
+        std::vector<cv::Rect> rois;              // 属于该聚类的细分 ROI 碎片
+        std::vector<cv::Rect> iris_exclusions;   // 该聚类内部的虹膜反光排除区域
+        Pupil best_pupil;                        // 该聚类对应的最佳 Pupil
+        cv::Rect limit_bound;                    // 整个聚类的外接限制框 (Bounding Box)
+    };
+
     std::string img_name_;
     cv::Mat threshold_output_;
     std::vector<cv::Mat> debug_imgs_;
@@ -173,26 +181,22 @@ private:
     double threshold_step_;
     double mini_threshold_;
 
-    double init_left_glints_x_min_, init_left_glints_x_max_;
-    double init_right_glints_x_min_, init_right_glints_x_max_;
-
-    std::vector<GlintGeometry> glint_geometry_list_;
     std::vector<GlintGeometry> final_geometries_;
 
     bool side2side(const cv::Point2f& l_pt, const cv::Point2f& r_pt);
     bool side2mid(const cv::Point2f& l_pt, const cv::Point2f& r_pt, const cv::Point2f& m_pt);
     bool side2mid(const cv::Point2f& s_pt, const cv::Point2f& m_pt);
 
-    std::tuple<cv::Mat, cv::Point2f>
-    getSearchRegionSideAndMid(
+    std::vector<cv::Rect> getSearchRegionSideAndMid(
         const cv::Point2f& s_pt, 
-        const cv::Point2f& m_pt
+        const cv::Point2f& m_pt,
+        const RoiCluster& cluster // 传入统一数据结构，返回切分后的有效区域
     );
 
-    std::tuple<cv::Mat, cv::Point2f>
-    getSearchRegionSideAndSide(
+    std::vector<cv::Rect> getSearchRegionSideAndSide(
         const cv::Point2f& l_pt,
-        const cv::Point2f& r_pt
+        const cv::Point2f& r_pt,
+        const RoiCluster& cluster // 传入统一数据结构，返回切分后的有效区域
     );
 
     void searchGlassReflections();
@@ -239,11 +243,16 @@ private:
         const cv::Rect& coarse_roi
     );
 
+    std::vector<cv::Rect> subtractRect(const cv::Rect& subject, const cv::Rect& clipper) const;
+
+    void excludeIrisReflectionsFromROIs(
+        std::vector<cv::Rect>& rois, 
+        std::vector<cv::Rect>& out_iris_bboxes // 新增输出参数，向外传递找到的反光区域
+    );
     std::vector<cv::Rect>
     determineCornealReflectionROI();
 
-    std::vector<cv::Rect>
-    getROI();
+    std::vector<RoiCluster> getROI();
 
     std::vector<std::vector<cv::Rect>> 
     clusterROIs(const std::vector<cv::Rect>& rois);
@@ -253,12 +262,8 @@ private:
     std::vector<GlintGeometry> 
     selectBestGlintsPerCluster(const std::vector<GlintGeometry>& all_candidates);
 
-    std::vector<GlintGeometry> 
-    detectCluster(
-        int cluster_id, 
-        const std::vector<cv::Rect>& cluster_rois,
-        const Pupil& best_pupil
-    );
+    std::vector<GlintDetector::GlintGeometry> 
+    GlintDetector::detectCluster(const RoiCluster& cluster);
 
     std::vector<cv::Point2f>
     searchGlintsInROI(
@@ -275,8 +280,14 @@ private:
     >
     GlintDetector::splitGlintsGeometry(std::vector<GlintDetector::GlintGeometry> glint_geometries);
 
-    std::vector<GlintGeometry>
-    findGeometry(std::vector<cv::Point2f> glint_candidates);
+    void sortGlintCandidates(std::vector<cv::Point2f>& glints);
+
+    std::vector<GlintGeometry> findGeometry(
+        std::vector<cv::Point2f> glint_candidates, 
+        double current_thr, 
+        const std::vector<GlintGeometry>& existing_geometries,
+        const RoiCluster& cluster // 传入统一数据结构
+    );
 
     bool isGlintRepeated(
         const std::vector<cv::Point2f>& roi_glints, 
@@ -285,23 +296,51 @@ private:
 
     bool isGlintGeometryRepeated(
         const cv::Point2f& s_pt, 
-        const cv::Point2f& m_pt
+        const cv::Point2f& m_pt,
+        const std::vector<GlintGeometry>& existing
     );
 
-    bool isGlintGeometryRepeated(
+    bool GlintDetector::isGlintGeometryRepeated(
         const GlintGeometry& geo,
         const std::vector<GlintGeometry>& existing
     );
 
-    bool checkAndPushGlintGeometry(
+    bool checkGlintGeometry(
         const cv::Point2f& l_pt,
         const cv::Point2f& r_pt,
-        const cv::Point2f& m_pt
+        const cv::Point2f& m_pt,
+        double& out_bg_brightness
     );
 
     std::vector<std::vector<cv::Point2f>>
     glintGeometryListToGlintVector(const std::vector<GlintGeometry>& glint_geometry);
     
+    // --- 射线与精细化瞳孔拟合相关函数 ---
+    Pupil refinePupil(
+        const cv::Mat& gray_img, 
+        const Pupil& rough_pupil, 
+        const GlintGeometry& glint_geo
+    );
+
+    std::vector<cv::Point2f> samplePupilEdgesByRayCasting(
+        const cv::Mat& gray_img, 
+        const cv::Point2f& rough_center, 
+        float rough_major_axis,
+        const GlintGeometry& glint_geo // 新增参数
+    );
+
+    std::vector<cv::Point2f> filterPupilEdgePoints(
+        const std::vector<cv::Point2f>& raw_edges, 
+        const cv::Point2f& rough_center,
+        const GlintGeometry& glint_geo
+    );
+
+    cv::RotatedRect fitEllipseRANSAC(
+        const std::vector<cv::Point2f>& clean_edges
+    );
+
+    // 亚像素双线性插值辅助函数
+    float getBilinearSubpixel(const cv::Mat& img, const cv::Point2f& pt) const;
 };
 
 } // namespace glintdetection

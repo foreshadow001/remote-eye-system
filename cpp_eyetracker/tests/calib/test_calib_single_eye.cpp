@@ -185,10 +185,10 @@ int main() {
     // 获取约束边界配置
     auto bounds_config = cfg["calib_values_bounds"];
     std::vector<std::vector<std::pair<double, double>>> bounds = {
-        { {deg_to_rad(bounds_config["alpha"].asVector<double>()[0]), deg_to_rad(bounds_config["alpha"].asVector<double>()[1])} },
-        { {deg_to_rad(bounds_config["beta"].asVector<double>()[0]),  deg_to_rad(bounds_config["beta"].asVector<double>()[1])} },
-        { {bounds_config["R"].asVector<double>()[0],  bounds_config["R"].asVector<double>()[1]} },
-        { {bounds_config["K"].asVector<double>()[0],  bounds_config["K"].asVector<double>()[1]} }
+        { {deg_to_rad(bounds_config["alpha"].as<std::vector<double>>()[0]), deg_to_rad(bounds_config["alpha"].as<std::vector<double>>()[1])} },
+        { {deg_to_rad(bounds_config["beta"].as<std::vector<double>>()[0]),  deg_to_rad(bounds_config["beta"].as<std::vector<double>>()[1])} },
+        { {bounds_config["R"].as<std::vector<double>>()[0],  bounds_config["R"].as<std::vector<double>>()[1]} },
+        { {bounds_config["K"].as<std::vector<double>>()[0],  bounds_config["K"].as<std::vector<double>>()[1]} }
     };
 
     // ================== 3. 左眼独立标定 ==================

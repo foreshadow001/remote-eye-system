@@ -11,6 +11,7 @@
 #include <cmath>
 #include <functional>
 #include <atomic>
+#include <fstream>
 #include <pylon/PylonIncludes.h>
 
 #include "cam/basler.hpp"
@@ -83,7 +84,6 @@ struct CameraContext {
     
     // 录制相关 (Temp存储)
     string temp_dir;      // 用于存 .raw
-    // string temp_jpg_dir;  // 新增：用于存生成的 .jpg
     string log_file_path;
     ofstream log_stream;
 
@@ -103,7 +103,7 @@ struct CameraContext {
     static atomic<int64_t> master_first_id; // 静态变量，记录第一台准备好的相机的ID
     static atomic<bool> master_set;
 
-    // 新增：用于视频写入的追踪
+    // 新增：用于写入的追踪
     int64_t last_recorded_aligned_id = -1;
 
     CameraContext(int idx, string cam_id) : index(idx), id(cam_id), cam(cam_id) {}
@@ -155,9 +155,7 @@ void writerWorker(shared_ptr<CameraContext> ctx) {
 void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time, bool use_hw_trigger) {
     TriggerMode mode = use_hw_trigger ? TriggerMode::Hardware : TriggerMode::Software;
     
-    // ctx->cam = BaslerCamera(ctx->id);
-    // 2. 将下面所有的 -> 改成 .
-    if (!ctx->cam.open(mode)) {  // <-- 修改这里
+    if (!ctx->cam.open(mode)) {
         ctx->status = CamStatus::ERROR_;
         ctx->status_msg = "OPEN FAILED";
         return;
@@ -165,14 +163,13 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
 
     cout << "[Step 2] Setting Params Cam " << ctx->index << "..." << endl;
     try {
-        if (!use_hw_trigger) ctx->cam.setFrameRate(fps);  // <-- 修改这里
-        ctx->cam.setGain(gain);                           // <-- 修改这里
-        ctx->cam.setGamma(gamma);                         // <-- 修改这里
-        ctx->cam.setExposureTime(exp_time);               // <-- 修改这里
+        if (!use_hw_trigger) ctx->cam.setFrameRate(fps);  
+        ctx->cam.setGain(gain);                           
+        ctx->cam.setGamma(gamma);                         
+        ctx->cam.setExposureTime(exp_time);               
     } catch (...) {}
 
-    // 独立计数器，给 lambda 回调使用 (需要用智能指针或者放到 ctx 中，这里使用静态局部包装或基于 ctx 扩展)
-    // 为避免 lambda 生命周期问题，我们使用 std::shared_ptr 包装状态
+    // 独立计数器，给 lambda 回调使用
     struct GrabState {
         int frame_seq = 0;
         int64_t frame_counter = 0;
@@ -221,7 +218,6 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
             
             {
                 lock_guard<mutex> lock(ctx->queue_mtx);
-                // (这里如果你之前加了防止内存溢出的容量限制，请保留)
                 if (ctx->write_queue.size() < 800) {
                     ctx->write_queue.push({ss.str(), frame.clone(), meta});
                 } else {
@@ -255,13 +251,11 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
 
     // 清理
     ctx->cam.close();
-    // delete ctx->cam;
-    // ctx->cam = nullptr;
 
     cout << "[End] Thread " << ctx->index << " exited." << endl;
 }
 
-// ================== 同步与视频合成逻辑 ==================
+// ================== 同步与图片保存逻辑 ==================
 
 vector<LogEntry> parseLogFile(const string& log_path) {
     vector<LogEntry> entries;
@@ -287,45 +281,35 @@ vector<LogEntry> parseLogFile(const string& log_path) {
     return entries;
 }
 
-// 视频合成线程函数 (去掉了 temp_jpg_dir 参数，移除了 imwrite)
-void compileVideoWorker(string temp_raw_dir, vector<LogEntry> valid_entries, string final_video_path, double fps, atomic<int>& global_processed, bool write_video) {
+// ============== RAW 转换存 JPG 逻辑 ==============
+void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEntry> valid_entries, atomic<int>& global_processed) {
     if (valid_entries.empty()) return;
-
-    int w = valid_entries[0].width;
-    int h = valid_entries[0].height;
     
-    cv::VideoWriter writer;
-    if (write_video) {
-        writer.open(final_video_path, cv::VideoWriter::fourcc('M','J','P','G'), fps, cv::Size(w, h));
-        if (!writer.isOpened()) {
-            cerr << "[Error] Cannot open writer: " << final_video_path << endl;
-        }
-    }
+    // 创建 JPG 目标目录
+    fs::create_directories(out_jpg_dir);
 
     for (const auto& entry : valid_entries) {
         string raw_path = temp_raw_dir + "/" + entry.filename;
-        
         cv::Mat raw_img(entry.height, entry.width, CV_8UC1);
         ifstream in_raw(raw_path, ios::binary);
         if (in_raw) {
             in_raw.read(reinterpret_cast<char*>(raw_img.data), raw_img.total());
             in_raw.close();
             
-            cv::Mat final_img;
-            // 黑白转彩色
-            cv::cvtColor(raw_img, final_img, cv::COLOR_GRAY2BGR); 
-
-            // 如果要求写视频，且 Writer 正常打开，则写入
-            if (write_video && writer.isOpened()) {
-                writer.write(final_img);
+            // 替换扩展名 .raw 为 .jpg
+            string jpg_filename = entry.filename;
+            size_t dot_pos = jpg_filename.find_last_of('.');
+            if (dot_pos != string::npos) {
+                jpg_filename = jpg_filename.substr(0, dot_pos) + ".jpg";
+            } else {
+                jpg_filename += ".jpg";
             }
+            
+            // 写入 JPG
+            string jpg_path = out_jpg_dir + "/" + jpg_filename;
+            cv::imwrite(jpg_path, raw_img);
         }
         global_processed++;
-    }
-    
-    if (write_video && writer.isOpened()) {
-        writer.release();
-        cout << "[Done] Saved Video " << final_video_path << " (" << valid_entries.size() << " frames)" << endl;
     }
 }
 
@@ -335,14 +319,9 @@ int main() {
     Cfg cfg;
     Pylon::PylonInitialize();
     
-    // --- 0. 配置读取 (假设 Config 中有相机列表，这里为了演示手动构建或从 string 读取) ---
-    // 假设 cfg["cameras"] 是一个包含相机ID的数组，或者我们在代码里指定
-    // 这里为了通用，假设我们读取一个字符串列表，或者你可以修改此处
     vector<string> camera_ids = cfg["test_multi_cam"]["cam_indices"].as<vector<string>>();
 
-    // !!! 新增：是否使用硬件触发 !!!
     bool use_hw_trigger = cfg["test_multi_cam"]["hardware_trigger"].as<bool>();
-
     double target_fps = cfg["test_multi_cam"]["fps"].as<double>();
     double gain = cfg["test_multi_cam"]["gain"].as<double>();
     double gamma = cfg["test_multi_cam"]["gamma"].as<double>();
@@ -351,7 +330,7 @@ int main() {
     string save_base_dir = cfg["test_multi_cam"]["save_dir"].as<std::string>();
     int win_w = cfg["test_multi_cam"]["window_width"].as<int>();
     int win_h = cfg["test_multi_cam"]["window_height"].as<int>();
-    bool write_video = cfg["test_multi_cam"]["write_video"].as<bool>();
+    bool write_jpg = cfg["test_multi_cam"]["write_jpg"].as<bool>(); // <--- 改为 write_jpg
     bool debug_time  = cfg["test_multi_cam"]["debug_time"].as<bool>();
 
     std::filesystem::path save_folder_path(save_base_dir);
@@ -469,7 +448,6 @@ int main() {
         if (valid_rows > 0 && valid_rows < grid_rows) {
             cv::Mat cropped = canvas(cv::Rect(0, 0, win_w, valid_rows * cell_h));
             // 保持比例显示在窗口中，或者调整窗口大小
-            // 这里我们更新显示的 Mat，不改变 Window 大小本身（或者你可以 resizeWindow）
             cv::resizeWindow("Multi-Cam Preview", cropped.cols, cropped.rows);
             cv::imshow("Multi-Cam Preview", cropped);
         } else {
@@ -499,11 +477,6 @@ int main() {
                     string batch_raw = save_base_dir + "/temp_raw_" + current_record_timestr + "/cam_" + to_string(ctx->index);
                     fs::create_directories(batch_raw);
                     ctx->temp_dir = batch_raw;
-                    
-                    // 创建 jpg 文件夹
-                    // string batch_jpg = save_base_dir + "/temp_jpg_" + current_record_timestr + "/cam_" + to_string(ctx->index);
-                    // fs::create_directories(batch_jpg);
-                    // ctx->temp_jpg_dir = batch_jpg; 
                     
                     ctx->log_file_path = save_base_dir + "/record_" + current_record_timestr + "_cam_" + to_string(ctx->index) + ".txt";
                     ctx->log_stream.open(ctx->log_file_path);
@@ -573,21 +546,21 @@ int main() {
                     char report_buf[256];
                     if (dropped_frames > 0) {
                         snprintf(report_buf, sizeof(report_buf), 
-                                 "[Warning] Cam %d | Saved: %4d | Dropped: %d | Time: %.2fs | Actual FPS: %.1f", 
+                                 "[Warning] Cam %d | Saved: %4d | Dropped: %d | Time: %.2fs | Actual FPS: %.4f", 
                                  cam_ctxs[i]->index, total_saved, dropped_frames, duration_s, actual_fps);
                     } else {
                         snprintf(report_buf, sizeof(report_buf), 
-                                 "[OK]      Cam %d | Saved: %4d | Dropped: 0 | Time: %.2fs | Actual FPS: %.1f", 
+                                 "[OK]      Cam %d | Saved: %4d | Dropped: 0 | Time: %.2fs | Actual FPS: %.4f", 
                                  cam_ctxs[i]->index, total_saved, duration_s, actual_fps);
                     }
                     cout << report_buf << endl;
                 }
 
                 // =========================================================
-                // 5. 根据配置决定是否进行后处理视频
+                // 5. 根据配置决定是否进行后处理保存 JPG
                 // =========================================================
-                if (write_video) {
-                    cout << "\n[Info] Analyzing timestamps for video synchronization..." << endl;
+                if (write_jpg) {
+                    cout << "\n[Info] Analyzing timestamps for JPG synchronization..." << endl;
 
                     int64_t max_start_time = -1;
                     int64_t min_end_time = 9223372036854775807LL; 
@@ -625,7 +598,7 @@ int main() {
                     auto draw_progress_ui = [&]() {
                         cv::Mat loading = cv::Mat::zeros(400, 600, CV_8UC3);
                         int processed = global_processed.load();
-                        string text = "Processing Videos... " + to_string(processed) + "/" + to_string(total_frames_all_cams);
+                        string text = "Saving JPGs... " + to_string(processed) + "/" + to_string(total_frames_all_cams);
                         cv::putText(loading, text, cv::Point(50, 180), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
                         
                         int bar_x = 50, bar_y = 220, bar_w = 500, bar_h = 20;
@@ -641,16 +614,13 @@ int main() {
                     
                     vector<thread> compile_threads;
                     for (int i = 0; i < cam_ctxs.size(); ++i) {
-                        string video_fn = save_base_dir + "/record_" + current_record_timestr + "_cam_" + to_string(cam_ctxs[i]->index) + ".avi";
+                        string out_jpg_dir = save_base_dir + "/record_" + current_record_timestr + "/cam_" + to_string(cam_ctxs[i]->index);
                         compile_threads.emplace_back(
-                            compileVideoWorker, 
+                            convertRawToJpgWorker, 
                             cam_ctxs[i]->temp_dir,      
-                            // 传入时去掉了 temp_jpg_dir
+                            out_jpg_dir,     
                             final_entries_lists[i],     
-                            video_fn, 
-                            target_fps, 
-                            std::ref(global_processed),
-                            write_video                 
+                            std::ref(global_processed)                 
                         );
                     }
                     
@@ -684,7 +654,7 @@ int main() {
                     cv::waitKey(500);
                 } 
                 else {
-                    cout << "\n[Info] Video writing disabled. Process complete." << endl;
+                    cout << "\n[Info] write_jpg is disabled. Process complete without JPG conversion." << endl;
                     cv::waitKey(200); 
                 }
             }

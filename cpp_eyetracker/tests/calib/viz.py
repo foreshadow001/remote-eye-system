@@ -7,7 +7,7 @@ import yaml
 import os
 
 # ==================== 路径配置 ====================
-BASE_DIR = "D:/hitsz/projects/new_dataset/debug_gaze"
+BASE_DIR = "D:/hitsz/projects/new_dataset/eyetracker_test/debug"
 CONFIG_PATH = "D:/hitsz/projects/new_dataset/remote-eye-system/cpp_eyetracker/cfg/default.yaml"
 LEFT_DATA_PATH = os.path.join(BASE_DIR, "calib_inference_result_left_single.txt")
 RIGHT_DATA_PATH = os.path.join(BASE_DIR, "calib_inference_result_right_single.txt")
@@ -127,22 +127,88 @@ class GazeVisualizer:
         return dist_err, ang_l, ang_r, P_pred
 
     def print_summary_stats(self):
-        """打印全局平均误差数据"""
-        dist_list, ang_l_list, ang_r_list = [], [],[]
+        """按校准点分组计算 Accuracy 和 Precision"""
+        num_frames = self.num_frames
+        if num_frames < 2: return
 
-        for i in range(self.num_frames):
+        # 1. 提取所有关键数据
+        all_dist_errs = []
+        all_ang_l = []
+        all_ang_r = []
+        all_vis_l = []
+        all_vis_r = []
+        all_gts = []
+
+        for i in range(num_frames):
             dist_err, ang_l, ang_r, _ = self.calc_binocular_errors(self.left_data[i], self.right_data[i])
-            dist_list.append(dist_err)
-            ang_l_list.append(ang_l)
-            ang_r_list.append(ang_r)
+            all_dist_errs.append(dist_err)
+            all_ang_l.append(ang_l)
+            all_ang_r.append(ang_r)
+            all_vis_l.append(self.normalize(self.left_data[i][IDX_VIS : IDX_VIS+3]))
+            all_vis_r.append(self.normalize(self.right_data[i][IDX_VIS : IDX_VIS+3]))
+            all_gts.append(self.left_data[i][IDX_GT : IDX_GT+3])
 
-        print("\n" + "="*50)
-        print("          GLOBAL ERROR SUMMARY")
-        print("="*50)
-        print(f"Mean Global Dist Loss : {np.mean(dist_list):.2f} cm")
-        print(f"Mean Left Angular Loss: {np.mean(ang_l_list):.2f}°")
-        print(f"Mean Right Angular Loss:{np.mean(ang_r_list):.2f}°")
-        print("="*50 + "\n")
+        all_gts = np.array(all_gts)
+        
+        # 2. 根据 GT 坐标识别不同的目标点
+        # 使用 np.unique 找唯一的 GT 坐标（考虑浮点数精度，保留3位小数）
+        unique_gts, inverse_indices = np.unique(np.round(all_gts, decimals=3), axis=0, return_inverse=True)
+        num_points = len(unique_gts)
+
+        point_accuracies_dist = []
+        point_precisions_sd_l = []
+        point_precisions_sd_r = []
+        point_jitters_l = []
+        point_jitters_r = []
+
+        for i in range(num_points):
+            # 提取属于当前 GT 点的所有帧索引
+            indices = np.where(inverse_indices == i)[0]
+            if len(indices) < 2: continue
+            
+            # --- Accuracy (该点的平均误差) ---
+            point_accuracies_dist.append(np.mean([all_dist_errs[idx] for idx in indices]))
+            
+            # --- Precision (SD): 视线在该点波动情况 ---
+            point_precisions_sd_l.append(np.std([all_ang_l[idx] for idx in indices]))
+            point_precisions_sd_r.append(np.std([all_ang_r[idx] for idx in indices]))
+            
+            # --- Precision (RMS S2S Jitter): 采样点间的连续跳变 ---
+            def calc_point_jitter(vec_list):
+                diffs = []
+                # 注意：这里只计算在该点内部连续的帧，如果索引不连续说明跨段了
+                for k in range(1, len(vec_list)):
+                    # 如果数据在txt中是连续存储的，indices[k] - indices[k-1] == 1
+                    # 只有真正连续的帧才计算 Jitter，避免把切点瞬间算进去
+                    if indices[k] - indices[k-1] == 1:
+                        v1 = vec_list[k]
+                        v2 = vec_list[k-1]
+                        dot = np.clip(np.dot(v1, v2), -1.0, 1.0)
+                        diffs.append(np.degrees(np.arccos(dot))**2)
+                return np.sqrt(np.mean(diffs)) if diffs else 0.0
+
+            point_jitters_l.append(calc_point_jitter([all_vis_l[idx] for idx in indices]))
+            point_jitters_r.append(calc_point_jitter([all_vis_r[idx] for idx in indices]))
+
+        # 3. 打印统计结果
+        print("\n" + "="*65)
+        print(f"          GAZE METRICS SUMMARY ({num_points} Target Points)")
+        print("="*65)
+        print(f"{'Metric Type':<20} | {'Left Eye':<12} | {'Right Eye':<12} | {'Global'}")
+        print("-" * 65)
+        
+        # Accuracy: 所有点平均误差的平均值
+        mean_acc_l = np.mean(all_ang_l)
+        mean_acc_r = np.mean(all_ang_r)
+        mean_acc_dist = np.mean(point_accuracies_dist)
+        print(f"{'Accuracy (Mean)':<20} | {mean_acc_l:.3f}°{'':<6} | {mean_acc_r:.3f}°{'':<6} | {mean_acc_dist:.3f} cm")
+        
+        # Precision (SD): 衡量静止时的散布情况
+        print(f"{'Precision (SD)':<20} | {np.mean(point_precisions_sd_l):.3f}°{'':<6} | {np.mean(point_precisions_sd_r):.3f}°{'':<6} | ---")
+        
+        # Precision (Jitter): 衡量采样点间的跳动
+        print(f"{'Precision (Jitter)':<20} | {np.mean(point_jitters_l):.3f}°{'':<6} | {np.mean(point_jitters_r):.3f}°{'':<6} | ---")
+        print("="*65 + "\n")
 
     def calc_screen_geometry(self):
         center = np.array(self.cfg['screen_center'])

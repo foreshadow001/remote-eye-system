@@ -1,17 +1,17 @@
 # Camera calibration
 cam_calib:
-  input_folder: "D:/hitsz/projects/new_dataset/calib/calib_three_cam/"
+  input_folder: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx/cam_calib/pictures/"
   calib_plane: "D:/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
-  output_folder: "D:/hitsz/projects/new_dataset/calib/cams/"
-  focus: 0.012 # m
+  output_folder: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx/cam_calib/output/"
+  focus: 0.0123
   pixel_size_x: 3.45e-6 # m
   pixel_size_y: 3.45e-6 # m
 
 # Calibration Offline Settings
 test_calib:
-  record_dir: "D:/hitsz/projects/new_dataset/test_record"
+  record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx"
   num_images_per_folder: 20
-  output_dir: "D:/hitsz/projects/new_dataset/test_record"
+  output_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx"
 
 # Gaze Tracker Settings
 gaze_tracker:
@@ -24,12 +24,10 @@ gaze_tracker:
     window_size: 5
 
 # Camera Settings
-cam_pos: [29.0, -31.0, 17.0]
 cam_xml_path:
-  - "D:/hitsz/projects/new_dataset/calib/cams/Camera0_Data.xml"
+  - "D:/hitsz/projects/new_dataset/eyetracker_test/zyx/cam_calib/output/Camera0_Data.xml"
 #  - "D:/ylx/calib/cams/Camera1_Data.xml"
 #  - "D:/ylx/calib/cams/Camera2_Data.xml"
-cam_angles: [-31.5, 0.0, 0.0]
 
 # Lights Settings
 lights_pos:
@@ -86,7 +84,7 @@ test_multi_cam:
   write_jpg: true
   write_video: false
   debug_time: true
-  save_dir: "D:/hitsz/projects/new_dataset/test_record"
+  save_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx/cam_calib/pictures"
   fps: 200
   gain: 0.0
   gamma: 1.0
@@ -95,6 +93,12 @@ test_multi_cam:
   window_height: 1080
   cam_width: 1440
   cam_height: 1080
+
+test_record:
+  save_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx"
+  write_jpg: true
+  target_frames: 200
+  remove_false: true
 
 # Calib Points Settings
 calib_points:
@@ -120,89 +124,52 @@ test_glint:
   param_type: "relaxed"
   is_collecting: false
   viz: true
-  viz_threshold: false
+  viz_threshold: true
   num_images: 200000
-  input_folder: "D:/hitsz/projects/new_dataset/test_record/collect_input"
-  use_record: true
-  record_dir: "D:/hitsz/projects/new_dataset/test_record"
+  input_folder: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx/collect_input"
+  use_record: false
+  record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx"
   gaussian_kernel_size: 3
   laplacian_kernel_size: 1
-  init_threshold_value: 130.0
+  init_threshold_value: 110
   threshold_step: 30
-  mini_threshold: 10.0
-  search_region_side_and_mid_offset_x: 1
-  search_region_side_and_mid_offset_y: 1
-  search_region_side_and_side_offset_y: 0
+  mini_threshold: 20
 
 # Collect Potential Glint Triangles
 collect_glint:
   use_record: true
-  record_dir: "D:/hitsz/projects/new_dataset/test_record"
+  record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx"
   num_images: 100
   input_folder: "D:/hitsz/projects/new_dataset/test_record/debug/collect_input"
   output_folder: "D:/hitsz/projects/new_dataset/test_record/collect_output"
-
-original_specific_hyperparameter:
-  pupil:
-    searchPupilInROI:
-      kAdaptiveThreshOffset: 10.0
-      kAdaptiveThreshMax: 15.0
-      kMinPupilArea: 50.0
-      kMaxPupilArea: 800.0
-      kMinPupilContourPoints: 5
-      kMaxPupilAxis: 50.0
-      kMaxAxisRatio: 2.0
-      kMinSolidity: 0.60
-      kMinFitRatio: 0.65
-      kMaxAvgResidual: 0.40
-      kMaxDarkness: 15.0
-  
-  glint:
-    isPupilNearby:
-      kExclusionRadiusRatio: 2.5
-      
-    checkAndPushGlintGeometry:
-      kBrightnessThreshold: 25.0
-
-    horizontal_pair:
-      lr_y_min: 0
-      lr_y_max: 7
-      lr_x_min: 5
-      lr_x_max: 20
-
-    middle_point:
-      conditions:
-        - [0, 2, 0.2, 0.8, 0.05, 0.55, 0.2, 0.8, 0.05, 0.55]
-        - [2, 3, 0.45, 0.7, 0.05, 0.25, 0.3, 0.55, 0.25, 0.5]
-        - [3, 5, 0.45, 0.85, 0.04, 0.25, 0.15, 0.55, 0.3, 0.65]
 
 recommended_specific_hyperparameter:
   pupil:
     searchPupilInROI:
       kAdaptiveThreshOffset: 10.0
       kAdaptiveThreshMax: 7.0
-      kMinPupilArea: 84.000000
-      kMaxPupilArea: 660.500000
-      kMinPupilContourPoints: 5.000000
-      kMaxPupilAxis: 41.170168
-      kMaxAxisRatio: 2.965951
+      kMinPupilArea: 84
+      kMaxPupilArea: 660
+      kMinPupilContourPoints: 5
+      kMaxPupilAxis: 41.1702
+      kMaxAxisRatio: 2.96595
       kMinSolidity: 0.543367
       kMinFitRatio: 0.597502
       kMaxAvgResidual: 0.564495
-      kMaxDarkness: 13.330961
+      kMaxDarkness: 13.331
   
   glint:
     isPupilNearby:
-      kExclusionRadiusRatio: 1.955589
+      kExclusionRadiusRatio: 1.95559
       
-    checkAndPushGlintGeometry:
-      kBrightnessThreshold: 23.976471
+    checkGlintGeometry:
+      kBrightnessThreshold: 23.9765
 
     horizontal_pair:
-      lr_y_min: 0.000000
-      lr_y_max: 6.500000
-      lr_x_min: 7.000000
-      lr_x_max: 15.000000
+      lr_y_min: 0
+      lr_y_max: 6.5
+      lr_x_min: 7
+      lr_x_max: 15
 
     middle_point:
       conditions:
@@ -215,8 +182,8 @@ relaxed_specific_hyperparameter:
     searchPupilInROI:
       kAdaptiveThreshOffset: 10.0
       kAdaptiveThreshMax: 7.0
-      kMinPupilArea: 50.0
-      kMaxPupilArea: 1000.0
+      kMinPupilArea: 50
+      kMaxPupilArea: 1000
       kMinPupilContourPoints: 5
       kMaxPupilAxis: 50.0
       kMaxAxisRatio: 2.5
@@ -229,14 +196,14 @@ relaxed_specific_hyperparameter:
     isPupilNearby:
       kExclusionRadiusRatio: 2.5
 
-    checkAndPushGlintGeometry:
+    checkGlintGeometry:
       kBrightnessThreshold: 25.0
 
     horizontal_pair:
       lr_y_min: 0
       lr_y_max: 10
-      lr_x_min: 3
-      lr_x_max: 25
+      lr_x_min: 5
+      lr_x_max: 20
 
     middle_point:
       conditions:
@@ -264,12 +231,21 @@ relaxed_specific_hyperparameter:
       ext_ratio_xy: 0.05
 
 empirical_hyperparameter:
+  getSearchRegionSideAndMid:
+    kOffsetX: 1
+    kOffsetY: 1
+    kMinRemainderArea: 5
+
+  getSearchRegionSideAndSide:
+    kOffsetY: 0
+    kMinRemainderArea: 5
+
   searchPupilInROI:
     kMorphKernelSize: 5
     kMorphCloseIterations: 2
     kValidResidualRatio: 0.60
     kAxisRatioTolerance: 1.75
-    kMaxAngleAbs: 30
+    kMaxAngleAbs: 35
 
   searchGlassReflections:
     kMinContourArea: 50.0
@@ -316,12 +292,16 @@ empirical_hyperparameter:
     kChainExclusionScale: 1.5
 
   shrinkRoiToValidGlints:
-    kMaxNoiseArea: 5.0
+    kMaxNoiseArea: 3.0
     kClusterDistThresh: 80.0
     kMinClusterSize: 2
-    padding_y: 20
-    kDefaultLowSensitivityThresh: 25.0
-    kPaddingXRatio: 0.2
+    kPadding: 30
+    kDefaultLowSensitivityThresh: 50.0
+
+  excludeIrisReflectionsFromROIs:
+    kIrisReflectionThreshold: 100
+    kMinIrisReflectionArea: 10
+    kPadding: 2
 
   determineCornealReflectionROI:
     kRatioH: 3
@@ -332,6 +312,9 @@ empirical_hyperparameter:
 
   splitGlintsGeometry:
     kDistanceThresholdX: 100.0
+
+  findBestPupilForCluster:
+    kDarknessTolerance: 5.0
 
   selectBestGlintsPerCluster:
     kDistTolerance: 5.0
@@ -344,12 +327,12 @@ empirical_hyperparameter:
     kMaxMissingPointsToFind: 2
 
   isGlintRepeated:
-    kMinGlintDist: 3.0
+    kMinGlintDist: 4.0
 
   isGlintGeometryRepeated:
     kPointMatchTolerance: 3.0
 
-  checkAndPushGlintGeometry:
+  checkGlintGeometry:
     kDangerMaskThresh: 50.0
     kMinPadding: 5
     kPaddingRatio: 0.20
@@ -357,3 +340,19 @@ empirical_hyperparameter:
     kDilateIterations: 1
     kMinValidPixels: 5
     kTrimRatio: 0.10
+
+  samplePupilEdgesByRayCasting:
+    kRayCount: 72
+    kRayMaxRadiusRatio: 1.5
+    kMaxGlintBrightness: 200
+    kGradientGap: 3
+    kMinGradient: 2
+
+  refinePupil:
+    kGlintExclusionRadius: 15.0
+    kMaxDistanceDeviationRatio: 0.2
+    kRansacIterations: 100
+    kRansacTolerance: 2.0
+    kMinInlierRatio: 0.4
+    kMaxGlintBrightness: 50
+

@@ -281,26 +281,26 @@ int main() {
     // 5. 将计算结果更新至 YAML 并保存
     // ==========================================
     string prefix_pupil = "recommended_specific_hyperparameter.pupil.searchPupilInROI.";
-    cfg.setScalar(prefix_pupil + "kMinPupilArea", rr_area.rec_min);
-    cfg.setScalar(prefix_pupil + "kMaxPupilArea", rr_area.rec_max);
-    cfg.setScalar(prefix_pupil + "kMinPupilContourPoints", (int)rr_pts.rec_min);
-    cfg.setScalar(prefix_pupil + "kMaxPupilAxis", rr_axis.rec_max);
-    cfg.setScalar(prefix_pupil + "kMaxAxisRatio", rr_rat.rec_max);
-    cfg.setScalar(prefix_pupil + "kMinSolidity", rr_sol.rec_min);
-    cfg.setScalar(prefix_pupil + "kMinFitRatio", rr_fit.rec_min);
-    cfg.setScalar(prefix_pupil + "kMaxAvgResidual", rr_res.rec_max);
-    cfg.setScalar(prefix_pupil + "kMaxDarkness", rr_dark.rec_max);
+    cfg.setScalar<int>(prefix_pupil + "kMinPupilArea", rr_area.rec_min);
+    cfg.setScalar<int>(prefix_pupil + "kMaxPupilArea", rr_area.rec_max);
+    cfg.setScalar<int>(prefix_pupil + "kMinPupilContourPoints", (int)rr_pts.rec_min);
+    cfg.setScalar<double>(prefix_pupil + "kMaxPupilAxis", rr_axis.rec_max);
+    cfg.setScalar<double>(prefix_pupil + "kMaxAxisRatio", rr_rat.rec_max);
+    cfg.setScalar<double>(prefix_pupil + "kMinSolidity", rr_sol.rec_min);
+    cfg.setScalar<double>(prefix_pupil + "kMinFitRatio", rr_fit.rec_min);
+    cfg.setScalar<double>(prefix_pupil + "kMaxAvgResidual", rr_res.rec_max);
+    cfg.setScalar<double>(prefix_pupil + "kMaxDarkness", rr_dark.rec_max);
     // cfg.setScalar(prefix_pupil + "kAdaptiveThreshOffset", rr_offset.rec_max);
     // cfg.setScalar(prefix_pupil + "kAdaptiveThreshMax", rr_dark.rec_max);
 
     string prefix_glint = "recommended_specific_hyperparameter.glint.";
-    cfg.setScalar(prefix_glint + "isPupilNearby.kExclusionRadiusRatio", rr_excl.rec_max);
-    cfg.setScalar(prefix_glint + "checkAndPushGlintGeometry.kBrightnessThreshold", rr_bri.rec_max);
-    cfg.setScalar(prefix_glint + "horizontal_pair.lr_y_min", rr_lr_y.rec_min);
-    cfg.setScalar(prefix_glint + "horizontal_pair.lr_y_max", rr_lr_y.rec_max);
-    cfg.setScalar(prefix_glint + "horizontal_pair.lr_x_min", rr_lr_x.rec_min);
-    cfg.setScalar(prefix_glint + "horizontal_pair.lr_x_max", rr_lr_x.rec_max);
-    cfg.setVector2D(prefix_glint + "middle_point.conditions", output_conditions);
+    cfg.setScalar<double>(prefix_glint + "isPupilNearby.kExclusionRadiusRatio", rr_excl.rec_max);
+    cfg.setScalar<double>(prefix_glint + "checkAndPushGlintGeometry.kBrightnessThreshold", rr_bri.rec_max);
+    cfg.setScalar<double>(prefix_glint + "horizontal_pair.lr_y_min", rr_lr_y.rec_min);
+    cfg.setScalar<double>(prefix_glint + "horizontal_pair.lr_y_max", rr_lr_y.rec_max);
+    cfg.setScalar<double>(prefix_glint + "horizontal_pair.lr_x_min", rr_lr_x.rec_min);
+    cfg.setScalar<double>(prefix_glint + "horizontal_pair.lr_x_max", rr_lr_x.rec_max);
+    cfg.setVector2D<double>(prefix_glint + "middle_point.conditions", output_conditions);
 
     cfg.save();
     Logger::info() << "Hyperparameters updated and saved successfully to config.yaml";

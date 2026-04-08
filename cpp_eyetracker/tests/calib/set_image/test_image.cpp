@@ -41,7 +41,7 @@ std::pair<int, int> getScreenResolution() {
 void drawMarkerPattern(Mat& img, const Point& center, const std::string& bg, int scale) {
     int cross_half = 10 * scale;     // 十字半长
     int circle_r   = 8 * scale;      // 小圆半径
-    int dot_r      = 2 * scale;      // 红点半径
+    int dot_r      = 4 * scale;      // 红点半径
     int thick      = std::max(1, scale);
 
     Scalar cross_color = (bg == "dark") ? Scalar(0, 255, 0) : Scalar(0, 128, 0); // 绿色
@@ -49,9 +49,9 @@ void drawMarkerPattern(Mat& img, const Point& center, const std::string& bg, int
     Scalar dot_color(0, 0, 255); // 红色中心点
 
     // 绘制十字、圆、中心红点
-    line(img, Point(center.x - cross_half, center.y), Point(center.x + cross_half, center.y), cross_color, thick, LINE_AA);
-    line(img, Point(center.x, center.y - cross_half), Point(center.x, center.y + cross_half), cross_color, thick, LINE_AA);
-    circle(img, center, circle_r, circle_color, thick, LINE_AA);
+    // line(img, Point(center.x - cross_half, center.y), Point(center.x + cross_half, center.y), cross_color, thick, LINE_AA);
+    // line(img, Point(center.x, center.y - cross_half), Point(center.x, center.y + cross_half), cross_color, thick, LINE_AA);
+    // circle(img, center, circle_r, circle_color, thick, LINE_AA);
     circle(img, center, dot_r, dot_color, FILLED, LINE_AA);
 }
 
