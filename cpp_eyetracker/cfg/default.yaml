@@ -77,22 +77,40 @@ viz_output_dir: "D:/ylx/calib_viz"
 # Test Multi Cam
 test_multi_cam:
   cam_indices:
-    - 40061061
-    - 40061280
-    - 40109652
+    # - 40768742
+    # - 40774056
+    # - 40768741
+    - 40774057
+    # - 40774063
+    # - 40774064
+    # - 40768744
+    # - 40768743
+    # - 40773101
+    - 40772280
   hardware_trigger: false
   write_jpg: true
-  write_video: false
   debug_time: true
-  save_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx/cam_calib/pictures"
+  save_dir: 
+    # - "D:/test_cam"
+    # - "D:/test_cam"
+    # - "D:/test_cam"
+    - "D:/test_cam"
+    # - "D:/test_cam"
+    # - "E:/test_cam"
+    # - "E:/test_cam"
+    # - "E:/test_cam"
+    # - "E:/test_cam"
+    - "E:/test_cam"
   fps: 200
   gain: 0.0
   gamma: 1.0
   exposure_time: 4000.0
-  window_width: 1440
-  window_height: 1080
-  cam_width: 1440
-  cam_height: 1080
+  window_width: 1224
+  window_height: 1024
+  cam_width: 2448
+  cam_height: 2048
+  record_time: 1.0       # 录制的核心秒数 (代码会自动加20%余量)
+  write_delay_ms: 0      # 录制结束后，写硬盘阶段每帧的延时(毫秒)，用以控制CPU和硬盘峰值压力，0为全速
 
 test_single_cam:
   sn: "40768741"
