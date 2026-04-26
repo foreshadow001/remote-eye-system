@@ -94,6 +94,14 @@ test_multi_cam:
   cam_width: 1440
   cam_height: 1080
 
+test_single_cam:
+  sn: "40768741"
+  hardware_trigger: false # 设为 false 就是软件触发，设为 true 就是硬件触发
+  fps: 30.0
+  gain: 0.0
+  gamma: 1.0
+  exposure_time: 20000.0 # 20ms
+
 test_record:
   save_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx"
   write_jpg: true
@@ -140,7 +148,6 @@ collect_glint:
   use_record: true
   record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx"
   num_images: 100
-<<<<<<< HEAD
   input_folder: "D:/hitsz/projects/new_dataset/test_record/debug/collect_input"
   output_folder: "D:/hitsz/projects/new_dataset/test_record/collect_output"
 
@@ -235,36 +242,6 @@ relaxed_specific_hyperparameter:
 
     horizontal_pair:
       lr_y_min: 0
-<<<<<<< HEAD
-      lr_y_max: 10
-      lr_x_min: 3
-      lr_x_max: 25
-
-    middle_point:
-      conditions:
-        - [0, 2, 0.2, 0.8, 0.05, 0.55, 0.2, 0.8, 0.05, 0.55]
-        - [2, 3, 0.45, 0.7, 0.05, 0.25, 0.3, 0.55, 0.25, 0.5]
-        - [3, 5, 0.45, 0.85, 0.04, 0.25, 0.15, 0.55, 0.3, 0.65]
-
-  ext:
-    pupil:
-      ext_area: 50.0
-      ext_points: 50.0
-      ext_axis: 10.0
-      ext_ratio: 0.5
-      ext_solidity: 0.10
-      ext_fit_ratio: 0.10
-      ext_residual: 0.10
-      ext_darkness: 3.0
-
-    glint:
-      ext_lr_x: 2.0
-      ext_lr_y: 2.0
-      ext_bg_bright: 3.0
-      ext_exclusion: 0.5
-      ext_ratio_xy: 0.05
-=======
->>>>>>> f96c68e62c4864c0279ef70ab8238e1f473fd4ad
 
 empirical_hyperparameter:
   getSearchRegionSideAndMid:
