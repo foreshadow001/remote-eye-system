@@ -1,7 +1,6 @@
 // ================== 1. 网络与系统核心头文件 (必须放在最前面) ==================
 #ifdef _WIN32
-    // 核心宏：阻止 windows.h 自动包含旧版 winsock.h 和其他不常用的 API
-    #define WIN32_LEAN_AND_MEAN 
+    #define WIN32_LEAN_AND_MEAN // 核心修复：防止 winsock.h 冲突
     #include <winsock2.h>
     #include <ws2tcpip.h>
     #include <windows.h>
@@ -25,11 +24,11 @@
 
 // ================== 3. 第三方库 ==================
 #include <opencv2/opencv.hpp>
-#include "cfg/config.hpp" 
+#include "cfg/config.hpp" // 请确保你的项目能找到它
 
 using namespace std;
 
-// 全局网络控制标志 (供主线程状态机使用)
+// ================== 全局标志位 ==================
 atomic<bool> net_cmd_record{false};
 atomic<bool> net_cmd_stop{false};
 atomic<bool> running{true};
@@ -38,7 +37,7 @@ atomic<bool> running{true};
 void sendUdpCommand(const string& target_ip, int port, const string& msg) {
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock == INVALID_SOCKET) {
-        cerr << "[Network] Failed to create socket." << endl;
+        cerr << "[Master ERROR] Failed to create socket." << endl;
         return;
     }
 
@@ -47,48 +46,81 @@ void sendUdpCommand(const string& target_ip, int port, const string& msg) {
     target_addr.sin_port = htons(port);
     inet_pton(AF_INET, target_ip.c_str(), &target_addr.sin_addr);
 
+    cout << "[Master] Sending '" << msg << "' to " << target_ip << ":" << port << "..." << endl;
+    
     int ret = sendto(sock, msg.c_str(), msg.length(), 0, (sockaddr*)&target_addr, sizeof(target_addr));
+    
     if (ret == -1) {
-        cerr << "[Network] Failed to send UDP packet." << endl;
+#ifdef _WIN32
+        cerr << "[Master ERROR] sendto failed. Error code: " << WSAGetLastError() << endl;
+#else
+        cerr << "[Master ERROR] sendto failed." << endl;
+#endif
+    } else {
+        cout << "[Master] Packet sent successfully (" << ret << " bytes)." << endl;
     }
+    
     closesocket(sock);
 }
 
 // ================== 网络监听模块 (Slave 专用) ==================
 void udpListenerWorker(int port) {
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == INVALID_SOCKET) return;
+    if (sock == INVALID_SOCKET) {
+        cerr << "[Slave ERROR] Failed to create socket." << endl;
+        return;
+    }
 
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
-    server_addr.sin_addr.s_addr = INADDR_ANY; // 监听所有网卡上的该端口
+    server_addr.sin_addr.s_addr = INADDR_ANY; // 监听本地所有网卡的 8888 端口
 
+    // 修复 1：使用 ::bind 避免和 std::bind 冲突
     if (::bind(sock, (sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
-        cerr << "[Network] Bind failed on port " << port << ". Port might be in use." << endl;
+#ifdef _WIN32
+        cerr << "[Slave ERROR] Bind failed on port " << port << ". Error code: " << WSAGetLastError() << endl;
+#else
+        cerr << "[Slave ERROR] Bind failed on port " << port << "." << endl;
+#endif
         closesocket(sock);
         return;
     }
 
-    // 设置非阻塞超时，以便优雅退出线程
+    // 修复 2：Windows 和 Linux 超时参数的平台差异
+#ifdef _WIN32
+    DWORD timeout = 100; // Windows 以毫秒为单位
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout)) == -1) {
+        cerr << "[Slave WARNING] setsockopt timeout failed." << endl;
+    }
+#else
     struct timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = 100000; // 100ms
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    tv.tv_usec = 100000; // Linux 为 100ms
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv)) == -1) {
+        cerr << "[Slave WARNING] setsockopt timeout failed." << endl;
+    }
+#endif
 
     char buffer[256];
-    cout << "[Network] Slave thread listening on UDP port " << port << "..." << endl;
+    cout << "[Slave] Thread successfully listening on UDP port " << port << "..." << endl;
 
     while (running) {
         sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
+        
+        // 由于设置了超时，recvfrom 不会死锁卡死主线程退出了
         int bytes = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, (sockaddr*)&client_addr, &client_len);
         
         if (bytes > 0) {
             buffer[bytes] = '\0';
             string cmd(buffer);
             
-            // 收到指令，触发原子变量
+            // 打印客户端信息，用于核实是 PC A 发来的包
+            char client_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+            cout << "\n[Slave] Received " << bytes << " bytes from " << client_ip << ":" << ntohs(client_addr.sin_port) << " -> " << cmd << endl;
+
             if (cmd == "CMD_START") {
                 net_cmd_record = true;
             } else if (cmd == "CMD_STOP") {
@@ -97,7 +129,7 @@ void udpListenerWorker(int port) {
         }
     }
     closesocket(sock);
-    cout << "[Network] Slave thread exited." << endl;
+    cout << "[Slave] Thread exited cleanly." << endl;
 }
 
 // ================== 主程序 ==================
@@ -105,43 +137,55 @@ int main() {
     cout << "=== [TEST] UDP Network Synchronization ===" << endl;
 
 #ifdef _WIN32
-    // Windows 必须初始化 Winsock
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        cerr << "WSAStartup failed." << endl;
+        cerr << "[System ERROR] WSAStartup failed." << endl;
         return 1;
     }
 #endif
 
     // 1. 读取配置
     Cfg cfg;
-    bool is_master_pc  = cfg["test_net"]["is_master"].as<bool>();
-    string master_ip   = cfg["test_net"]["master_ip"].as<string>();
-    string slave_ip    = cfg["test_net"]["slave_ip"].as<string>();
-    int port           = cfg["test_net"]["port"].as<int>();
+    bool is_master_pc = true;
+    string master_ip = "192.168.10.1";
+    string slave_ip = "192.168.10.2";
+    int port = 8888;
 
-    cout << "Role: " << (is_master_pc ? "MASTER (Sender)" : "SLAVE (Receiver)") << endl;
+    try {
+        is_master_pc  = cfg["test_net"]["is_master"].as<bool>();
+        master_ip     = cfg["test_net"]["master_ip"].as<string>();
+        slave_ip      = cfg["test_net"]["slave_ip"].as<string>();
+        port          = cfg["test_net"]["port"].as<int>();
+    } catch (const std::exception& e) {
+        cerr << "[System ERROR] Error reading config: " << e.what() << endl;
+    }
+
+    cout << "\n--- Current Configuration ---" << endl;
+    cout << "Role     : " << (is_master_pc ? "MASTER (Sender)" : "SLAVE (Receiver)") << endl;
+    cout << "Master IP: " << master_ip << endl;
+    cout << "Slave IP : " << slave_ip << endl;
+    cout << "Port     : " << port << endl;
+    cout << "-----------------------------\n" << endl;
 
     // 2. 角色分支初始化
     thread listener_thread;
     if (!is_master_pc) {
-        // 从机启动监听线程
         listener_thread = thread(udpListenerWorker, port);
     }
 
-    // 3. 准备 OpenCV 模拟 UI
+    // 3. 准备 UI
     cv::namedWindow("Net Sync Test UI", cv::WINDOW_NORMAL);
     cv::resizeWindow("Net Sync Test UI", 400, 300);
     bool is_recording = false;
 
-    // 4. 事件主循环 (完全模拟相机的循环结构)
+    // 4. 事件主循环
     while (running) {
-        // --- A. 渲染 UI 状态 ---
         cv::Mat canvas = cv::Mat::zeros(300, 400, CV_8UC3);
         string status_text = is_recording ? "STATUS: ARMED & RECORDING" : "STATUS: IDLE";
         cv::Scalar color = is_recording ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 0);
         
         cv::putText(canvas, status_text, cv::Point(20, 150), cv::FONT_HERSHEY_SIMPLEX, 0.7, color, 2);
+        
         if (is_master_pc) {
             cv::putText(canvas, "Press 'r' to Send START", cv::Point(20, 200), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255,255,255), 1);
             cv::putText(canvas, "Press 's' to Send STOP",  cv::Point(20, 230), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255,255,255), 1);
@@ -150,58 +194,52 @@ int main() {
         }
         cv::imshow("Net Sync Test UI", canvas);
 
-        // --- B. 事件与按键捕获 ---
-        char key = (char)cv::waitKey(50); // 50ms 刷新率
+        char key = (char)cv::waitKey(50);
         if (key == 'q' || key == 27) {
             running = false;
+            cout << "[System] Shutdown signal received." << endl;
+            break;
         }
 
-        // --- C. 状态机统一触发逻辑 ---
         bool trigger_start = false;
         bool trigger_stop = false;
 
         if (is_master_pc) {
-            // Master 由键盘接管触发，并发送网络包
             if (key == 'r' && !is_recording) {
-                cout << "\n[Master] Keyboard 'r' pressed. Sending START cmd..." << endl;
+                cout << "\n[UI] 'r' pressed. Sending START command..." << endl;
                 sendUdpCommand(slave_ip, port, "CMD_START");
                 trigger_start = true;
             } 
             else if (key == 's' && is_recording) {
-                cout << "\n[Master] Keyboard 's' pressed. Sending STOP cmd..." << endl;
+                cout << "\n[UI] 's' pressed. Sending STOP command..." << endl;
                 sendUdpCommand(slave_ip, port, "CMD_STOP");
                 trigger_stop = true;
             }
         } else {
-            // Slave 由网络标志位接管触发
             if (net_cmd_record) {
-                cout << "\n[Slave] Net signal received. Triggering START..." << endl;
+                cout << "[UI] Network START command processed." << endl;
                 trigger_start = true;
-                net_cmd_record = false; // 消费信号
+                net_cmd_record = false;
             }
             if (net_cmd_stop) {
-                cout << "\n[Slave] Net signal received. Triggering STOP..." << endl;
+                cout << "[UI] Network STOP command processed." << endl;
                 trigger_stop = true;
-                net_cmd_stop = false;   // 消费信号
+                net_cmd_stop = false;
             }
         }
 
-        // --- D. 实际执行业务逻辑 ---
         if (trigger_start && !is_recording) {
             is_recording = true;
-            // TODO: 在集成时，这里将放置创建目录、打开日志流、设置 ctx->recording = true 等操作
-            cout << "[System] >>> RECORDING QUEUES ARMED. Waiting for HW Trigger! <<<" << endl;
+            cout << "[System] >>> QUEUES ARMED. Waiting for HW Trigger! <<<" << endl;
         }
 
         if (trigger_stop && is_recording) {
             is_recording = false;
-            // TODO: 在集成时，这里将放置刷新写入队列、关闭日志流等操作
-            cout << "[System] >>> RECORDING STOPPED. Writers flushed. <<<" << endl;
+            cout << "[System] >>> STOPPED. <<<" << endl;
         }
     }
 
     // 5. 退出清理
-    cout << "[System] Shutting down..." << endl;
     if (listener_thread.joinable()) {
         listener_thread.join();
     }
@@ -211,5 +249,6 @@ int main() {
     WSACleanup();
 #endif
 
+    cout << "[System] Exited cleanly." << endl;
     return 0;
 }
