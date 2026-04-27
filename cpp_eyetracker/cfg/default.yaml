@@ -74,6 +74,12 @@ screen_vertical_direction: [0.00, 0.91, -0.42]
 viz: true
 viz_output_dir: "D:/ylx/calib_viz"
 
+test_net:
+  is_master: true          # 在 PC A 上设为 true，在 PC B 上设为 false
+  master_ip: "192.168.10.1"
+  slave_ip: "192.168.10.2"
+  port: 8888
+
 # Test Multi Cam
 test_multi_cam:
   cam_indices:

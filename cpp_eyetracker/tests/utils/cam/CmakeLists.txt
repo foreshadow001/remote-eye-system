@@ -9,3 +9,15 @@ target_link_libraries(test_multi_cam
 )
 
 message(STATUS "✅ test_multi_cam will be built and linked with eyetracker::cam")
+
+add_executable(test_net
+    test_net.cpp
+)
+
+target_link_libraries(test_net
+    PRIVATE
+        eyetracker::cfg
+        eyetracker::cam
+)
+
+message(STATUS "✅ test_net will be built and linked with eyetracker::cam")
