@@ -1,17 +1,10 @@
-#include <iostream>
-#include <string>
-#include <thread>
-#include <atomic>
-#include <chrono>
-#include <opencv2/opencv.hpp>
-
-// 包含你的配置读取头文件
-#include "cfg/config.hpp" 
-
-// --- 跨平台 Socket 宏定义 ---
+// ================== 1. 网络与系统核心头文件 (必须放在最前面) ==================
 #ifdef _WIN32
+    // 核心宏：阻止 windows.h 自动包含旧版 winsock.h 和其他不常用的 API
+    #define WIN32_LEAN_AND_MEAN 
     #include <winsock2.h>
     #include <ws2tcpip.h>
+    #include <windows.h>
     #pragma comment(lib, "ws2_32.lib")
 #else
     #include <sys/socket.h>
@@ -22,6 +15,17 @@
     #define INVALID_SOCKET -1
     #define closesocket close
 #endif
+
+// ================== 2. 标准库 ==================
+#include <iostream>
+#include <string>
+#include <thread>
+#include <atomic>
+#include <chrono>
+
+// ================== 3. 第三方库 ==================
+#include <opencv2/opencv.hpp>
+#include "cfg/config.hpp" 
 
 using namespace std;
 
@@ -60,7 +64,7 @@ void udpListenerWorker(int port) {
     server_addr.sin_port = htons(port);
     server_addr.sin_addr.s_addr = INADDR_ANY; // 监听所有网卡上的该端口
 
-    if (bind(sock, (sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+    if (::bind(sock, (sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
         cerr << "[Network] Bind failed on port " << port << ". Port might be in use." << endl;
         closesocket(sock);
         return;
