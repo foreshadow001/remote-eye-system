@@ -65,7 +65,6 @@ void sendUdpCommand(const string& local_ip, const string& target_ip, int port, c
 
 // ================== 网络监听模块 (Slave - 提权至最高优先级) ==================
 void udpListenerWorker(const string& bind_ip, int port) {
-    // 提升为最高线程优先级以降低延迟
 #ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 #else
@@ -112,7 +111,7 @@ void udpListenerWorker(const string& bind_ip, int port) {
             buffer[bytes] = '\0';
             string cmd(buffer);
             if (cmd == "CMD_START") {
-                net_cmd_record = true; // 触发原子标志
+                net_cmd_record = true; 
             }
         } 
     }
@@ -352,7 +351,7 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
             
             cv::Mat final_img;
             if (is_mono) {
-                final_img = raw_img.clone(); // 强制深拷贝，确保底层内存块连续且独立
+                final_img = raw_img.clone(); // 已修复：深拷贝，解决单通道jpg保存失败
             } else {
                 cv::cvtColor(raw_img, final_img, cv::COLOR_BayerRG2RGB);
             }
@@ -463,67 +462,83 @@ int main() {
     string current_record_timestr;
     std::chrono::steady_clock::time_point record_start_time;
 
+    // --- 已修改：UI 刷新频率控制 ---
+    double target_ui_fps = 30.0; // 配置UI刷新率
+    auto ui_interval = std::chrono::milliseconds(static_cast<int>(1000.0 / target_ui_fps));
+    auto last_ui_time = std::chrono::steady_clock::now() - ui_interval; 
+
     while (global_running) {
-        int n_cams = cam_ctxs.size();
-        int grid_rows = 1, grid_cols = 1;
-        if (n_cams == 1) { grid_rows = 1; grid_cols = 1; }
-        else if (n_cams <= 4) { grid_rows = 2; grid_cols = 2; }
-        else if (n_cams <= 9) { grid_rows = 3; grid_cols = 3; }
-        else { grid_rows = 4; grid_cols = (n_cams + 3) / 4; }
+        auto current_time = std::chrono::steady_clock::now();
+        bool need_ui_update = (current_time - last_ui_time) >= ui_interval;
 
-        int cell_w = win_w / grid_cols;
-        int cell_h = win_h / grid_rows;
-        cv::Mat canvas = cv::Mat::zeros(win_h, win_w, CV_8UC3);
-        int valid_rows = 0; 
+        // ===== 1. 解耦 UI 渲染模块 =====
+        if (need_ui_update && !is_dumping) {
+            int n_cams = cam_ctxs.size();
+            int grid_rows = 1, grid_cols = 1;
+            if (n_cams == 1) { grid_rows = 1; grid_cols = 1; }
+            else if (n_cams <= 4) { grid_rows = 2; grid_cols = 2; }
+            else if (n_cams <= 9) { grid_rows = 3; grid_cols = 3; }
+            else { grid_rows = 4; grid_cols = (n_cams + 3) / 4; }
 
-        for (int i = 0; i < n_cams; ++i) {
-            cv::Mat img, local_raw;
-            {
-                lock_guard<mutex> lock(cam_ctxs[i]->frame_mtx);
-                if (!cam_ctxs[i]->latest_frame.empty()) local_raw = cam_ctxs[i]->latest_frame.clone(); 
-            }
+            int cell_w = win_w / grid_cols;
+            int cell_h = win_h / grid_rows;
+            cv::Mat canvas = cv::Mat::zeros(win_h, win_w, CV_8UC3);
+            int valid_rows = 0; 
 
-            if (!local_raw.empty()) {
-                cv::Mat color_full;
-                if (cam_ctxs[i]->is_mono) cv::cvtColor(local_raw, color_full, cv::COLOR_GRAY2RGB);
-                else cv::cvtColor(local_raw, color_full, cv::COLOR_BayerRG2RGB); 
-                cv::resize(color_full, img, cv::Size(cell_w, cell_h));
-            }
-
-            if (img.empty()) {
-                img = cv::Mat::zeros(cell_h, cell_w, CV_8UC3);
-                int baseline = 0;
-                cv::Size textSize = cv::getTextSize(cam_ctxs[i]->status_msg, cv::FONT_HERSHEY_SIMPLEX, 0.7, 2, &baseline);
-                cv::Point textOrg((cell_w - textSize.width) / 2, (cell_h + textSize.height) / 2);
-                cv::putText(img, cam_ctxs[i]->status_msg, textOrg, cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
-            } else {
-                if (is_recording) {
-                    int radius = 10;
-                    cv::Point center(img.cols - radius * 2, radius * 2);
-                    cv::circle(img, center, radius, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
-                    cv::putText(img, "REC", cv::Point(img.cols - radius * 7, radius * 2.5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
-
-                    int current_frame = cam_ctxs[i]->recorded_frames.load(std::memory_order_relaxed);
-                    double elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - record_start_time).count();
-                    char time_buf[32]; snprintf(time_buf, sizeof(time_buf), "Time: %.1fs", elapsed_s);
-                    
-                    cv::putText(img, "Frame: " + to_string(current_frame) + "/" + to_string(total_record_frames), cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3);
-                    cv::putText(img, "Frame: " + to_string(current_frame) + "/" + to_string(total_record_frames), cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
-                    cv::putText(img, time_buf, cv::Point(15, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3);
-                    cv::putText(img, time_buf, cv::Point(15, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+            for (int i = 0; i < n_cams; ++i) {
+                cv::Mat img, local_raw;
+                {
+                    lock_guard<mutex> lock(cam_ctxs[i]->frame_mtx);
+                    if (!cam_ctxs[i]->latest_frame.empty()) local_raw = cam_ctxs[i]->latest_frame.clone(); 
                 }
+
+                if (!local_raw.empty()) {
+                    cv::Mat color_full;
+                    if (cam_ctxs[i]->is_mono) cv::cvtColor(local_raw, color_full, cv::COLOR_GRAY2RGB);
+                    else cv::cvtColor(local_raw, color_full, cv::COLOR_BayerRG2RGB); 
+                    cv::resize(color_full, img, cv::Size(cell_w, cell_h));
+                }
+
+                if (img.empty()) {
+                    img = cv::Mat::zeros(cell_h, cell_w, CV_8UC3);
+                    int baseline = 0;
+                    cv::Size textSize = cv::getTextSize(cam_ctxs[i]->status_msg, cv::FONT_HERSHEY_SIMPLEX, 0.7, 2, &baseline);
+                    cv::Point textOrg((cell_w - textSize.width) / 2, (cell_h + textSize.height) / 2);
+                    cv::putText(img, cam_ctxs[i]->status_msg, textOrg, cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
+                } else {
+                    if (is_recording) {
+                        int radius = 10;
+                        cv::Point center(img.cols - radius * 2, radius * 2);
+                        cv::circle(img, center, radius, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+                        cv::putText(img, "REC", cv::Point(img.cols - radius * 7, radius * 2.5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
+
+                        int current_frame = cam_ctxs[i]->recorded_frames.load(std::memory_order_relaxed);
+                        double elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - record_start_time).count();
+                        char time_buf[32]; snprintf(time_buf, sizeof(time_buf), "Time: %.1fs", elapsed_s);
+                        
+                        cv::putText(img, "Frame: " + to_string(current_frame) + "/" + to_string(total_record_frames), cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3);
+                        cv::putText(img, "Frame: " + to_string(current_frame) + "/" + to_string(total_record_frames), cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+                        cv::putText(img, time_buf, cv::Point(15, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3);
+                        cv::putText(img, time_buf, cv::Point(15, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+                    }
+                }
+                int r = i / grid_cols; int c = i % grid_cols;
+                img.copyTo(canvas(cv::Rect(c * cell_w, r * cell_h, cell_w, cell_h)));
+                if (r + 1 > valid_rows) valid_rows = r + 1;
             }
-            int r = i / grid_cols; int c = i % grid_cols;
-            img.copyTo(canvas(cv::Rect(c * cell_w, r * cell_h, cell_w, cell_h)));
-            if (r + 1 > valid_rows) valid_rows = r + 1;
+
+            if (valid_rows > 0 && valid_rows < grid_rows) {
+                cv::Mat cropped = canvas(cv::Rect(0, 0, win_w, valid_rows * cell_h));
+                cv::resizeWindow("Multi-Cam Preview", cropped.cols, cropped.rows);
+                cv::imshow("Multi-Cam Preview", cropped);
+            } else {
+                cv::imshow("Multi-Cam Preview", canvas);
+            }
+            
+            last_ui_time = current_time; 
         }
 
-        if (valid_rows > 0 && valid_rows < grid_rows) {
-            cv::Mat cropped = canvas(cv::Rect(0, 0, win_w, valid_rows * cell_h));
-            cv::resizeWindow("Multi-Cam Preview", cropped.cols, cropped.rows);
-            cv::imshow("Multi-Cam Preview", cropped);
-        } else cv::imshow("Multi-Cam Preview", canvas);
-
+        // ===== 2. 落盘等待逻辑 =====
         if (is_recording && !is_dumping) {
             bool all_done = true;
             for (auto& ctx : cam_ctxs) if (!ctx->dump_ready.load()) { all_done = false; break; }
@@ -660,14 +675,16 @@ int main() {
 
                 cout << "\n[Info] Ready for next capture." << endl;
                 is_dumping = false;
+                
                 while (cv::waitKey(1) >= 0); 
+                last_ui_time = std::chrono::steady_clock::now(); 
             }
         }
 
-        char key = (char)cv::waitKey(50); 
+        // ===== 3. 事件轮询 (1000Hz 极速响应) =====
+        char key = (char)cv::waitKey(1); 
         bool trigger_start = false;
 
-        // ===== 去中心化的输入与网络事件解析 =====
         if (key == 'q' || key == 27) {
             global_running = false;
         } else if (is_master_pc && key == 'r' && !is_recording && !is_dumping) {
@@ -691,7 +708,7 @@ int main() {
                     if (!snapshot.empty()) {
                         cv::Mat out_snapshot;
                         if (ctx->is_mono) {
-                            out_snapshot = snapshot.clone(); // 强制深拷贝
+                            out_snapshot = snapshot.clone(); // 已修复：深拷贝
                         } else {
                             cv::cvtColor(snapshot, out_snapshot, cv::COLOR_BayerRG2RGB);
                         }
@@ -703,15 +720,15 @@ int main() {
             }
         }
 
-        // ===== 核心触发流 =====
+        // ===== 4. 核心触发优化：两阶段触发分离 I/O =====
         if (trigger_start && !is_recording && !is_dumping) {
             auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
             char buf[64]; strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", localtime(&t));
             current_record_timestr = string(buf);
 
-            record_start_time = std::chrono::steady_clock::now(); 
-            cout << "[Info] ASYNC CAPTURE STARTED: " << current_record_timestr << endl;
+            cout << "[Info] PREPARING I/O FOR ASYNC CAPTURE..." << endl;
 
+            // 阶段 1：预前处理所有的耗时I/O，不影响时序
             for (auto& ctx : cam_ctxs) {
                 string batch_raw = ctx->save_base_dir + "/temp_raw_" + current_record_timestr + "/cam_" + to_string(ctx->index);
                 fs::create_directories(batch_raw);
@@ -725,9 +742,16 @@ int main() {
 
                 ctx->recorded_frames = 0; 
                 ctx->dump_ready = false;  
-                ctx->recording = true; 
             }
+
+            // 阶段 2：原子操作同步启动录制标记
+            record_start_time = std::chrono::steady_clock::now(); 
+            for (auto& ctx : cam_ctxs) {
+                ctx->recording.store(true, std::memory_order_release);
+            }
+            
             is_recording = true;
+            cout << "[Info] ASYNC CAPTURE STARTED: " << current_record_timestr << endl;
         }
     }
 
