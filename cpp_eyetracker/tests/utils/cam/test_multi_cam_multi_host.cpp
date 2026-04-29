@@ -1,4 +1,4 @@
-// ================== 1. 网络与系统核心头文件 (必须置顶) ==================
+// ================== 网络与系统核心头文件 (必须放在最前面) ==================
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
     #include <winsock2.h>
@@ -10,12 +10,13 @@
     #include <netinet/in.h>
     #include <arpa/inet.h>
     #include <unistd.h>
+    #include <pthread.h>
     #define SOCKET int
     #define INVALID_SOCKET -1
     #define closesocket close
 #endif
 
-// ================== 2. 标准库与第三方库 ==================
+// ================== 标准库与第三方库 ==================
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <chrono>
@@ -39,10 +40,10 @@ using namespace std;
 using namespace gazeestimation;
 
 // ================== 全局网络同步标志 ==================
+atomic<bool> global_running{true};
 atomic<bool> net_cmd_record{false};
-atomic<bool> app_running{true};
 
-// ================== 网络同步功能函数 ==================
+// ================== 网络发送模块 (Master) ==================
 void sendUdpCommand(const string& local_ip, const string& target_ip, int port, const string& msg) {
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock == INVALID_SOCKET) return;
@@ -52,20 +53,28 @@ void sendUdpCommand(const string& local_ip, const string& target_ip, int port, c
     local_addr.sin_port = 0; 
     inet_pton(AF_INET, local_ip.c_str(), &local_addr.sin_addr);
 
-    if (::bind(sock, (sockaddr*)&local_addr, sizeof(local_addr)) == -1) {
-        cerr << "[Net Warning] Master failed to bind local interface " << local_ip << endl;
+    if (::bind(sock, (sockaddr*)&local_addr, sizeof(local_addr)) != -1) {
+        sockaddr_in target_addr{};
+        target_addr.sin_family = AF_INET;
+        target_addr.sin_port = htons(port);
+        inet_pton(AF_INET, target_ip.c_str(), &target_addr.sin_addr);
+        sendto(sock, msg.c_str(), msg.length(), 0, (sockaddr*)&target_addr, sizeof(target_addr));
     }
-
-    sockaddr_in target_addr{};
-    target_addr.sin_family = AF_INET;
-    target_addr.sin_port = htons(port);
-    inet_pton(AF_INET, target_ip.c_str(), &target_addr.sin_addr);
-
-    sendto(sock, msg.c_str(), msg.length(), 0, (sockaddr*)&target_addr, sizeof(target_addr));
     closesocket(sock);
 }
 
+// ================== 网络监听模块 (Slave - 提权至最高优先级) ==================
 void udpListenerWorker(const string& bind_ip, int port) {
+    // 提升为最高线程优先级以降低延迟
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#else
+    pthread_t this_thread = pthread_self();
+    struct sched_param params;
+    params.sched_priority = sched_get_priority_max(SCHED_FIFO);
+    pthread_setschedparam(this_thread, SCHED_FIFO, &params);
+#endif
+
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock == INVALID_SOCKET) return;
 
@@ -78,13 +87,13 @@ void udpListenerWorker(const string& bind_ip, int port) {
     inet_pton(AF_INET, bind_ip.c_str(), &server_addr.sin_addr);
 
     if (::bind(sock, (sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
-        cerr << "[Net Error] Slave bind failed on " << bind_ip << ":" << port << endl;
+        cerr << "[Slave ERROR] Bind failed on " << bind_ip << ":" << port << endl;
         closesocket(sock);
         return;
     }
 
 #ifdef _WIN32
-    DWORD timeout = 100;
+    DWORD timeout = 100; // 100ms
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
 #else
     struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 100000;
@@ -92,9 +101,9 @@ void udpListenerWorker(const string& bind_ip, int port) {
 #endif
 
     char buffer[256];
-    cout << "[Net Sync] Slave rigorously bound to " << bind_ip << ":" << port << " waiting for START..." << endl;
+    cout << "[Net Sync] Priority UDP Listener Bound to " << bind_ip << ":" << port << endl;
 
-    while (app_running) {
+    while (global_running) {
         sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int bytes = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, (sockaddr*)&client_addr, &client_len);
@@ -103,16 +112,14 @@ void udpListenerWorker(const string& bind_ip, int port) {
             buffer[bytes] = '\0';
             string cmd(buffer);
             if (cmd == "CMD_START") {
-                net_cmd_record = true;
+                net_cmd_record = true; // 触发原子标志
             }
-        }
+        } 
     }
     closesocket(sock);
 }
 
-
-// ================== 相机核心业务逻辑 ==================
-
+// ================== 相机通用功能 ==================
 int getNextCalibCounter(const std::string& save_dir) {
     int max_counter = -1;
     if (!fs::exists(save_dir)) return 0;
@@ -184,6 +191,7 @@ atomic<bool> CameraContext::master_set(false);
 
 vector<shared_ptr<CameraContext>> cam_ctxs;
 
+// ================== 后台异步拷贝线程 ==================
 void copyWorker(shared_ptr<CameraContext> ctx) {
     while (ctx->running) {
         pair<Pylon::CBaslerUniversalGrabResultPtr, FrameMeta> task;
@@ -213,7 +221,6 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
                 int next_seq = seq + 1;
                 ctx->recorded_frames.store(next_seq, std::memory_order_relaxed);
 
-                // 自动停止逻辑
                 if (next_seq == ctx->total_record_frames) {
                     ctx->recording = false;
                     ctx->dump_ready = true;
@@ -231,6 +238,7 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
     }
 }
 
+// ================== Pylon 回调触发线程 ==================
 void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time, bool use_hw_trigger) {
     TriggerMode mode = use_hw_trigger ? TriggerMode::Hardware : TriggerMode::Software;
     if (!ctx->cam.open(mode)) { ctx->status = CamStatus::ERROR_; return; }
@@ -343,11 +351,8 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
             in_raw.close();
             
             cv::Mat final_img;
-            if (is_mono) {
-                final_img = raw_img;
-            } else {
-                cv::cvtColor(raw_img, final_img, cv::COLOR_BayerRG2RGB);
-            }
+            if (is_mono) final_img = raw_img;
+            else cv::cvtColor(raw_img, final_img, cv::COLOR_BayerRG2RGB);
 
             string jpg_filename = entry.filename;
             size_t dot_pos = jpg_filename.find_last_of('.');
@@ -360,9 +365,8 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
     }
 }
 
-// ================== 主程序 ==================
 int main() {
-    cout << "=== Multi-Basler Camera Tool (Network Sync & Auto Dump) ===" << endl;
+    cout << "=== [TEST] Multi-Basler Camera Tool (Sync Network Node) ===" << endl;
     
 #ifdef _WIN32
     WSADATA wsaData;
@@ -375,13 +379,12 @@ int main() {
     Cfg cfg;
     Pylon::PylonInitialize();
     
-    // 网络配置读取
+    // --- 网络参数注入 ---
     bool is_master_pc = cfg["test_multi_cam"]["is_master"].as<bool>();
-    string master_ip = cfg["test_multi_cam"]["master_ip"].as<string>();
-    string slave_ip = cfg["test_multi_cam"]["slave_ip"].as<string>();
-    int port = cfg["test_multi_cam"]["port"].as<int>();
-
-    // 相机配置读取
+    string master_ip  = cfg["test_multi_cam"]["master_ip"].as<string>();
+    string slave_ip   = cfg["test_multi_cam"]["slave_ip"].as<string>();
+    int net_port      = cfg["test_multi_cam"]["port"].as<int>();
+    
     vector<string> camera_ids = cfg["test_multi_cam"]["cam_indices"].as<vector<string>>();
     bool use_hw_trigger = cfg["test_multi_cam"]["hardware_trigger"].as<bool>();
     double target_fps = cfg["test_multi_cam"]["fps"].as<double>();
@@ -403,10 +406,17 @@ int main() {
     int margin_frames = static_cast<int>(std::ceil(core_frames * 0.1));
     int total_record_frames = core_frames + 2 * margin_frames;
 
-    // 启动网络监听线程 (如果是 Slave)
+    cout << "\n--- Network Sync Configuration ---" << endl;
+    cout << "Role     : " << (is_master_pc ? "MASTER (Sender)" : "SLAVE (Receiver)") << endl;
+    cout << "Master IP: " << master_ip << endl;
+    cout << "Slave IP : " << slave_ip << endl;
+    cout << "Port     : " << net_port << endl;
+    cout << "----------------------------------\n" << endl;
+
+    // --- 启动网络监听器 (仅Slave) ---
     thread listener_thread;
     if (!is_master_pc) {
-        listener_thread = thread(udpListenerWorker, slave_ip, port);
+        listener_thread = thread(udpListenerWorker, slave_ip, net_port);
     }
 
     if (save_dirs.size() != camera_ids.size()) { cerr << "Mismatch config." << endl; return -1; }
@@ -442,16 +452,15 @@ int main() {
     cv::namedWindow("Multi-Cam Preview", cv::WINDOW_NORMAL);
     cv::resizeWindow("Multi-Cam Preview", win_w, win_h);
     
-    // UI 文字更新
-    if (is_master_pc) cout << "MASTER Node. Press 'r' to START sync recording, 'space' to photo, 'q' to quit.\n";
-    else cout << "SLAVE Node. Waiting for network START command. 'space' to photo, 'q' to quit.\n";
+    if (is_master_pc) cout << "Press 'r' to START REC across ALL nodes, 'space' to photo, 'q' to quit.\n";
+    else cout << "Waiting for Master trigger... Press 'space' to photo, 'q' to quit.\n";
 
     bool is_recording = false;
     atomic<bool> is_dumping{false}; 
     string current_record_timestr;
     std::chrono::steady_clock::time_point record_start_time;
 
-    while (app_running) {
+    while (global_running) {
         int n_cams = cam_ctxs.size();
         int grid_rows = 1, grid_cols = 1;
         if (n_cams == 1) { grid_rows = 1; grid_cols = 1; }
@@ -473,13 +482,8 @@ int main() {
 
             if (!local_raw.empty()) {
                 cv::Mat color_full;
-                
-                if (cam_ctxs[i]->is_mono) {
-                    cv::cvtColor(local_raw, color_full, cv::COLOR_GRAY2RGB);
-                } else {
-                    cv::cvtColor(local_raw, color_full, cv::COLOR_BayerRG2RGB); 
-                }
-                
+                if (cam_ctxs[i]->is_mono) cv::cvtColor(local_raw, color_full, cv::COLOR_GRAY2RGB);
+                else cv::cvtColor(local_raw, color_full, cv::COLOR_BayerRG2RGB); 
                 cv::resize(color_full, img, cv::Size(cell_w, cell_h));
             }
 
@@ -517,18 +521,15 @@ int main() {
             cv::imshow("Multi-Cam Preview", cropped);
         } else cv::imshow("Multi-Cam Preview", canvas);
 
-        // 检测系统是否满足自动停止条件
         if (is_recording && !is_dumping) {
             bool all_done = true;
-            for (auto& ctx : cam_ctxs) {
-                if (!ctx->dump_ready.load()) { all_done = false; break; }
-            }
+            for (auto& ctx : cam_ctxs) if (!ctx->dump_ready.load()) { all_done = false; break; }
 
             if (all_done) {
                 is_recording = false;
                 is_dumping = true;
                 
-                cout << "\n[Info] Auto Record Finished. Processing Disk Dump in background..." << endl;
+                cout << "\n[Info] Auto-Stop Reached. Processing Disk Dump in background..." << endl;
                 
                 auto dump_start_time = std::chrono::steady_clock::now();
                 atomic<int> finished_cams{0};
@@ -660,38 +661,50 @@ int main() {
             }
         }
 
-        // ================= 按键与网络触发器事件 =================
         char key = (char)cv::waitKey(50); 
-        if (key == 'q' || key == 27) app_running = false;
-        
         bool trigger_start = false;
 
-        // Master 监听键盘 'r'
-        if (is_master_pc) {
-            if (key == 'r' && !is_recording && !is_dumping) {
-                cout << "\n[Master] 'r' pressed. Sending START command..." << endl;
-                sendUdpCommand(master_ip, slave_ip, port, "CMD_START");
-                trigger_start = true;
-            }
-        } 
-        // Slave 监听网络标志位
-        else {
-            if (net_cmd_record && !is_recording && !is_dumping) {
-                cout << "\n[Slave] Network START command processed." << endl;
-                trigger_start = true;
-                net_cmd_record = false;
+        // ===== 去中心化的输入与网络事件解析 =====
+        if (key == 'q' || key == 27) {
+            global_running = false;
+        } else if (is_master_pc && key == 'r' && !is_recording && !is_dumping) {
+            cout << "\n[Master UI] 'r' pressed. Broadcast START to Slave..." << endl;
+            sendUdpCommand(master_ip, slave_ip, net_port, "CMD_START");
+            trigger_start = true;
+        } else if (!is_master_pc && net_cmd_record.exchange(false) && !is_recording && !is_dumping) {
+            cout << "\n[Slave Net] Network START command received. Syncing..." << endl;
+            trigger_start = true;
+        } else if (key == ' ') { 
+            if (!is_recording && !is_dumping) { 
+                int counter = 0;
+                if (!cam_ctxs.empty()) counter = getNextCalibCounter(cam_ctxs[0]->save_base_dir);
+                std::stringstream ss; ss << std::setw(2) << std::setfill('0') << counter;
+                string calib_str = ss.str();
+                cout << "\n[Photo] Capturing calibration set " << calib_str << endl;
+
+                for (auto& ctx : cam_ctxs) {
+                    cv::Mat snapshot;
+                    { lock_guard<mutex> lock(ctx->frame_mtx); snapshot = ctx->latest_frame.clone(); }
+                    if (!snapshot.empty()) {
+                        cv::Mat out_snapshot;
+                        if (ctx->is_mono) out_snapshot = snapshot;
+                        else cv::cvtColor(snapshot, out_snapshot, cv::COLOR_BayerRG2RGB);
+                        string fn = ctx->save_base_dir + "/calib_cam_" + to_string(ctx->index) + "_" + calib_str + ".jpg";
+                        cv::imwrite(fn, out_snapshot);
+                        cout << "  -> Saved " << fn << endl;
+                    }
+                }
             }
         }
 
-        // 统一开始录制逻辑
-        if (trigger_start) { 
+        // ===== 核心触发流 =====
+        if (trigger_start && !is_recording && !is_dumping) {
             auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
             char buf[64]; strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", localtime(&t));
             current_record_timestr = string(buf);
 
             record_start_time = std::chrono::steady_clock::now(); 
-            cout << "\n[Info] ASYNC CAPTURE ARMED: " << current_record_timestr << endl;
-            cout << "[Info] Waiting for hardware trigger signal..." << endl;
+            cout << "[Info] ASYNC CAPTURE STARTED: " << current_record_timestr << endl;
 
             for (auto& ctx : cam_ctxs) {
                 string batch_raw = ctx->save_base_dir + "/temp_raw_" + current_record_timestr + "/cam_" + to_string(ctx->index);
@@ -710,31 +723,6 @@ int main() {
             }
             is_recording = true;
         }
-        else if (key == ' ') { 
-            if (!is_recording && !is_dumping) { 
-                int counter = 0;
-                if (!cam_ctxs.empty()) counter = getNextCalibCounter(cam_ctxs[0]->save_base_dir);
-                std::stringstream ss; ss << std::setw(2) << std::setfill('0') << counter;
-                string calib_str = ss.str();
-                cout << "\n[Photo] Capturing calibration set " << calib_str << endl;
-
-                for (auto& ctx : cam_ctxs) {
-                    cv::Mat snapshot;
-                    { lock_guard<mutex> lock(ctx->frame_mtx); snapshot = ctx->latest_frame.clone(); }
-                    if (!snapshot.empty()) {
-                        cv::Mat out_snapshot;
-                        if (ctx->is_mono) {
-                            out_snapshot = snapshot;
-                        } else {
-                            cv::cvtColor(snapshot, out_snapshot, cv::COLOR_BayerRG2RGB);
-                        }
-                        string fn = ctx->save_base_dir + "/calib_cam_" + to_string(ctx->index) + "_" + calib_str + ".jpg";
-                        cv::imwrite(fn, out_snapshot);
-                        cout << "  -> Saved " << fn << endl;
-                    }
-                }
-            }
-        }
     }
 
     cout << "[System] Shutting down threads..." << endl;
@@ -748,9 +736,10 @@ int main() {
     if (listener_thread.joinable()) {
         listener_thread.join();
     }
-    
+
     cv::destroyAllWindows();
     Pylon::PylonTerminate();
+
 #ifdef _WIN32
     WSACleanup();
 #endif
