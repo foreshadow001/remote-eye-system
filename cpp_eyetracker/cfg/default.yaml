@@ -84,28 +84,28 @@ test_net:
 test_multi_cam:
   cam_indices:
     - 40768742 # - 40772282 
-    - 40774056 # - 40772278
-    - 40768741 # - 40772281
-    - 40774057 # - 40777498
-    - 40774063 # - 40772279
-    - 40774064 # - 40777497
-    - 40768744 # - 40772277
-    - 40768743 # - 40772284
-    - 40773101 # - 40772283
+    # - 40774056 # - 40772278
+    # - 40768741 # - 40772281
+    # - 40774057 # - 40777498
+    # - 40774063 # - 40772279
+    # - 40774064 # - 40777497
+    # - 40768744 # - 40772277
+    # - 40768743 # - 40772284
+    # - 40773101 # - 40772283
     - 40772280 # - 40772276
   hardware_trigger: false
   write_jpg: true
   debug_time: true
   save_dir: 
     - "D:/test_cam"
-    - "D:/test_cam"
-    - "D:/test_cam"
-    - "D:/test_cam"
-    - "D:/test_cam"
-    - "E:/test_cam"
-    - "E:/test_cam"
-    - "E:/test_cam"
-    - "E:/test_cam"
+    # - "D:/test_cam"
+    # - "D:/test_cam"
+    # - "D:/test_cam"
+    # - "D:/test_cam"
+    # - "E:/test_cam"
+    # - "E:/test_cam"
+    # - "E:/test_cam"
+    # - "E:/test_cam"
     - "E:/test_cam"
   fps: 200
   gain: 0.0

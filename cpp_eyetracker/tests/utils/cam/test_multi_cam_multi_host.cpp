@@ -351,8 +351,11 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
             in_raw.close();
             
             cv::Mat final_img;
-            if (is_mono) final_img = raw_img;
-            else cv::cvtColor(raw_img, final_img, cv::COLOR_BayerRG2RGB);
+            if (is_mono) {
+                final_img = raw_img.clone(); // 强制深拷贝，确保底层内存块连续且独立
+            } else {
+                cv::cvtColor(raw_img, final_img, cv::COLOR_BayerRG2RGB);
+            }
 
             string jpg_filename = entry.filename;
             size_t dot_pos = jpg_filename.find_last_of('.');
@@ -687,8 +690,11 @@ int main() {
                     { lock_guard<mutex> lock(ctx->frame_mtx); snapshot = ctx->latest_frame.clone(); }
                     if (!snapshot.empty()) {
                         cv::Mat out_snapshot;
-                        if (ctx->is_mono) out_snapshot = snapshot;
-                        else cv::cvtColor(snapshot, out_snapshot, cv::COLOR_BayerRG2RGB);
+                        if (ctx->is_mono) {
+                            out_snapshot = snapshot.clone(); // 强制深拷贝
+                        } else {
+                            cv::cvtColor(snapshot, out_snapshot, cv::COLOR_BayerRG2RGB);
+                        }
                         string fn = ctx->save_base_dir + "/calib_cam_" + to_string(ctx->index) + "_" + calib_str + ".jpg";
                         cv::imwrite(fn, out_snapshot);
                         cout << "  -> Saved " << fn << endl;
