@@ -30,6 +30,7 @@
 #include <cmath>
 #include <functional>
 #include <fstream>
+#include <algorithm> // [新增] 用于 std::min / std::max
 #include <pylon/PylonIncludes.h>
 
 #include "cam/basler.hpp"
@@ -238,7 +239,8 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
 }
 
 // ================== Pylon 回调触发线程 ==================
-void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time, bool use_hw_trigger) {
+// [修改] 增加 enable_offset 参数
+void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time, bool use_hw_trigger, bool enable_offset) {
     TriggerMode mode = use_hw_trigger ? TriggerMode::Hardware : TriggerMode::Software;
     if (!ctx->cam.open(mode)) { ctx->status = CamStatus::ERROR_; return; }
 
@@ -254,29 +256,38 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
     struct GrabState { int64_t frame_counter = 0; };
     auto state = make_shared<GrabState>();
 
-    ctx->cam.setFrameCallback([ctx, state](const Pylon::CBaslerUniversalGrabResultPtr& ptr, FrameMeta meta) {
+    // [修改] 将 enable_offset 捕获进 lambda
+    ctx->cam.setFrameCallback([ctx, state, use_hw_trigger, enable_offset](const Pylon::CBaslerUniversalGrabResultPtr& ptr, FrameMeta meta) {
         state->frame_counter++;
         ctx->status = CamStatus::STREAMING;
 
         if (!ctx->offset_initialized && state->frame_counter > 1) {
-            if (!CameraContext::master_set.exchange(true)) {
-                CameraContext::master_first_id = meta.blockID;
+            // [修改] 如果是硬件触发 或者 软件触发但未开启偏移补偿，直接将偏移置0
+            if (use_hw_trigger || !enable_offset) {
                 ctx->frame_offset = 0;
                 ctx->offset_initialized = true;
             } else {
-                int retry = 0;
-                while (CameraContext::master_first_id == -1 && retry < 100) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                    retry++;
-                }
-                if (CameraContext::master_first_id != -1) {
-                    ctx->frame_offset = meta.blockID - CameraContext::master_first_id.load();
+                // 原有逻辑：软件触发下利用全局变量寻找第一帧差值
+                if (!CameraContext::master_set.exchange(true)) {
+                    CameraContext::master_first_id = meta.blockID;
+                    ctx->frame_offset = 0;
                     ctx->offset_initialized = true;
+                } else {
+                    int retry = 0;
+                    while (CameraContext::master_first_id == -1 && retry < 100) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        retry++;
+                    }
+                    if (CameraContext::master_first_id != -1) {
+                        ctx->frame_offset = meta.blockID - CameraContext::master_first_id.load();
+                        ctx->offset_initialized = true;
+                    }
                 }
             }
         }
 
         if (ctx->offset_initialized) {
+            // 对于硬件触发(offset=0)，blockID自然保持严格一致
             meta.blockID = meta.blockID - ctx->frame_offset; 
             ctx->captured_frames++;
 
@@ -351,7 +362,7 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
             
             cv::Mat final_img;
             if (is_mono) {
-                final_img = raw_img.clone(); // 已修复：深拷贝，解决单通道jpg保存失败
+                final_img = raw_img.clone();
             } else {
                 cv::cvtColor(raw_img, final_img, cv::COLOR_BayerRG2RGB);
             }
@@ -389,6 +400,18 @@ int main() {
     
     vector<string> camera_ids = cfg["test_multi_cam"]["cam_indices"].as<vector<string>>();
     bool use_hw_trigger = cfg["test_multi_cam"]["hardware_trigger"].as<bool>();
+    
+    // [新增] 读取对齐相关控制开关
+    // 请确保您的 yaml/json 配置文件中含有 enable_offset 和 enable_intersection 这两项布尔值
+    bool enable_offset = true; 
+    bool enable_intersection = true;
+    try {
+        enable_offset = cfg["test_multi_cam"]["enable_offset"].as<bool>();
+        enable_intersection = cfg["test_multi_cam"]["enable_intersection"].as<bool>();
+    } catch (...) {
+        cout << "[WARN] 'enable_offset' or 'enable_intersection' missing in config, defaulting to TRUE" << endl;
+    }
+
     double target_fps = cfg["test_multi_cam"]["fps"].as<double>();
     double gain = cfg["test_multi_cam"]["gain"].as<double>();
     double gamma = cfg["test_multi_cam"]["gamma"].as<double>();
@@ -409,10 +432,13 @@ int main() {
     int total_record_frames = core_frames + 2 * margin_frames;
 
     cout << "\n--- Network Sync Configuration ---" << endl;
-    cout << "Role     : " << (is_master_pc ? "MASTER (Sender)" : "SLAVE (Receiver)") << endl;
-    cout << "Master IP: " << master_ip << endl;
-    cout << "Slave IP : " << slave_ip << endl;
-    cout << "Port     : " << net_port << endl;
+    cout << "Role             : " << (is_master_pc ? "MASTER (Sender)" : "SLAVE (Receiver)") << endl;
+    cout << "Master IP        : " << master_ip << endl;
+    cout << "Slave IP         : " << slave_ip << endl;
+    cout << "Port             : " << net_port << endl;
+    cout << "HW Trigger       : " << (use_hw_trigger ? "ON" : "OFF") << endl;
+    cout << "SW Offset Init   : " << (enable_offset ? "ON" : "OFF") << endl;
+    cout << "Intersection Crop: " << (enable_intersection ? "ON" : "OFF") << endl;
     cout << "----------------------------------\n" << endl;
 
     // --- 启动网络监听器 (仅Slave) ---
@@ -448,7 +474,8 @@ int main() {
         ctx->dump_ready = false;
         ctx->offset_initialized = false;
         ctx->copy_thread = thread(copyWorker, ctx);
-        ctx->capture_thread = thread(captureWorker, ctx, target_fps, gain, gamma, exp_time, use_hw_trigger);
+        // [修改] 传递 enable_offset 参数
+        ctx->capture_thread = thread(captureWorker, ctx, target_fps, gain, gamma, exp_time, use_hw_trigger, enable_offset);
     }
 
     cv::namedWindow("Multi-Cam Preview", cv::WINDOW_NORMAL);
@@ -462,8 +489,7 @@ int main() {
     string current_record_timestr;
     std::chrono::steady_clock::time_point record_start_time;
 
-    // --- 已修改：UI 刷新频率控制 ---
-    double target_ui_fps = 30.0; // 配置UI刷新率
+    double target_ui_fps = cfg["test_multi_cam"]["ui_fps"].as<double>(); 
     auto ui_interval = std::chrono::milliseconds(static_cast<int>(1000.0 / target_ui_fps));
     auto last_ui_time = std::chrono::steady_clock::now() - ui_interval; 
 
@@ -600,34 +626,43 @@ int main() {
                     }
                     cout << report_buf << endl;
 
+                    // core_sliced_logs: 切除首尾冗余边距的帧数组，剩下的即为最中间（core）帧
                     if (logs.size() > 2 * margin_frames) core_sliced_logs.push_back(vector<LogEntry>(logs.begin() + margin_frames, logs.end() - margin_frames));
                     else core_sliced_logs.push_back(logs);
                 }
 
                 if (write_jpg) {
                     cout << "\n[Info] Generating Sync JPGs for Core Frames..." << endl;
-                    int64_t max_start_time = -1;
-                    int64_t min_end_time = 9223372036854775807LL; 
-                    int64_t global_start_idx = 0;
-                    int64_t global_end_idx = 9999999999LL; 
-
-                    for (auto& logs : core_sliced_logs) {
-                        if (logs.empty()) continue;
-                        if (logs.front().blockID > global_start_idx) global_start_idx = logs.front().blockID;
-                        if (logs.back().blockID < global_end_idx) global_end_idx = logs.back().blockID;
-                        if (logs.front().timestamp > max_start_time) max_start_time = logs.front().timestamp;
-                        if (logs.back().timestamp < min_end_time) min_end_time = logs.back().timestamp;
-                    }
-
+                    
                     vector<vector<LogEntry>> final_entries_lists(cam_ctxs.size()); 
                     int total_frames_all_cams = 0;
 
-                    for (int i = 0; i < cam_ctxs.size(); ++i) {
-                        for (const auto& entry : core_sliced_logs[i]) {
-                            if (entry.blockID >= global_start_idx && entry.blockID <= global_end_idx) final_entries_lists[i].push_back(entry); 
-                        } 
-                        total_frames_all_cams += final_entries_lists[i].size(); 
-                    } 
+                    // [修改] 硬件触发（原生对齐）或开启取交集配置时，计算并过滤对齐边界
+                    if (use_hw_trigger || enable_intersection) {
+                        int64_t global_start_idx = 0;
+                        int64_t global_end_idx = 9999999999LL; 
+
+                        for (auto& logs : core_sliced_logs) {
+                            if (logs.empty()) continue;
+                            if (logs.front().blockID > global_start_idx) global_start_idx = logs.front().blockID;
+                            if (logs.back().blockID < global_end_idx) global_end_idx = logs.back().blockID;
+                        }
+
+                        for (int i = 0; i < cam_ctxs.size(); ++i) {
+                            for (const auto& entry : core_sliced_logs[i]) {
+                                if (entry.blockID >= global_start_idx && entry.blockID <= global_end_idx) {
+                                    final_entries_lists[i].push_back(entry); 
+                                }
+                            } 
+                            total_frames_all_cams += final_entries_lists[i].size(); 
+                        }
+                    } else {
+                        // [修改] 如果没有开启取交集，每个相机直接取被切掉两边 margin 后的中间帧数组
+                        for (int i = 0; i < cam_ctxs.size(); ++i) {
+                            final_entries_lists[i] = core_sliced_logs[i];
+                            total_frames_all_cams += final_entries_lists[i].size();
+                        }
+                    }
 
                     if (total_frames_all_cams > 0) {
                         std::atomic<int> global_processed{0};
@@ -708,7 +743,7 @@ int main() {
                     if (!snapshot.empty()) {
                         cv::Mat out_snapshot;
                         if (ctx->is_mono) {
-                            out_snapshot = snapshot.clone(); // 已修复：深拷贝
+                            out_snapshot = snapshot.clone(); 
                         } else {
                             cv::cvtColor(snapshot, out_snapshot, cv::COLOR_BayerRG2RGB);
                         }
@@ -728,7 +763,6 @@ int main() {
 
             cout << "[Info] PREPARING I/O FOR ASYNC CAPTURE..." << endl;
 
-            // 阶段 1：预前处理所有的耗时I/O，不影响时序
             for (auto& ctx : cam_ctxs) {
                 string batch_raw = ctx->save_base_dir + "/temp_raw_" + current_record_timestr + "/cam_" + to_string(ctx->index);
                 fs::create_directories(batch_raw);
@@ -744,7 +778,6 @@ int main() {
                 ctx->dump_ready = false;  
             }
 
-            // 阶段 2：原子操作同步启动录制标记
             record_start_time = std::chrono::steady_clock::now(); 
             for (auto& ctx : cam_ctxs) {
                 ctx->recording.store(true, std::memory_order_release);
