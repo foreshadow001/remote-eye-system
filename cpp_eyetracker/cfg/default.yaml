@@ -101,14 +101,14 @@ test_multi_cam:
   enable_intersection: false
   save_dir: 
     - "D:/test_cam"
-    # - "D:/test_cam"
-    # - "D:/test_cam"
-    # - "D:/test_cam"
-    # - "D:/test_cam"
-    # - "E:/test_cam"
-    # - "E:/test_cam"
-    # - "E:/test_cam"
-    # - "E:/test_cam"
+    - "D:/test_cam"
+    - "D:/test_cam"
+    - "D:/test_cam"
+    - "D:/test_cam"
+    - "E:/test_cam"
+    - "E:/test_cam"
+    - "E:/test_cam"
+    - "E:/test_cam"
     - "E:/test_cam"
   fps: 200
   gain: 0.0
