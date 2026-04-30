@@ -37,7 +37,7 @@ bool BaslerCamera::open(TriggerMode mode) {
         INodeMap& nodemap = camera_.GetNodeMap();
 
         if (mode == TriggerMode::Hardware) {
-            CEnumerationPtr(nodemap.GetNode("LineSelector"))->FromString("Line1");
+            CEnumerationPtr(nodemap.GetNode("LineSelector"))->FromString("Line2");
             CEnumerationPtr(nodemap.GetNode("LineMode"))->FromString("Input");
             CEnumerationPtr(nodemap.GetNode("TriggerSelector"))->FromString("FrameStart");
             CEnumerationPtr(nodemap.GetNode("TriggerMode"))->FromString("On");
