@@ -41,7 +41,7 @@ bool BaslerCamera::open(TriggerMode mode) {
             CEnumerationPtr(nodemap.GetNode("LineMode"))->FromString("Input");
             CEnumerationPtr(nodemap.GetNode("TriggerSelector"))->FromString("FrameStart");
             CEnumerationPtr(nodemap.GetNode("TriggerMode"))->FromString("On");
-            CEnumerationPtr(nodemap.GetNode("TriggerSource"))->FromString("Line1"); 
+            CEnumerationPtr(nodemap.GetNode("TriggerSource"))->FromString("Line2"); 
             CEnumerationPtr(nodemap.GetNode("TriggerActivation"))->FromString("RisingEdge"); 
             CBooleanPtr frameRateEnable(nodemap.GetNode("AcquisitionFrameRateEnable"));
             if (IsWritable(frameRateEnable)) frameRateEnable->SetValue(false);
