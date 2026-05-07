@@ -64,6 +64,67 @@ void sendUdpCommand(const string& local_ip, const string& target_ip, int port, c
     closesocket(sock);
 }
 
+// ================== 网络同步与协商模块 (TCP 可靠传输) ==================
+bool syncGlobalBlockIDTCP(bool is_master, const string& master_ip, int port, int64_t& local_start, int64_t& local_end) {
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) return false;
+
+    int64_t my_range[2] = { local_start, local_end };
+    int64_t other_range[2] = { 0, 0 };
+
+    if (is_master) {
+        // Master 监听 port + 1 端口，等待 Slave 连接
+        sockaddr_in server_addr{};
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_addr.s_addr = INADDR_ANY;
+        server_addr.sin_port = htons(port + 1);
+
+        ::bind(sock, (sockaddr*)&server_addr, sizeof(server_addr));
+        listen(sock, 1);
+        
+        cout << "[Net Sync] Master is dumping faster. Waiting for Slave blockID..." << endl;
+        sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        SOCKET client_sock = accept(sock, (sockaddr*)&client_addr, &client_len);
+        
+        // 1. 接收 Slave 的边界
+        recv(client_sock, (char*)other_range, sizeof(other_range), 0);
+        
+        // 2. Master 计算真正的全局交集
+        my_range[0] = std::max(my_range[0], other_range[0]);
+        my_range[1] = std::min(my_range[1], other_range[1]);
+        
+        // 3. 将结果发回给 Slave
+        send(client_sock, (const char*)my_range, sizeof(my_range), 0);
+        
+        closesocket(client_sock);
+        local_start = my_range[0];
+        local_end = my_range[1];
+    } else {
+        // Slave 主动连接 Master
+        sockaddr_in server_addr{};
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(port + 1);
+        inet_pton(AF_INET, master_ip.c_str(), &server_addr.sin_addr);
+
+        cout << "[Net Sync] Slave connecting to Master to sync blockID..." << endl;
+        // 循环等待，直到 Master 准备好接收
+        while (connect(sock, (sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500)); 
+        }
+        
+        // 1. 发送自己的边界给 Master
+        send(sock, (const char*)my_range, sizeof(my_range), 0);
+        // 2. 接收 Master 计算好的全局边界
+        recv(sock, (char*)other_range, sizeof(other_range), 0);
+        
+        local_start = other_range[0];
+        local_end = other_range[1];
+    }
+    closesocket(sock);
+    return true;
+}
+
 // ================== 网络监听模块 (Slave - 提权至最高优先级) ==================
 void udpListenerWorker(const string& bind_ip, int port) {
 #ifdef _WIN32
@@ -316,12 +377,11 @@ void dumpToDiskWorker(shared_ptr<CameraContext> ctx, int write_delay_ms, atomic<
     int frames_to_dump = ctx->recorded_frames.load();
     
     for (int i = 0; i < frames_to_dump; ++i) {
-        std::stringstream ss;
-        ss << ctx->temp_dir << "/" << std::setw(6) << std::setfill('0') << i << ".raw";
-        string filename = ss.str();
-        
         cv::Mat& img = ctx->ram_buffer[i];
         FrameMeta& meta = ctx->meta_buffer[i];
+        
+        // [修改] 使用 meta.blockID 作为 raw 的文件名
+        string filename = ctx->temp_dir + "/" + to_string(meta.blockID) + ".raw";
         
         std::ofstream out_raw(filename, std::ios::binary);
         if (out_raw) out_raw.write(reinterpret_cast<const char*>(img.data), img.total() * img.elemSize());
@@ -367,12 +427,8 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
                 cv::cvtColor(raw_img, final_img, cv::COLOR_BayerRG2RGB);
             }
 
-            string jpg_filename = entry.filename;
-            size_t dot_pos = jpg_filename.find_last_of('.');
-            if (dot_pos != string::npos) jpg_filename = jpg_filename.substr(0, dot_pos) + ".jpg";
-            else jpg_filename += ".jpg";
-            
-            cv::imwrite(out_jpg_dir + "/" + jpg_filename, final_img); 
+            string jpg_filename = to_string(entry.blockID) + ".jpg";
+            cv::imwrite(out_jpg_dir + "/" + jpg_filename, final_img);
         }
         global_processed++;
     }
@@ -621,11 +677,11 @@ int main() {
                     
                     char report_buf[256];
                     if (dropped_frames > 0) {
-                        snprintf(report_buf, sizeof(report_buf), "[Warning] Cam %d | StartID: %6lld | Saved: %4d | Drop: %d | Actual FPS: %.4f", 
-                                 cam_ctxs[i]->index, start_block_id, total_saved, dropped_frames, actual_fps);
+                        snprintf(report_buf, sizeof(report_buf), "[Warning] Cam %s | StartID: %6lld | Saved: %4d | Drop: %d | Actual FPS: %.4f", 
+                                 cam_ctxs[i]->id.c_str(), start_block_id, total_saved, dropped_frames, actual_fps);
                     } else {
-                        snprintf(report_buf, sizeof(report_buf), "[OK]      Cam %d | StartID: %6lld | Saved: %4d | Drop: 0 | Actual FPS: %.4f", 
-                                 cam_ctxs[i]->index, start_block_id, total_saved, actual_fps);
+                        snprintf(report_buf, sizeof(report_buf), "[OK]      Cam %s | StartID: %6lld | Saved: %4d | Drop: 0 | Actual FPS: %.4f", 
+                                 cam_ctxs[i]->id.c_str(), start_block_id, total_saved, actual_fps);
                     }
                     cout << report_buf << endl;
                 }
@@ -640,15 +696,18 @@ int main() {
                         int64_t global_start_idx = 0;
                         int64_t global_end_idx = 9999999999LL; 
 
-                        // 1. 在完整的 raw 数据集 (all_logs) 上寻找全局交集边界
+                        // 1. 在完整的 raw 数据集 (all_logs) 上寻找【本机】交集边界
                         for (const auto& logs : all_logs) {
                             if (logs.empty()) continue;
                             if (logs.front().blockID > global_start_idx) global_start_idx = logs.front().blockID;
                             if (logs.back().blockID < global_end_idx) global_end_idx = logs.back().blockID;
                         }
 
-                        cout << "[Alignment] Global Intersection Range (BlockID): [" << global_start_idx << ", " << global_end_idx << "]" << endl;
-
+                        // ============ [新增] 跨主机 BlockID 交换 ============
+                        cout << "[Alignment] Local Range: [" << global_start_idx << ", " << global_end_idx << "]. Syncing with " << (is_master_pc ? "Slave" : "Master") << "..." << endl;
+                        syncGlobalBlockIDTCP(is_master_pc, master_ip, net_port, global_start_idx, global_end_idx);
+                        cout << "[Alignment] Final Global Intersection Range: [" << global_start_idx << ", " << global_end_idx << "]" << endl;
+                        // ====================================================
                         // 2. 先取出交集，再从中截取 core_frames
                         for (int i = 0; i < cam_ctxs.size(); ++i) {
                             vector<LogEntry> intersected;
@@ -697,7 +756,7 @@ int main() {
                         
                         vector<thread> compile_threads;
                         for (int i = 0; i < cam_ctxs.size(); ++i) {
-                            string out_jpg_dir = cam_ctxs[i]->save_base_dir + "/record_" + current_record_timestr + "/cam_" + to_string(cam_ctxs[i]->index);
+                            string out_jpg_dir = cam_ctxs[i]->save_base_dir + "/record_" + current_record_timestr + "/" + cam_ctxs[i]->id;
                             compile_threads.emplace_back(
                                 convertRawToJpgWorker, 
                                 cam_ctxs[i]->temp_dir, 
@@ -764,7 +823,7 @@ int main() {
                         } else {
                             cv::cvtColor(snapshot, out_snapshot, cv::COLOR_BayerRG2RGB);
                         }
-                        string fn = ctx->save_base_dir + "/calib_cam_" + to_string(ctx->index) + "_" + calib_str + ".jpg";
+                        string fn = ctx->save_base_dir + "/calib_cam_" + ctx->id + "_" + calib_str + ".jpg";
                         cv::imwrite(fn, out_snapshot);
                         cout << "  -> Saved " << fn << endl;
                     }
@@ -781,10 +840,10 @@ int main() {
             cout << "[Info] PREPARING I/O FOR ASYNC CAPTURE..." << endl;
 
             for (auto& ctx : cam_ctxs) {
-                string batch_raw = ctx->save_base_dir + "/temp_raw_" + current_record_timestr + "/cam_" + to_string(ctx->index);
+                string batch_raw = ctx->save_base_dir + "/temp_raw_" + current_record_timestr + "/" + ctx->id;
                 fs::create_directories(batch_raw);
                 ctx->temp_dir = batch_raw;
-                ctx->log_file_path = ctx->save_base_dir + "/record_" + current_record_timestr + "_cam_" + to_string(ctx->index) + ".txt";
+                ctx->log_file_path = ctx->save_base_dir + "/record_" + current_record_timestr + "_" + ctx->id + ".txt";
                 
                 {
                     lock_guard<mutex> lock(ctx->copy_mtx);
