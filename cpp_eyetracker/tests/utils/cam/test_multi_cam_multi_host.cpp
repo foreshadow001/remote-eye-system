@@ -428,7 +428,8 @@ int main() {
     int cam_h = cfg["test_multi_cam"]["cam_height"].as<int>();
 
     int core_frames = static_cast<int>(std::ceil(target_fps * record_time));
-    int margin_frames = static_cast<int>(std::ceil(core_frames * 0.1));
+    double margin_frames_ratio = cfg["test_multi_cam"]["margin_frames_ratio"].as<double>();
+    int margin_frames = static_cast<int>(std::ceil(core_frames * margin_frames_ratio));
     int total_record_frames = core_frames + 2 * margin_frames;
 
     cout << "\n--- Network Sync Configuration ---" << endl;
@@ -598,6 +599,7 @@ int main() {
                 vector<vector<LogEntry>> all_logs;
                 vector<vector<LogEntry>> core_sliced_logs; 
                 
+                // 【需替换的部分：统计与报告打印】
                 for (int i = 0; i < cam_ctxs.size(); ++i) {
                     auto logs = parseLogFile(cam_ctxs[i]->log_file_path);
                     all_logs.push_back(logs);
@@ -606,6 +608,7 @@ int main() {
                     int dropped_frames = 0;
                     double actual_fps = 0.0;
                     double duration_s = 0.0;
+                    int64_t start_block_id = logs.empty() ? -1 : logs.front().blockID; // 获取起始 blockID
                     
                     if (total_saved > 1) {
                         for (size_t k = 1; k < logs.size(); ++k) {
@@ -618,17 +621,13 @@ int main() {
                     
                     char report_buf[256];
                     if (dropped_frames > 0) {
-                        snprintf(report_buf, sizeof(report_buf), "[Warning] Cam %d | Saved: %4d | Dropped: %d | Time: %.2fs | Actual FPS: %.4f", 
-                                 cam_ctxs[i]->index, total_saved, dropped_frames, duration_s, actual_fps);
+                        snprintf(report_buf, sizeof(report_buf), "[Warning] Cam %d | StartID: %6lld | Saved: %4d | Drop: %d | Actual FPS: %.4f", 
+                                 cam_ctxs[i]->index, start_block_id, total_saved, dropped_frames, actual_fps);
                     } else {
-                        snprintf(report_buf, sizeof(report_buf), "[OK]      Cam %d | Saved: %4d | Dropped: 0 | Time: %.2fs | Actual FPS: %.4f", 
-                                 cam_ctxs[i]->index, total_saved, duration_s, actual_fps);
+                        snprintf(report_buf, sizeof(report_buf), "[OK]      Cam %d | StartID: %6lld | Saved: %4d | Drop: 0 | Actual FPS: %.4f", 
+                                 cam_ctxs[i]->index, start_block_id, total_saved, actual_fps);
                     }
                     cout << report_buf << endl;
-
-                    // core_sliced_logs: 切除首尾冗余边距的帧数组，剩下的即为最中间（core）帧
-                    if (logs.size() > 2 * margin_frames) core_sliced_logs.push_back(vector<LogEntry>(logs.begin() + margin_frames, logs.end() - margin_frames));
-                    else core_sliced_logs.push_back(logs);
                 }
 
                 if (write_jpg) {
@@ -637,29 +636,47 @@ int main() {
                     vector<vector<LogEntry>> final_entries_lists(cam_ctxs.size()); 
                     int total_frames_all_cams = 0;
 
-                    // [修改] 硬件触发（原生对齐）或开启取交集配置时，计算并过滤对齐边界
                     if (use_hw_trigger || enable_intersection) {
                         int64_t global_start_idx = 0;
                         int64_t global_end_idx = 9999999999LL; 
 
-                        for (auto& logs : core_sliced_logs) {
+                        // 1. 在完整的 raw 数据集 (all_logs) 上寻找全局交集边界
+                        for (const auto& logs : all_logs) {
                             if (logs.empty()) continue;
                             if (logs.front().blockID > global_start_idx) global_start_idx = logs.front().blockID;
                             if (logs.back().blockID < global_end_idx) global_end_idx = logs.back().blockID;
                         }
 
+                        cout << "[Alignment] Global Intersection Range (BlockID): [" << global_start_idx << ", " << global_end_idx << "]" << endl;
+
+                        // 2. 先取出交集，再从中截取 core_frames
                         for (int i = 0; i < cam_ctxs.size(); ++i) {
-                            for (const auto& entry : core_sliced_logs[i]) {
+                            vector<LogEntry> intersected;
+                            for (const auto& entry : all_logs[i]) {
                                 if (entry.blockID >= global_start_idx && entry.blockID <= global_end_idx) {
-                                    final_entries_lists[i].push_back(entry); 
+                                    intersected.push_back(entry); 
                                 }
                             } 
+
+                            // 3. 从交集中取最中间的 core_frames
+                            if (intersected.size() >= core_frames) {
+                                int start_offset = (intersected.size() - core_frames) / 2;
+                                final_entries_lists[i] = vector<LogEntry>(intersected.begin() + start_offset, intersected.begin() + start_offset + core_frames);
+                            } else {
+                                cout << "[Warning] Cam " << cam_ctxs[i]->index << " intersected frames (" << intersected.size() << ") < core_frames (" << core_frames << ")." << endl;
+                                final_entries_lists[i] = intersected; // 数量不够则全量保留
+                            }
                             total_frames_all_cams += final_entries_lists[i].size(); 
                         }
                     } else {
-                        // [修改] 如果没有开启取交集，每个相机直接取被切掉两边 margin 后的中间帧数组
+                        // 如果不开启对齐，直接在每台相机自己的 raw 数组中切取中间的 core_frames
                         for (int i = 0; i < cam_ctxs.size(); ++i) {
-                            final_entries_lists[i] = core_sliced_logs[i];
+                            if (all_logs[i].size() >= core_frames) {
+                                int start_offset = (all_logs[i].size() - core_frames) / 2;
+                                final_entries_lists[i] = vector<LogEntry>(all_logs[i].begin() + start_offset, all_logs[i].begin() + start_offset + core_frames);
+                            } else {
+                                final_entries_lists[i] = all_logs[i];
+                            }
                             total_frames_all_cams += final_entries_lists[i].size();
                         }
                     }

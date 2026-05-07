@@ -93,7 +93,7 @@ test_multi_cam:
     - 40768743 # - 40772284
     - 40773101 # - 40772283
     - 40772280 # - 40772276
-  hardware_trigger: false
+  hardware_trigger: true
   write_jpg: true
   debug_time: true
   ui_fps: 20.0
@@ -119,6 +119,7 @@ test_multi_cam:
   cam_width: 2448
   cam_height: 2048
   record_time: 1.0       # 录制的核心秒数 (代码会自动加20%余量)
+  margin_frames_ratio: 0.2
   write_delay_ms: 0      # 录制结束后，写硬盘阶段每帧的延时(毫秒)，用以控制CPU和硬盘峰值压力，0为全速
   is_master: true             # 主机设为 true，从机设为 false
   master_ip: "192.168.10.1"
