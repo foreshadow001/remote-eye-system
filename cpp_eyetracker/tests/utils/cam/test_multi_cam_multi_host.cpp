@@ -461,11 +461,13 @@ int main() {
     // 请确保您的 yaml/json 配置文件中含有 enable_offset 和 enable_intersection 这两项布尔值
     bool enable_offset = true; 
     bool enable_intersection = true;
+    bool enable_net_sync = true; // [新增]
     try {
         enable_offset = cfg["test_multi_cam"]["enable_offset"].as<bool>();
         enable_intersection = cfg["test_multi_cam"]["enable_intersection"].as<bool>();
+        enable_net_sync = cfg["test_multi_cam"]["enable_net_sync"].as<bool>(); // [新增]
     } catch (...) {
-        cout << "[WARN] 'enable_offset' or 'enable_intersection' missing in config, defaulting to TRUE" << endl;
+        cout << "[WARN] Sync configs missing, defaulting to TRUE" << endl;
     }
 
     double target_fps = cfg["test_multi_cam"]["fps"].as<double>();
@@ -496,11 +498,12 @@ int main() {
     cout << "HW Trigger       : " << (use_hw_trigger ? "ON" : "OFF") << endl;
     cout << "SW Offset Init   : " << (enable_offset ? "ON" : "OFF") << endl;
     cout << "Intersection Crop: " << (enable_intersection ? "ON" : "OFF") << endl;
+    cout << "Net Sync         : " << (enable_net_sync ? "ON" : "OFF (Local Mode)") << endl;
     cout << "----------------------------------\n" << endl;
 
     // --- 启动网络监听器 (仅Slave) ---
     thread listener_thread;
-    if (!is_master_pc) {
+    if (enable_net_sync && !is_master_pc) { // [修改] 加入 enable_net_sync 判断
         listener_thread = thread(udpListenerWorker, slave_ip, net_port);
     }
 
@@ -588,22 +591,23 @@ int main() {
                     cv::Size textSize = cv::getTextSize(cam_ctxs[i]->status_msg, cv::FONT_HERSHEY_SIMPLEX, 0.7, 2, &baseline);
                     cv::Point textOrg((cell_w - textSize.width) / 2, (cell_h + textSize.height) / 2);
                     cv::putText(img, cam_ctxs[i]->status_msg, textOrg, cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
-                } else {
-                    if (is_recording) {
-                        int radius = 10;
-                        cv::Point center(img.cols - radius * 2, radius * 2);
-                        cv::circle(img, center, radius, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
-                        cv::putText(img, "REC", cv::Point(img.cols - radius * 7, radius * 2.5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
+                }
+                
+                // [修复] 将 REC 绘制移出 else 块。即使没图像(HW WAITING)，按下 r 也能在黑屏上看到 REC 和 Frame: 0/200
+                if (is_recording) {
+                    int radius = 10;
+                    cv::Point center(img.cols - radius * 2, radius * 2);
+                    cv::circle(img, center, radius, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+                    cv::putText(img, "REC", cv::Point(img.cols - radius * 7, radius * 2.5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
 
-                        int current_frame = cam_ctxs[i]->recorded_frames.load(std::memory_order_relaxed);
-                        double elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - record_start_time).count();
-                        char time_buf[32]; snprintf(time_buf, sizeof(time_buf), "Time: %.1fs", elapsed_s);
-                        
-                        cv::putText(img, "Frame: " + to_string(current_frame) + "/" + to_string(total_record_frames), cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3);
-                        cv::putText(img, "Frame: " + to_string(current_frame) + "/" + to_string(total_record_frames), cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
-                        cv::putText(img, time_buf, cv::Point(15, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3);
-                        cv::putText(img, time_buf, cv::Point(15, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
-                    }
+                    int current_frame = cam_ctxs[i]->recorded_frames.load(std::memory_order_relaxed);
+                    double elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - record_start_time).count();
+                    char time_buf[32]; snprintf(time_buf, sizeof(time_buf), "Time: %.1fs", elapsed_s);
+                    
+                    cv::putText(img, "Frame: " + to_string(current_frame) + "/" + to_string(total_record_frames), cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3);
+                    cv::putText(img, "Frame: " + to_string(current_frame) + "/" + to_string(total_record_frames), cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+                    cv::putText(img, time_buf, cv::Point(15, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3);
+                    cv::putText(img, time_buf, cv::Point(15, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
                 }
                 int r = i / grid_cols; int c = i % grid_cols;
                 img.copyTo(canvas(cv::Rect(c * cell_w, r * cell_h, cell_w, cell_h)));
@@ -704,10 +708,15 @@ int main() {
                         }
 
                         // ============ [新增] 跨主机 BlockID 交换 ============
-                        cout << "[Alignment] Local Range: [" << global_start_idx << ", " << global_end_idx << "]. Syncing with " << (is_master_pc ? "Slave" : "Master") << "..." << endl;
-                        syncGlobalBlockIDTCP(is_master_pc, master_ip, net_port, global_start_idx, global_end_idx);
-                        cout << "[Alignment] Final Global Intersection Range: [" << global_start_idx << ", " << global_end_idx << "]" << endl;
+                        if (enable_net_sync) {
+                            cout << "[Alignment] Local Range: [" << global_start_idx << ", " << global_end_idx << "]. Syncing with " << (is_master_pc ? "Slave" : "Master") << "..." << endl;
+                            syncGlobalBlockIDTCP(is_master_pc, master_ip, net_port, global_start_idx, global_end_idx);
+                            cout << "[Alignment] Final Global Intersection Range: [" << global_start_idx << ", " << global_end_idx << "]" << endl;
+                        } else {
+                            cout << "[Alignment] Net Sync OFF. Using Local Intersection Range: [" << global_start_idx << ", " << global_end_idx << "]" << endl;
+                        }
                         // ====================================================
+                        
                         // 2. 先取出交集，再从中截取 core_frames
                         for (int i = 0; i < cam_ctxs.size(); ++i) {
                             vector<LogEntry> intersected;
@@ -798,14 +807,23 @@ int main() {
 
         if (key == 'q' || key == 27) {
             global_running = false;
-        } else if (is_master_pc && key == 'r' && !is_recording && !is_dumping) {
-            cout << "\n[Master UI] 'r' pressed. Broadcast START to Slave..." << endl;
-            sendUdpCommand(master_ip, slave_ip, net_port, "CMD_START");
-            trigger_start = true;
-        } else if (!is_master_pc && net_cmd_record.exchange(false) && !is_recording && !is_dumping) {
+        } else if (key == 'r' && !is_recording && !is_dumping) {
+            if (enable_net_sync) {
+                if (is_master_pc) {
+                    cout << "\n[Master UI] 'r' pressed. Broadcast START to Slave..." << endl;
+                    sendUdpCommand(master_ip, slave_ip, net_port, "CMD_START");
+                    trigger_start = true;
+                } else {
+                    cout << "\n[Warning] Net Sync is ON. Please press 'r' on the Master PC." << endl;
+                }
+            } else {
+                cout << "\n[Local UI] 'r' pressed. Local capture starting..." << endl;
+                trigger_start = true;
+            }
+        } else if (enable_net_sync && !is_master_pc && net_cmd_record.exchange(false) && !is_recording && !is_dumping) {
             cout << "\n[Slave Net] Network START command received. Syncing..." << endl;
             trigger_start = true;
-        } else if (key == ' ') { 
+        } else if (key == ' ') {
             if (!is_recording && !is_dumping) { 
                 int counter = 0;
                 if (!cam_ctxs.empty()) counter = getNextCalibCounter(cam_ctxs[0]->save_base_dir);
