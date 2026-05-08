@@ -44,24 +44,91 @@ using namespace gazeestimation;
 atomic<bool> global_running{true};
 atomic<bool> net_cmd_record{false};
 
-// ================== 网络发送模块 (Master) ==================
-void sendUdpCommand(const string& local_ip, const string& target_ip, int port, const string& msg) {
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == INVALID_SOCKET) return;
+// [新增] 极速触发相关的全局变量
+string shared_record_timestr = "";
+std::chrono::steady_clock::time_point global_record_start_time;
+SOCKET master_udp_sock = INVALID_SOCKET;
+sockaddr_in slave_udp_addr{};
 
-    sockaddr_in local_addr{};
-    local_addr.sin_family = AF_INET;
-    local_addr.sin_port = 0; 
-    inet_pton(AF_INET, local_ip.c_str(), &local_addr.sin_addr);
+// ------------------------------------------------------------------
+// [重要修改] 将原代码中的 "相机通用功能" (包括 CameraContext 结构体和 cam_ctxs 变量) 
+// 全部剪切并移动到这里！(必须在 UDP 线程函数之上)
+// ------------------------------------------------------------------
+enum class CamStatus { INIT, OPENED, WAITING_TRIGGER, STREAMING, ERROR_ };
 
-    if (::bind(sock, (sockaddr*)&local_addr, sizeof(local_addr)) != -1) {
-        sockaddr_in target_addr{};
-        target_addr.sin_family = AF_INET;
-        target_addr.sin_port = htons(port);
-        inet_pton(AF_INET, target_ip.c_str(), &target_addr.sin_addr);
-        sendto(sock, msg.c_str(), msg.length(), 0, (sockaddr*)&target_addr, sizeof(target_addr));
+struct LogEntry { string filename; int64_t blockID; int64_t timestamp; int width; int height; };
+
+struct CameraContext {
+    int index;
+    string id;
+    string save_base_dir; 
+    BaslerCamera cam{""};
+
+    bool is_mono = true;
+    
+    thread capture_thread;
+    thread copy_thread; 
+    atomic<bool> running{true};
+    atomic<bool> recording{false};
+
+    cv::Mat latest_frame;
+    FrameMeta latest_meta;
+    mutex frame_mtx; 
+
+    vector<cv::Mat> ram_buffer;
+    vector<FrameMeta> meta_buffer;
+    int total_record_frames = 0;
+    atomic<bool> dump_ready{false};
+
+    queue<pair<Pylon::CBaslerUniversalGrabResultPtr, FrameMeta>> copy_queue;
+    mutex copy_mtx;
+    condition_variable copy_cv;
+
+    string temp_dir;      
+    string log_file_path;
+    ofstream log_stream;
+
+    atomic<int> captured_frames{0};
+    atomic<int> recorded_frames{0}; 
+
+    atomic<CamStatus> status{CamStatus::INIT};
+    string status_msg = "Initializing";
+
+    int64_t frame_offset = 0;
+    bool offset_initialized = false;
+    static atomic<int64_t> master_first_id; 
+    static atomic<bool> master_set;
+
+    CameraContext(int idx, string cam_id, string save_dir) : index(idx), id(cam_id), save_base_dir(save_dir), cam(cam_id) {}
+};
+
+atomic<int64_t> CameraContext::master_first_id(-1);
+atomic<bool> CameraContext::master_set(false);
+
+vector<shared_ptr<CameraContext>> cam_ctxs;
+
+// ================== [新增] 核心：极速零延迟触发函数 ==================
+void instantTrigger() {
+    global_record_start_time = std::chrono::steady_clock::now();
+    for (auto& ctx : cam_ctxs) {
+        {
+            // 瞬间清空残余队列
+            lock_guard<mutex> lock(ctx->copy_mtx);
+            while (!ctx->copy_queue.empty()) ctx->copy_queue.pop();
+        }
+        ctx->recorded_frames.store(0, std::memory_order_relaxed);
+        ctx->dump_ready.store(false, std::memory_order_relaxed);
+        // 核心：直接开启内存拷贝，彻底绕过 UI 线程！
+        ctx->recording.store(true, std::memory_order_release); 
     }
-    closesocket(sock);
+}
+
+// ================== 网络发送模块 (Master) ==================
+// [修改] 替换为内联的长连接发送函数，消除 socket 创建开销
+inline void fastUdpSend(const string& msg) {
+    if (master_udp_sock != INVALID_SOCKET) {
+        sendto(master_udp_sock, msg.c_str(), msg.length(), 0, (sockaddr*)&slave_udp_addr, sizeof(slave_udp_addr));
+    }
 }
 
 // ================== 网络同步与协商模块 (TCP 可靠传输) ==================
@@ -172,8 +239,11 @@ void udpListenerWorker(const string& bind_ip, int port) {
         if (bytes > 0) {
             buffer[bytes] = '\0';
             string cmd(buffer);
-            if (cmd == "CMD_START") {
-                net_cmd_record = true; 
+            // [修改] 识别带时间戳的指令，瞬间开火
+            if (cmd.rfind("CMD_START:", 0) == 0) { 
+                instantTrigger(); // 零延迟！立即让底层回调开始拷贝图像到 RAM
+                shared_record_timestr = cmd.substr(10); // 提取 Master 发来的时间戳
+                net_cmd_record = true; // 仅作为 UI 更新和后续 IO 准备的通知标志
             }
         } 
     }
@@ -198,59 +268,6 @@ int getNextCalibCounter(const std::string& save_dir) {
     }
     return max_counter + 1;
 }
-
-enum class CamStatus { INIT, OPENED, WAITING_TRIGGER, STREAMING, ERROR_ };
-
-struct LogEntry { string filename; int64_t blockID; int64_t timestamp; int width; int height; };
-
-struct CameraContext {
-    int index;
-    string id;
-    string save_base_dir; 
-    BaslerCamera cam{""};
-
-    bool is_mono = true;
-    
-    thread capture_thread;
-    thread copy_thread; 
-    atomic<bool> running{true};
-    atomic<bool> recording{false};
-
-    cv::Mat latest_frame;
-    FrameMeta latest_meta;
-    mutex frame_mtx; 
-
-    vector<cv::Mat> ram_buffer;
-    vector<FrameMeta> meta_buffer;
-    int total_record_frames = 0;
-    atomic<bool> dump_ready{false};
-
-    queue<pair<Pylon::CBaslerUniversalGrabResultPtr, FrameMeta>> copy_queue;
-    mutex copy_mtx;
-    condition_variable copy_cv;
-
-    string temp_dir;      
-    string log_file_path;
-    ofstream log_stream;
-
-    atomic<int> captured_frames{0};
-    atomic<int> recorded_frames{0}; 
-
-    atomic<CamStatus> status{CamStatus::INIT};
-    string status_msg = "Initializing";
-
-    int64_t frame_offset = 0;
-    bool offset_initialized = false;
-    static atomic<int64_t> master_first_id; 
-    static atomic<bool> master_set;
-
-    CameraContext(int idx, string cam_id, string save_dir) : index(idx), id(cam_id), save_base_dir(save_dir), cam(cam_id) {}
-};
-
-atomic<int64_t> CameraContext::master_first_id(-1);
-atomic<bool> CameraContext::master_set(false);
-
-vector<shared_ptr<CameraContext>> cam_ctxs;
 
 // ================== 后台异步拷贝线程 ==================
 void copyWorker(shared_ptr<CameraContext> ctx) {
@@ -500,6 +517,14 @@ int main() {
     cout << "Intersection Crop: " << (enable_intersection ? "ON" : "OFF") << endl;
     cout << "Net Sync         : " << (enable_net_sync ? "ON" : "OFF (Local Mode)") << endl;
     cout << "----------------------------------\n" << endl;
+
+    // [新增] Master 预先建立 UDP Socket (常驻内存)
+    if (is_master_pc && enable_net_sync) {
+        master_udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        slave_udp_addr.sin_family = AF_INET;
+        slave_udp_addr.sin_port = htons(net_port);
+        inet_pton(AF_INET, slave_ip.c_str(), &slave_udp_addr.sin_addr);
+    }
 
     // --- 启动网络监听器 (仅Slave) ---
     thread listener_thread;
@@ -808,21 +833,24 @@ int main() {
         if (key == 'q' || key == 27) {
             global_running = false;
         } else if (key == 'r' && !is_recording && !is_dumping) {
+            auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            char buf[64]; strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", localtime(&t));
+            shared_record_timestr = string(buf);
+
             if (enable_net_sync) {
                 if (is_master_pc) {
                     cout << "\n[Master UI] 'r' pressed. Broadcast START to Slave..." << endl;
-                    sendUdpCommand(master_ip, slave_ip, net_port, "CMD_START");
+                    fastUdpSend("CMD_START:" + shared_record_timestr); // 极速发送
+                    instantTrigger(); // Master 本地瞬间开火
                     trigger_start = true;
                 } else {
                     cout << "\n[Warning] Net Sync is ON. Please press 'r' on the Master PC." << endl;
                 }
             } else {
                 cout << "\n[Local UI] 'r' pressed. Local capture starting..." << endl;
+                instantTrigger();
                 trigger_start = true;
             }
-        } else if (enable_net_sync && !is_master_pc && net_cmd_record.exchange(false) && !is_recording && !is_dumping) {
-            cout << "\n[Slave Net] Network START command received. Syncing..." << endl;
-            trigger_start = true;
         } else if (key == ' ') {
             if (!is_recording && !is_dumping) { 
                 int counter = 0;
@@ -849,36 +877,26 @@ int main() {
             }
         }
 
-        // ===== 4. 核心触发优化：两阶段触发分离 I/O =====
-        if (trigger_start && !is_recording && !is_dumping) {
-            auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-            char buf[64]; strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", localtime(&t));
-            current_record_timestr = string(buf);
+        // ===== 4. 目录创建与 IO 准备 (完全移出关键路径) =====
+        // 这里同时处理 Master(靠 trigger_start) 和 Slave(靠 net_cmd_record) 的 IO 请求
+        if ((trigger_start || net_cmd_record.exchange(false)) && !is_recording && !is_dumping) {
+            
+            // 同步主线程状态与网络线程状态
+            current_record_timestr = shared_record_timestr;
+            record_start_time = global_record_start_time;
 
-            cout << "[Info] PREPARING I/O FOR ASYNC CAPTURE..." << endl;
+            cout << "[Info] RAM CAPTURE STARTED. PREPARING I/O ASYNC..." << endl;
 
+            // 慢慢建文件夹，完全不影响底层的图像拷贝
             for (auto& ctx : cam_ctxs) {
                 string batch_raw = ctx->save_base_dir + "/temp_raw_" + current_record_timestr + "/" + ctx->id;
                 fs::create_directories(batch_raw);
                 ctx->temp_dir = batch_raw;
                 ctx->log_file_path = ctx->save_base_dir + "/record_" + current_record_timestr + "_" + ctx->id + ".txt";
-                
-                {
-                    lock_guard<mutex> lock(ctx->copy_mtx);
-                    while (!ctx->copy_queue.empty()) ctx->copy_queue.pop();
-                }
-
-                ctx->recorded_frames = 0; 
-                ctx->dump_ready = false;  
-            }
-
-            record_start_time = std::chrono::steady_clock::now(); 
-            for (auto& ctx : cam_ctxs) {
-                ctx->recording.store(true, std::memory_order_release);
             }
             
-            is_recording = true;
-            cout << "[Info] ASYNC CAPTURE STARTED: " << current_record_timestr << endl;
+            is_recording = true; // 更新主线程 UI 状态
+            cout << "[Info] I/O PREPARED FOR: " << current_record_timestr << endl;
         }
     }
 
@@ -896,6 +914,7 @@ int main() {
 
     cv::destroyAllWindows();
     Pylon::PylonTerminate();
+    if (master_udp_sock != INVALID_SOCKET) closesocket(master_udp_sock);
 
 #ifdef _WIN32
     WSACleanup();

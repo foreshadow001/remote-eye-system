@@ -99,7 +99,7 @@ test_multi_cam:
   ui_fps: 20.0
   enable_offset: false
   enable_intersection: false
-  enable_net_sync: false
+  enable_net_sync: true
   save_dir: 
     - "D:/test_cam"
     - "D:/test_cam"
