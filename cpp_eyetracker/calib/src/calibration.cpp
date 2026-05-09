@@ -2,6 +2,7 @@
 
 #include "calib/calibration.hpp"
 #include "utils/shared_calculations.hpp"
+#include "utils/intersection.hpp"
 
 #include <iostream>
 #include <cassert>
@@ -96,6 +97,59 @@ public:
                 residual[index++] = diff[0] - dot * V[0];
                 residual[index++] = diff[1] - dot * V[1];
                 residual[index++] = diff[2] - dot * V[2];
+            } catch (...) {
+                // 如果参数探索导致推断过程异常(比如计算出NaN)，返回false让Ceres重试
+                return false;
+            }
+        }
+
+        return true;
+    }
+};
+
+// 私有仿函数类，用于提供给 Ceres 自动求导计算残差
+class SingleEyeScreenCalibrationErrorFunctor
+{
+private:
+    GazeTracker* const gaze_estimation;
+    const Calibration::SingleEyeCalibrationDataMap* const data;
+    const SingleEyeAndCameraParameters parameters;
+    Cfg cfg_;
+
+public:
+    SingleEyeScreenCalibrationErrorFunctor(
+        GazeTracker* const gaze_estimation,
+        const Calibration::SingleEyeCalibrationDataMap* const data,
+        const SingleEyeAndCameraParameters parameters
+    ) :
+        gaze_estimation(gaze_estimation),
+        data(data),
+        parameters(parameters)
+    {
+    }
+
+    bool operator()(double const* const* variables, double* residual) const {
+        auto our_parameters = variables_calibration_applicator(parameters, variables);
+        int index = 0;
+        
+        for (auto It = data->begin(); It != data->end(); ++It)
+        {
+            SingleEyePupilCenterGlintInputs data_in = (*It).first;
+            Vec3 truth = (*It).second;
+
+            try {
+                DefaultSingleEyeGazeEstimationResult result = gaze_estimation->estimate(data_in, our_parameters);
+                
+                Vec3 C = result.cornea_center;     // 视线起点 (角膜中心)
+                Vec3 V = result.visual_axis_unit;  // 视线方向 (单位向量)
+
+                Vec3 pred = rayPlaneIntersection(C, V, cfg_);
+                Vec3 diff = truth - pred;
+                
+                // 垂足向量 (误差向量)
+                residual[index++] = diff[0];
+                residual[index++] = diff[1];
+                residual[index++] = diff[2];
             } catch (...) {
                 // 如果参数探索导致推断过程异常(比如计算出NaN)，返回false让Ceres重试
                 return false;
@@ -246,6 +300,75 @@ std::vector<std::vector<double>> Calibration::calibrate(
     return result;
 }
 
+std::vector<std::vector<double>> Calibration::calibrateScreen(
+    GazeTracker& estimation,
+    SingleEyeAndCameraParameters& parameters,
+    SingleEyeCalibrationDataMap& data,
+    std::vector<std::vector<double>> initial_values,
+    std::vector<std::vector<std::pair<double, double>>> bounds)
+{
+    assert(bounds.size() == initial_values.size());
+
+    ceres::Problem problem;
+
+    auto cost_function = new ceres::DynamicNumericDiffCostFunction<SingleEyeScreenCalibrationErrorFunctor, ceres::CENTRAL>
+        (new SingleEyeScreenCalibrationErrorFunctor(&estimation, &data, parameters));
+
+    for (size_t i = 0; i < initial_values.size(); i++)
+    {
+        cost_function->AddParameterBlock(initial_values[i].size());
+    }
+
+    cost_function->SetNumResiduals(data.size() * 3);
+
+    std::vector<double*> variables;
+
+    for(size_t i = 0; i < initial_values.size(); i++)
+    {
+        double* element = new double[initial_values[i].size()];
+        for(size_t j = 0; j < initial_values[i].size(); j++)
+        {
+            element[j] = initial_values[i][j];
+        }
+        variables.push_back(element);
+    }
+
+    problem.AddResidualBlock(cost_function, nullptr, variables);
+
+    for(size_t i = 0; i < initial_values.size(); i++)
+    {
+        for (size_t j = 0; j < bounds[i].size(); j++) {
+            double* element = variables[i];
+            problem.SetParameterLowerBound(element, j, bounds[i][j].first);
+            problem.SetParameterUpperBound(element, j, bounds[i][j].second);
+        }
+    }
+    
+    ceres::Solver::Options options;
+    options.minimizer_progress_to_stdout = false;
+    options.linear_solver_type = ceres::DENSE_QR;
+    options.max_num_iterations = 1e4;
+
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+
+    std::cout << summary.BriefReport() << "\n";
+
+    std::vector<std::vector<double>> result;
+
+    for(size_t i = 0; i < variables.size(); i++)
+    {
+        std::vector<double> this_variable;
+        for(size_t j = 0; j < initial_values[i].size(); j++)
+        {
+            this_variable.push_back(variables[i][j]);
+        }
+        result.push_back(this_variable);
+        
+        delete[] variables[i]; // 防止内存泄漏
+    }
+    return result;
+}
 
 Vec3
 result_processor(

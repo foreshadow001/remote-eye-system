@@ -1,17 +1,35 @@
 # Camera calibration
 cam_calib:
-  input_folder: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx/cam_calib/pictures/"
+  input_folder: "D:/hitsz/projects/new_dataset/test_cam_calib/pictures/"
   calib_plane: "D:/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
-  output_folder: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx/cam_calib/output/"
-  focus: 0.0123
+  output_folder: "D:/hitsz/projects/new_dataset/test_cam_calib/output/"
+  focus: 0.012 # m
   pixel_size_x: 3.45e-6 # m
   pixel_size_y: 3.45e-6 # m
 
 # Calibration Offline Settings
 test_calib:
-  record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx"
+  record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/ylx"
   num_images_per_folder: 20
-  output_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx"
+  output_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/ylx"
+
+test_jitter:
+  record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/ylx"
+  output_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/ylx"
+  num_images_per_folder: 20
+  
+  # 新增：对每个干净样本生成的噪声样本数量
+  num_noise_samples: 10
+  
+  # Pupil Jitter 遍历配置 (单位: pixel std)
+  pupil_jitter_start: 0.0
+  pupil_jitter_step: 0.25
+  pupil_jitter_end: 2.0
+  
+  # Glint Jitter 遍历配置 (单位: pixel std)
+  glint_jitter_start: 0.0
+  glint_jitter_step: 0.25
+  glint_jitter_end: 2.0
 
 # Gaze Tracker Settings
 gaze_tracker:
@@ -25,7 +43,7 @@ gaze_tracker:
 
 # Camera Settings
 cam_xml_path:
-  - "D:/hitsz/projects/new_dataset/eyetracker_test/zyx/cam_calib/output/Camera0_Data.xml"
+  - "D:/hitsz/projects/new_dataset/eyetracker_test/ylx/cam_calib/output/Camera0_Data.xml"
 #  - "D:/ylx/calib/cams/Camera1_Data.xml"
 #  - "D:/ylx/calib/cams/Camera2_Data.xml"
 
@@ -84,7 +102,7 @@ test_multi_cam:
   write_jpg: true
   write_video: false
   debug_time: true
-  save_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx/cam_calib/pictures"
+  save_dir: "D:/hitsz/projects/new_dataset/test_cam_calib/pictures"
   fps: 200
   gain: 0.0
   gamma: 1.0
@@ -95,7 +113,7 @@ test_multi_cam:
   cam_height: 1080
 
 test_record:
-  save_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx"
+  save_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/ylx"
   write_jpg: true
   target_frames: 200
   remove_false: true
@@ -126,19 +144,20 @@ test_glint:
   viz: true
   viz_threshold: true
   num_images: 200000
-  input_folder: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx/collect_input"
+  input_folder: "D:/hitsz/projects/new_dataset/eyetracker_test/sby/record_20260408_152345/cam_0"
   use_record: false
-  record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx"
+  record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/ylx"
   gaussian_kernel_size: 3
   laplacian_kernel_size: 1
   init_threshold_value: 110
   threshold_step: 30
   mini_threshold: 20
+  use_glint_sr: true
 
 # Collect Potential Glint Triangles
 collect_glint:
   use_record: true
-  record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/zyx"
+  record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/ylx"
   num_images: 100
 <<<<<<< HEAD
   input_folder: "D:/hitsz/projects/new_dataset/test_record/debug/collect_input"
@@ -390,3 +409,20 @@ empirical_hyperparameter:
     kMinInlierRatio: 0.4
     kMaxGlintBrightness: 50
 
+  refineGlintPoint:
+    viz_mult: 5
+    # --- ROI 提取与超分设置 ---
+    kWindowSize: 6            # ROI 基础窗口大小（原图像素）。Glint 通常在 3~8 个像素左右，16 足够包围它并提供背景上下文。
+    kPaddingRatio: 0.0        # ROI 扩展比例（按你要求设置为 0.1）。
+    sr_scale: 4               # 超分辨率放大倍数。推荐 4 倍（Lanczos4 在 4 倍放大时平滑度与计算耗时的平衡最佳）。
+    
+    # --- 边缘射线采样设置 ---
+    kRayCount: 36             # 射线发射数量。36 意味着每 10 度采样一次，对于极小圆的拟合来说点数刚刚好，再多容易引入临近噪声。
+    kGradientGap: 2           # 梯度计算步长（SR 图像像素跨度）。配合 Lanczos4 的平滑特性，跨度设为 2 能有效捕获由于衍射产生的平缓下降沿。
+    kMinGradient: 10          # 判定为边缘的最小梯度阈值。Glint 相比背景亮度落差很大，5.0 能滤除底噪同时保留微弱的真实边缘。
+    kMinBrightness: 30.0    # 边缘点靠光斑内侧的最低亮度限制
+    kRadiusMargin: 2.0      # 距离中点的一半后，附加的微小安全冗余半径 (原图像素级)
+
+    # --- RANSAC 拟合设置 ---
+    kRansacIterations: 100    # RANSAC 迭代次数。候选点最多只有 36 个，100 次迭代足够覆盖绝大多数有效组合（置信度 > 99%）。
+    kInlierTolerance: 2.0     # 内点容差（SR 图像像素）。在 sr_scale=4 的情况下，2.0 代表原图的 0.5 个像素，这是一个非常严格且准确的正圆约束条件。

@@ -7,10 +7,10 @@ import yaml
 import os
 
 # ==================== 路径配置 ====================
-BASE_DIR = "D:/hitsz/projects/new_dataset/eyetracker_test/debug"
+BASE_DIR = "D:/hitsz/projects/new_dataset/eyetracker_test/lzx"
 CONFIG_PATH = "D:/hitsz/projects/new_dataset/remote-eye-system/cpp_eyetracker/cfg/default.yaml"
-LEFT_DATA_PATH = os.path.join(BASE_DIR, "calib_inference_result_left_single.txt")
-RIGHT_DATA_PATH = os.path.join(BASE_DIR, "calib_inference_result_right_single.txt")
+LEFT_DATA_PATH = os.path.join(BASE_DIR, "calib_inference_result_left_single_screen.txt")
+RIGHT_DATA_PATH = os.path.join(BASE_DIR, "calib_inference_result_right_single_screen.txt")
 
 # ==================== 列索引常量 ====================
 # 对应 C++ 输出: cornea(3) opt(3) vis(3) gt(3) pred(3)
@@ -355,6 +355,7 @@ class GazeVisualizer:
         plt.show()
 
 if __name__ == "__main__":
+    print("Visualizing gaze data from" + BASE_DIR)
     if os.path.exists(LEFT_DATA_PATH) and os.path.exists(RIGHT_DATA_PATH):
         viz = GazeVisualizer(LEFT_DATA_PATH, RIGHT_DATA_PATH, CONFIG_PATH)
         viz.show()

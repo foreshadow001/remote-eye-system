@@ -21,6 +21,13 @@ computeGazeIntersection(
 );
 
 Vec3
+rayPlaneIntersection(
+    const Vec3& ray_origin,
+    const Vec3& ray_direction,
+    const Cfg& cfg
+);
+
+Vec3
 screenToWCS(
     const Vec2& screen_point,
     const Cfg& cfg
