@@ -1,8 +1,6 @@
-set(TEST_CAM_SOURCES
+add_executable(test_multi_cam
     test_multi_cam.cpp
 )
-
-add_executable(test_multi_cam ${TEST_CAM_SOURCES})
 
 target_link_libraries(test_multi_cam
     PRIVATE
@@ -11,3 +9,15 @@ target_link_libraries(test_multi_cam
 )
 
 message(STATUS "✅ test_multi_cam will be built and linked with eyetracker::cam")
+
+add_executable(test_multi_cam_multi_host
+    test_multi_cam_multi_host.cpp
+)
+
+target_link_libraries(test_multi_cam_multi_host
+    PRIVATE
+        eyetracker::cfg
+        eyetracker::cam
+)
+
+message(STATUS "✅ test_multi_cam_multi_host will be built and linked with eyetracker::cam")

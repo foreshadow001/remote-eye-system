@@ -278,19 +278,6 @@ int main() {
     // 5. 将计算结果更新至 YAML 并保存
     // ==========================================
     string prefix_pupil = "recommended_specific_hyperparameter.pupil.searchPupilInROI.";
-<<<<<<< HEAD
-    cfg.setScalar(prefix_pupil + "kMinPupilArea", rr_area.rec_min);
-    cfg.setScalar(prefix_pupil + "kMaxPupilArea", rr_area.rec_max);
-    cfg.setScalar(prefix_pupil + "kMinPupilContourPoints", (int)rr_pts.rec_min);
-    cfg.setScalar(prefix_pupil + "kMaxPupilAxis", rr_axis.rec_max);
-    cfg.setScalar(prefix_pupil + "kMaxAxisRatio", rr_rat.rec_max);
-    cfg.setScalar(prefix_pupil + "kMinSolidity", rr_sol.rec_min);
-    cfg.setScalar(prefix_pupil + "kMinFitRatio", rr_fit.rec_min);
-    cfg.setScalar(prefix_pupil + "kMaxAvgResidual", rr_res.rec_max);
-    cfg.setScalar(prefix_pupil + "kMaxDarkness", rr_dark.rec_max);
-    // 更新 Threshold Max (使用 darkness 作为基准并提供一定偏移)
-    cfg.setScalar(prefix_pupil + "kAdaptiveThreshMax", rr_dark.rec_max + 2.0);
-=======
     cfg.setScalar<int>(prefix_pupil + "kMinPupilArea", rr_area.rec_min);
     cfg.setScalar<int>(prefix_pupil + "kMaxPupilArea", rr_area.rec_max);
     cfg.setScalar<int>(prefix_pupil + "kMinPupilContourPoints", (int)rr_pts.rec_min);
@@ -302,7 +289,6 @@ int main() {
     cfg.setScalar<double>(prefix_pupil + "kMaxDarkness", rr_dark.rec_max);
     // cfg.setScalar(prefix_pupil + "kAdaptiveThreshOffset", rr_offset.rec_max);
     // cfg.setScalar(prefix_pupil + "kAdaptiveThreshMax", rr_dark.rec_max);
->>>>>>> dev-5060-1
 
     string prefix_glint = "recommended_specific_hyperparameter.glint.";
     cfg.setScalar<double>(prefix_glint + "isPupilNearby.kExclusionRadiusRatio", rr_excl.rec_max);
