@@ -144,6 +144,7 @@ private:
     bool viz_ = false;
     bool viz_threshold_ = false;
     bool is_collecting_ = false;
+    bool use_glint_sr_ = false;
     std::string param_type_ = "default";
 
     Cfg cfg_;
@@ -341,6 +342,21 @@ private:
 
     // 亚像素双线性插值辅助函数
     float getBilinearSubpixel(const cv::Mat& img, const cv::Point2f& pt) const;
+
+    // (保留 fitCircleRANSAC)
+    cv::Point3f fitCircleRANSAC(
+        const std::vector<cv::Point2f>& points, 
+        int max_iters, 
+        float tolerance, 
+        float max_radius
+    );
+
+    // ✨ 删除 refineGlintPoint 声明，将签名简化为：
+    void refineGlintGeometry(
+        const cv::Mat& gray_img, 
+        GlintGeometry& geo,
+        int debug_img_idx
+    );
 };
 
 } // namespace glintdetection

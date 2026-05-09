@@ -27,3 +27,24 @@ target_link_libraries(cam_calib PUBLIC
 )
 
 message(STATUS "✅ cam_calib will be built")
+
+add_executable(cam_calib_chain
+    calib_cam_chain.cpp
+)
+
+target_include_directories(cam_calib_chain PUBLIC
+    "${HALCONROOT}/include"
+    "${HALCONROOT}/include/halconcpp"
+)
+
+target_link_directories(cam_calib_chain PUBLIC
+    "${HALCONROOT}/lib/x64-win64"
+)
+
+target_link_libraries(cam_calib_chain PUBLIC
+    halcon.lib
+    halconcpp.lib
+    eyetracker::cfg
+)
+
+message(STATUS "✅ cam_calib_chain will be built")

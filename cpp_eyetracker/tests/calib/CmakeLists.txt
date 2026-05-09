@@ -1,15 +1,37 @@
 # /tests/calib/CmakeLists.txt
 
-add_subdirectory(record_data)
-add_subdirectory(set_image)
+# add_subdirectory(record_data)
+# add_subdirectory(set_image)
 
-set(TEST_CALIB_SOURCES
+add_executable(test_calib_single_eye
     test_calib_single_eye.cpp
 )
 
-add_executable(test_calib_single_eye ${TEST_CALIB_SOURCES})
-
 target_link_libraries(test_calib_single_eye
+    PRIVATE
+        eyetracker::inference
+        eyetracker::glint_detection
+        eyetracker::utils
+        eyetracker::calib
+)
+
+add_executable(test_calib_screen
+    test_calib_screen.cpp
+)
+
+target_link_libraries(test_calib_screen
+    PRIVATE
+        eyetracker::inference
+        eyetracker::glint_detection
+        eyetracker::utils
+        eyetracker::calib
+)
+
+add_executable(test_jitter
+    test_jitter.cpp
+)
+
+target_link_libraries(test_jitter
     PRIVATE
         eyetracker::inference
         eyetracker::glint_detection

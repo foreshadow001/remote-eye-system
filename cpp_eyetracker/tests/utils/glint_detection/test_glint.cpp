@@ -55,60 +55,65 @@ bool processRecordDirectory(
         Logger::info() << "Processing folder: " << target_dir.filename().string();
 
         // 递归遍历该特定 record 文件夹下的所有文件 (例如 cam_0, cam_1 子目录里的图片)
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(target_dir)) {
-            if (!entry.is_regular_file()) continue;
+        for (const auto& sub_dir : std::filesystem::directory_iterator(target_dir)) {
+            // 过滤掉 target_dir 根目录下的普通文件，只处理文件夹
+            if (!sub_dir.is_directory()) continue;
 
-            std::string ext = entry.path().extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(),[](unsigned char c){ return std::tolower(c); });
+            for (const auto& entry : std::filesystem::directory_iterator(sub_dir.path())) {
+                if (!entry.is_regular_file()) continue;
 
-            if (ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".bmp") {
-                continue;
+                std::string ext = entry.path().extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(),[](unsigned char c){ return std::tolower(c); });
+
+                if (ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".bmp") {
+                    continue;
+                }
+
+                std::string filepath = entry.path().string();
+                glint_detector.setImageName(entry.path().stem().string());
+
+                cv::Mat img = cv::imread(filepath, cv::IMREAD_GRAYSCALE);
+                if (img.empty()) {
+                    Logger::error() << "Failed to read image: " << filepath;
+                    continue;
+                }
+
+                // 核心检测调用
+                auto[leftEyeGlintsList, rightEyeGlintsList, leftPupilCenter, rightPupilCenter] = glint_detector.detect(img);
+
+                // 获取相对路径 (例如: cam_0/000000.jpg)
+                std::string rel_path = std::filesystem::relative(entry.path(), target_dir).generic_string();
+
+                record_csv << rel_path << ","
+                        << leftPupilCenter.x << "," << leftPupilCenter.y << ","
+                        << rightPupilCenter.x << "," << rightPupilCenter.y << ",";
+
+                // 保存左眼 glint geometry
+                if (!leftEyeGlintsList.empty() && leftEyeGlintsList[0].size() == 3) {
+                    record_csv << leftEyeGlintsList[0][0].x << "," << leftEyeGlintsList[0][0].y << ","
+                            << leftEyeGlintsList[0][1].x << "," << leftEyeGlintsList[0][1].y << ","
+                            << leftEyeGlintsList[0][2].x << "," << leftEyeGlintsList[0][2].y << ",";
+                } else {
+                    record_csv << "0,0,0,0,0,0,";
+                }
+
+                // 保存右眼 glint geometry
+                if (!rightEyeGlintsList.empty() && rightEyeGlintsList[0].size() == 3) {
+                    record_csv << rightEyeGlintsList[0][0].x << "," << rightEyeGlintsList[0][0].y << ","
+                            << rightEyeGlintsList[0][1].x << "," << rightEyeGlintsList[0][1].y << ","
+                            << rightEyeGlintsList[0][2].x << "," << rightEyeGlintsList[0][2].y << "\n";
+                } else {
+                    record_csv << "0,0,0,0,0,0\n";
+                }
+
+                idx++;
+                // 抽样打印进度，防止刷屏卡顿
+                if (idx % 1000 == 0) {
+                    Logger::info() << "  -> Processed " << idx << " images...";
+                }
+
+                if (idx >= max_images) break;
             }
-
-            std::string filepath = entry.path().string();
-            glint_detector.setImageName(entry.path().stem().string());
-
-            cv::Mat img = cv::imread(filepath, cv::IMREAD_GRAYSCALE);
-            if (img.empty()) {
-                Logger::error() << "Failed to read image: " << filepath;
-                continue;
-            }
-
-            // 核心检测调用
-            auto[leftEyeGlintsList, rightEyeGlintsList, leftPupilCenter, rightPupilCenter] = glint_detector.detect(img);
-
-            // 获取相对路径 (例如: cam_0/000000.jpg)
-            std::string rel_path = std::filesystem::relative(entry.path(), target_dir).generic_string();
-
-            record_csv << rel_path << ","
-                    << leftPupilCenter.x << "," << leftPupilCenter.y << ","
-                    << rightPupilCenter.x << "," << rightPupilCenter.y << ",";
-
-            // 保存左眼 glint geometry
-            if (!leftEyeGlintsList.empty() && leftEyeGlintsList[0].size() == 3) {
-                record_csv << leftEyeGlintsList[0][0].x << "," << leftEyeGlintsList[0][0].y << ","
-                        << leftEyeGlintsList[0][1].x << "," << leftEyeGlintsList[0][1].y << ","
-                        << leftEyeGlintsList[0][2].x << "," << leftEyeGlintsList[0][2].y << ",";
-            } else {
-                record_csv << "0,0,0,0,0,0,";
-            }
-
-            // 保存右眼 glint geometry
-            if (!rightEyeGlintsList.empty() && rightEyeGlintsList[0].size() == 3) {
-                record_csv << rightEyeGlintsList[0][0].x << "," << rightEyeGlintsList[0][0].y << ","
-                        << rightEyeGlintsList[0][1].x << "," << rightEyeGlintsList[0][1].y << ","
-                        << rightEyeGlintsList[0][2].x << "," << rightEyeGlintsList[0][2].y << "\n";
-            } else {
-                record_csv << "0,0,0,0,0,0\n";
-            }
-
-            idx++;
-            // 抽样打印进度，防止刷屏卡顿
-            if (idx % 1000 == 0) {
-                Logger::info() << "  -> Processed " << idx << " images...";
-            }
-
-            if (idx >= max_images) break;
         }
 
         record_csv.close();
@@ -193,7 +198,8 @@ int main() {
 
     std::vector<std::string> sub_dirs = {
         "/0_binary_pupil", "/1_glass_reflection", "/2_frame_reflection",
-        "/3_exclusion_mask", "/4_res", "/5_refine_pupil"
+        "/3_exclusion_mask", "/4_res", "/5_jitter_pupil", "/6_jitter_glint", 
+        "/7_sr_left", "/8_sr_right"
     };
 
     if (!std::filesystem::exists(input_folder) || !std::filesystem::is_directory(input_folder)) {
@@ -231,6 +237,7 @@ int main() {
         std::vector<cv::Mat> debug_imgs = glint_detector.getDebugImgs();
         if (!debug_imgs.empty()) {
             for (int i = 0; i < debug_imgs.size(); i++) {
+                if (debug_imgs[i].empty()) continue;
                 std::string save_path = debug_img_output_folder + sub_dirs[i];
                 std::filesystem::create_directories(save_path);
                 cv::imwrite(save_path + "/" + filename, debug_imgs[i]);

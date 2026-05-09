@@ -201,6 +201,7 @@ GlintDetector::GlintDetector(const std::string& param_type)
 	init_threshold_value_ = cfg_["test_glint"]["init_threshold_value"].as<double>();
     threshold_step_ = cfg_["test_glint"]["threshold_step"].as<double>();
     mini_threshold_ = cfg_["test_glint"]["mini_threshold"].as<double>();
+    use_glint_sr_ = cfg_["test_glint"]["use_glint_sr"].as<bool>();
 }
 
 bool GlintDetector::side2side(
@@ -563,7 +564,7 @@ void GlintDetector::searchGlassReflections()
     {
         cv::Mat viz;
         cv::cvtColor(gray_, viz, cv::COLOR_GRAY2BGR);
-        debug_imgs_.push_back(viz); // glass reflection viz
+        debug_imgs_[1] = viz; // glass reflection viz
     }
 
     // 2. Iterate through candidate contours
@@ -835,7 +836,7 @@ GlintDetector::searchPupilInROI(cv::Rect roi_rect)
     if (viz_) {
         cv::Mat viz = binary_pupil.clone();
         cv::cvtColor(viz, viz, cv::COLOR_GRAY2BGR);
-        debug_imgs_.push_back(viz);
+        debug_imgs_[0] = viz;
     }
 
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(kMorphKernelSize, kMorphKernelSize));
@@ -1275,7 +1276,7 @@ void GlintDetector::searchFrameReflections()
         // ---- 可视化底图 ----
         cv::Mat viz;
         cv::cvtColor(gray_, viz, cv::COLOR_GRAY2BGR);
-        debug_imgs_.push_back(viz); // frame reflection viz
+        debug_imgs_[2] = viz; // frame reflection viz
     }
 
     // 1. Threshold
@@ -1484,7 +1485,7 @@ void GlintDetector::buildExclusionMask()
         }
     }
     
-    if (viz_) debug_imgs_.push_back(exclusion_mask_); // exclusion mask viz
+    if (viz_) debug_imgs_[3] = exclusion_mask_; // exclusion mask viz
 }
 
 bool GlintDetector::isInsideExclusionRegion(const cv::Point2f& pt) const
@@ -1727,8 +1728,8 @@ void GlintDetector::excludeIrisReflectionsFromROIs(std::vector<cv::Rect>& rois, 
         cv::Rect safe_roi = roi & cv::Rect(0, 0, gray_.cols, gray_.rows);
         if (safe_roi.empty()) continue;
 
-        if (viz_ && !debug_imgs_.empty()) {
-            cv::rectangle(debug_imgs_.back(), safe_roi, cv::Scalar(0, 255, 0), 1);
+        if (viz_) {
+            cv::rectangle(debug_imgs_[4], safe_roi, cv::Scalar(0, 255, 0), 1);
         }
 
         cv::Mat roi_gray = gray_(safe_roi);
@@ -1761,8 +1762,8 @@ void GlintDetector::excludeIrisReflectionsFromROIs(std::vector<cv::Rect>& rois, 
                 iris_bboxes.push_back(global_bbox);
                 out_iris_bboxes.push_back(global_bbox); // 收集到外部容器中提供给 Cluster
 
-                if (viz_ && !debug_imgs_.empty()) {
-                    cv::rectangle(debug_imgs_.back(), global_bbox, cv::Scalar(255, 0, 0), 1);
+                if (viz_) {
+                    cv::rectangle(debug_imgs_[4], global_bbox, cv::Scalar(255, 0, 0), 1);
                 }
             }
         }
@@ -1902,7 +1903,7 @@ std::vector<cv::Rect> GlintDetector::determineCornealReflectionROI()
             cv::circle(viz_raw, p, 3, cv::Scalar(0, 0, 255), -1);
         }
         
-        debug_imgs_.push_back(viz_raw);
+        debug_imgs_[4] = viz_raw;
     }
 
     // ...[Layered Difference Logic remains unchanged] ...
@@ -2078,6 +2079,140 @@ GlintDetector::searchGlintsInROI(
 
     return contour_centers;
 }
+
+/*
+std::vector<cv::Point2f>
+GlintDetector::searchGlintsInROI(
+    const cv::Mat& roi_img, 
+    const cv::Point2f& roi_offset,
+    const std::vector<cv::Point2f>& glints,
+    const double threshold_value,
+    const std::string& debug_tag,
+    bool use_super_resolution // 新增参数
+)
+{
+    cv::Mat process_img;
+    cv::Mat sr_raw_roi; // ★ 新增：用于存储超分后的原始灰度图（非特征提取图）
+    
+    int sr_scale = emp_cfg_["searchGlintsInROI"]["sr_scale"].as<int>();
+    int sr_padding = emp_cfg_["searchGlintsInROI"]["sr_padding"].as<int>();
+
+    if (use_super_resolution) {
+        int x = static_cast<int>(roi_offset.x);
+        int y = static_cast<int>(roi_offset.y);
+        int w = roi_img.cols;
+        int h = roi_img.rows;
+
+        int pad_l = std::min(x, sr_padding);
+        int pad_t = std::min(y, sr_padding);
+        int pad_r = std::min(gray_.cols - (x + w), sr_padding);
+        int pad_b = std::min(gray_.rows - (y + h), sr_padding);
+
+        cv::Rect padded_rect(x - pad_l, y - pad_t, w + pad_l + pad_r, h + pad_t + pad_b);
+        cv::Mat padded_img = gray_(padded_rect); 
+
+        // 1. 使用 Lanczos4 插值生成高清原图
+        cv::Mat upscaled_padded;
+        cv::resize(padded_img, upscaled_padded, cv::Size(), sr_scale, sr_scale, cv::INTER_LANCZOS4);
+
+        // 2. 裁剪出 ROI 对应的超分灰度图 (用于可视化)
+        cv::Rect crop_rect(pad_l * sr_scale, pad_t * sr_scale, w * sr_scale, h * sr_scale);
+        sr_raw_roi = upscaled_padded(crop_rect).clone();
+
+        // 3. 执行特征提取管线 (用于实际检测)
+        cv::Mat sr_gaussed, sr_laplaced, sr_abs;
+        cv::GaussianBlur(sr_raw_roi, sr_gaussed, cv::Size(gaussian_kernel_size_, gaussian_kernel_size_), 0, 0);
+        cv::Laplacian(sr_gaussed, sr_laplaced, CV_16S, laplacian_kernel_size_, laplacian_scale_, laplacian_delta_);
+        cv::convertScaleAbs(sr_laplaced, sr_abs);
+        process_img = sr_abs;
+    } else {
+        process_img = roi_img.clone();
+    }
+
+    // 执行阈值处理和轮廓搜索
+    cv::Mat threshold_output;
+    cv::threshold(process_img, threshold_output, threshold_value, 255, cv::THRESH_BINARY);
+
+    // ★ 改进后的可视化逻辑：直接拷贝 SR 后的 gray 原图到底图
+    if (viz_ && use_super_resolution && !debug_imgs_[7].empty()) {
+        cv::Rect dst_rect(
+            static_cast<int>(roi_offset.x) * sr_scale,
+            static_cast<int>(roi_offset.y) * sr_scale,
+            sr_raw_roi.cols,
+            sr_raw_roi.rows
+        );
+        
+        dst_rect &= cv::Rect(0, 0, debug_imgs_[7].cols, debug_imgs_[7].rows);
+        
+        if (dst_rect.width > 0 && dst_rect.height > 0) {
+            for (int r = 0; r < dst_rect.height; ++r) {
+                const uchar* src_ptr = sr_raw_roi.ptr<uchar>(r);
+                cv::Vec3b* dst_ptr = debug_imgs_[7].ptr<cv::Vec3b>(dst_rect.y + r);
+                for (int c = 0; c < dst_rect.width; ++c) {
+                    uchar val = src_ptr[c];
+                    // 拷贝原始灰度值，无颜色标记，方便对比 Lanczos4 的平滑度
+                    dst_ptr[dst_rect.x + c] = cv::Vec3b(val, val, val);
+                }
+            }
+        }
+    }
+
+    if (viz_threshold_ && debug_tag.size() > 0) {
+        std::string threshold_output_folder = 
+            cfg_["test_glint"]["input_folder"].as<std::string>() + "\\threshold_output\\" + img_name_ + "\\"
+            + debug_tag;
+
+        std::string save_path = threshold_output_folder + "\\" +  std::to_string(threshold_value) + ".png";
+
+        std::filesystem::path folder_path(threshold_output_folder);
+        if (!std::filesystem::exists(folder_path)) std::filesystem::create_directories(folder_path);
+
+        cv::imwrite(save_path, threshold_output);
+    }
+
+    std::vector<std::vector<cv::Point>> contours;
+    std::vector<cv::Vec4i> hierarchy;
+
+    // ★ 注意：此时不能传入 roi_offset，因为超分后坐标系尺度已经发生了变化，需在局部找完后再放缩
+    cv::findContours(
+        threshold_output, 
+        contours, 
+        hierarchy, 
+        cv::RETR_EXTERNAL, 
+        cv::CHAIN_APPROX_SIMPLE
+    );
+
+    std::vector<cv::RotatedRect> min_rects;
+    std::vector<cv::Point2f> contour_centers;
+
+    if (contours.empty()) return contour_centers;
+
+    for (size_t k = 0; k < contours.size(); ++k)
+    {
+        cv::RotatedRect rect = cv::minAreaRect(contours[k]);
+        cv::Point2f global_center;
+
+        // 5. 将尺度缩放回原始原图坐标系
+        if (use_super_resolution) {
+            global_center.x = (rect.center.x / sr_scale) + roi_offset.x;
+            global_center.y = (rect.center.y / sr_scale) + roi_offset.y;
+        } else {
+            global_center.x = rect.center.x + roi_offset.x;
+            global_center.y = rect.center.y + roi_offset.y;
+        }
+
+        if (threshold_value == mini_threshold_) {
+            Logger::debug() << std::fixed << std::setprecision(2) << "[SearchGlintsInROI] Mini threshold point found: (" << global_center.x << ", " << global_center.y << ")";
+        }
+        if (isGlintRepeated(glints, global_center)) continue;
+
+        min_rects.push_back(rect);
+        contour_centers.push_back(global_center);
+    }
+
+    return contour_centers;
+}
+*/
 
 std::tuple<
     std::vector<GlintDetector::GlintGeometry>, 
@@ -2322,9 +2457,12 @@ GlintDetector::detectCluster(const RoiCluster& cluster)
         {
             cv::Mat roi_img = abs_dst_(roi);
             cv::Point2f roi_offset(roi.x, roi.y);
+
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(2) << "cluster_" << roi.x << "_" << roi.y;
             
             // 传入 accumulated_glints 进行判重屏蔽
-            auto pts = searchGlintsInROI(roi_img, roi_offset, accumulated_glints, thr, "");
+            auto pts = searchGlintsInROI(roi_img, roi_offset, accumulated_glints, thr, oss.str());
             newly_found_glints.insert(newly_found_glints.end(), pts.begin(), pts.end());
         }
 
@@ -2377,6 +2515,7 @@ GlintDetector::detect(cv::Mat gray)
     Logger::ScopedTimer timer("[GlintDetector::detectFullImage]");
     
     debug_imgs_.clear();
+    debug_imgs_.resize(8);
     final_geometries_.clear();
 
     gray_ = gray.clone();
@@ -2404,7 +2543,6 @@ GlintDetector::detect(cv::Mat gray)
 
     if (!cfg_["test_glint"]["debug_geometry"].as<bool>()) Logger::setLevel(Logger::Level::INFO);
 
-    // 5. 对每个聚类区域独立处理 (不再需要手动调用 clusterROIs，getROI 已经包办了)
     for (const auto& cluster : roi_clusters)
     {
         // 带着 Cluster 数据集（包含边界框，防虹膜越界约束等）去检测 Glints
@@ -2418,12 +2556,12 @@ GlintDetector::detect(cv::Mat gray)
         } else {
             oss << "empty";
         }
-        timer.lap("[5] Cluster " + oss.str());
     }
 
     if (local_debug_) Logger::setLevel(Logger::Level::DEBUG);
     if (!local_debug_ && debug_time_) Logger::setLevel(Logger::Level::TIME);
     if (!local_debug_ && !debug_time_) Logger::setLevel(Logger::Level::INFO);
+    timer.lap("[5] detectCluster()");
 
     // 6. Select Best Glints Per Cluster
     auto best_geometries = selectBestGlintsPerCluster(all_geometries);
@@ -2451,6 +2589,15 @@ GlintDetector::detect(cv::Mat gray)
         }
     }
 
+    Logger::debug() << "[GlintDetector::detect] Total Glints: " << best_geometries.size();
+    for (const auto& geo : all_geometries)
+    {
+        Logger::debug() << std::fixed << std::setprecision(2) << "\t" 
+                        << "(" << geo.l_pt.x << ", " << geo.l_pt.y << ") "
+                        << "(" << geo.r_pt.x << ", " << geo.r_pt.y << ") "
+                        << "(" << geo.m_pt.x << ", " << geo.m_pt.y << ") ";
+    }
+
     // 7. Split
     std::vector<GlintDetector::GlintGeometry> glint_geometry_list;
     if (is_collecting_)
@@ -2469,52 +2616,115 @@ GlintDetector::detect(cv::Mat gray)
 
     if (!is_collecting_)
     {
-        // 只有两眼各自刚好检测到一个 glint geometry 才视为合法
         if (left_glint_geometries.size() == 1 && right_glint_geometries.size() == 1)
         {
             left_pupil_center = left_glint_geometries[0].linked_pupil.rr.center;
             right_pupil_center = right_glint_geometries[0].linked_pupil.rr.center;
 
-            // === 执行精细化瞳孔修复 ===
             if (viz_) {
                 cv::Mat viz_pupil = gray_.clone();
                 cv::cvtColor(viz_pupil, viz_pupil, cv::COLOR_GRAY2BGR);
-                debug_imgs_.push_back(viz_pupil);
+                debug_imgs_[5] = viz_pupil;
             }
-            // 针对左眼
-            auto& left_geo = left_glint_geometries[0];
+
+            // === 针对左眼 (渲染至 debug_imgs_[7]) ===
+            GlintGeometry left_geo = left_glint_geometries[0]; // 拷贝取值
+            if (use_glint_sr_) refineGlintGeometry(gray_, left_geo, 7);
             Pupil refined_left = refinePupil(gaussed_, left_geo.linked_pupil, left_geo);
             left_geo.linked_pupil = refined_left;
-            // left_pupil_center = refined_left.rr.center;
+            left_glint_geometries[0] = left_geo; // ✨ 显式写回容器
 
-            // 针对右眼
-            auto& right_geo = right_glint_geometries[0];
+            // === 针对右眼 (渲染至 debug_imgs_[8]) ===
+            GlintGeometry right_geo = right_glint_geometries[0]; // 拷贝取值
+            if (use_glint_sr_) refineGlintGeometry(gray_, right_geo, 8);
             Pupil refined_right = refinePupil(gaussed_, right_geo.linked_pupil, right_geo);
             right_geo.linked_pupil = refined_right;
-            // right_pupil_center = refined_right.rr.center;
+            right_glint_geometries[0] = right_geo; // ✨ 显式写回容器
         }
         else
         {
-            // 数量异常：清空结果，返回空的 glint geometry
             left_glint_geometries.clear();
             right_glint_geometries.clear();
         }
-    } else {
-        if (!left_glint_geometries.empty()) left_pupil_center = left_glint_geometries[0].linked_pupil.rr.center;
-        if (!right_glint_geometries.empty()) right_pupil_center = right_glint_geometries[0].linked_pupil.rr.center;
+    }
+    timer.lap("[8] Glint Pupil refinement");
+
+    Logger::debug() << "[GlintDetector::detect] Glints after refinement: ";
+    if (!left_glint_geometries.empty()) {
+        Logger::debug() << std::fixed << std::setprecision(2) << "\t" 
+                        << "(" << left_glint_geometries[0].l_pt.x << ", " << left_glint_geometries[0].l_pt.y << ") "
+                        << "(" << left_glint_geometries[0].r_pt.x << ", " << left_glint_geometries[0].r_pt.y << ") "
+                        << "(" << left_glint_geometries[0].m_pt.x << ", " << left_glint_geometries[0].m_pt.y << ") ";
+    }
+    if (!right_glint_geometries.empty()) {
+        Logger::debug() << std::fixed << std::setprecision(2) << "\t" 
+                        << "(" << right_glint_geometries[0].l_pt.x << ", " << right_glint_geometries[0].l_pt.y << ") "
+                        << "(" << right_glint_geometries[0].r_pt.x << ", " << right_glint_geometries[0].r_pt.y << ") "
+                        << "(" << right_glint_geometries[0].m_pt.x << ", " << right_glint_geometries[0].m_pt.y << ") ";
     }
 
-    Logger::debug() << "[GlintDetector::detect] Total Glints: " << all_geometries.size();
-    for (const auto& geo : all_geometries)
-    {
-        Logger::debug() << std::fixed << std::setprecision(2) << "\t" 
-                        << "(" << geo.l_pt.x << ", " << geo.l_pt.y << ") "
-                        << "(" << geo.r_pt.x << ", " << geo.r_pt.y << ") "
-                        << "(" << geo.m_pt.x << ", " << geo.m_pt.y << ") ";
+    // viz glint jitter
+    if (viz_) {
+        const int viz_mult = 5; // 放大倍数，可根据需要调整 (如 10 代表 1 个像素被放大为 10x10 的区域)
+        cv::Mat viz_geo = cv::Mat::zeros(gray_.rows * viz_mult, gray_.cols * viz_mult, CV_8UC3);
+
+        // 1. 图像多倍扩展：将 1 个灰度像素的值赋给 N*N 个 BGR 像素区块，与 refineGlintGeometry 保持一致
+        for (int y = 0; y < gray_.rows; ++y) {
+            const uchar* src_row = gray_.ptr<uchar>(y);
+            int base_y = y * viz_mult;
+            for (int x = 0; x < gray_.cols; ++x) {
+                int base_x = x * viz_mult;
+                cv::Vec3b color(src_row[x], src_row[x], src_row[x]); // 灰度转 BGR
+                for (int dy = 0; dy < viz_mult; ++dy) {
+                    cv::Vec3b* dst_row = viz_geo.ptr<cv::Vec3b>(base_y + dy);
+                    for (int dx = 0; dx < viz_mult; ++dx) {
+                        dst_row[base_x + dx] = color;
+                    }
+                }
+            }
+        }
+        debug_imgs_[6] = viz_geo;
+
+        // 2. 精细化子像素绘图函数
+        auto setVizPixel = [&](float x, float y, cv::Vec3b color) {
+            int px = static_cast<int>(std::round(x * viz_mult));
+            int py = static_cast<int>(std::round(y * viz_mult));
+            if (px >= 0 && px < debug_imgs_[6].cols && py >= 0 && py < debug_imgs_[6].rows) {
+                debug_imgs_[6].at<cv::Vec3b>(py, px) = color;
+            }
+        };
+
+        // 3. 十字准星绘制逻辑
+        auto drawCrosshair = [&](const cv::Point2f& pt, cv::Vec3b color) {
+            // 十字准星覆盖的单侧跨度：相当于在原图上延伸 2 个原图像素距离
+            int cross_len = 2 * viz_mult; 
+            for (int d = -cross_len; d <= cross_len; ++d) {
+                setVizPixel(pt.x + d / static_cast<float>(viz_mult), pt.y, color); // 横线
+                setVizPixel(pt.x, pt.y + d / static_cast<float>(viz_mult), color); // 竖线
+            }
+        };
+
+        // 4. 绘制所有 Glints 的精细坐标
+        for (const auto& geo : left_glint_geometries) {
+            cv::Vec3b color = geo.on_cornea ? cv::Vec3b(0, 255, 0) : cv::Vec3b(0, 0, 255); // BGR: 绿 / 红
+            drawCrosshair(geo.l_pt, color);
+            drawCrosshair(geo.r_pt, color);
+            drawCrosshair(geo.m_pt, color);
+        }
+        for (const auto& geo : right_glint_geometries) {
+            cv::Vec3b color = geo.on_cornea ? cv::Vec3b(0, 255, 0) : cv::Vec3b(0, 0, 255);
+            drawCrosshair(geo.l_pt, color);
+            drawCrosshair(geo.r_pt, color);
+            drawCrosshair(geo.m_pt, color);
+        }
     }
 
     auto left_glint_geometry_list = glintGeometryListToGlintVector(left_glint_geometries);
     auto right_glint_geometry_list = glintGeometryListToGlintVector(right_glint_geometries);
+
+    cv::Point2f offset(0.5f, 0.5f);
+    left_pupil_center += offset;
+    right_pupil_center += offset;
 
     return { left_glint_geometry_list, right_glint_geometry_list, left_pupil_center, right_pupil_center };
 }
@@ -2997,7 +3207,12 @@ GlintDetector::glintGeometryListToGlintVector(const std::vector<GlintDetector::G
 {
     std::vector<std::vector<cv::Point2f>> glint_vectors;
     for (const auto& geo : glint_geometry) {
-        std::vector<cv::Point2f> glint_vector = {geo.l_pt, geo.r_pt, geo.m_pt};
+        cv::Point2f offset(0.5f, 0.5f);
+        std::vector<cv::Point2f> glint_vector = {
+            geo.l_pt + offset, 
+            geo.r_pt + offset, 
+            geo.m_pt + offset
+        };
         glint_vectors.push_back(glint_vector);
     }
     return glint_vectors;
@@ -3059,7 +3274,7 @@ std::vector<cv::Point2f> GlintDetector::samplePupilEdgesByRayCasting(
     // =========================================================================
 
     std::vector<cv::Point2f> raw_edges;
-    float r_max = rough_major_axis * kRayMaxRadiusRatio;
+    float r_max = rough_major_axis * 0.5 * kRayMaxRadiusRatio;
 
     // A. 预计算每个光斑的危险扇区范围和判定深度
     struct DangerZone {
@@ -3144,9 +3359,6 @@ std::vector<cv::Point2f> GlintDetector::samplePupilEdgesByRayCasting(
             float val_front = intensities[last_pupil_idx + kGradientGap];
             if (val_front - val_back > kMinGradient) {
                 raw_edges.push_back(points[last_pupil_idx]);
-                if (viz_ && debug_imgs_.size() > 0) {
-                    cv::circle(debug_imgs_.back(), points[last_pupil_idx], 1, cv::Scalar(255, 0, 255), -1);
-                }
             }
         }
     }
@@ -3232,9 +3444,9 @@ std::vector<cv::Point2f> GlintDetector::filterPupilEdgePoints(
     }
 
     // 可视化过滤后的点 (青色)
-    if (viz_ && debug_imgs_.size() > 0) {
+    if (viz_) {
         for (const auto& pt : clean_edges) {
-            cv::circle(debug_imgs_.back(), pt, 1, cv::Scalar(255, 255, 0), -1);
+            cv::circle(debug_imgs_[5], pt, 1, cv::Scalar(255, 255, 0), -1);
         }
     }
 
@@ -3322,9 +3534,13 @@ GlintDetector::Pupil GlintDetector::refinePupil(
     std::vector<cv::Point2f> raw_edges = samplePupilEdgesByRayCasting(
         gray_img, rough_pupil.rr.center, rough_pupil.major_axis, glint_geo);
 
+    Logger::debug() << "Raw edges count: " << raw_edges.size();
+
     // 2. 根据 Glint 和统计学过滤坏点
     std::vector<cv::Point2f> clean_edges = filterPupilEdgePoints(
         raw_edges, rough_pupil.rr.center, glint_geo);
+
+    Logger::debug() << "Clean edges count: " << clean_edges.size();
 
     // 3. RANSAC 鲁棒拟合
     cv::RotatedRect refined_rect = fitEllipseRANSAC(clean_edges);
@@ -3340,17 +3556,475 @@ GlintDetector::Pupil GlintDetector::refinePupil(
         Logger::debug() << "[RefinePupil] Refined center: (" 
                         << refined.rr.center.x << ", " << refined.rr.center.y << ")";
 
-        if (viz_ && debug_imgs_.size() > 0) {
+        if (viz_) {
             // 可视化：用粗黄线画出 Refined 后的完美瞳孔
-            // cv::ellipse(debug_imgs_.back(), rough_pupil.rr, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
-            cv::ellipse(debug_imgs_.back(), refined.rr, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
-            cv::circle(debug_imgs_.back(), refined.rr.center, 2, cv::Scalar(0, 255, 255), -1);
+            cv::ellipse(debug_imgs_[5], rough_pupil.rr, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
+            cv::ellipse(debug_imgs_[5], refined.rr, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+            cv::Point2f x_offset(3.0, 0.0);
+            cv::Point2f y_offset(0.0, 3.0);
+            cv::line(debug_imgs_[5], refined.rr.center - x_offset, refined.rr.center + x_offset, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
+            cv::line(debug_imgs_[5], refined.rr.center - y_offset, refined.rr.center + y_offset, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
         }
         return refined;
     }
 
     Logger::debug() << "[RefinePupil] Refinement failed or rejected, returning rough pupil.";
     return rough_pupil; // 退回原粗略结果
+}
+
+cv::Point3f GlintDetector::fitCircleRANSAC(const std::vector<cv::Point2f>& points, int max_iters, float tolerance, float max_radius) 
+{
+    if (points.size() < 3) return cv::Point3f(0, 0, 0);
+
+    cv::RNG rng(cv::getTickCount());
+    int best_inlier_count = 0;
+    cv::Point3f best_circle(0, 0, 0);
+    std::vector<cv::Point2f> best_inliers; // ✨ 记录最优内点集
+
+    for (int i = 0; i < max_iters; ++i) {
+        cv::Point2f p1 = points[rng.uniform(0, (int)points.size())];
+        cv::Point2f p2 = points[rng.uniform(0, (int)points.size())];
+        cv::Point2f p3 = points[rng.uniform(0, (int)points.size())];
+
+        // 求解外接圆
+        float D = 2.0f * (p1.x * (p2.y - p3.y) + p2.x * (p3.y - p1.y) + p3.x * (p1.y - p2.y));
+        if (std::abs(D) < 1e-5f) continue;
+
+        float cx = ((p1.x*p1.x + p1.y*p1.y) * (p2.y - p3.y) + (p2.x*p2.x + p2.y*p2.y) * (p3.y - p1.y) + (p3.x*p3.x + p3.y*p3.y) * (p1.y - p2.y)) / D;
+        float cy = ((p1.x*p1.x + p1.y*p1.y) * (p3.x - p2.x) + (p2.x*p2.x + p2.y*p2.y) * (p1.x - p3.x) + (p3.x*p3.x + p3.y*p3.y) * (p2.x - p1.x)) / D;
+        float r = std::sqrt((p1.x - cx)*(p1.x - cx) + (p1.y - cy)*(p1.y - cy));
+
+        // 约束限制
+        if (r < 1.0f || r > max_radius) continue;
+
+        // ✨ 收集当前模型的内点
+        std::vector<cv::Point2f> current_inliers;
+        for (const auto& pt : points) {
+            float dist = std::sqrt((pt.x - cx)*(pt.x - cx) + (pt.y - cy)*(pt.y - cy));
+            if (std::abs(dist - r) < tolerance) {
+                current_inliers.push_back(pt);
+            }
+        }
+
+        // 择优
+        if ((int)current_inliers.size() > best_inlier_count) {
+            best_inlier_count = (int)current_inliers.size();
+            best_inliers = current_inliers;
+            best_circle = cv::Point3f(cx, cy, r);
+        }
+    }
+
+    // ====================================================================================
+    // 🌟 核心改进：和 refinePupil 一样，使用收集到的*所有*最优内点进行全局最小二乘重拟合
+    // 引入 Mean-Centering (坐标去均值化) + double 精度，绝对防止高次项运算导致浮点溢出/发散
+    // ====================================================================================
+    if (best_inlier_count >= 3) {
+        double sum_x = 0, sum_y = 0;
+        int n = best_inliers.size();
+        for (const auto& pt : best_inliers) {
+            sum_x += pt.x;
+            sum_y += pt.y;
+        }
+        double mean_x = sum_x / n;
+        double mean_y = sum_y / n;
+
+        // 累加中心化后的高次矩
+        double su2 = 0, sv2 = 0, suv = 0, su3 = 0, sv3 = 0, su2v = 0, suv2 = 0;
+        for (const auto& pt : best_inliers) {
+            double u = pt.x - mean_x;
+            double v = pt.y - mean_y;
+            double u2 = u * u;
+            double v2 = v * v;
+            
+            su2 += u2;
+            sv2 += v2;
+            suv += u * v;
+            su3 += u2 * u;
+            sv3 += v2 * v;
+            su2v += u2 * v;
+            suv2 += u * v2;
+        }
+
+        // 构造线性方程组
+        double c_x = su2;
+        double c_y = sv2;
+        double c_xy = suv;
+        double d_x = 0.5 * (su3 + suv2);
+        double d_y = 0.5 * (sv3 + su2v);
+
+        // 求解
+        double det = c_x * c_y - c_xy * c_xy;
+        if (std::abs(det) > 1e-7) {
+            double uc = (d_x * c_y - d_y * c_xy) / det;
+            double vc = (c_x * d_y - c_xy * d_x) / det;
+            
+            // 还原到真实坐标系
+            double cx = uc + mean_x;
+            double cy = vc + mean_y;
+            
+            // 计算基于所有点的平均拟合半径
+            double r2 = 0;
+            for (const auto& pt : best_inliers) {
+                r2 += (pt.x - cx) * (pt.x - cx) + (pt.y - cy) * (pt.y - cy);
+            }
+            double r = std::sqrt(r2 / n);
+            
+            // 最终约束，确保不会因为奇异点阵列拟合出无穷大直线
+            if (r >= 1.0f && r <= max_radius) {
+                best_circle = cv::Point3f(static_cast<float>(cx), static_cast<float>(cy), static_cast<float>(r));
+            }
+        }
+    }
+
+    return best_circle;
+}
+
+void GlintDetector::refineGlintGeometry(const cv::Mat& gray_img, GlintGeometry& geo, int debug_img_idx)
+{
+    // --- 1. 超参数与配置读取 ---
+    CfgNode emp = emp_cfg_["refineGlintPoint"]; 
+    const int sr_scale         = emp["sr_scale"].as<int>();
+    const int kRayCount        = emp["kRayCount"].as<int>();
+    const int kGradientGap     = emp["kGradientGap"].as<int>();
+    const float kMinGradient   = emp["kMinGradient"].as<float>();
+    const int kRansacIters     = emp["kRansacIterations"].as<int>();
+    const float kInlierTol     = emp["kInlierTolerance"].as<float>();
+    
+    // ✨ 新增亮度和半径约束的超参数
+    const float kMinBrightness = emp["kMinBrightness"].as<float>(); 
+    const float kRadiusMargin  = emp["kRadiusMargin"].as<float>(); 
+
+    const int viz_mult         = emp["viz_mult"].as<int>();
+    const int total_scale      = sr_scale * viz_mult;
+
+    // --- 2. 计算统一的 ROI 包围盒 ---
+    float min_x = std::min({geo.l_pt.x, geo.r_pt.x, geo.m_pt.x});
+    float max_x = std::max({geo.l_pt.x, geo.r_pt.x, geo.m_pt.x});
+    float min_y = std::min({geo.l_pt.y, geo.r_pt.y, geo.m_pt.y});
+    float max_y = std::max({geo.l_pt.y, geo.r_pt.y, geo.m_pt.y});
+
+    int pad = 15; // 针对三个光斑整体外扩 15 原图像素
+    cv::Rect roi(
+        std::max(0, static_cast<int>(min_x) - pad),
+        std::max(0, static_cast<int>(min_y) - pad),
+        static_cast<int>(max_x - min_x) + pad * 2,
+        static_cast<int>(max_y - min_y) + pad * 2
+    );
+    roi &= cv::Rect(0, 0, gray_img.cols, gray_img.rows);
+    if (roi.empty()) return;
+
+    // --- 3. 执行单次超分辨率计算 ---
+    cv::Mat sr_patch;
+    cv::resize(gray_img(roi), sr_patch, cv::Size(), sr_scale, sr_scale, cv::INTER_LANCZOS4);
+
+// --- 4. 初始化 2x2 组合四象限局部高清画布 ---
+    int W = roi.width * total_scale;
+    int H = roi.height * total_scale;
+
+    if (viz_) {
+        if (debug_imgs_.size() <= debug_img_idx) debug_imgs_.resize(debug_img_idx + 1);
+        
+        // 创建 2W x 2H 的画布
+        debug_imgs_[debug_img_idx] = cv::Mat::zeros(H * 2, W * 2, CV_8UC3);
+
+        cv::Mat raw_roi = gray_img(roi);
+
+        // [TL 左上角] 填充超分之前的原始 ROI
+        for (int y = 0; y < raw_roi.rows; ++y) {
+            const uchar* raw_ptr = raw_roi.ptr<uchar>(y);
+            for (int x = 0; x < raw_roi.cols; ++x) {
+                cv::Vec3b color(raw_ptr[x], raw_ptr[x], raw_ptr[x]);
+                cv::Rect tl_rect(x * total_scale, y * total_scale, total_scale, total_scale);
+                cv::rectangle(debug_imgs_[debug_img_idx], tl_rect, color, cv::FILLED);
+            }
+        }
+
+        // [TR 右上角]、[BL 左下角]、[BR 右下角] 填充超分之后的 sr_patch
+        for (int y = 0; y < sr_patch.rows; ++y) {
+            const uchar* sr_row_ptr = sr_patch.ptr<uchar>(y);
+            int base_y = y * viz_mult;
+            for (int x = 0; x < sr_patch.cols; ++x) {
+                int base_x = x * viz_mult;
+                cv::Vec3b color(sr_row_ptr[x], sr_row_ptr[x], sr_row_ptr[x]);
+                for (int dy = 0; dy < viz_mult; ++dy) {
+                    cv::Vec3b* dst_row_TR = debug_imgs_[debug_img_idx].ptr<cv::Vec3b>(base_y + dy);
+                    cv::Vec3b* dst_row_BL = debug_imgs_[debug_img_idx].ptr<cv::Vec3b>(base_y + dy + H);
+                    cv::Vec3b* dst_row_BR = debug_imgs_[debug_img_idx].ptr<cv::Vec3b>(base_y + dy + H);
+                    for (int dx = 0; dx < viz_mult; ++dx) {
+                        dst_row_TR[base_x + dx + W] = color;
+                        dst_row_BL[base_x + dx] = color;
+                        dst_row_BR[base_x + dx + W] = color; // BR 初始化为纯净图
+                    }
+                }
+            }
+        }
+        
+        // 绘制象限标签
+        cv::putText(debug_imgs_[debug_img_idx], "Raw ROI", cv::Point(10, 20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+        cv::putText(debug_imgs_[debug_img_idx], "SR Patch", cv::Point(W + 10, 20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+        cv::putText(debug_imgs_[debug_img_idx], "RANSAC Viz", cv::Point(10, H + 20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+        cv::putText(debug_imgs_[debug_img_idx], "Global Grid & Final Coord", cv::Point(W + 10, H + 20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+    }
+
+    // 限定渲染到 BL (左下角) 的像素绘制器（用于边缘点和拟合圆）
+    auto setVizPixelBL = [&](float sr_x, float sr_y, cv::Vec3b color) {
+        if (!viz_ || debug_imgs_[debug_img_idx].empty()) return;
+        // ✨ 核心修正：视觉平移半个原图像素，使浮点坐标严格对齐到视觉像素块的中心
+        sr_x += sr_scale / 2.0f;
+        sr_y += sr_scale / 2.0f;
+        int px = static_cast<int>(std::round(sr_x * viz_mult));
+        int py = static_cast<int>(std::round(sr_y * viz_mult));
+        if (px >= 0 && px < W && py >= 0 && py < H) {
+            debug_imgs_[debug_img_idx].at<cv::Vec3b>(py + H, px) = color;
+        }
+    };
+
+    // 同步渲染到 BL 或 BR 的十字准星绘制器
+    auto drawCrosshair = [&](float sr_x, float sr_y, cv::Vec3b color, bool in_BL = true, bool in_BR = true) {
+        if (!viz_ || debug_imgs_[debug_img_idx].empty()) return;
+        // ✨ 核心修正：视觉平移半个原图像素，对齐像素中心
+        sr_x += sr_scale / 2.0f;
+        sr_y += sr_scale / 2.0f;
+        int center_px = static_cast<int>(std::round(sr_x * viz_mult));
+        int center_py = static_cast<int>(std::round(sr_y * viz_mult));
+        
+        for (int d = -3; d <= 3; ++d) {
+            int px_h = center_px + d, py_h = center_py;
+            int px_v = center_px, py_v = center_py + d;
+            
+            // 绘制 BL
+            if (in_BL) {
+                if (px_h >= 0 && px_h < W && py_h >= 0 && py_h < H) debug_imgs_[debug_img_idx].at<cv::Vec3b>(py_h + H, px_h) = color;
+                if (px_v >= 0 && px_v < W && py_v >= 0 && py_v < H) debug_imgs_[debug_img_idx].at<cv::Vec3b>(py_v + H, px_v) = color;
+            }
+            // 绘制 BR
+            if (in_BR) {
+                if (px_h >= 0 && px_h < W && py_h >= 0 && py_h < H) debug_imgs_[debug_img_idx].at<cv::Vec3b>(py_h + H, px_h + W) = color;
+                if (px_v >= 0 && px_v < W && py_v >= 0 && py_v < H) debug_imgs_[debug_img_idx].at<cv::Vec3b>(py_v + H, px_v + W) = color;
+            }
+        }
+    };
+
+    // 结构体：收集优化点信息，实现 Deferred 延迟渲染，确保光斑画在 Grid 之上
+    struct BR_Viz_Info {
+        cv::Point2f final_pt;
+        bool fit_success;
+    };
+    std::vector<BR_Viz_Info> deferred_br_viz;
+
+    // --- 5. 定义内部单点处理逻辑 ---
+    auto processPoint = [&](const cv::Point2f& rough_pt, const cv::Point2f& other1, const cv::Point2f& other2, const std::string& pt_loc) -> cv::Point2f {
+        
+        float dist1 = cv::norm(rough_pt - other1);
+        float dist2 = cv::norm(rough_pt - other2);
+        float max_search_radius_orig = std::min(dist1, dist2) / 2.0f + kRadiusMargin;
+        float max_search_radius_sr = max_search_radius_orig * sr_scale;
+
+        float center_sr_x = (rough_pt.x - roi.x) * sr_scale;
+        float center_sr_y = (rough_pt.y - roi.y) * sr_scale;
+        cv::Point2f center_sr(center_sr_x, center_sr_y);
+        
+        // ✨ [Viz] 绘制 Rough 初始位置 (品红十字，仅显示在 BL)
+        if (viz_) {
+            drawCrosshair(center_sr_x, center_sr_y, cv::Vec3b(255, 0, 255), true, false);
+        }
+
+        std::vector<cv::Point2f> edge_pts_sr;
+
+        for (int i = 0; i < kRayCount; ++i) {
+            float angle = i * 2.0f * CV_PI / kRayCount;
+            float cos_a = std::cos(angle);
+            float sin_a = std::sin(angle);
+            
+            cv::Point2f best_edge_pt;
+            bool found_edge = false;
+            bool is_dropping = false; 
+
+            for (float r = 0; r < max_search_radius_sr; r += 1.0f) {
+                cv::Point2f pt1(center_sr.x + r * cos_a, center_sr.y + r * sin_a);
+                cv::Point2f pt2(center_sr.x + (r + kGradientGap) * cos_a, center_sr.y + (r + kGradientGap) * sin_a);
+
+                if (pt2.x < 0 || pt2.x >= sr_patch.cols - 1 || pt2.y < 0 || pt2.y >= sr_patch.rows - 1) break;
+
+                float val1 = getBilinearSubpixel(sr_patch, pt1);
+                float val2 = getBilinearSubpixel(sr_patch, pt2);
+                float grad = val1 - val2; 
+                
+                if (grad > kMinGradient && val1 > kMinBrightness) {
+                    if (viz_) setVizPixelBL(pt1.x, pt1.y, cv::Vec3b(255, 0, 0)); 
+                }
+
+                if (!is_dropping) {
+                    if (grad > kMinGradient && val1 > kMinBrightness) {
+                        is_dropping = true;
+                    }
+                } else {
+                    if (grad <= 0.0f) {
+                        if (val1 > kMinBrightness) {
+                            best_edge_pt = cv::Point2f(center_sr.x + (r + kGradientGap/2.0f) * cos_a, center_sr.y + (r + kGradientGap/2.0f) * sin_a);
+                            found_edge = true;
+                        }
+                        break; 
+                    }
+                    if (val1 <= kMinBrightness) {
+                        best_edge_pt = cv::Point2f(center_sr.x + (r - 1.0f + kGradientGap/2.0f) * cos_a, center_sr.y + (r - 1.0f + kGradientGap/2.0f) * sin_a);
+                        found_edge = true;
+                        break; 
+                    }
+                }
+            }
+            if (found_edge) edge_pts_sr.push_back(best_edge_pt);
+        }
+
+        cv::Point2f final_pt = rough_pt;
+        bool fit_success = false;
+        cv::Point3f best_circle(0, 0, 0);
+
+        if (edge_pts_sr.size() >= 3) {
+            std::vector<float> dists;
+            for (auto& p : edge_pts_sr) dists.push_back(cv::norm(p - center_sr));
+            std::sort(dists.begin(), dists.end());
+            float median_d = dists[dists.size() / 2];
+
+            std::vector<cv::Point2f> clean_edges;
+            for (auto& p : edge_pts_sr) {
+                if (std::abs(cv::norm(p - center_sr) - median_d) < median_d * 0.5f) { 
+                    clean_edges.push_back(p);
+                    setVizPixelBL(p.x, p.y, cv::Vec3b(255, 255, 0)); // 黄色边缘点 (仅 BL)
+                }
+            }
+
+            float max_r = max_search_radius_sr; 
+            best_circle = fitCircleRANSAC(clean_edges, kRansacIters, kInlierTol, max_r);
+
+            if (best_circle.z > 0) {
+                final_pt = cv::Point2f((best_circle.x / sr_scale) + roi.x, (best_circle.y / sr_scale) + roi.y);
+                fit_success = true;
+
+                if (viz_) {
+                    // 拟合红圈仅画在 BL 
+                    int num_points = static_cast<int>(best_circle.z * viz_mult * 2 * CV_PI * 1.5); 
+                    for (int i = 0; i < num_points; ++i) {
+                        float theta = i * 2.0f * CV_PI / num_points;
+                        float cx = best_circle.x + best_circle.z * std::cos(theta);
+                        float cy = best_circle.y + best_circle.z * std::sin(theta);
+                        setVizPixelBL(cx, cy, cv::Vec3b(0, 0, 255)); 
+                    }
+                    
+                    // ✨ 绿十字仅先画在 BL，BR 的渲染延后处理
+                    drawCrosshair(best_circle.x, best_circle.y, cv::Vec3b(0, 255, 0), true, false); 
+
+                    // --- 在 BR 中绘制全局坐标系网格 (此时处于最底层) ---
+                    int cx_global = static_cast<int>(std::round(final_pt.x));
+                    int cy_global = static_cast<int>(std::round(final_pt.y));
+                    int grid_radius = 3; // 优化点周围 +-3 像素的局部网格
+
+                    // 绘制水平横线 (Y 坐标)
+                    for (int y_g = cy_global - grid_radius; y_g <= cy_global + grid_radius; ++y_g) {
+                        if (y_g >= roi.y && y_g < roi.y + roi.height) {
+                            // 映射到 SR 的像素中心坐标
+                            float sr_y = (y_g - roi.y) * sr_scale + sr_scale / 2.0f;
+                            int line_y = H + static_cast<int>(sr_y * viz_mult);
+                            
+                            int start_x_g = std::max(roi.x, cx_global - grid_radius);
+                            int end_x_g = std::min(roi.x + roi.width - 1, cx_global + grid_radius);
+                            int px_start = W + static_cast<int>(((start_x_g - roi.x) * sr_scale + sr_scale / 2.0f) * viz_mult);
+                            int px_end = W + static_cast<int>(((end_x_g - roi.x) * sr_scale + sr_scale / 2.0f) * viz_mult);
+                            
+                            cv::line(debug_imgs_[debug_img_idx], cv::Point(px_start, line_y), cv::Point(px_end, line_y), cv::Scalar(80, 80, 80), 1);
+                            
+                            // 交错排布避免遮挡
+                            int stagger_x = (y_g % 2 == 0) ? 0 : 25;
+                            cv::putText(debug_imgs_[debug_img_idx], std::to_string(y_g), cv::Point(px_end + 3 + stagger_x, line_y + 4), cv::FONT_HERSHEY_PLAIN, 0.7, cv::Scalar(150, 150, 150), 1, cv::LINE_AA);
+                        }
+                    }
+
+                    // 绘制垂直竖线 (X 坐标)
+                    for (int x_g = cx_global - grid_radius; x_g <= cx_global + grid_radius; ++x_g) {
+                        if (x_g >= roi.x && x_g < roi.x + roi.width) {
+                            float sr_x = (x_g - roi.x) * sr_scale + sr_scale / 2.0f;
+                            int line_x = W + static_cast<int>(sr_x * viz_mult);
+                            
+                            int start_y_g = std::max(roi.y, cy_global - grid_radius);
+                            int end_y_g = std::min(roi.y + roi.height - 1, cy_global + grid_radius);
+                            int py_start = H + static_cast<int>(((start_y_g - roi.y) * sr_scale + sr_scale / 2.0f) * viz_mult);
+                            int py_end = H + static_cast<int>(((end_y_g - roi.y) * sr_scale + sr_scale / 2.0f) * viz_mult);
+                            
+                            cv::line(debug_imgs_[debug_img_idx], cv::Point(line_x, py_start), cv::Point(line_x, py_end), cv::Scalar(80, 80, 80), 1);
+                            
+                            // 交错排布避免遮挡
+                            int stagger_y = (x_g % 2 == 0) ? 0 : 15;
+                            cv::putText(debug_imgs_[debug_img_idx], std::to_string(x_g), cv::Point(line_x - 10, py_end + 12 + stagger_y), cv::FONT_HERSHEY_PLAIN, 0.7, cv::Scalar(150, 150, 150), 1, cv::LINE_AA);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 收集待渲染信息供 Deferred 阶段使用
+        deferred_br_viz.push_back({final_pt, fit_success});
+
+        // 绘制相关说明文本（固定限制在 BL 象限内展示）
+        if (viz_) {
+            std::ostringstream rough_ss, refined_ss;
+            rough_ss << std::fixed << std::setprecision(2) << "Rough:   (" << rough_pt.x << ", " << rough_pt.y << ")";
+            if (fit_success) {
+                refined_ss << std::fixed << std::setprecision(2) << "Refined: (" << final_pt.x << ", " << final_pt.y << ")";
+            } else {
+                refined_ss << "Refined: Failed (fallback)";
+            }
+
+            int base_x = static_cast<int>((center_sr_x + sr_scale / 2.0f) * viz_mult);
+            int base_y = static_cast<int>((center_sr_y + sr_scale / 2.0f) * viz_mult);
+            int anchor_x, anchor_y_line1, anchor_y_line2;
+            int y_offset = 20;
+
+            if (pt_loc == "L") {
+                anchor_x = base_x - 60; anchor_y_line1 = base_y - 35 - y_offset; anchor_y_line2 = base_y - 20 - y_offset;
+            } else if (pt_loc == "R") {
+                anchor_x = base_x + 10; anchor_y_line1 = base_y - 35 - y_offset; anchor_y_line2 = base_y - 20 - y_offset;
+            } else {
+                anchor_x = base_x - 30; anchor_y_line1 = base_y + 35 + y_offset; anchor_y_line2 = base_y + 50 + y_offset;
+            }
+
+            // 文本 Y 轴偏移到 BL 象限
+            anchor_y_line1 += H;
+            anchor_y_line2 += H;
+
+            cv::putText(debug_imgs_[debug_img_idx], rough_ss.str(), cv::Point(anchor_x, anchor_y_line1), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
+            cv::putText(debug_imgs_[debug_img_idx], refined_ss.str(), cv::Point(anchor_x, anchor_y_line2), cv::FONT_HERSHEY_SIMPLEX, 0.4, fit_success ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
+        }
+
+        return final_pt;
+    };
+
+    // --- 6. 执行处理 ---
+    geo.l_pt = processPoint(geo.l_pt, geo.r_pt, geo.m_pt, "L");
+    geo.r_pt = processPoint(geo.r_pt, geo.l_pt, geo.m_pt, "R");
+    geo.m_pt = processPoint(geo.m_pt, geo.l_pt, geo.r_pt, "M");
+
+    // --- 7. Deferred Rendering 延迟绘制：保证光斑准星和坐标显示在网格最上层 ---
+    if (viz_) {
+        for (const auto& info : deferred_br_viz) {
+            if (info.fit_success) {
+                float sr_x = (info.final_pt.x - roi.x) * sr_scale;
+                float sr_y = (info.final_pt.y - roi.y) * sr_scale;
+                
+                // 画在 BR 的绿十字
+                drawCrosshair(sr_x, sr_y, cv::Vec3b(0, 255, 0), false, true);
+                
+                // 绘制带微小黑色背景的坐标文本，防网格干扰
+                std::ostringstream br_ss;
+                br_ss << std::fixed << std::setprecision(2) << "(" << info.final_pt.x << ", " << info.final_pt.y << ")";
+                int text_x = W + static_cast<int>((sr_x + sr_scale / 2.0f) * viz_mult) - 30;
+                int text_y = H + static_cast<int>((sr_y + sr_scale / 2.0f) * viz_mult) - 15;
+                
+                cv::Size text_size = cv::getTextSize(br_ss.str(), cv::FONT_HERSHEY_SIMPLEX, 0.4, 1, nullptr);
+                cv::rectangle(debug_imgs_[debug_img_idx], cv::Rect(text_x - 2, text_y - text_size.height - 2, text_size.width + 4, text_size.height + 4), cv::Scalar(0, 0, 0), cv::FILLED);
+                cv::putText(debug_imgs_[debug_img_idx], br_ss.str(), cv::Point(text_x, text_y), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
+            }
+        }
+    }
 }
 
 } // namespace glintdetection

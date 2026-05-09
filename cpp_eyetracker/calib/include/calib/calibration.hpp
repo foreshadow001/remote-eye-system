@@ -8,6 +8,7 @@
 #include "core/math_types.hpp"
 #include "utils/gaze_estimation_types.hpp"
 #include "inference/one_camera_spherical.hpp"
+#include "cfg/config.hpp"
 
 namespace gazeestimation {
 
@@ -26,6 +27,13 @@ public:
         std::vector<std::vector<std::pair<double, double>>> bounds);
 
     std::vector<std::vector<double>> calibrate(
+        GazeTracker& estimation,
+        SingleEyeAndCameraParameters& parameters,
+        SingleEyeCalibrationDataMap& data,
+        std::vector<std::vector<double>> initial_values,
+        std::vector<std::vector<std::pair<double, double>>> bounds);
+
+    std::vector<std::vector<double>> calibrateScreen(
         GazeTracker& estimation,
         SingleEyeAndCameraParameters& parameters,
         SingleEyeCalibrationDataMap& data,
