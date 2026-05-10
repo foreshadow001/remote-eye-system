@@ -6,3 +6,5 @@ cpp_eyetracker/build/
 
 # build settings
 # cpp_eyetracker/CMakePresets.json
+
+/.claude/

@@ -35,7 +35,8 @@ void gen_cam_par_area_scan_division(HTuple hv_Focus, HTuple hv_Kappa, HTuple hv_
 void scan_calib_image_folder(
     const HTuple& hv_FolderPath,
     HTuple* hv_NumCameras,
-    HTuple* hv_NumImages)
+    HTuple* hv_NumImages,
+    std::vector<std::string>* out_sn_list = nullptr)
 {
     namespace fs = std::filesystem;
 
@@ -45,8 +46,8 @@ void scan_calib_image_folder(
         throw std::runtime_error("Invalid calibration image folder");
     }
 
-    // camIdx -> max image index
-    std::map<int, int> camMaxImg;
+    // SN -> max image index
+    std::map<std::string, int> camMaxImg;
 
     for (const auto& entry : fs::directory_iterator(folderPath))
     {
@@ -59,25 +60,21 @@ void scan_calib_image_folder(
         if (name.rfind("calib_cam_", 0) != 0)
             continue;
 
-        // calib_cam_<cam>_<img>
-        size_t p = name.find('_', 10);
-        if (p == std::string::npos)
+        // calib_cam_<SN>_<imgIdx>
+        // 从末尾找最后一个 '_'，之前的部分是 "calib_cam_<SN>"
+        size_t p_last = name.find_last_of('_');
+        if (p_last == std::string::npos || p_last <= 10)
             continue;
 
-        try {
-            int camIdx = std::stoi(name.substr(10, p - 10));
-            int imgIdx = std::stoi(name.substr(p + 1));
+        std::string sn = name.substr(10, p_last - 10);
+        int imgIdx = std::stoi(name.substr(p_last + 1));
 
-            auto it = camMaxImg.find(camIdx);
-            if (it == camMaxImg.end()) {
-                camMaxImg[camIdx] = imgIdx;
-            } else {
-                if (imgIdx > it->second)
-                    it->second = imgIdx;
-            }
-        }
-        catch (...) {
-            continue;
+        auto it = camMaxImg.find(sn);
+        if (it == camMaxImg.end()) {
+            camMaxImg[sn] = imgIdx;
+        } else {
+            if (imgIdx > it->second)
+                it->second = imgIdx;
         }
     }
 
@@ -95,7 +92,20 @@ void scan_calib_image_folder(
 
     *hv_NumImages = maxImgIdx + 1; // 假定从 00 开始
 
+    // 输出排序后的 SN 列表（按加入顺序，保证确定性）
+    if (out_sn_list) {
+        out_sn_list->clear();
+        for (const auto& kv : camMaxImg) {
+            out_sn_list->push_back(kv.first);
+        }
+    }
+
     std::cout << "Found " << (*hv_NumCameras).I() << " cameras and " << (*hv_NumImages).I() << " images." << std::endl;
+    if (out_sn_list) {
+        for (size_t i = 0; i < out_sn_list->size(); ++i) {
+            std::cout << "  Camera " << i << ": SN=" << (*out_sn_list)[i] << std::endl;
+        }
+    }
 }
 
 void action()
@@ -111,10 +121,11 @@ void action()
     std::string output_folder= cfg["cam_calib"]["output_folder"].as<std::string>();
     std::filesystem::create_directories(output_folder);
 
-    HTuple hv_NumCameras; 
+    HTuple hv_NumCameras;
     HTuple hv_NumCalibImages;
+    std::vector<std::string> cam_sn_list;
 
-    scan_calib_image_folder(hv_ImagePath, &hv_NumCameras, &hv_NumCalibImages);
+    scan_calib_image_folder(hv_ImagePath, &hv_NumCameras, &hv_NumCalibImages, &cam_sn_list);
 
     double focus = cfg["cam_calib"]["focus"].as<double>();
     double pixel_size_x = cfg["cam_calib"]["pixel_size_x"].as<double>();
@@ -137,7 +148,7 @@ void action()
     std::cout << "--- Initializing Cameras ---" << std::endl;
     for (int camIdx = 0; camIdx < num_cams; ++camIdx)
     {
-        HTuple hv_CurrentFile = hv_ImagePath + "/calib_cam_" + HTuple(camIdx) + "_01";
+        HTuple hv_CurrentFile = hv_ImagePath + "/calib_cam_" + HTuple(cam_sn_list[camIdx].c_str()) + "_01";
         try {
             ReadImage(&ho_Image, hv_CurrentFile);
             GetImageSize(ho_Image, &hv_Width, &hv_Height);
@@ -169,7 +180,7 @@ void action()
         
         for (int camIdx = 0; camIdx < num_cams; ++camIdx)
         {
-            HTuple currentFileName = hv_ImagePath + "/calib_cam_" + HTuple(camIdx) + "_" + imgIdxStr;
+            HTuple currentFileName = hv_ImagePath + "/calib_cam_" + HTuple(cam_sn_list[camIdx].c_str()) + "_" + imgIdxStr;
             try {
                 ReadImage(&ho_Image, currentFileName);
                 
@@ -283,7 +294,7 @@ void action()
             GetCalibData(hv_CalibDataID, "camera", camIdx, "pose", &hv_CurrentPose);
         }
 
-        HTuple outFileName = hv_OutputBaseDir + "Camera" + HTuple(camIdx) + "_Data.xml";
+        HTuple outFileName = hv_OutputBaseDir + HTuple(cam_sn_list[camIdx].c_str()) + "_Data.xml";
         OpenFile(outFileName, "output", &hv_FileHandle);
         
         // Write XML Header
