@@ -170,6 +170,17 @@ struct CameraContext {
 
 vector<shared_ptr<CameraContext>> cam_ctxs;
 
+// ================== 传输状态机 (非阻塞) ==================
+struct TransferState {
+    bool active = false;
+    int received = 0;
+    int expected_total = 0;
+    size_t total_bytes = 0;
+    chrono::steady_clock::time_point start_time;
+    chrono::steady_clock::time_point deadline;
+};
+TransferState xfer;
+
 // ================== 辅助函数 ==================
 int getNextCalibCounter(const string& save_dir) {
     int max_counter = -1;
@@ -500,11 +511,61 @@ int main() {
                 cell.copyTo(canvas(cv::Rect(c * cell_w, r * cell_h, cell_w, cell_h)));
             }
 
+            // 传输进度条
+            if (xfer.active && xfer.expected_total > 0) {
+                int bar_h = 30;
+                int bar_y = canvas.rows - bar_h - 10;
+                int bar_x = 20;
+                int bar_w = canvas.cols - 40;
+                float ratio = static_cast<float>(xfer.received) / xfer.expected_total;
+                cv::rectangle(canvas, cv::Point(bar_x, bar_y), cv::Point(bar_x + bar_w, bar_y + bar_h), cv::Scalar(80, 80, 80), -1);
+                cv::rectangle(canvas, cv::Point(bar_x, bar_y), cv::Point(bar_x + static_cast<int>(bar_w * ratio), bar_y + bar_h), cv::Scalar(0, 200, 0), -1);
+                cv::rectangle(canvas, cv::Point(bar_x, bar_y), cv::Point(bar_x + bar_w, bar_y + bar_h), cv::Scalar(255, 255, 255), 1);
+                string prog_text = "XFER " + to_string(xfer.received) + "/" + to_string(xfer.expected_total);
+                auto elapsed = chrono::duration<double>(chrono::steady_clock::now() - xfer.start_time).count();
+                if (elapsed > 0.1) {
+                    double speed_mbps = (xfer.total_bytes / 1048576.0) / elapsed;
+                    stringstream ss_speed;
+                    ss_speed << fixed << setprecision(1) << speed_mbps;
+                    prog_text += "  " + ss_speed.str() + " MB/s";
+                }
+                cv::putText(canvas, prog_text, cv::Point(bar_x + 10, bar_y + 20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+            }
+
             cv::imshow("Calib Capture", canvas);
             last_ui_time = current_time;
         }
 
-        // ===== 2. 键盘事件 (1ms 轮询 — 极速响应) =====
+        // ===== 2. 传输状态机 (非阻塞 — 每次循环尝试收一帧) =====
+        if (xfer.active) {
+            if (xfer.received < xfer.expected_total && chrono::steady_clock::now() < xfer.deadline) {
+                string sn;
+                uint32_t file_idx = 0;
+                vector<uint8_t> jpeg_data = recvImageViaUdp(UINT32_MAX, &sn, &file_idx, 100);
+                if (!jpeg_data.empty() && !sn.empty()) {
+                    stringstream ss;
+                    ss << setw(2) << setfill('0') << file_idx;
+                    string out_fn = g_calib_save_dir + "/calib_cam_" + sn + "_" + ss.str() + ".jpg";
+                    ofstream out(out_fn, ios::binary);
+                    out.write(reinterpret_cast<const char*>(jpeg_data.data()), jpeg_data.size());
+                    xfer.received++;
+                    xfer.total_bytes += jpeg_data.size();
+                    cout << "  -> Received " << out_fn << " (" << jpeg_data.size() << " bytes)" << endl;
+                }
+            } else {
+                // 传输完成或超时
+                auto elapsed = chrono::duration<double>(chrono::steady_clock::now() - xfer.start_time);
+                double speed_mbps = elapsed.count() > 0 ? (xfer.total_bytes / 1048576.0) / elapsed.count() : 0;
+                cout << "\n=== Transfer Complete ===" << endl;
+                cout << "Files    : " << xfer.received << " / " << xfer.expected_total << endl;
+                cout << "Data     : " << (xfer.total_bytes / 1048576.0) << " MB" << endl;
+                cout << "Time     : " << fixed << setprecision(2) << elapsed.count() << " s" << endl;
+                cout << "Speed    : " << fixed << setprecision(2) << speed_mbps << " MB/s" << endl;
+                xfer.active = false;
+            }
+        }
+
+        // ===== 3. 键盘事件 (1ms 轮询 — 极速响应) =====
         char key = static_cast<char>(cv::waitKey(1));
 
         if (key == 'q' || key == 27) {
@@ -541,31 +602,20 @@ int main() {
                 }
             }
         }
-        else if ((key == 't' || key == 'T') && g_is_master && g_enable_net_sync) {
-            cout << "\n=== Transferring Slave Images ===" << endl;
-
+        else if ((key == 't' || key == 'T') && g_is_master && g_enable_net_sync && !xfer.active) {
             int max_idx = getNextCalibCounter(g_calib_save_dir) - 1;
             if (max_idx < 0) {
                 cout << "No local images found. Capture first." << endl;
             } else {
-                fastUdpSend(g_slave_addr, "XFER:0," + to_string(max_idx));
+                xfer.active = true;
+                xfer.received = 0;
+                xfer.expected_total = static_cast<int>(cam_ctxs.size()) * (max_idx + 1);
+                xfer.total_bytes = 0;
+                xfer.start_time = chrono::steady_clock::now();
+                xfer.deadline = xfer.start_time + chrono::seconds(120);
 
-                int expected_total = static_cast<int>(cam_ctxs.size()) * (max_idx + 1);
-                cout << "Receiving " << expected_total << " slave images..." << endl;
-                for (int r = 0; r < expected_total && global_running; ++r) {
-                    string sn;
-                    uint32_t file_idx = 0;
-                    vector<uint8_t> jpeg_data = recvImageViaUdp(UINT32_MAX, &sn, &file_idx, 15000);
-                    if (!jpeg_data.empty() && !sn.empty()) {
-                        stringstream ss;
-                        ss << setw(2) << setfill('0') << file_idx;
-                        string out_fn = g_calib_save_dir + "/calib_cam_" + sn + "_" + ss.str() + ".jpg";
-                        ofstream out(out_fn, ios::binary);
-                        out.write(reinterpret_cast<const char*>(jpeg_data.data()), jpeg_data.size());
-                        cout << "  -> Received " << out_fn << " (" << jpeg_data.size() << " bytes)" << endl;
-                    }
-                }
-                cout << "=== Transfer Complete ===" << endl;
+                fastUdpSend(g_slave_addr, "XFER:0," + to_string(max_idx));
+                cout << "\n=== Transferring " << xfer.expected_total << " Slave Images ===" << endl;
             }
         }
     }
