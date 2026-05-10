@@ -93,7 +93,7 @@ void sendImageViaUdp(const sockaddr_in& target, const vector<uint8_t>& data,
 
         sendto(g_udp_sock, reinterpret_cast<const char*>(packet.data()),
                static_cast<int>(packet.size()), 0, (const sockaddr*)&target, sizeof(target));
-        this_thread::sleep_for(chrono::microseconds(200));
+        this_thread::sleep_for(chrono::milliseconds(1));
     }
 }
 
@@ -429,6 +429,12 @@ int main() {
 
         int optval = 1;
         setsockopt(g_udp_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&optval, sizeof(optval));
+
+        // 增大 UDP 接收缓冲区，防止高速多 chunk 传输时内核丢包
+        {
+            int rcvbuf = 8 * 1024 * 1024; // 8 MB
+            setsockopt(g_udp_sock, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvbuf, sizeof(rcvbuf));
+        }
 
         g_master_addr.sin_family = AF_INET;
         g_master_addr.sin_port = htons(g_net_port);
