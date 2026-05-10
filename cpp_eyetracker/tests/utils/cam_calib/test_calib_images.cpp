@@ -189,6 +189,10 @@ struct TransferState {
     int consecutive_empty = 0;
     chrono::steady_clock::time_point start_time;
     chrono::steady_clock::time_point deadline;
+    // 多相机 chunk 缓冲：SN -> {chunk_index -> data}
+    map<string, map<uint32_t, vector<uint8_t>>> pending_chunks;
+    map<string, uint32_t> pending_totals;
+    map<string, uint32_t> pending_file_idx;
 };
 TransferState xfer;
 
@@ -555,21 +559,81 @@ int main() {
                 // 强制下一轮 UI 立即刷新，确保进度条可见
                 last_ui_time = chrono::steady_clock::now() - ui_interval;
 
-                string sn;
-                uint32_t file_idx = 0;
-                vector<uint8_t> jpeg_data = recvImageViaUdp(UINT32_MAX, &sn, &file_idx, 500);
-                if (!jpeg_data.empty() && !sn.empty()) {
-                    stringstream ss;
-                    ss << setw(2) << setfill('0') << file_idx;
-                    string out_fn = g_calib_save_dir + "/calib_cam_" + sn + "_" + ss.str() + ".jpg";
-                    ofstream out(out_fn, ios::binary);
-                    out.write(reinterpret_cast<const char*>(jpeg_data.data()), jpeg_data.size());
-                    xfer.received++;
-                    xfer.total_bytes += jpeg_data.size();
-                    xfer.consecutive_empty = 0;
-                    cout << "  -> Received " << out_fn << " (" << jpeg_data.size() << " bytes)" << endl;
-                } else {
-                    xfer.consecutive_empty++;
+                // --- 多相机 chunk 缓冲接收 ---
+                // 所有相机并发发送，必须按 SN 分别缓存，防止不同 SN 的 chunk 互相覆盖
+                {
+#ifdef _WIN32
+                    DWORD timeout = min(500, 2000);
+                    setsockopt(g_udp_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+#endif
+                    vector<uint8_t> recv_buf(65536);
+                    auto recv_deadline = chrono::steady_clock::now() + chrono::milliseconds(500);
+                    bool got_any = false;
+
+                    while (chrono::steady_clock::now() < recv_deadline) {
+                        sockaddr_in sender;
+                        socklen_t sender_len = sizeof(sender);
+                        int bytes = recvfrom(g_udp_sock, reinterpret_cast<char*>(recv_buf.data()),
+                                             static_cast<int>(recv_buf.size()), 0,
+                                             (sockaddr*)&sender, &sender_len);
+                        if (bytes < static_cast<int>(sizeof(FileTransferHeader))) continue;
+
+                        auto* hdr = reinterpret_cast<FileTransferHeader*>(recv_buf.data());
+                        string chunk_sn(hdr->sn);
+                        string chunk_key = chunk_sn + "_" + to_string(hdr->file_index);
+
+                        xfer.pending_chunks[chunk_key][hdr->chunk_index] = vector<uint8_t>(
+                            recv_buf.data() + sizeof(FileTransferHeader),
+                            recv_buf.data() + sizeof(FileTransferHeader) + hdr->data_size);
+                        xfer.pending_totals[chunk_key] = hdr->total_chunks;
+                        xfer.pending_file_idx[chunk_key] = hdr->file_index;
+                        got_any = true;
+                    }
+
+                    // 收集所有已完成的 SN+idx
+                    vector<string> completed_keys;
+                    for (auto& [key, chunks] : xfer.pending_chunks) {
+                        auto it_tc = xfer.pending_totals.find(key);
+                        if (it_tc != xfer.pending_totals.end() && chunks.size() == it_tc->second)
+                            completed_keys.push_back(key);
+                    }
+
+                    // 组装并保存所有已完成的图像
+                    for (const string& key : completed_keys) {
+                        auto& chunks = xfer.pending_chunks[key];
+                        uint32_t tc = xfer.pending_totals[key];
+                        uint32_t fidx = xfer.pending_file_idx[key];
+
+                        vector<uint8_t> result;
+                        for (uint32_t i = 0; i < tc; ++i) {
+                            auto it = chunks.find(i);
+                            if (it == chunks.end()) { result.clear(); break; }
+                            result.insert(result.end(), it->second.begin(), it->second.end());
+                        }
+
+                        if (!result.empty()) {
+                            string sn = key.substr(0, key.rfind('_'));
+                            stringstream ss;
+                            ss << setw(2) << setfill('0') << fidx;
+                            string out_fn = g_calib_save_dir + "/calib_cam_" + sn + "_" + ss.str() + ".jpg";
+                            ofstream out(out_fn, ios::binary);
+                            out.write(reinterpret_cast<const char*>(result.data()), result.size());
+                            xfer.received++;
+                            xfer.total_bytes += result.size();
+                            cout << "  -> Received " << out_fn << " (" << result.size() << " bytes)" << endl;
+                        }
+
+                        xfer.pending_chunks.erase(key);
+                        xfer.pending_totals.erase(key);
+                        xfer.pending_file_idx.erase(key);
+                    }
+
+                    if (!completed_keys.empty()) {
+                        xfer.consecutive_empty = 0;
+                    } else if (!got_any) {
+                        xfer.consecutive_empty++;
+                    }
+                    // got_any==true 但没有完整 SN → 数据还在流动，不增加 consecutive_empty
                 }
             } else {
                 // 传输完成或超时
@@ -635,6 +699,9 @@ int main() {
                 xfer.expected_total = static_cast<int>(cam_ctxs.size()) * (max_idx + 1);
                 xfer.total_bytes = 0;
                 xfer.consecutive_empty = 0;
+                xfer.pending_chunks.clear();
+                xfer.pending_totals.clear();
+                xfer.pending_file_idx.clear();
                 xfer.start_time = chrono::steady_clock::now();
                 xfer.deadline = xfer.start_time + chrono::seconds(120);
 
