@@ -105,6 +105,7 @@ vector<uint8_t> recvImageViaUdp(uint32_t expected_index, string* out_sn = nullpt
 #endif
     map<uint32_t, vector<uint8_t>> chunk_map;
     uint32_t total_chunks = 0;
+    string current_sn;
     auto deadline = chrono::steady_clock::now() + chrono::milliseconds(timeout_ms);
 
     vector<uint8_t> recv_buf(65536);
@@ -120,15 +121,24 @@ vector<uint8_t> recvImageViaUdp(uint32_t expected_index, string* out_sn = nullpt
         auto* hdr = reinterpret_cast<FileTransferHeader*>(recv_buf.data());
         if (expected_index != UINT32_MAX && hdr->file_index != expected_index) continue;
 
-        if (out_index) *out_index = hdr->file_index;
-        if (total_chunks == 0) total_chunks = hdr->total_chunks;
-
-        if (out_sn && out_sn->empty()) {
+        // 通配模式下：按 SN 隔离，防止多相机相同 file_index 的 chunk 互相覆盖
+        if (expected_index == UINT32_MAX && out_sn) {
+            string chunk_sn(hdr->sn);
+            if (current_sn.empty()) {
+                current_sn = chunk_sn;
+                *out_sn = chunk_sn;
+            } else if (chunk_sn != current_sn) {
+                continue; // 跳过其他相机的 chunk，留给下次 recvImageViaUdp
+            }
+        } else if (out_sn && out_sn->empty()) {
             char tmp[32];
             strncpy(tmp, hdr->sn, sizeof(hdr->sn));
             tmp[sizeof(hdr->sn) - 1] = '\0';
             *out_sn = tmp;
         }
+
+        if (out_index && total_chunks == 0) *out_index = hdr->file_index;
+        if (total_chunks == 0) total_chunks = hdr->total_chunks;
 
         chunk_map[hdr->chunk_index] = vector<uint8_t>(
             recv_buf.data() + sizeof(FileTransferHeader),
@@ -536,12 +546,15 @@ int main() {
             last_ui_time = current_time;
         }
 
-        // ===== 2. 传输状态机 (非阻塞 — 每次循环尝试收一帧) =====
+        // ===== 2. 传输状态机 (每次循环尝试收一帧) =====
         if (xfer.active) {
             if (xfer.received < xfer.expected_total && chrono::steady_clock::now() < xfer.deadline) {
+                // 强制下一轮 UI 立即刷新，确保进度条可见
+                last_ui_time = chrono::steady_clock::now() - ui_interval;
+
                 string sn;
                 uint32_t file_idx = 0;
-                vector<uint8_t> jpeg_data = recvImageViaUdp(UINT32_MAX, &sn, &file_idx, 100);
+                vector<uint8_t> jpeg_data = recvImageViaUdp(UINT32_MAX, &sn, &file_idx, 500);
                 if (!jpeg_data.empty() && !sn.empty()) {
                     stringstream ss;
                     ss << setw(2) << setfill('0') << file_idx;
