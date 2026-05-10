@@ -100,7 +100,7 @@ void sendImageViaUdp(const sockaddr_in& target, const vector<uint8_t>& data,
 vector<uint8_t> recvImageViaUdp(uint32_t expected_index, string* out_sn = nullptr,
                                  uint32_t* out_index = nullptr, int timeout_ms = 10000) {
 #ifdef _WIN32
-    DWORD timeout = timeout_ms;
+    DWORD timeout = min(timeout_ms, 2000);
     setsockopt(g_udp_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
 #endif
     map<uint32_t, vector<uint8_t>> chunk_map;
@@ -186,6 +186,7 @@ struct TransferState {
     int received = 0;
     int expected_total = 0;
     size_t total_bytes = 0;
+    int consecutive_empty = 0;
     chrono::steady_clock::time_point start_time;
     chrono::steady_clock::time_point deadline;
 };
@@ -548,7 +549,9 @@ int main() {
 
         // ===== 2. 传输状态机 (每次循环尝试收一帧) =====
         if (xfer.active) {
-            if (xfer.received < xfer.expected_total && chrono::steady_clock::now() < xfer.deadline) {
+            if (xfer.received < xfer.expected_total
+                && chrono::steady_clock::now() < xfer.deadline
+                && xfer.consecutive_empty < 6) {
                 // 强制下一轮 UI 立即刷新，确保进度条可见
                 last_ui_time = chrono::steady_clock::now() - ui_interval;
 
@@ -563,10 +566,17 @@ int main() {
                     out.write(reinterpret_cast<const char*>(jpeg_data.data()), jpeg_data.size());
                     xfer.received++;
                     xfer.total_bytes += jpeg_data.size();
+                    xfer.consecutive_empty = 0;
                     cout << "  -> Received " << out_fn << " (" << jpeg_data.size() << " bytes)" << endl;
+                } else {
+                    xfer.consecutive_empty++;
                 }
             } else {
                 // 传输完成或超时
+                if (xfer.consecutive_empty >= 6) {
+                    cout << "  Early finish: no data from slave for " << xfer.consecutive_empty
+                         << " rounds." << endl;
+                }
                 auto elapsed = chrono::duration<double>(chrono::steady_clock::now() - xfer.start_time);
                 double speed_mbps = elapsed.count() > 0 ? (xfer.total_bytes / 1048576.0) / elapsed.count() : 0;
                 cout << "\n=== Transfer Complete ===" << endl;
@@ -624,6 +634,7 @@ int main() {
                 xfer.received = 0;
                 xfer.expected_total = static_cast<int>(cam_ctxs.size()) * (max_idx + 1);
                 xfer.total_bytes = 0;
+                xfer.consecutive_empty = 0;
                 xfer.start_time = chrono::steady_clock::now();
                 xfer.deadline = xfer.start_time + chrono::seconds(120);
 
