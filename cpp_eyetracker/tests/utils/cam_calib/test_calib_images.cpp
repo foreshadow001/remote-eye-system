@@ -53,6 +53,9 @@ int g_net_port = 0;
 string g_calib_save_dir;
 bool g_enable_net_sync = false;
 bool g_is_master = false;
+atomic<bool> g_xfer_active{false};
+int g_win_w = 1224;
+int g_win_h = 1024;
 
 // ================== UDP 文件传输协议 ==================
 struct FileTransferHeader {
@@ -235,8 +238,22 @@ set<string> scanLocalCalibFiles() {
     return files;
 }
 
+void showTransferringOverlay() {
+    cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
+    string text = "Transferring...";
+    int baseline = 0;
+    cv::Size text_sz = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 1.5, 3, &baseline);
+    cv::Point text_org((g_win_w - text_sz.width) / 2, (g_win_h + text_sz.height) / 2);
+    cv::putText(canvas, text, text_org, cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(255, 255, 255), 3);
+    cv::imshow("Calib Capture", canvas);
+    cv::waitKey(1);
+}
+
 // 同步传输缺失的标定图片（阻塞调用，每次一张）
 void transferMissingImages() {
+    g_xfer_active = true;
+    showTransferringOverlay();
+
     cout << "\n=== Querying Slave File List ===" << endl;
 
     drainSocket(100);
@@ -245,6 +262,7 @@ void transferMissingImages() {
     string resp = recvStringResponse(3000);
     if (resp.empty() || resp.rfind("LIST_RESP:", 0) != 0) {
         cout << "[Error] No response from slave." << endl;
+        g_xfer_active = false;
         return;
     }
 
@@ -267,10 +285,14 @@ void transferMissingImages() {
 
     if (missing.empty()) {
         cout << "All files in sync. Nothing to transfer.\n" << endl;
+        g_xfer_active = false;
         return;
     }
 
     cout << "Transferring " << missing.size() << " missing files:\n" << endl;
+
+    // 通知 slave 进入传输状态
+    fastUdpSend(g_slave_addr, "XFER_INFO:" + to_string(missing.size()));
 
     int received = 0;
     size_t total_bytes = 0;
@@ -284,6 +306,8 @@ void transferMissingImages() {
 
         cout << "[" << (i + 1) << "/" << missing.size() << "] "
              << sn << " idx=" << idx << " ... " << flush;
+
+        showTransferringOverlay();
 
         fastUdpSend(g_slave_addr, "GET:" + sn_idx);
 
@@ -302,6 +326,9 @@ void transferMissingImages() {
         }
     }
 
+    // 通知 slave 传输结束
+    fastUdpSend(g_slave_addr, "XFER_END");
+
     auto elapsed = chrono::duration<double>(chrono::steady_clock::now() - start_time);
     double speed_mbps = elapsed.count() > 0 ? (total_bytes / 1048576.0) / elapsed.count() : 0;
     cout << "\n=== Transfer Complete ===" << endl;
@@ -309,6 +336,8 @@ void transferMissingImages() {
     cout << "Data : " << fixed << setprecision(2) << (total_bytes / 1048576.0) << " MB" << endl;
     cout << "Time : " << fixed << setprecision(2) << elapsed.count() << " s" << endl;
     cout << "Speed: " << fixed << setprecision(2) << speed_mbps << " MB/s\n" << endl;
+
+    g_xfer_active = false;
 }
 
 // ================== 辅助函数 ==================
@@ -500,6 +529,14 @@ void udpListenerWorker(const string& bind_ip, int port) {
                 fastUdpSend(client_addr, "CLEAR_DONE");
                 cout << "[Slave] Cleared." << endl;
             }
+            else if (cmd.rfind("XFER_INFO:", 0) == 0) {
+                cout << "[Slave] Transfer started" << endl;
+                g_xfer_active = true;
+            }
+            else if (cmd == "XFER_END") {
+                cout << "[Slave] Transfer ended" << endl;
+                g_xfer_active = false;
+            }
         }
     }
     closesocket(listen_sock);
@@ -535,8 +572,8 @@ int main() {
     double gamma_val  = cfg["test_multi_cam"]["gamma"].as<double>();
     double exp_time   = cfg["test_multi_cam"]["exposure_time"].as<double>();
 
-    int win_w = cfg["test_multi_cam"]["window_width"].as<int>();
-    int win_h = cfg["test_multi_cam"]["window_height"].as<int>();
+    g_win_w = cfg["test_multi_cam"]["window_width"].as<int>();
+    g_win_h = cfg["test_multi_cam"]["window_height"].as<int>();
     double ui_fps = cfg["test_multi_cam"]["ui_fps"].as<double>();
 
     cout << "\n--- Calibration Capture Configuration ---" << endl;
@@ -619,7 +656,7 @@ int main() {
 
     // === 预览窗口 ===
     cv::namedWindow("Calib Capture", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Calib Capture", win_w, win_h);
+    cv::resizeWindow("Calib Capture", g_win_w, g_win_h);
 
     auto ui_interval = chrono::milliseconds(static_cast<int>(1000.0 / ui_fps));
     auto last_ui_time = chrono::steady_clock::now() - ui_interval;
@@ -640,41 +677,45 @@ int main() {
 
         // ===== 1. UI 渲染 (按 ui_fps 控制) =====
         if (need_ui_update) {
-            int n_cams = static_cast<int>(cam_ctxs.size());
-            int grid_rows = 1, grid_cols = 1;
-            if (n_cams <= 1) { grid_rows = 1; grid_cols = 1; }
-            else if (n_cams <= 4) { grid_rows = 2; grid_cols = 2; }
-            else if (n_cams <= 9) { grid_rows = 3; grid_cols = 3; }
-            else { grid_rows = 4; grid_cols = (n_cams + 3) / 4; }
+            if (!g_is_master && g_xfer_active) {
+                showTransferringOverlay();
+            } else {
+                int n_cams = static_cast<int>(cam_ctxs.size());
+                int grid_rows = 1, grid_cols = 1;
+                if (n_cams <= 1) { grid_rows = 1; grid_cols = 1; }
+                else if (n_cams <= 4) { grid_rows = 2; grid_cols = 2; }
+                else if (n_cams <= 9) { grid_rows = 3; grid_cols = 3; }
+                else { grid_rows = 4; grid_cols = (n_cams + 3) / 4; }
 
-            int cell_w = win_w / grid_cols;
-            int cell_h = win_h / grid_rows;
-            cv::Mat canvas = cv::Mat::zeros(win_h, win_w, CV_8UC3);
+                int cell_w = g_win_w / grid_cols;
+                int cell_h = g_win_h / grid_rows;
+                cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
 
-            for (size_t i = 0; i < cam_ctxs.size(); ++i) {
-                cv::Mat local_raw;
-                {
-                    lock_guard<mutex> lock(cam_ctxs[i]->frame_mtx);
-                    if (!cam_ctxs[i]->latest_frame.empty())
-                        local_raw = cam_ctxs[i]->latest_frame.clone();
+                for (size_t i = 0; i < cam_ctxs.size(); ++i) {
+                    cv::Mat local_raw;
+                    {
+                        lock_guard<mutex> lock(cam_ctxs[i]->frame_mtx);
+                        if (!cam_ctxs[i]->latest_frame.empty())
+                            local_raw = cam_ctxs[i]->latest_frame.clone();
+                    }
+
+                    cv::Mat cell;
+                    if (!local_raw.empty()) {
+                        cv::Mat color;
+                        if (cam_ctxs[i]->is_mono) cv::cvtColor(local_raw, color, cv::COLOR_GRAY2RGB);
+                        else cv::cvtColor(local_raw, color, cv::COLOR_BayerRG2RGB);
+                        cv::resize(color, cell, cv::Size(cell_w, cell_h));
+                    } else {
+                        cell = cv::Mat::zeros(cell_h, cell_w, CV_8UC3);
+                    }
+
+                    int r = static_cast<int>(i) / grid_cols;
+                    int c = static_cast<int>(i) % grid_cols;
+                    cell.copyTo(canvas(cv::Rect(c * cell_w, r * cell_h, cell_w, cell_h)));
                 }
 
-                cv::Mat cell;
-                if (!local_raw.empty()) {
-                    cv::Mat color;
-                    if (cam_ctxs[i]->is_mono) cv::cvtColor(local_raw, color, cv::COLOR_GRAY2RGB);
-                    else cv::cvtColor(local_raw, color, cv::COLOR_BayerRG2RGB);
-                    cv::resize(color, cell, cv::Size(cell_w, cell_h));
-                } else {
-                    cell = cv::Mat::zeros(cell_h, cell_w, CV_8UC3);
-                }
-
-                int r = static_cast<int>(i) / grid_cols;
-                int c = static_cast<int>(i) % grid_cols;
-                cell.copyTo(canvas(cv::Rect(c * cell_w, r * cell_h, cell_w, cell_h)));
+                cv::imshow("Calib Capture", canvas);
             }
-
-            cv::imshow("Calib Capture", canvas);
             last_ui_time = current_time;
         }
 
@@ -685,7 +726,9 @@ int main() {
             global_running = false;
         }
         else if (key == ' ') {
-            if (g_enable_net_sync && !g_is_master) {
+            if (g_xfer_active) {
+                // Block SPACE during transfer on both hosts
+            } else if (g_enable_net_sync && !g_is_master) {
                 cout << "[Slave] Waiting for master SPACE..." << endl;
             } else {
                 int counter = getNextCalibCounter(g_calib_save_dir);
@@ -715,13 +758,13 @@ int main() {
                 }
             }
         }
-        else if ((key == 't' || key == 'T') && g_is_master && g_enable_net_sync) {
+        else if ((key == 't' || key == 'T') && g_is_master && g_enable_net_sync && !g_xfer_active) {
             // 传输缺失的 slave 图片（同步阻塞调用）
             transferMissingImages();
             // 传输期间 UI 被阻塞，返回后刷新 UI
             last_ui_time = chrono::steady_clock::now() - ui_interval;
         }
-        else if ((key == 'c' || key == 'C') && g_is_master && g_enable_net_sync) {
+        else if ((key == 'c' || key == 'C') && g_is_master && g_enable_net_sync && !g_xfer_active) {
             cout << "\n[Clear] Removing local calibration photos..." << endl;
             if (fs::exists(g_calib_save_dir)) {
                 for (auto& e : fs::directory_iterator(g_calib_save_dir)) {
