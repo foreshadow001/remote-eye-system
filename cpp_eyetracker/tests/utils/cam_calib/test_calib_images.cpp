@@ -223,6 +223,11 @@ struct CameraContext {
 };
 
 vector<shared_ptr<CameraContext>> cam_ctxs;
+atomic<int> g_enlarged_cam{-1};
+
+// UI layout constants (recomputed each frame)
+int g_left_w = 0, g_right_x = 0, g_right_w = 0;
+int g_thumb_w = 0, g_thumb_h = 0;
 
 // 扫描本地文件夹，返回 "SN_idx" 的集合
 set<string> scanLocalCalibFiles() {
@@ -236,6 +241,124 @@ set<string> scanLocalCalibFiles() {
         }
     }
     return files;
+}
+
+// ================== UI 布局计算 ==================
+void updateLayout() {
+    g_left_w = g_win_h * 2 / 5;
+    g_right_x = g_left_w;
+    g_right_w = g_win_w - g_left_w;
+    g_thumb_w = g_left_w / 2;
+    g_thumb_h = g_win_h / 5;
+}
+
+// ================== 鼠标回调 ==================
+void onMouse(int event, int x, int y, int, void*) {
+    if (event != cv::EVENT_LBUTTONDOWN) return;
+    if (x < g_left_w) {
+        int col = x / g_thumb_w;
+        int row = y / g_thumb_h;
+        int idx = row * 2 + col;
+        int n = static_cast<int>(cam_ctxs.size());
+        if (idx >= 0 && idx < n) {
+            int prev = g_enlarged_cam.load();
+            g_enlarged_cam.store((prev == idx) ? -1 : idx);
+        }
+    }
+}
+
+// ================== UI 渲染函数 ==================
+void renderThumbnailGrid(cv::Mat& canvas, int selected_idx) {
+    int n = static_cast<int>(cam_ctxs.size());
+    for (int i = 0; i < 10; ++i) {
+        int row = i / 2;
+        int col = i % 2;
+        int x = col * g_thumb_w;
+        int y = row * g_thumb_h;
+        cv::Rect roi(x, y, g_thumb_w, g_thumb_h);
+
+        if (i < n) {
+            cv::Mat local_raw;
+            {
+                lock_guard<mutex> lock(cam_ctxs[i]->frame_mtx);
+                if (!cam_ctxs[i]->latest_frame.empty())
+                    local_raw = cam_ctxs[i]->latest_frame.clone();
+            }
+            cv::Mat cell;
+            if (!local_raw.empty()) {
+                if (cam_ctxs[i]->is_mono) cv::cvtColor(local_raw, cell, cv::COLOR_GRAY2RGB);
+                else cv::cvtColor(local_raw, cell, cv::COLOR_BayerRG2RGB);
+                double scale = min(static_cast<double>(g_thumb_w) / cell.cols,
+                                   static_cast<double>(g_thumb_h) / cell.rows);
+                int dw = static_cast<int>(cell.cols * scale);
+                int dh = static_cast<int>(cell.rows * scale);
+                cv::Mat resized;
+                cv::resize(cell, resized, cv::Size(dw, dh));
+                cell = cv::Mat::zeros(g_thumb_h, g_thumb_w, CV_8UC3);
+                int ox = (g_thumb_w - dw) / 2;
+                int oy = (g_thumb_h - dh) / 2;
+                resized.copyTo(cell(cv::Rect(ox, oy, dw, dh)));
+            } else {
+                cell = cv::Mat::zeros(g_thumb_h, g_thumb_w, CV_8UC3);
+            }
+
+            // SN label drawn on cell
+            string label = cam_ctxs[i]->sn;
+            int baseline = 0;
+            double font_scale = 0.45;
+            cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, font_scale, 1, &baseline);
+            cv::Point org((g_thumb_w - ts.width) / 2, g_thumb_h - 6);
+            cv::putText(cell, label, org, cv::FONT_HERSHEY_SIMPLEX, font_scale,
+                        cv::Scalar(0, 0, 0), 3);
+            cv::putText(cell, label, org, cv::FONT_HERSHEY_SIMPLEX, font_scale,
+                        cv::Scalar(255, 255, 255), 1);
+
+            cell.copyTo(canvas(roi));
+
+            // Green border when selected
+            if (i == selected_idx) {
+                cv::rectangle(canvas, roi, cv::Scalar(0, 255, 0), 2);
+            }
+        } else {
+            canvas(roi) = cv::Scalar(0, 0, 0);
+        }
+    }
+}
+
+void renderEnlargedView(cv::Mat& canvas, int cam_idx) {
+    cv::Rect right_roi(g_right_x, 0, g_right_w, g_win_h);
+    if (cam_idx < 0 || cam_idx >= static_cast<int>(cam_ctxs.size())) {
+        canvas(right_roi) = cv::Scalar(0, 0, 0);
+        return;
+    }
+
+    cv::Mat local_raw;
+    {
+        lock_guard<mutex> lock(cam_ctxs[cam_idx]->frame_mtx);
+        if (!cam_ctxs[cam_idx]->latest_frame.empty())
+            local_raw = cam_ctxs[cam_idx]->latest_frame.clone();
+    }
+
+    if (local_raw.empty()) {
+        canvas(right_roi) = cv::Scalar(0, 0, 0);
+        return;
+    }
+
+    cv::Mat img;
+    if (cam_ctxs[cam_idx]->is_mono) cv::cvtColor(local_raw, img, cv::COLOR_GRAY2RGB);
+    else cv::cvtColor(local_raw, img, cv::COLOR_BayerRG2RGB);
+
+    double scale = min(static_cast<double>(g_right_w) / img.cols,
+                       static_cast<double>(g_win_h) / img.rows);
+    int dst_w = static_cast<int>(img.cols * scale);
+    int dst_h = static_cast<int>(img.rows * scale);
+
+    cv::Mat resized;
+    cv::resize(img, resized, cv::Size(dst_w, dst_h));
+
+    int off_x = g_right_x + (g_right_w - dst_w) / 2;
+    int off_y = (g_win_h - dst_h) / 2;
+    resized.copyTo(canvas(cv::Rect(off_x, off_y, dst_w, dst_h)));
 }
 
 void showTransferringOverlay() {
@@ -657,6 +780,8 @@ int main() {
     // === 预览窗口 ===
     cv::namedWindow("Calib Capture", cv::WINDOW_NORMAL);
     cv::resizeWindow("Calib Capture", g_win_w, g_win_h);
+    updateLayout();
+    cv::setMouseCallback("Calib Capture", onMouse);
 
     auto ui_interval = chrono::milliseconds(static_cast<int>(1000.0 / ui_fps));
     auto last_ui_time = chrono::steady_clock::now() - ui_interval;
@@ -680,40 +805,13 @@ int main() {
             if (!g_is_master && g_xfer_active) {
                 showTransferringOverlay();
             } else {
-                int n_cams = static_cast<int>(cam_ctxs.size());
-                int grid_rows = 1, grid_cols = 1;
-                if (n_cams <= 1) { grid_rows = 1; grid_cols = 1; }
-                else if (n_cams <= 4) { grid_rows = 2; grid_cols = 2; }
-                else if (n_cams <= 9) { grid_rows = 3; grid_cols = 3; }
-                else { grid_rows = 4; grid_cols = (n_cams + 3) / 4; }
-
-                int cell_w = g_win_w / grid_cols;
-                int cell_h = g_win_h / grid_rows;
                 cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
-
-                for (size_t i = 0; i < cam_ctxs.size(); ++i) {
-                    cv::Mat local_raw;
-                    {
-                        lock_guard<mutex> lock(cam_ctxs[i]->frame_mtx);
-                        if (!cam_ctxs[i]->latest_frame.empty())
-                            local_raw = cam_ctxs[i]->latest_frame.clone();
-                    }
-
-                    cv::Mat cell;
-                    if (!local_raw.empty()) {
-                        cv::Mat color;
-                        if (cam_ctxs[i]->is_mono) cv::cvtColor(local_raw, color, cv::COLOR_GRAY2RGB);
-                        else cv::cvtColor(local_raw, color, cv::COLOR_BayerRG2RGB);
-                        cv::resize(color, cell, cv::Size(cell_w, cell_h));
-                    } else {
-                        cell = cv::Mat::zeros(cell_h, cell_w, CV_8UC3);
-                    }
-
-                    int r = static_cast<int>(i) / grid_cols;
-                    int c = static_cast<int>(i) % grid_cols;
-                    cell.copyTo(canvas(cv::Rect(c * cell_w, r * cell_h, cell_w, cell_h)));
-                }
-
+                int sel = g_enlarged_cam.load();
+                renderThumbnailGrid(canvas, sel);
+                renderEnlargedView(canvas, sel);
+                // Vertical separator
+                cv::line(canvas, cv::Point(g_left_w, 0), cv::Point(g_left_w, g_win_h),
+                         cv::Scalar(60, 60, 60), 2);
                 cv::imshow("Calib Capture", canvas);
             }
             last_ui_time = current_time;

@@ -107,6 +107,12 @@ atomic<bool> CameraContext::master_set(false);
 
 vector<shared_ptr<CameraContext>> cam_ctxs;
 
+// ================== UI 布局全局变量 ==================
+atomic<int> g_enlarged_cam{-1};
+int g_win_w = 1224, g_win_h = 1024;
+int g_left_w = 0, g_right_x = 0, g_right_w = 0;
+int g_thumb_w = 0, g_thumb_h = 0;
+
 // ================== [新增] 核心：极速零延迟触发函数 ==================
 void instantTrigger() {
     global_record_start_time = std::chrono::steady_clock::now();
@@ -267,6 +273,163 @@ int getNextCalibCounter(const std::string& save_dir) {
         }
     }
     return max_counter + 1;
+}
+
+// ================== UI 布局计算 ==================
+void updateLayout() {
+    g_left_w = g_win_h * 2 / 5;
+    g_right_x = g_left_w;
+    g_right_w = g_win_w - g_left_w;
+    g_thumb_w = g_left_w / 2;
+    g_thumb_h = g_win_h / 5;
+}
+
+// ================== 鼠标回调 ==================
+void onMouse(int event, int x, int y, int, void*) {
+    if (event != cv::EVENT_LBUTTONDOWN) return;
+    if (x < g_left_w) {
+        int col = x / g_thumb_w;
+        int row = y / g_thumb_h;
+        int idx = row * 2 + col;
+        int n = static_cast<int>(cam_ctxs.size());
+        if (idx >= 0 && idx < n) {
+            int prev = g_enlarged_cam.load();
+            g_enlarged_cam.store((prev == idx) ? -1 : idx);
+        }
+    }
+}
+
+// ================== UI 渲染函数 ==================
+void renderThumbnailGrid(cv::Mat& canvas, int selected_idx, bool is_recording,
+                         const chrono::steady_clock::time_point& record_start_time, int total_record_frames) {
+    int n = static_cast<int>(cam_ctxs.size());
+    for (int i = 0; i < 10; ++i) {
+        int row = i / 2;
+        int col = i % 2;
+        int x = col * g_thumb_w;
+        int y = row * g_thumb_h;
+        cv::Rect roi(x, y, g_thumb_w, g_thumb_h);
+
+        if (i < n) {
+            cv::Mat local_raw;
+            {
+                lock_guard<mutex> lock(cam_ctxs[i]->frame_mtx);
+                if (!cam_ctxs[i]->latest_frame.empty())
+                    local_raw = cam_ctxs[i]->latest_frame.clone();
+            }
+            cv::Mat cell;
+            if (!local_raw.empty()) {
+                if (cam_ctxs[i]->is_mono) cv::cvtColor(local_raw, cell, cv::COLOR_GRAY2RGB);
+                else cv::cvtColor(local_raw, cell, cv::COLOR_BayerRG2RGB);
+                double scale = min(static_cast<double>(g_thumb_w) / cell.cols,
+                                   static_cast<double>(g_thumb_h) / cell.rows);
+                int dw = static_cast<int>(cell.cols * scale);
+                int dh = static_cast<int>(cell.rows * scale);
+                cv::Mat resized;
+                cv::resize(cell, resized, cv::Size(dw, dh));
+                cell = cv::Mat::zeros(g_thumb_h, g_thumb_w, CV_8UC3);
+                int ox = (g_thumb_w - dw) / 2;
+                int oy = (g_thumb_h - dh) / 2;
+                resized.copyTo(cell(cv::Rect(ox, oy, dw, dh)));
+            } else {
+                cell = cv::Mat::zeros(g_thumb_h, g_thumb_w, CV_8UC3);
+                int baseline = 0;
+                cv::Size textSize = cv::getTextSize(cam_ctxs[i]->status_msg, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+                cv::Point textOrg((g_thumb_w - textSize.width) / 2, (g_thumb_h + textSize.height) / 2);
+                cv::putText(cell, cam_ctxs[i]->status_msg, textOrg, cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
+            }
+
+            // Recording indicator on cell
+            if (is_recording) {
+                int radius = 6;
+                cv::Point center(g_thumb_w - radius * 2, radius * 2);
+                cv::circle(cell, center, radius, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+                int current_frame = cam_ctxs[i]->recorded_frames.load(std::memory_order_relaxed);
+                cv::putText(cell, to_string(current_frame) + "/" + to_string(total_record_frames),
+                            cv::Point(4, 14), cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(0, 0, 0), 2);
+                cv::putText(cell, to_string(current_frame) + "/" + to_string(total_record_frames),
+                            cv::Point(4, 14), cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(0, 255, 0), 1);
+            }
+
+            // SN label
+            string label = cam_ctxs[i]->id;
+            int baseline = 0;
+            double font_scale = 0.4;
+            cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, font_scale, 1, &baseline);
+            cv::Point org((g_thumb_w - ts.width) / 2, g_thumb_h - 5);
+            cv::putText(cell, label, org, cv::FONT_HERSHEY_SIMPLEX, font_scale,
+                        cv::Scalar(0, 0, 0), 3);
+            cv::putText(cell, label, org, cv::FONT_HERSHEY_SIMPLEX, font_scale,
+                        cv::Scalar(255, 255, 255), 1);
+
+            cell.copyTo(canvas(roi));
+
+            // Green border when selected
+            if (i == selected_idx) {
+                cv::rectangle(canvas, roi, cv::Scalar(0, 255, 0), 2);
+            }
+        } else {
+            canvas(roi) = cv::Scalar(0, 0, 0);
+        }
+    }
+}
+
+void renderEnlargedView(cv::Mat& canvas, int cam_idx, bool is_recording,
+                        const chrono::steady_clock::time_point& record_start_time, int total_record_frames) {
+    cv::Rect right_roi(g_right_x, 0, g_right_w, g_win_h);
+    if (cam_idx < 0 || cam_idx >= static_cast<int>(cam_ctxs.size())) {
+        canvas(right_roi) = cv::Scalar(0, 0, 0);
+        return;
+    }
+
+    cv::Mat local_raw;
+    {
+        lock_guard<mutex> lock(cam_ctxs[cam_idx]->frame_mtx);
+        if (!cam_ctxs[cam_idx]->latest_frame.empty())
+            local_raw = cam_ctxs[cam_idx]->latest_frame.clone();
+    }
+
+    if (local_raw.empty()) {
+        canvas(right_roi) = cv::Scalar(0, 0, 0);
+        return;
+    }
+
+    cv::Mat img;
+    if (cam_ctxs[cam_idx]->is_mono) cv::cvtColor(local_raw, img, cv::COLOR_GRAY2RGB);
+    else cv::cvtColor(local_raw, img, cv::COLOR_BayerRG2RGB);
+
+    double scale = min(static_cast<double>(g_right_w) / img.cols,
+                       static_cast<double>(g_win_h) / img.rows);
+    int dst_w = static_cast<int>(img.cols * scale);
+    int dst_h = static_cast<int>(img.rows * scale);
+
+    cv::Mat resized;
+    cv::resize(img, resized, cv::Size(dst_w, dst_h));
+
+    int off_x = g_right_x + (g_right_w - dst_w) / 2;
+    int off_y = (g_win_h - dst_h) / 2;
+
+    // Recording info on enlarged view
+    if (is_recording) {
+        int radius = 14;
+        cv::Point center(off_x + dst_w - radius * 2, off_y + radius * 2);
+        cv::circle(resized, cv::Point(dst_w - radius * 2, radius * 2), radius, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+        cv::putText(resized, "REC", cv::Point(dst_w - radius * 10, radius * 3), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 255), 2);
+
+        int current_frame = cam_ctxs[cam_idx]->recorded_frames.load(std::memory_order_relaxed);
+        double elapsed_s = chrono::duration<double>(chrono::steady_clock::now() - record_start_time).count();
+        char buf[64]; snprintf(buf, sizeof(buf), "%.1fs", elapsed_s);
+
+        cv::putText(resized, "Frame: " + to_string(current_frame) + "/" + to_string(total_record_frames),
+                    cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3);
+        cv::putText(resized, "Frame: " + to_string(current_frame) + "/" + to_string(total_record_frames),
+                    cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+        cv::putText(resized, string(buf), cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3);
+        cv::putText(resized, string(buf), cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+    }
+
+    canvas(right_roi) = cv::Scalar(0, 0, 0);
+    resized.copyTo(canvas(cv::Rect(off_x, off_y, dst_w, dst_h)));
 }
 
 // ================== 后台异步拷贝线程 ==================
@@ -493,8 +656,8 @@ int main() {
     double exp_time = cfg["test_multi_cam"]["exposure_time"].as<double>();
     vector<string> save_dirs = cfg["test_multi_cam"]["save_dir"].as<vector<string>>();
     
-    int win_w = cfg["test_multi_cam"]["window_width"].as<int>();
-    int win_h = cfg["test_multi_cam"]["window_height"].as<int>();
+    g_win_w = cfg["test_multi_cam"]["window_width"].as<int>();
+    g_win_h = cfg["test_multi_cam"]["window_height"].as<int>();
     bool write_jpg = cfg["test_multi_cam"]["write_jpg"].as<bool>(); 
     
     double record_time = cfg["test_multi_cam"]["record_time"].as<double>(); 
@@ -564,8 +727,10 @@ int main() {
     }
 
     cv::namedWindow("Multi-Cam Preview", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Multi-Cam Preview", win_w, win_h);
-    
+    cv::resizeWindow("Multi-Cam Preview", g_win_w, g_win_h);
+    updateLayout();
+    cv::setMouseCallback("Multi-Cam Preview", onMouse);
+
     if (is_master_pc) cout << "Press 'r' to START REC across ALL nodes, 'space' to photo, 'q' to quit.\n";
     else cout << "Waiting for Master trigger... Press 'space' to photo, 'q' to quit.\n";
 
@@ -584,70 +749,14 @@ int main() {
 
         // ===== 1. 解耦 UI 渲染模块 =====
         if (need_ui_update && !is_dumping) {
-            int n_cams = cam_ctxs.size();
-            int grid_rows = 1, grid_cols = 1;
-            if (n_cams == 1) { grid_rows = 1; grid_cols = 1; }
-            else if (n_cams <= 4) { grid_rows = 2; grid_cols = 2; }
-            else if (n_cams <= 9) { grid_rows = 3; grid_cols = 3; }
-            else { grid_rows = 4; grid_cols = (n_cams + 3) / 4; }
-
-            int cell_w = win_w / grid_cols;
-            int cell_h = win_h / grid_rows;
-            cv::Mat canvas = cv::Mat::zeros(win_h, win_w, CV_8UC3);
-            int valid_rows = 0; 
-
-            for (int i = 0; i < n_cams; ++i) {
-                cv::Mat img, local_raw;
-                {
-                    lock_guard<mutex> lock(cam_ctxs[i]->frame_mtx);
-                    if (!cam_ctxs[i]->latest_frame.empty()) local_raw = cam_ctxs[i]->latest_frame.clone(); 
-                }
-
-                if (!local_raw.empty()) {
-                    cv::Mat color_full;
-                    if (cam_ctxs[i]->is_mono) cv::cvtColor(local_raw, color_full, cv::COLOR_GRAY2RGB);
-                    else cv::cvtColor(local_raw, color_full, cv::COLOR_BayerRG2RGB); 
-                    cv::resize(color_full, img, cv::Size(cell_w, cell_h));
-                }
-
-                if (img.empty()) {
-                    img = cv::Mat::zeros(cell_h, cell_w, CV_8UC3);
-                    int baseline = 0;
-                    cv::Size textSize = cv::getTextSize(cam_ctxs[i]->status_msg, cv::FONT_HERSHEY_SIMPLEX, 0.7, 2, &baseline);
-                    cv::Point textOrg((cell_w - textSize.width) / 2, (cell_h + textSize.height) / 2);
-                    cv::putText(img, cam_ctxs[i]->status_msg, textOrg, cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
-                }
-                
-                // [修复] 将 REC 绘制移出 else 块。即使没图像(HW WAITING)，按下 r 也能在黑屏上看到 REC 和 Frame: 0/200
-                if (is_recording) {
-                    int radius = 10;
-                    cv::Point center(img.cols - radius * 2, radius * 2);
-                    cv::circle(img, center, radius, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
-                    cv::putText(img, "REC", cv::Point(img.cols - radius * 7, radius * 2.5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 2);
-
-                    int current_frame = cam_ctxs[i]->recorded_frames.load(std::memory_order_relaxed);
-                    double elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - record_start_time).count();
-                    char time_buf[32]; snprintf(time_buf, sizeof(time_buf), "Time: %.1fs", elapsed_s);
-                    
-                    cv::putText(img, "Frame: " + to_string(current_frame) + "/" + to_string(total_record_frames), cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3);
-                    cv::putText(img, "Frame: " + to_string(current_frame) + "/" + to_string(total_record_frames), cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
-                    cv::putText(img, time_buf, cv::Point(15, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3);
-                    cv::putText(img, time_buf, cv::Point(15, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
-                }
-                int r = i / grid_cols; int c = i % grid_cols;
-                img.copyTo(canvas(cv::Rect(c * cell_w, r * cell_h, cell_w, cell_h)));
-                if (r + 1 > valid_rows) valid_rows = r + 1;
-            }
-
-            if (valid_rows > 0 && valid_rows < grid_rows) {
-                cv::Mat cropped = canvas(cv::Rect(0, 0, win_w, valid_rows * cell_h));
-                cv::resizeWindow("Multi-Cam Preview", cropped.cols, cropped.rows);
-                cv::imshow("Multi-Cam Preview", cropped);
-            } else {
-                cv::imshow("Multi-Cam Preview", canvas);
-            }
-            
-            last_ui_time = current_time; 
+            cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
+            int sel = g_enlarged_cam.load();
+            renderThumbnailGrid(canvas, sel, is_recording, record_start_time, total_record_frames);
+            renderEnlargedView(canvas, sel, is_recording, record_start_time, total_record_frames);
+            cv::line(canvas, cv::Point(g_left_w, 0), cv::Point(g_left_w, g_win_h),
+                     cv::Scalar(60, 60, 60), 2);
+            cv::imshow("Multi-Cam Preview", canvas);
+            last_ui_time = current_time;
         }
 
         // ===== 2. 落盘等待逻辑 =====

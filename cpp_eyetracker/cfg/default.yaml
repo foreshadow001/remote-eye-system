@@ -134,8 +134,8 @@ test_multi_cam:
   gain: 0.0
   gamma: 1.0
   exposure_time: 4000.0
-  window_width: 1224
-  window_height: 1024
+  window_width: 1600
+  window_height: 800
   cam_width: 2448
   cam_height: 2048
   record_time: 1.0       # 录制的核心秒数 (代码会自动加20%余量)
