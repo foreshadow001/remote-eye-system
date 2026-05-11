@@ -126,9 +126,15 @@ string recvStringResponse(int timeout_ms) {
         socklen_t sender_len = sizeof(sender);
         int bytes = recvfrom(g_udp_sock, buf.data(), static_cast<int>(buf.size()) - 1, 0,
                              (sockaddr*)&sender, &sender_len);
-        if (bytes > 0 && bytes < static_cast<int>(sizeof(FileTransferHeader))) {
+        if (bytes > 0) {
             buf[bytes] = '\0';
-            return string(buf.data());
+            string data(buf.data(), bytes);
+            // 只接受已知协议前缀的控制消息；跳过意外到达的 chunk 数据
+            if (data.rfind("LIST_RESP:", 0) == 0 ||
+                data.rfind("DONE:", 0) == 0 ||
+                data.rfind("CLEAR_DONE", 0) == 0) {
+                return data;
+            }
         }
     }
     return {};
