@@ -32,6 +32,7 @@
 #include <fstream>
 #include <sstream>
 #include <map>
+#include <set>
 #include <functional>
 
 #include "cam/basler.hpp"
@@ -97,17 +98,51 @@ void sendImageViaUdp(const sockaddr_in& target, const vector<uint8_t>& data,
     }
 }
 
-vector<uint8_t> recvImageViaUdp(uint32_t expected_index, string* out_sn = nullptr,
-                                 uint32_t* out_index = nullptr, int timeout_ms = 10000) {
+// --- 可靠的 UDP 接收辅助函数 ---
+
+void drainSocket(int timeout_ms) {
+#ifdef _WIN32
+    DWORD timeout = timeout_ms;
+    setsockopt(g_udp_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+#endif
+    vector<char> buf(65536);
+    auto deadline = chrono::steady_clock::now() + chrono::milliseconds(timeout_ms);
+    while (chrono::steady_clock::now() < deadline) {
+        int bytes = recvfrom(g_udp_sock, buf.data(), static_cast<int>(buf.size()), 0, nullptr, nullptr);
+        if (bytes <= 0) break;
+    }
+}
+
+// 接收短字符串响应（如 LIST_RESP, DONE, CLEAR_DONE 等控制消息）
+string recvStringResponse(int timeout_ms) {
+#ifdef _WIN32
+    DWORD timeout = min(timeout_ms, 2000);
+    setsockopt(g_udp_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+#endif
+    vector<char> buf(65536);
+    auto deadline = chrono::steady_clock::now() + chrono::milliseconds(timeout_ms);
+    while (chrono::steady_clock::now() < deadline) {
+        sockaddr_in sender;
+        socklen_t sender_len = sizeof(sender);
+        int bytes = recvfrom(g_udp_sock, buf.data(), static_cast<int>(buf.size()) - 1, 0,
+                             (sockaddr*)&sender, &sender_len);
+        if (bytes > 0 && bytes < static_cast<int>(sizeof(FileTransferHeader))) {
+            buf[bytes] = '\0';
+            return string(buf.data());
+        }
+    }
+    return {};
+}
+
+// 接收单个文件的 chunk 传输（阻塞，直到组装完成或超时）
+vector<uint8_t> recvSingleFile(const string& expected_sn, uint32_t expected_idx, int timeout_ms) {
 #ifdef _WIN32
     DWORD timeout = min(timeout_ms, 2000);
     setsockopt(g_udp_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
 #endif
     map<uint32_t, vector<uint8_t>> chunk_map;
     uint32_t total_chunks = 0;
-    string current_sn;
     auto deadline = chrono::steady_clock::now() + chrono::milliseconds(timeout_ms);
-
     vector<uint8_t> recv_buf(65536);
 
     while (chrono::steady_clock::now() < deadline) {
@@ -116,30 +151,20 @@ vector<uint8_t> recvImageViaUdp(uint32_t expected_index, string* out_sn = nullpt
         int bytes = recvfrom(g_udp_sock, reinterpret_cast<char*>(recv_buf.data()),
                              static_cast<int>(recv_buf.size()), 0, (sockaddr*)&sender, &sender_len);
 
-        if (bytes < static_cast<int>(sizeof(FileTransferHeader))) continue;
-
-        auto* hdr = reinterpret_cast<FileTransferHeader*>(recv_buf.data());
-        if (expected_index != UINT32_MAX && hdr->file_index != expected_index) continue;
-
-        // 通配模式下：按 SN 隔离，防止多相机相同 file_index 的 chunk 互相覆盖
-        if (expected_index == UINT32_MAX && out_sn) {
-            string chunk_sn(hdr->sn);
-            if (current_sn.empty()) {
-                current_sn = chunk_sn;
-                *out_sn = chunk_sn;
-            } else if (chunk_sn != current_sn) {
-                continue; // 跳过其他相机的 chunk，留给下次 recvImageViaUdp
+        if (bytes < static_cast<int>(sizeof(FileTransferHeader))) {
+            // 检查是否有 DONE 短消息
+            if (bytes > 0) {
+                string msg(reinterpret_cast<char*>(recv_buf.data()), bytes);
+                if (msg == "DONE:" + expected_sn + "_" + to_string(expected_idx)) break;
             }
-        } else if (out_sn && out_sn->empty()) {
-            char tmp[32];
-            strncpy(tmp, hdr->sn, sizeof(hdr->sn));
-            tmp[sizeof(hdr->sn) - 1] = '\0';
-            *out_sn = tmp;
+            continue;
         }
 
-        if (out_index && total_chunks == 0) *out_index = hdr->file_index;
-        if (total_chunks == 0) total_chunks = hdr->total_chunks;
+        auto* hdr = reinterpret_cast<FileTransferHeader*>(recv_buf.data());
+        string chunk_sn(hdr->sn);
+        if (chunk_sn != expected_sn || hdr->file_index != expected_idx) continue;
 
+        if (total_chunks == 0) total_chunks = hdr->total_chunks;
         chunk_map[hdr->chunk_index] = vector<uint8_t>(
             recv_buf.data() + sizeof(FileTransferHeader),
             recv_buf.data() + sizeof(FileTransferHeader) + hdr->data_size);
@@ -153,6 +178,16 @@ vector<uint8_t> recvImageViaUdp(uint32_t expected_index, string* out_sn = nullpt
             }
             return result;
         }
+    }
+    // 超时：如果有完整 chunk 集合就组装，否则返回空
+    if (total_chunks > 0 && chunk_map.size() == total_chunks) {
+        vector<uint8_t> result;
+        for (uint32_t i = 0; i < total_chunks; ++i) {
+            auto it = chunk_map.find(i);
+            if (it == chunk_map.end()) return {};
+            result.insert(result.end(), it->second.begin(), it->second.end());
+        }
+        return result;
     }
     return {};
 }
@@ -180,21 +215,95 @@ struct CameraContext {
 
 vector<shared_ptr<CameraContext>> cam_ctxs;
 
-// ================== 传输状态机 (非阻塞) ==================
-struct TransferState {
-    bool active = false;
+// 扫描本地文件夹，返回 "SN_idx" 的集合
+set<string> scanLocalCalibFiles() {
+    set<string> files;
+    if (!fs::exists(g_calib_save_dir)) return files;
+    for (auto& e : fs::directory_iterator(g_calib_save_dir)) {
+        if (e.path().extension() == ".jpg") {
+            string stem = e.path().stem().string();
+            if (stem.rfind("calib_cam_", 0) == 0)
+                files.insert(stem.substr(10)); // 去掉 "calib_cam_" 前缀
+        }
+    }
+    return files;
+}
+
+// 同步传输缺失的标定图片（阻塞调用，每次一张）
+void transferMissingImages() {
+    cout << "\n=== Querying Slave File List ===" << endl;
+
+    drainSocket(100);
+    fastUdpSend(g_slave_addr, "LIST");
+
+    string resp = recvStringResponse(3000);
+    if (resp.empty() || resp.rfind("LIST_RESP:", 0) != 0) {
+        cout << "[Error] No response from slave." << endl;
+        return;
+    }
+
+    // 解析 slave 文件列表
+    set<string> slave_files;
+    stringstream ss(resp.substr(10)); // 去掉 "LIST_RESP:"
+    string token;
+    while (getline(ss, token, ',')) {
+        if (!token.empty()) slave_files.insert(token);
+    }
+    cout << "Slave has " << slave_files.size() << " files." << endl;
+
+    set<string> local_files = scanLocalCalibFiles();
+    cout << "Master has " << local_files.size() << " files." << endl;
+
+    // 找缺失
+    vector<string> missing;
+    for (auto& f : slave_files)
+        if (!local_files.count(f)) missing.push_back(f);
+
+    if (missing.empty()) {
+        cout << "All files in sync. Nothing to transfer.\n" << endl;
+        return;
+    }
+
+    cout << "Transferring " << missing.size() << " missing files:\n" << endl;
+
     int received = 0;
-    int expected_total = 0;
     size_t total_bytes = 0;
-    int consecutive_empty = 0;
-    chrono::steady_clock::time_point start_time;
-    chrono::steady_clock::time_point deadline;
-    // 多相机 chunk 缓冲：SN -> {chunk_index -> data}
-    map<string, map<uint32_t, vector<uint8_t>>> pending_chunks;
-    map<string, uint32_t> pending_totals;
-    map<string, uint32_t> pending_file_idx;
-};
-TransferState xfer;
+    auto start_time = chrono::steady_clock::now();
+
+    for (size_t i = 0; i < missing.size(); ++i) {
+        const string& sn_idx = missing[i];
+        size_t us = sn_idx.rfind('_');
+        string sn = sn_idx.substr(0, us);
+        uint32_t idx = static_cast<uint32_t>(stoi(sn_idx.substr(us + 1)));
+
+        cout << "[" << (i + 1) << "/" << missing.size() << "] "
+             << sn << " idx=" << idx << " ... " << flush;
+
+        fastUdpSend(g_slave_addr, "GET:" + sn_idx);
+
+        vector<uint8_t> jpeg_data = recvSingleFile(sn, idx, 10000);
+        if (!jpeg_data.empty()) {
+            stringstream fss;
+            fss << setw(2) << setfill('0') << idx;
+            string fn = g_calib_save_dir + "/calib_cam_" + sn + "_" + fss.str() + ".jpg";
+            ofstream out(fn, ios::binary);
+            out.write(reinterpret_cast<const char*>(jpeg_data.data()), jpeg_data.size());
+            received++;
+            total_bytes += jpeg_data.size();
+            cout << "OK (" << jpeg_data.size() << " bytes)" << endl;
+        } else {
+            cout << "FAILED" << endl;
+        }
+    }
+
+    auto elapsed = chrono::duration<double>(chrono::steady_clock::now() - start_time);
+    double speed_mbps = elapsed.count() > 0 ? (total_bytes / 1048576.0) / elapsed.count() : 0;
+    cout << "\n=== Transfer Complete ===" << endl;
+    cout << "Files: " << received << " / " << missing.size() << endl;
+    cout << "Data : " << fixed << setprecision(2) << (total_bytes / 1048576.0) << " MB" << endl;
+    cout << "Time : " << fixed << setprecision(2) << elapsed.count() << " s" << endl;
+    cout << "Speed: " << fixed << setprecision(2) << speed_mbps << " MB/s\n" << endl;
+}
 
 // ================== 辅助函数 ==================
 int getNextCalibCounter(const string& save_dir) {
@@ -298,7 +407,7 @@ void udpListenerWorker(const string& bind_ip, int port) {
     setsockopt(listen_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
 #endif
 
-    char buffer[256];
+    char buffer[4096];
     cout << "[Net Sync] Slave UDP listener on " << bind_ip << ":" << port << endl;
 
     while (global_running) {
@@ -332,34 +441,58 @@ void udpListenerWorker(const string& bind_ip, int port) {
                     }
                 }
             }
-            else if (cmd.rfind("XFER:", 0) == 0) {
-                size_t comma = cmd.find(',', 5);
-                if (comma != string::npos) {
-                    int start_idx = stoi(cmd.substr(5, comma - 5));
-                    int end_idx = stoi(cmd.substr(comma + 1));
-                    cout << "[Slave] Transfer request: " << start_idx << ".." << end_idx << endl;
+            else if (cmd == "LIST") {
+                cout << "[Slave] LIST request" << endl;
+                stringstream file_list;
+                if (fs::exists(g_calib_save_dir)) {
+                    for (auto& e : fs::directory_iterator(g_calib_save_dir)) {
+                        if (e.path().extension() == ".jpg") {
+                            string stem = e.path().stem().string();
+                            if (stem.rfind("calib_cam_", 0) == 0)
+                                file_list << stem.substr(10) << ",";
+                        }
+                    }
+                }
+                string resp = "LIST_RESP:" + file_list.str();
+                fastUdpSend(client_addr, resp);
+                cout << "[Slave] Sent file list" << endl;
+            }
+            else if (cmd.rfind("GET:", 0) == 0) {
+                string sn_idx = cmd.substr(4); // "SN_idx"
+                size_t us = sn_idx.rfind('_');
+                if (us != string::npos) {
+                    string sn = sn_idx.substr(0, us);
+                    int idx = stoi(sn_idx.substr(us + 1));
+                    stringstream ss;
+                    ss << setw(2) << setfill('0') << idx;
+                    string fn = g_calib_save_dir + "/calib_cam_" + sn + "_" + ss.str() + ".jpg";
 
-                    for (auto& ctx : cam_ctxs) {
-                        for (int i = start_idx; i <= end_idx; ++i) {
-                            stringstream ss;
-                            ss << setw(2) << setfill('0') << i;
-                            string fn = g_calib_save_dir + "/calib_cam_" + ctx->sn + "_" + ss.str() + ".jpg";
-                            if (!fs::exists(fn)) continue;
-
-                            ifstream in(fn, ios::binary | ios::ate);
-                            if (!in) continue;
+                    if (fs::exists(fn)) {
+                        ifstream in(fn, ios::binary | ios::ate);
+                        if (in) {
                             size_t fsize = in.tellg();
                             in.seekg(0, ios::beg);
                             vector<uint8_t> jpeg_data(fsize);
                             in.read(reinterpret_cast<char*>(jpeg_data.data()), fsize);
                             in.close();
-
-                            sendImageViaUdp(client_addr, jpeg_data, i, ctx->sn);
+                            sendImageViaUdp(client_addr, jpeg_data, idx, sn);
+                            cout << "[Slave] Sent " << fn << endl;
                         }
                     }
-                    fastUdpSend(client_addr, "XFER_DONE");
-                    cout << "[Slave] Transfer done." << endl;
+                    // 无论文件是否存在都发 DONE，让 master 确认传输结束
+                    fastUdpSend(client_addr, "DONE:" + sn_idx);
                 }
+            }
+            else if (cmd == "CLEAR") {
+                cout << "[Slave] CLEAR — removing all calibration photos" << endl;
+                if (fs::exists(g_calib_save_dir)) {
+                    for (auto& e : fs::directory_iterator(g_calib_save_dir)) {
+                        if (e.path().extension() == ".jpg")
+                            fs::remove(e.path());
+                    }
+                }
+                fastUdpSend(client_addr, "CLEAR_DONE");
+                cout << "[Slave] Cleared." << endl;
             }
         }
     }
@@ -489,7 +622,10 @@ int main() {
     cout << "  SPACE - Take one calibration photo";
     if (g_enable_net_sync) cout << " (synced)";
     cout << endl;
-    if (g_is_master && g_enable_net_sync) cout << "  T     - Pull slave images" << endl;
+    if (g_is_master && g_enable_net_sync) {
+        cout << "  T     - Pull missing slave images" << endl;
+        cout << "  C     - Clear all calibration photos (both hosts)" << endl;
+    }
     cout << "  Q/ESC - Quit\n" << endl;
 
     while (global_running) {
@@ -532,133 +668,11 @@ int main() {
                 cell.copyTo(canvas(cv::Rect(c * cell_w, r * cell_h, cell_w, cell_h)));
             }
 
-            // 传输进度条
-            if (xfer.active && xfer.expected_total > 0) {
-                int bar_h = 30;
-                int bar_y = canvas.rows - bar_h - 10;
-                int bar_x = 20;
-                int bar_w = canvas.cols - 40;
-                float ratio = static_cast<float>(xfer.received) / xfer.expected_total;
-                cv::rectangle(canvas, cv::Point(bar_x, bar_y), cv::Point(bar_x + bar_w, bar_y + bar_h), cv::Scalar(80, 80, 80), -1);
-                cv::rectangle(canvas, cv::Point(bar_x, bar_y), cv::Point(bar_x + static_cast<int>(bar_w * ratio), bar_y + bar_h), cv::Scalar(0, 200, 0), -1);
-                cv::rectangle(canvas, cv::Point(bar_x, bar_y), cv::Point(bar_x + bar_w, bar_y + bar_h), cv::Scalar(255, 255, 255), 1);
-                string prog_text = "XFER " + to_string(xfer.received) + "/" + to_string(xfer.expected_total);
-                auto elapsed = chrono::duration<double>(chrono::steady_clock::now() - xfer.start_time).count();
-                if (elapsed > 0.1) {
-                    double speed_mbps = (xfer.total_bytes / 1048576.0) / elapsed;
-                    stringstream ss_speed;
-                    ss_speed << fixed << setprecision(1) << speed_mbps;
-                    prog_text += "  " + ss_speed.str() + " MB/s";
-                }
-                cv::putText(canvas, prog_text, cv::Point(bar_x + 10, bar_y + 20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
-            }
-
             cv::imshow("Calib Capture", canvas);
             last_ui_time = current_time;
         }
 
-        // ===== 2. 传输状态机 (每次循环尝试收一帧) =====
-        if (xfer.active) {
-            if (xfer.received < xfer.expected_total
-                && chrono::steady_clock::now() < xfer.deadline
-                && xfer.consecutive_empty < 6) {
-                // 强制下一轮 UI 立即刷新，确保进度条可见
-                last_ui_time = chrono::steady_clock::now() - ui_interval;
-
-                // --- 多相机 chunk 缓冲接收 ---
-                // 所有相机并发发送，必须按 SN 分别缓存，防止不同 SN 的 chunk 互相覆盖
-                {
-#ifdef _WIN32
-                    DWORD timeout = min(500, 2000);
-                    setsockopt(g_udp_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-#endif
-                    vector<uint8_t> recv_buf(65536);
-                    auto recv_deadline = chrono::steady_clock::now() + chrono::milliseconds(500);
-                    bool got_any = false;
-
-                    while (chrono::steady_clock::now() < recv_deadline) {
-                        sockaddr_in sender;
-                        socklen_t sender_len = sizeof(sender);
-                        int bytes = recvfrom(g_udp_sock, reinterpret_cast<char*>(recv_buf.data()),
-                                             static_cast<int>(recv_buf.size()), 0,
-                                             (sockaddr*)&sender, &sender_len);
-                        if (bytes < static_cast<int>(sizeof(FileTransferHeader))) continue;
-
-                        auto* hdr = reinterpret_cast<FileTransferHeader*>(recv_buf.data());
-                        string chunk_sn(hdr->sn);
-                        string chunk_key = chunk_sn + "_" + to_string(hdr->file_index);
-
-                        xfer.pending_chunks[chunk_key][hdr->chunk_index] = vector<uint8_t>(
-                            recv_buf.data() + sizeof(FileTransferHeader),
-                            recv_buf.data() + sizeof(FileTransferHeader) + hdr->data_size);
-                        xfer.pending_totals[chunk_key] = hdr->total_chunks;
-                        xfer.pending_file_idx[chunk_key] = hdr->file_index;
-                        got_any = true;
-                    }
-
-                    // 收集所有已完成的 SN+idx
-                    vector<string> completed_keys;
-                    for (auto& [key, chunks] : xfer.pending_chunks) {
-                        auto it_tc = xfer.pending_totals.find(key);
-                        if (it_tc != xfer.pending_totals.end() && chunks.size() == it_tc->second)
-                            completed_keys.push_back(key);
-                    }
-
-                    // 组装并保存所有已完成的图像
-                    for (const string& key : completed_keys) {
-                        auto& chunks = xfer.pending_chunks[key];
-                        uint32_t tc = xfer.pending_totals[key];
-                        uint32_t fidx = xfer.pending_file_idx[key];
-
-                        vector<uint8_t> result;
-                        for (uint32_t i = 0; i < tc; ++i) {
-                            auto it = chunks.find(i);
-                            if (it == chunks.end()) { result.clear(); break; }
-                            result.insert(result.end(), it->second.begin(), it->second.end());
-                        }
-
-                        if (!result.empty()) {
-                            string sn = key.substr(0, key.rfind('_'));
-                            stringstream ss;
-                            ss << setw(2) << setfill('0') << fidx;
-                            string out_fn = g_calib_save_dir + "/calib_cam_" + sn + "_" + ss.str() + ".jpg";
-                            ofstream out(out_fn, ios::binary);
-                            out.write(reinterpret_cast<const char*>(result.data()), result.size());
-                            xfer.received++;
-                            xfer.total_bytes += result.size();
-                            cout << "  -> Received " << out_fn << " (" << result.size() << " bytes)" << endl;
-                        }
-
-                        xfer.pending_chunks.erase(key);
-                        xfer.pending_totals.erase(key);
-                        xfer.pending_file_idx.erase(key);
-                    }
-
-                    if (!completed_keys.empty()) {
-                        xfer.consecutive_empty = 0;
-                    } else if (!got_any) {
-                        xfer.consecutive_empty++;
-                    }
-                    // got_any==true 但没有完整 SN → 数据还在流动，不增加 consecutive_empty
-                }
-            } else {
-                // 传输完成或超时
-                if (xfer.consecutive_empty >= 6) {
-                    cout << "  Early finish: no data from slave for " << xfer.consecutive_empty
-                         << " rounds." << endl;
-                }
-                auto elapsed = chrono::duration<double>(chrono::steady_clock::now() - xfer.start_time);
-                double speed_mbps = elapsed.count() > 0 ? (xfer.total_bytes / 1048576.0) / elapsed.count() : 0;
-                cout << "\n=== Transfer Complete ===" << endl;
-                cout << "Files    : " << xfer.received << " / " << xfer.expected_total << endl;
-                cout << "Data     : " << (xfer.total_bytes / 1048576.0) << " MB" << endl;
-                cout << "Time     : " << fixed << setprecision(2) << elapsed.count() << " s" << endl;
-                cout << "Speed    : " << fixed << setprecision(2) << speed_mbps << " MB/s" << endl;
-                xfer.active = false;
-            }
-        }
-
-        // ===== 3. 键盘事件 (1ms 轮询 — 极速响应) =====
+        // ===== 2. 键盘事件 (1ms 轮询 — 极速响应) =====
         char key = static_cast<char>(cv::waitKey(1));
 
         if (key == 'q' || key == 27) {
@@ -695,25 +709,26 @@ int main() {
                 }
             }
         }
-        else if ((key == 't' || key == 'T') && g_is_master && g_enable_net_sync && !xfer.active) {
-            int max_idx = getNextCalibCounter(g_calib_save_dir) - 1;
-            if (max_idx < 0) {
-                cout << "No local images found. Capture first." << endl;
-            } else {
-                xfer.active = true;
-                xfer.received = 0;
-                xfer.expected_total = static_cast<int>(cam_ctxs.size()) * (max_idx + 1);
-                xfer.total_bytes = 0;
-                xfer.consecutive_empty = 0;
-                xfer.pending_chunks.clear();
-                xfer.pending_totals.clear();
-                xfer.pending_file_idx.clear();
-                xfer.start_time = chrono::steady_clock::now();
-                xfer.deadline = xfer.start_time + chrono::seconds(120);
-
-                fastUdpSend(g_slave_addr, "XFER:0," + to_string(max_idx));
-                cout << "\n=== Transferring " << xfer.expected_total << " Slave Images ===" << endl;
+        else if ((key == 't' || key == 'T') && g_is_master && g_enable_net_sync) {
+            // 传输缺失的 slave 图片（同步阻塞调用）
+            transferMissingImages();
+            // 传输期间 UI 被阻塞，返回后刷新 UI
+            last_ui_time = chrono::steady_clock::now() - ui_interval;
+        }
+        else if ((key == 'c' || key == 'C') && g_is_master && g_enable_net_sync) {
+            cout << "\n[Clear] Removing local calibration photos..." << endl;
+            if (fs::exists(g_calib_save_dir)) {
+                for (auto& e : fs::directory_iterator(g_calib_save_dir)) {
+                    if (e.path().extension() == ".jpg")
+                        fs::remove(e.path());
+                }
             }
+            cout << "[Clear] Local photos removed." << endl;
+
+            fastUdpSend(g_slave_addr, "CLEAR");
+            this_thread::sleep_for(chrono::milliseconds(200));
+            drainSocket(200);
+            cout << "[Clear] Slave photos should be removed.\n" << endl;
         }
     }
 
