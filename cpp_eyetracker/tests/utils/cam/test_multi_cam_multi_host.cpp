@@ -314,8 +314,7 @@ void renderThumbnailGrid(cv::Mat& canvas, int selected_idx, bool is_recording,
             cv::Mat local_raw;
             {
                 lock_guard<mutex> lock(cam_ctxs[i]->frame_mtx);
-                if (!cam_ctxs[i]->latest_frame.empty())
-                    local_raw = cam_ctxs[i]->latest_frame.clone();
+                local_raw = cam_ctxs[i]->latest_frame;
             }
             cv::Mat cell;
             if (!local_raw.empty()) {
@@ -385,8 +384,7 @@ void renderEnlargedView(cv::Mat& canvas, int cam_idx, bool is_recording,
     cv::Mat local_raw;
     {
         lock_guard<mutex> lock(cam_ctxs[cam_idx]->frame_mtx);
-        if (!cam_ctxs[cam_idx]->latest_frame.empty())
-            local_raw = cam_ctxs[cam_idx]->latest_frame.clone();
+        local_raw = cam_ctxs[cam_idx]->latest_frame;
     }
 
     if (local_raw.empty()) {
