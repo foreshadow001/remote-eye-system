@@ -151,6 +151,12 @@ void action()
         HTuple hv_CurrentFile = hv_ImagePath + "/calib_cam_" + HTuple(cam_sn_list[camIdx].c_str()) + "_01";
         try {
             ReadImage(&ho_Image, hv_CurrentFile);
+            // 彩色图转为灰度，保证标定一致性
+            HTuple hv_Channels;
+            CountChannels(ho_Image, &hv_Channels);
+            if (hv_Channels.I() == 3) {
+                Rgb1ToGray(ho_Image, &ho_Image);
+            }
             GetImageSize(ho_Image, &hv_Width, &hv_Height);
             
             gen_cam_par_area_scan_division(focus, 0, pixel_size_x, pixel_size_y, 
@@ -183,9 +189,16 @@ void action()
             HTuple currentFileName = hv_ImagePath + "/calib_cam_" + HTuple(cam_sn_list[camIdx].c_str()) + "_" + imgIdxStr;
             try {
                 ReadImage(&ho_Image, currentFileName);
-                
+
+                // 彩色图转为灰度，保证标定一致性
+                HTuple hv_Channels;
+                CountChannels(ho_Image, &hv_Channels);
+                if (hv_Channels.I() == 3) {
+                    Rgb1ToGray(ho_Image, &ho_Image);
+                }
+
                 // 尝试提取特征并直接添加到模型
-                FindCalibObject(ho_Image, hv_CalibDataID, camIdx, 0, imgIdx, 
+                FindCalibObject(ho_Image, hv_CalibDataID, camIdx, 0, imgIdx,
                                 (HTuple("alpha").Append("sigma")), 
                                 (HTuple(0.5).Append(1.0)));
                 
