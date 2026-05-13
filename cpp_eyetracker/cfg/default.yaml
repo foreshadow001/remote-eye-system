@@ -134,6 +134,7 @@ test_multi_cam:
   gain: 0.0
   gamma: 1.0
   exposure_time: 4000.0
+  calib_mono_exp_ext: 1.0
   window_width: 1600
   window_height: 800
   cam_width: 2448

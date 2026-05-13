@@ -503,13 +503,19 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
 }
 
 // ================== 相机采集线程 (仅软件触发) ==================
-void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time) {
+void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time, double mono_exp_ext) {
     if (!ctx->cam.open(TriggerMode::Software)) {
         cerr << "[Error] Failed to open camera " << ctx->sn << endl;
         return;
     }
 
     ctx->is_mono = ctx->cam.isMono();
+
+    if (ctx->is_mono && mono_exp_ext > 1.0) {
+        exp_time *= mono_exp_ext;
+        fps /= mono_exp_ext;
+        cout << "[Mono] Camera " << ctx->sn << " calib mode: exp_time=" << exp_time << "us, fps=" << fps << endl;
+    }
 
     try {
         ctx->cam.setFrameRate(fps);
@@ -693,6 +699,8 @@ int main() {
     double gamma_val  = cfg["test_multi_cam"]["gamma"].as<double>();
     double exp_time   = cfg["test_multi_cam"]["exposure_time"].as<double>();
 
+    double mono_exp_ext = cfg["test_multi_cam"]["calib_mono_exp_ext"].as<double>();
+
     g_win_w = cfg["test_multi_cam"]["window_width"].as<int>();
     g_win_h = cfg["test_multi_cam"]["window_height"].as<int>();
     double ui_fps = cfg["test_multi_cam"]["ui_fps"].as<double>();
@@ -772,7 +780,7 @@ int main() {
     for (auto& ctx : cam_ctxs) {
         ctx->running = true;
         ctx->copy_thread = thread(copyWorker, ctx);
-        ctx->capture_thread = thread(captureWorker, ctx, target_fps, gain_val, gamma_val, exp_time);
+        ctx->capture_thread = thread(captureWorker, ctx, target_fps, gain_val, gamma_val, exp_time, mono_exp_ext);
     }
 
     // === 预览窗口 ===
