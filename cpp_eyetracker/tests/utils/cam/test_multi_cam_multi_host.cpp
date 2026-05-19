@@ -49,8 +49,6 @@ string shared_record_timestr = "";
 std::chrono::steady_clock::time_point global_record_start_time;
 SOCKET master_udp_sock = INVALID_SOCKET;
 sockaddr_in slave_udp_addr{};
-SOCKET g_fault_sock = INVALID_SOCKET;
-sockaddr_in g_peer_fault_addr{};
 
 // ------------------------------------------------------------------
 // [重要修改] 将原代码中的 "相机通用功能" (包括 CameraContext 结构体和 cam_ctxs 变量) 
@@ -98,15 +96,8 @@ struct CameraContext {
 
     int64_t frame_offset = 0;
     bool offset_initialized = false;
-
-    static atomic<int64_t> master_first_id;
+    static atomic<int64_t> master_first_id; 
     static atomic<bool> master_set;
-
-    // Health monitoring
-    atomic<int64_t> last_block_id{-1};
-    atomic<chrono::steady_clock::time_point> last_frame_time{chrono::steady_clock::now()};
-    atomic<bool> has_streamed{false};
-    atomic<bool> needs_restart{false};
 
     CameraContext(int idx, string cam_id, string save_dir) : index(idx), id(cam_id), save_base_dir(save_dir), cam(cam_id) {}
 };
@@ -115,12 +106,6 @@ atomic<int64_t> CameraContext::master_first_id(-1);
 atomic<bool> CameraContext::master_set(false);
 
 vector<shared_ptr<CameraContext>> cam_ctxs;
-
-// ================== 故障状态 ==================
-atomic<bool> g_fault_active{false};
-atomic<int> g_faulty_cam{-1};
-atomic<bool> g_fault_on_master{false};
-bool g_use_hw_trigger = false;  // cached for fault recovery logic
 
 // ================== UI 布局全局变量 ==================
 atomic<int> g_enlarged_cam{-1};
@@ -261,25 +246,12 @@ void udpListenerWorker(const string& bind_ip, int port) {
             buffer[bytes] = '\0';
             string cmd(buffer);
             // [修改] 识别带时间戳的指令，瞬间开火
-            if (cmd.rfind("CMD_START:", 0) == 0) {
-                instantTrigger();
-                shared_record_timestr = cmd.substr(10);
-                net_cmd_record = true;
+            if (cmd.rfind("CMD_START:", 0) == 0) { 
+                instantTrigger(); // 零延迟！立即让底层回调开始拷贝图像到 RAM
+                shared_record_timestr = cmd.substr(10); // 提取 Master 发来的时间戳
+                net_cmd_record = true; // 仅作为 UI 更新和后续 IO 准备的通知标志
             }
-            else if (cmd.rfind("FAULT:", 0) == 0 && !g_fault_active.load()) {
-                char host_flag = cmd[6];
-                int faulty_idx = stoi(cmd.substr(7));
-                cout << "[Slave] Received fault from MASTER: camera index " << faulty_idx << endl;
-                g_fault_active.store(true);
-                g_faulty_cam.store(faulty_idx);
-                g_fault_on_master.store(true);
-                if (!g_use_hw_trigger) {
-                    for (auto& ctx : cam_ctxs) {
-                        ctx->needs_restart.store(true);
-                    }
-                }
-            }
-        }
+        } 
     }
     closesocket(sock);
 }
@@ -458,38 +430,6 @@ void renderEnlargedView(cv::Mat& canvas, int cam_idx, bool is_recording,
     resized.copyTo(canvas(cv::Rect(off_x, off_y, dst_w, dst_h)));
 }
 
-void showFaultOverlay(int faulty_cam, bool is_hw_trigger) {
-    cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
-    int y = g_win_h / 2 - 70;
-
-    cv::putText(canvas, "CAMERA FAULT DETECTED",
-                cv::Point((g_win_w - 400) / 2, y), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
-
-    y += 40;
-    string cam_info = "Camera: " + (faulty_cam >= 0 && faulty_cam < static_cast<int>(cam_ctxs.size())
-                                    ? cam_ctxs[faulty_cam]->id : "?")
-                      + " (index " + to_string(faulty_cam) + ")";
-    cv::putText(canvas, cam_info,
-                cv::Point((g_win_w - 400) / 2, y), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 1);
-
-    y += 30;
-    string host_info = "Host: " + string(g_fault_on_master.load() ? "MASTER" : "SLAVE");
-    cv::putText(canvas, host_info,
-                cv::Point((g_win_w - 400) / 2, y), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 1);
-
-    y += 40;
-    if (is_hw_trigger) {
-        cv::putText(canvas, "Turn off hardware trigger signal, then press 'b' to restart",
-                    cv::Point((g_win_w - 600) / 2, y), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 1);
-    } else {
-        cv::putText(canvas, "Auto-restarting cameras...",
-                    cv::Point((g_win_w - 400) / 2, y), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 1);
-    }
-
-    cv::imshow("Multi-Cam Preview", canvas);
-    cv::waitKey(1);
-}
-
 // ================== 后台异步拷贝线程 ==================
 void copyWorker(shared_ptr<CameraContext> ctx) {
     while (ctx->running) {
@@ -525,20 +465,14 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
                     ctx->dump_ready = true;
                 }
             }
-            ctx->last_block_id.store(task.second.blockID, memory_order_relaxed);
-            ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
-            ctx->has_streamed.store(true, memory_order_relaxed);
         } else {
             cv::Mat temp(task.first->GetHeight(), task.first->GetWidth(), CV_8UC1, task.first->GetBuffer());
-            cv::Mat clone_img = temp.clone();
+            cv::Mat clone_img = temp.clone(); 
             {
                 lock_guard<mutex> lock(ctx->frame_mtx);
                 ctx->latest_frame = clone_img;
                 ctx->latest_meta = task.second;
             }
-            ctx->last_block_id.store(task.second.blockID, memory_order_relaxed);
-            ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
-            ctx->has_streamed.store(true, memory_order_relaxed);
         }
     }
 }
@@ -612,41 +546,7 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
     if (!ctx->cam.start()) { ctx->status = CamStatus::ERROR_; return; }
     ctx->status_msg = use_hw_trigger ? "HW WAITING" : "STREAMING";
 
-    while (ctx->running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-        if (ctx->needs_restart.exchange(false)) {
-            cout << "[Restart] Camera " << ctx->id << " reinitializing..." << endl;
-            ctx->status_msg = "RESTARTING";
-            ctx->cam.close();
-
-            if (!ctx->cam.open(mode)) {
-                cerr << "[Error] Failed to reopen camera " << ctx->id << endl;
-                ctx->running = false;
-                break;
-            }
-
-            ctx->is_mono = ctx->cam.isMono();
-
-            try {
-                if (!use_hw_trigger) ctx->cam.setFrameRate(fps);
-                ctx->cam.setGain(gain);
-                ctx->cam.setGamma(gamma);
-                ctx->cam.setExposureTime(exp_time);
-            } catch (...) {}
-
-            if (!ctx->cam.start()) {
-                cerr << "[Error] Failed to restart camera " << ctx->id << endl;
-                ctx->running = false;
-                break;
-            }
-            ctx->has_streamed.store(false, memory_order_relaxed);
-            ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
-            ctx->status = CamStatus::STREAMING;
-            ctx->status_msg = use_hw_trigger ? "HW WAITING" : "STREAMING";
-            cout << "[Restart] Camera " << ctx->id << " restarted." << endl;
-        }
-    }
+    while (ctx->running) std::this_thread::sleep_for(std::chrono::milliseconds(50));
     ctx->cam.close();
 }
 
@@ -779,34 +679,12 @@ int main() {
     cout << "Net Sync         : " << (enable_net_sync ? "ON" : "OFF (Local Mode)") << endl;
     cout << "----------------------------------\n" << endl;
 
-    g_use_hw_trigger = use_hw_trigger;
-
     // [新增] Master 预先建立 UDP Socket (常驻内存)
     if (is_master_pc && enable_net_sync) {
         master_udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         slave_udp_addr.sin_family = AF_INET;
         slave_udp_addr.sin_port = htons(net_port);
         inet_pton(AF_INET, slave_ip.c_str(), &slave_udp_addr.sin_addr);
-    }
-
-    // 故障通信 socket (port + 200)
-    if (enable_net_sync) {
-        g_fault_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        sockaddr_in fault_bind{};
-        fault_bind.sin_family = AF_INET;
-        fault_bind.sin_port = htons(net_port + 200);
-        if (is_master_pc)
-            inet_pton(AF_INET, master_ip.c_str(), &fault_bind.sin_addr);
-        else
-            inet_pton(AF_INET, slave_ip.c_str(), &fault_bind.sin_addr);
-        ::bind(g_fault_sock, (sockaddr*)&fault_bind, sizeof(fault_bind));
-
-        g_peer_fault_addr.sin_family = AF_INET;
-        g_peer_fault_addr.sin_port = htons(net_port + 200);
-        if (is_master_pc)
-            inet_pton(AF_INET, slave_ip.c_str(), &g_peer_fault_addr.sin_addr);
-        else
-            inet_pton(AF_INET, master_ip.c_str(), &g_peer_fault_addr.sin_addr);
     }
 
     // --- 启动网络监听器 (仅Slave) ---
@@ -867,80 +745,15 @@ int main() {
         auto current_time = std::chrono::steady_clock::now();
         bool need_ui_update = (current_time - last_ui_time) >= ui_interval;
 
-        // ===== 0. 非阻塞轮询对端故障消息 =====
-        if (enable_net_sync && g_fault_sock != INVALID_SOCKET) {
-            char poll_buf[64];
-            sockaddr_in sender;
-            socklen_t sender_len = sizeof(sender);
-#ifdef _WIN32
-            DWORD poll_timeout = 0;
-            setsockopt(g_fault_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&poll_timeout, sizeof(poll_timeout));
-#endif
-            int poll_bytes = recvfrom(g_fault_sock, poll_buf, sizeof(poll_buf) - 1, 0, (sockaddr*)&sender, &sender_len);
-            if (poll_bytes > 0) {
-                poll_buf[poll_bytes] = '\0';
-                string poll_msg(poll_buf);
-                if (poll_msg.rfind("FAULT:", 0) == 0 && !g_fault_active.load()) {
-                    char host_flag = poll_msg[6];
-                    int faulty_idx = stoi(poll_msg.substr(7));
-                    cout << "[Fault] Received fault notification from " << (host_flag == 'M' ? "MASTER" : "SLAVE")
-                         << ": camera index " << faulty_idx << endl;
-                    g_fault_active.store(true);
-                    g_faulty_cam.store(faulty_idx);
-                    g_fault_on_master.store(host_flag == 'M');
-                    if (!g_use_hw_trigger) {
-                        for (auto& ctx : cam_ctxs) {
-                            ctx->needs_restart.store(true);
-                        }
-                    }
-                }
-                else if (poll_msg == "RESTART_DONE" && g_fault_active.load()) {
-                    cout << "[Fault] Received RESTART_DONE from peer." << endl;
-                }
-            }
-        }
-
-        // ===== 1. 相机健康检查 =====
-        if (!g_fault_active.load() && !is_dumping.load()) {
-            auto now = std::chrono::steady_clock::now();
-            for (size_t i = 0; i < cam_ctxs.size(); ++i) {
-                if (!cam_ctxs[i]->has_streamed.load()) continue;
-                auto last_t = cam_ctxs[i]->last_frame_time.load();
-                if (std::chrono::duration<double>(now - last_t).count() > 1.0) {
-                    cerr << "\n[FAULT] Camera " << cam_ctxs[i]->id << " (index " << i << ") stalled!" << endl;
-                    g_fault_active.store(true);
-                    g_faulty_cam.store(static_cast<int>(i));
-                    g_fault_on_master.store(is_master_pc);
-
-                    if (enable_net_sync && g_fault_sock != INVALID_SOCKET) {
-                        string fault_msg = "FAULT:" + string(is_master_pc ? "M" : "S") + to_string(i);
-                        sendto(g_fault_sock, fault_msg.c_str(), static_cast<int>(fault_msg.length()), 0,
-                               (sockaddr*)&g_peer_fault_addr, sizeof(g_peer_fault_addr));
-                    }
-
-                    if (!g_use_hw_trigger) {
-                        for (auto& ctx : cam_ctxs) {
-                            ctx->needs_restart.store(true);
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        // ===== 2. 解耦 UI 渲染模块 =====
+        // ===== 1. 解耦 UI 渲染模块 =====
         if (need_ui_update && !is_dumping) {
-            if (g_fault_active.load()) {
-                showFaultOverlay(g_faulty_cam.load(), g_use_hw_trigger);
-            } else {
-                cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
-                int sel = g_enlarged_cam.load();
-                renderThumbnailGrid(canvas, sel, is_recording, record_start_time, total_record_frames);
-                renderEnlargedView(canvas, sel, is_recording, record_start_time, total_record_frames);
-                cv::line(canvas, cv::Point(g_left_w, 0), cv::Point(g_left_w, g_win_h),
-                         cv::Scalar(60, 60, 60), 2);
-                cv::imshow("Multi-Cam Preview", canvas);
-            }
+            cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
+            int sel = g_enlarged_cam.load();
+            renderThumbnailGrid(canvas, sel, is_recording, record_start_time, total_record_frames);
+            renderEnlargedView(canvas, sel, is_recording, record_start_time, total_record_frames);
+            cv::line(canvas, cv::Point(g_left_w, 0), cv::Point(g_left_w, g_win_h),
+                     cv::Scalar(60, 60, 60), 2);
+            cv::imshow("Multi-Cam Preview", canvas);
             last_ui_time = current_time;
         }
 
@@ -1120,41 +933,12 @@ int main() {
             }
         }
 
-        // ===== 3. 故障恢复检查 =====
-        if (g_fault_active.load()) {
-            if (!g_use_hw_trigger) {
-                bool all_restarted = true;
-                for (auto& ctx : cam_ctxs) {
-                    if (!ctx->has_streamed.load()) { all_restarted = false; break; }
-                }
-                if (all_restarted) {
-                    if (enable_net_sync && g_fault_sock != INVALID_SOCKET) {
-                        string done_msg = "RESTART_DONE";
-                        sendto(g_fault_sock, done_msg.c_str(), static_cast<int>(done_msg.length()), 0,
-                               (sockaddr*)&g_peer_fault_addr, sizeof(g_peer_fault_addr));
-                    }
-                    g_fault_active.store(false);
-                    g_faulty_cam.store(-1);
-                    cout << "[Recovery] All cameras restarted. Resuming normal operation." << endl;
-                    last_ui_time = std::chrono::steady_clock::now() - ui_interval;
-                }
-            }
-        }
-
-        // ===== 4. 事件轮询 (1000Hz 极速响应) =====
-        char key = (char)cv::waitKey(1);
+        // ===== 3. 事件轮询 (1000Hz 极速响应) =====
+        char key = (char)cv::waitKey(1); 
         bool trigger_start = false;
 
         if (key == 'q' || key == 27) {
             global_running = false;
-        } else if (g_fault_active.load()) {
-            if (key == 'b' && g_use_hw_trigger) {
-                cout << "[Fault] User requested restart. Restarting all cameras..." << endl;
-                for (auto& ctx : cam_ctxs) {
-                    ctx->needs_restart.store(true);
-                }
-            }
-            // Block all other keys during fault recovery
         } else if (key == 'r' && !is_recording && !is_dumping) {
             auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
             char buf[64]; strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", localtime(&t));
@@ -1238,7 +1022,6 @@ int main() {
     cv::destroyAllWindows();
     Pylon::PylonTerminate();
     if (master_udp_sock != INVALID_SOCKET) closesocket(master_udp_sock);
-    if (g_fault_sock != INVALID_SOCKET) closesocket(g_fault_sock);
 
 #ifdef _WIN32
     WSACleanup();
