@@ -544,7 +544,7 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
 // ================== 网络监听线程 (Slave - 最高优先级) ==================
 void udpListenerWorker(const string& bind_ip, int port) {
 #ifdef _WIN32
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 #endif
 
     SOCKET listen_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);

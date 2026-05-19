@@ -201,7 +201,7 @@ bool syncGlobalBlockIDTCP(bool is_master, const string& master_ip, int port, int
 // ================== 网络监听模块 (Slave - 提权至最高优先级) ==================
 void udpListenerWorker(const string& bind_ip, int port) {
 #ifdef _WIN32
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 #else
     pthread_t this_thread = pthread_self();
     struct sched_param params;
