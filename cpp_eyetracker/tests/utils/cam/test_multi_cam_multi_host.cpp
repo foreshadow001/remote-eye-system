@@ -599,7 +599,9 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
     while (ctx->running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-        if (ctx->needs_restart.exchange(false)) {
+        if (ctx->needs_restart.load()) {
+            ctx->has_streamed.store(false, memory_order_relaxed);  // prevent recovery false-positive
+            ctx->needs_restart.store(false);
             cout << "[Restart] Camera " << ctx->id << " reinitializing..." << endl;
             ctx->status_msg = "RESTARTING";
             ctx->cam.close();
@@ -624,7 +626,6 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
                 ctx->running = false;
                 break;
             }
-            ctx->has_streamed.store(false, memory_order_relaxed);
             ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
             ctx->status = CamStatus::STREAMING;
             ctx->status_msg = use_hw_trigger ? "HW WAITING" : "STREAMING";
@@ -1080,14 +1081,23 @@ int main() {
         // ===== 3. 故障恢复检查 =====
         if (g_fault_active.load()) {
             bool recovered = false;
+            auto now = std::chrono::steady_clock::now();
             if (!g_use_hw_trigger) {
                 int fc = g_faulty_cam.load();
-                if (fc >= 0 && fc < (int)cam_ctxs.size() && cam_ctxs[fc]->has_streamed.load())
-                    recovered = true;
+                if (fc >= 0 && fc < (int)cam_ctxs.size()) {
+                    auto& ctx = cam_ctxs[fc];
+                    if (ctx->has_streamed.load() &&
+                        std::chrono::duration<double>(now - ctx->last_frame_time.load()).count() < 1.0)
+                        recovered = true;
+                }
             } else {
                 bool all_ok = true;
-                for (auto& ctx : cam_ctxs)
-                    if (!ctx->has_streamed.load()) { all_ok = false; break; }
+                for (auto& ctx : cam_ctxs) {
+                    if (!ctx->has_streamed.load() ||
+                        std::chrono::duration<double>(now - ctx->last_frame_time.load()).count() >= 1.0) {
+                        all_ok = false; break;
+                    }
+                }
                 if (all_ok) recovered = true;
             }
             if (recovered) {

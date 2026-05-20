@@ -573,7 +573,9 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
     while (ctx->running) {
         this_thread::sleep_for(chrono::milliseconds(50));
 
-        if (ctx->needs_restart.exchange(false)) {
+        if (ctx->needs_restart.load()) {
+            ctx->has_streamed.store(false, memory_order_relaxed);  // prevent recovery check false-positive
+            ctx->needs_restart.store(false);
             cout << "[Restart] Camera " << ctx->sn << " reinitializing..." << endl;
             ctx->cam.close();
 
@@ -602,7 +604,6 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
                 ctx->running = false;
                 break;
             }
-            ctx->has_streamed.store(false, memory_order_relaxed);
             ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
             cout << "[Restart] Camera " << ctx->sn << " restarted." << endl;
         }
@@ -949,12 +950,16 @@ int main() {
         // ===== 3. 故障恢复检查 =====
         if (g_fault_active.load()) {
             int fc = g_faulty_cam.load();
-            if (fc >= 0 && fc < (int)cam_ctxs.size() && cam_ctxs[fc]->has_streamed.load()) {
-                if (g_enable_net_sync)
-                    fastUdpSend(g_peer_fault_addr, "RESTART_DONE");
-                g_fault_active.store(false); g_faulty_cam.store(-1);
-                cout << "[Recovery] Camera restarted. Resuming normal operation." << endl;
-                last_ui_time = chrono::steady_clock::now() - ui_interval;
+            if (fc >= 0 && fc < (int)cam_ctxs.size()) {
+                auto& ctx = cam_ctxs[fc];
+                if (ctx->has_streamed.load() &&
+                    chrono::duration<double>(chrono::steady_clock::now() - ctx->last_frame_time.load()).count() < 1.0) {
+                    if (g_enable_net_sync)
+                        fastUdpSend(g_peer_fault_addr, "RESTART_DONE");
+                    g_fault_active.store(false); g_faulty_cam.store(-1);
+                    cout << "[Recovery] Camera restarted. Resuming normal operation." << endl;
+                    last_ui_time = chrono::steady_clock::now() - ui_interval;
+                }
             }
         }
 
