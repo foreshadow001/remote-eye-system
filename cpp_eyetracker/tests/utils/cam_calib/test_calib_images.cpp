@@ -49,11 +49,15 @@ atomic<bool> global_running{true};
 SOCKET g_udp_sock = INVALID_SOCKET;
 sockaddr_in g_master_addr{};
 sockaddr_in g_slave_addr{};
+sockaddr_in g_peer_fault_addr{};  // other host's port+100 for fault messages
 int g_net_port = 0;
 string g_calib_save_dir;
 bool g_enable_net_sync = false;
 bool g_is_master = false;
 atomic<bool> g_xfer_active{false};
+atomic<bool> g_fault_active{false};
+atomic<int> g_faulty_cam{-1};
+atomic<bool> g_fault_on_master{false};
 int g_win_w = 1224;
 int g_win_h = 1024;
 
@@ -219,6 +223,12 @@ struct CameraContext {
     mutex copy_mtx;
     condition_variable copy_cv;
 
+    // Health monitoring
+    atomic<int64_t> last_block_id{-1};
+    atomic<chrono::steady_clock::time_point> last_frame_time{chrono::steady_clock::now()};
+    atomic<bool> has_streamed{false};
+    atomic<bool> needs_restart{false};
+
     explicit CameraContext(string cam_sn) : sn(cam_sn), cam(cam_sn) {}
 };
 
@@ -371,6 +381,26 @@ void showTransferringOverlay() {
 }
 
 // 同步传输缺失的标定图片（阻塞调用，每次一张）
+void showFaultOverlay(int faulty_cam) {
+    cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
+    int cx = g_win_w / 2, y = g_win_h / 2 - 60;
+    auto put = [&](int y, const string& text, double scale, cv::Scalar color) {
+        int bl; cv::Size sz = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, scale, 2, &bl);
+        cv::putText(canvas, text, cv::Point(cx - sz.width / 2, y), cv::FONT_HERSHEY_SIMPLEX, scale, color, 2);
+    };
+    put(y, "CAMERA FAULT DETECTED", 1.0, cv::Scalar(0, 0, 255));
+    y += 40;
+    string cam_info = "Camera: " + (faulty_cam >= 0 && faulty_cam < (int)cam_ctxs.size() ? cam_ctxs[faulty_cam]->sn : "?")
+                      + " (index " + to_string(faulty_cam) + ")";
+    put(y, cam_info, 0.7, cv::Scalar(255, 255, 255));
+    y += 30;
+    put(y, string("Host: ") + (g_fault_on_master.load() ? "MASTER" : "SLAVE"), 0.7, cv::Scalar(255, 255, 255));
+    y += 40;
+    put(y, "Auto-restarting camera...", 0.7, cv::Scalar(0, 255, 255));
+    cv::imshow("Calib Capture", canvas);
+    cv::waitKey(1);
+}
+
 void transferMissingImages() {
     g_xfer_active = true;
     showTransferringOverlay();
@@ -499,6 +529,9 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
             ctx->latest_frame = clone_img;
             ctx->latest_meta = task.second;
         }
+        ctx->last_block_id.store(task.second.blockID, memory_order_relaxed);
+        ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
+        ctx->has_streamed.store(true, memory_order_relaxed);
     }
 }
 
@@ -537,7 +570,43 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
         return;
     }
 
-    while (ctx->running) this_thread::sleep_for(chrono::milliseconds(50));
+    while (ctx->running) {
+        this_thread::sleep_for(chrono::milliseconds(50));
+
+        if (ctx->needs_restart.exchange(false)) {
+            cout << "[Restart] Camera " << ctx->sn << " reinitializing..." << endl;
+            ctx->cam.close();
+
+            if (!ctx->cam.open(TriggerMode::Software)) {
+                cerr << "[Error] Failed to reopen camera " << ctx->sn << endl;
+                ctx->running = false;
+                break;
+            }
+
+            ctx->is_mono = ctx->cam.isMono();
+            double re_fps = fps;
+            double re_exp = exp_time;
+            if (ctx->is_mono && mono_exp_ext > 1.0) {
+                re_exp *= mono_exp_ext;
+                re_fps /= mono_exp_ext;
+            }
+            try {
+                ctx->cam.setFrameRate(re_fps);
+                ctx->cam.setGain(gain);
+                ctx->cam.setGamma(gamma);
+                ctx->cam.setExposureTime(re_exp);
+            } catch (...) {}
+
+            if (!ctx->cam.start()) {
+                cerr << "[Error] Failed to restart camera " << ctx->sn << endl;
+                ctx->running = false;
+                break;
+            }
+            ctx->has_streamed.store(false, memory_order_relaxed);
+            ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
+            cout << "[Restart] Camera " << ctx->sn << " restarted." << endl;
+        }
+    }
     ctx->cam.close();
 }
 
@@ -664,6 +733,13 @@ void udpListenerWorker(const string& bind_ip, int port) {
                 cout << "[Slave] Transfer ended" << endl;
                 g_xfer_active = false;
             }
+            else if (cmd.rfind("FAULT:", 0) == 0 && !g_fault_active.load()) {
+                char hf = cmd[6]; int fi = stoi(cmd.substr(7));
+                cout << "[Slave] Fault from MASTER: cam " << fi << endl;
+                g_fault_active.store(true); g_faulty_cam.store(fi); g_fault_on_master.store(true);
+                if (fi >= 0 && fi < (int)cam_ctxs.size())
+                    cam_ctxs[fi]->needs_restart.store(true);
+            }
         }
     }
     closesocket(listen_sock);
@@ -749,6 +825,11 @@ int main() {
         g_slave_addr.sin_port = htons(g_net_port);
         inet_pton(AF_INET, slave_ip.c_str(), &g_slave_addr.sin_addr);
 
+        // Peer fault addr (other host's port+100)
+        g_peer_fault_addr.sin_family = AF_INET;
+        g_peer_fault_addr.sin_port = htons(g_net_port + 100);
+        inet_pton(AF_INET, (g_is_master ? slave_ip : master_ip).c_str(), &g_peer_fault_addr.sin_addr);
+
         // 绑定文件传输端口 (port + 100)
         {
             sockaddr_in bind_addr{};
@@ -806,16 +887,57 @@ int main() {
         auto current_time = chrono::steady_clock::now();
         bool need_ui_update = (current_time - last_ui_time) >= ui_interval;
 
-        // ===== 1. UI 渲染 (按 ui_fps 控制) =====
+        // ===== 0. 非阻塞故障消息轮询 =====
+        if (g_enable_net_sync && g_udp_sock != INVALID_SOCKET) {
+            char poll_buf[64];
+            sockaddr_in sender; socklen_t slen = sizeof(sender);
+#ifdef _WIN32
+            DWORD pt = 0; setsockopt(g_udp_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&pt, sizeof(pt));
+#endif
+            int nb = recvfrom(g_udp_sock, poll_buf, sizeof(poll_buf) - 1, 0, (sockaddr*)&sender, &slen);
+            if (nb > 0) {
+                poll_buf[nb] = '\0'; string pm(poll_buf);
+                if (pm.rfind("FAULT:", 0) == 0 && !g_fault_active.load()) {
+                    char hf = pm[6]; int fi = stoi(pm.substr(7));
+                    cout << "[Fault] Received from " << (hf == 'M' ? "MASTER" : "SLAVE")
+                         << ": cam " << fi << endl;
+                    g_fault_active.store(true); g_faulty_cam.store(fi); g_fault_on_master.store(hf == 'M');
+                    if (fi >= 0 && fi < (int)cam_ctxs.size())
+                        cam_ctxs[fi]->needs_restart.store(true);
+                }
+            }
+        }
+
+        // ===== 1. 相机健康检查 =====
+        if (!g_fault_active.load()) {
+            auto now = chrono::steady_clock::now();
+            for (size_t i = 0; i < cam_ctxs.size(); ++i) {
+                if (!cam_ctxs[i]->has_streamed.load()) continue;
+                if (chrono::duration<double>(now - cam_ctxs[i]->last_frame_time.load()).count() > 1.0) {
+                    cerr << "\n[FAULT] Camera " << cam_ctxs[i]->sn
+                         << " (index " << i << ") stalled!" << endl;
+                    g_fault_active.store(true); g_faulty_cam.store((int)i);
+                    g_fault_on_master.store(g_is_master);
+                    if (g_enable_net_sync)
+                        fastUdpSend(g_peer_fault_addr,
+                                    "FAULT:" + string(g_is_master ? "M" : "S") + to_string(i));
+                    cam_ctxs[i]->needs_restart.store(true);
+                    break;
+                }
+            }
+        }
+
+        // ===== 2. UI 渲染 (按 ui_fps 控制) =====
         if (need_ui_update) {
-            if (!g_is_master && g_xfer_active) {
+            if (g_fault_active.load()) {
+                showFaultOverlay(g_faulty_cam.load());
+            } else if (!g_is_master && g_xfer_active) {
                 showTransferringOverlay();
             } else {
                 cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
                 int sel = g_enlarged_cam.load();
                 renderThumbnailGrid(canvas, sel);
                 renderEnlargedView(canvas, sel);
-                // Vertical separator
                 cv::line(canvas, cv::Point(g_left_w, 0), cv::Point(g_left_w, g_win_h),
                          cv::Scalar(60, 60, 60), 2);
                 cv::imshow("Calib Capture", canvas);
@@ -823,11 +945,26 @@ int main() {
             last_ui_time = current_time;
         }
 
-        // ===== 2. 键盘事件 (1ms 轮询 — 极速响应) =====
+        // ===== 3. 故障恢复检查 =====
+        if (g_fault_active.load()) {
+            int fc = g_faulty_cam.load();
+            if (fc >= 0 && fc < (int)cam_ctxs.size() && cam_ctxs[fc]->has_streamed.load()) {
+                if (g_enable_net_sync)
+                    fastUdpSend(g_peer_fault_addr, "RESTART_DONE");
+                g_fault_active.store(false); g_faulty_cam.store(-1);
+                cout << "[Recovery] Camera restarted. Resuming normal operation." << endl;
+                last_ui_time = chrono::steady_clock::now() - ui_interval;
+            }
+        }
+
+        // ===== 4. 键盘事件 (1ms 轮询 — 极速响应) =====
         char key = static_cast<char>(cv::waitKey(1));
 
         if (key == 'q' || key == 27) {
             global_running = false;
+        }
+        else if (g_fault_active.load()) {
+            // Block all keys except Q/ESC during fault recovery
         }
         else if (key == ' ') {
             if (g_xfer_active) {
