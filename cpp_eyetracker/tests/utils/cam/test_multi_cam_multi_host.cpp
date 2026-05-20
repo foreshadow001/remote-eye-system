@@ -843,21 +843,22 @@ int main() {
 
         // ===== 0. 非阻塞故障消息轮询 =====
         if (enable_net_sync && g_fault_sock != INVALID_SOCKET) {
-            char poll_buf[64];
-            sockaddr_in sender; socklen_t slen = sizeof(sender);
-#ifdef _WIN32
-            DWORD pt = 0; setsockopt(g_fault_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&pt, sizeof(pt));
-#endif
-            int nb = recvfrom(g_fault_sock, poll_buf, sizeof(poll_buf) - 1, 0, (sockaddr*)&sender, &slen);
-            if (nb > 0) {
-                poll_buf[nb] = '\0'; string pm(poll_buf);
-                if (pm.rfind("FAULT:", 0) == 0 && !g_fault_active.load()) {
-                    char hf = pm[6]; int fi = stoi(pm.substr(7));
-                    cout << "[Fault] Received from " << (hf == 'M' ? "MASTER" : "SLAVE")
-                         << ": cam " << fi << endl;
-                    g_fault_active.store(true); g_faulty_cam.store(fi); g_fault_on_master.store(hf == 'M');
-                    if (!g_use_hw_trigger && fi >= 0 && fi < (int)cam_ctxs.size())
-                        cam_ctxs[fi]->needs_restart.store(true);
+            fd_set readfds; FD_ZERO(&readfds); FD_SET(g_fault_sock, &readfds);
+            timeval tv = {0, 0};
+            if (select(0, &readfds, NULL, NULL, &tv) > 0) {
+                char poll_buf[64];
+                sockaddr_in sender; socklen_t slen = sizeof(sender);
+                int nb = recvfrom(g_fault_sock, poll_buf, sizeof(poll_buf) - 1, 0, (sockaddr*)&sender, &slen);
+                if (nb > 0) {
+                    poll_buf[nb] = '\0'; string pm(poll_buf);
+                    if (pm.rfind("FAULT:", 0) == 0 && !g_fault_active.load()) {
+                        char hf = pm[6]; int fi = stoi(pm.substr(7));
+                        cout << "[Fault] Received from " << (hf == 'M' ? "MASTER" : "SLAVE")
+                             << ": cam " << fi << endl;
+                        g_fault_active.store(true); g_faulty_cam.store(fi); g_fault_on_master.store(hf == 'M');
+                        if (!g_use_hw_trigger && fi >= 0 && fi < (int)cam_ctxs.size())
+                            cam_ctxs[fi]->needs_restart.store(true);
+                    }
                 }
             }
         }
