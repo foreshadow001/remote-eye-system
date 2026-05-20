@@ -42,5 +42,14 @@ else()
         eyetracker::cfg
     )
 
+    # Copy HALCON DLLs to output directory for runtime
+    add_custom_command(TARGET cam_calib_chain POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${HALCONROOT}/bin/x64-win64/halcon.dll"
+            "${HALCONROOT}/bin/x64-win64/halconcpp.dll"
+            $<TARGET_FILE_DIR:cam_calib_chain>
+        COMMENT "Copying HALCON DLLs to output..."
+    )
+
     message(STATUS "✅ cam_calib_chain will be built")
 endif()
