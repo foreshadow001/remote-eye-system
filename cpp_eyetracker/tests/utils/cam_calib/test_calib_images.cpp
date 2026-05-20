@@ -58,6 +58,8 @@ atomic<bool> g_xfer_active{false};
 atomic<bool> g_fault_active{false};
 atomic<int> g_faulty_cam{-1};
 atomic<bool> g_fault_on_master{false};
+chrono::steady_clock::time_point g_ready_time;
+chrono::steady_clock::time_point g_fault_time;
 int g_win_w = 1224;
 int g_win_h = 1024;
 
@@ -227,7 +229,6 @@ struct CameraContext {
     atomic<int64_t> last_block_id{-1};
     atomic<chrono::steady_clock::time_point> last_frame_time{chrono::steady_clock::now()};
     atomic<bool> has_streamed{false};
-    atomic<bool> needs_restart{false};
 
     explicit CameraContext(string cam_sn) : sn(cam_sn), cam(cam_sn) {}
 };
@@ -383,7 +384,7 @@ void showTransferringOverlay() {
 // 同步传输缺失的标定图片（阻塞调用，每次一张）
 void showFaultOverlay(int faulty_cam) {
     cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
-    int cx = g_win_w / 2, y = g_win_h / 2 - 60;
+    int cx = g_win_w / 2, y = g_win_h / 2 - 80;
     auto put = [&](int y, const string& text, double scale, cv::Scalar color) {
         int bl; cv::Size sz = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, scale, 2, &bl);
         cv::putText(canvas, text, cv::Point(cx - sz.width / 2, y), cv::FONT_HERSHEY_SIMPLEX, scale, color, 2);
@@ -395,8 +396,13 @@ void showFaultOverlay(int faulty_cam) {
     put(y, cam_info, 0.7, cv::Scalar(255, 255, 255));
     y += 30;
     put(y, string("Host: ") + (g_fault_on_master.load() ? "MASTER" : "SLAVE"), 0.7, cv::Scalar(255, 255, 255));
+    y += 30;
+    auto uptime_s = chrono::duration<double>(g_fault_time - g_ready_time).count();
+    int h = (int)uptime_s / 3600, m = ((int)uptime_s % 3600) / 60;
+    char ubuf[64]; snprintf(ubuf, sizeof(ubuf), "Uptime: %dh %dm", h, m);
+    put(y, string(ubuf), 0.7, cv::Scalar(255, 255, 255));
     y += 40;
-    put(y, "Auto-restarting camera...", 0.7, cv::Scalar(0, 255, 255));
+    put(y, "All cameras stopped. Press ESC to exit both hosts.", 0.6, cv::Scalar(0, 255, 255));
     cv::imshow("Calib Capture", canvas);
     cv::waitKey(1);
 }
@@ -570,44 +576,7 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
         return;
     }
 
-    while (ctx->running) {
-        this_thread::sleep_for(chrono::milliseconds(50));
-
-        if (ctx->needs_restart.load()) {
-            ctx->has_streamed.store(false, memory_order_relaxed);  // prevent recovery check false-positive
-            ctx->needs_restart.store(false);
-            cout << "[Restart] Camera " << ctx->sn << " reinitializing..." << endl;
-            ctx->cam.close();
-
-            if (!ctx->cam.open(TriggerMode::Software)) {
-                cerr << "[Error] Failed to reopen camera " << ctx->sn << endl;
-                ctx->running = false;
-                break;
-            }
-
-            ctx->is_mono = ctx->cam.isMono();
-            double re_fps = fps;
-            double re_exp = exp_time;
-            if (ctx->is_mono && mono_exp_ext > 1.0) {
-                re_exp *= mono_exp_ext;
-                re_fps /= mono_exp_ext;
-            }
-            try {
-                ctx->cam.setFrameRate(re_fps);
-                ctx->cam.setGain(gain);
-                ctx->cam.setGamma(gamma);
-                ctx->cam.setExposureTime(re_exp);
-            } catch (...) {}
-
-            if (!ctx->cam.start()) {
-                cerr << "[Error] Failed to restart camera " << ctx->sn << endl;
-                ctx->running = false;
-                break;
-            }
-            ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
-            cout << "[Restart] Camera " << ctx->sn << " restarted." << endl;
-        }
-    }
+    while (ctx->running) this_thread::sleep_for(chrono::milliseconds(50));
     ctx->cam.close();
 }
 
@@ -737,9 +706,22 @@ void udpListenerWorker(const string& bind_ip, int port) {
             else if (cmd.rfind("FAULT:", 0) == 0 && !g_fault_active.load()) {
                 char hf = cmd[6]; int fi = stoi(cmd.substr(7));
                 cout << "[Slave] Fault from MASTER: cam " << fi << endl;
+                g_fault_time = chrono::steady_clock::now();
                 g_fault_active.store(true); g_faulty_cam.store(fi); g_fault_on_master.store(true);
-                if (fi >= 0 && fi < (int)cam_ctxs.size())
-                    cam_ctxs[fi]->needs_restart.store(true);
+                // Close all cameras
+                for (auto& ctx : cam_ctxs) {
+                    ctx->running = false;
+                    ctx->copy_cv.notify_all();
+                }
+                for (auto& ctx : cam_ctxs) {
+                    if (ctx->capture_thread.joinable()) ctx->capture_thread.join();
+                    if (ctx->copy_thread.joinable()) ctx->copy_thread.join();
+                }
+                cout << "[Fault] All cameras stopped. Press ESC to exit." << endl;
+            }
+            else if (cmd == "SHUTDOWN") {
+                cout << "[Slave] Received SHUTDOWN from master." << endl;
+                global_running = false;
             }
         }
     }
@@ -884,11 +866,13 @@ int main() {
     }
     cout << "  Q/ESC - Quit\n" << endl;
 
+    g_ready_time = chrono::steady_clock::now();
+
     while (global_running) {
         auto current_time = chrono::steady_clock::now();
         bool need_ui_update = (current_time - last_ui_time) >= ui_interval;
 
-        // ===== 0. 非阻塞故障消息轮询 =====
+        // ===== 0. 非阻塞故障/SHUTDOWN 消息轮询 =====
         if (g_enable_net_sync && g_udp_sock != INVALID_SOCKET) {
             fd_set readfds; FD_ZERO(&readfds); FD_SET(g_udp_sock, &readfds);
             timeval tv = {0, 0};
@@ -902,9 +886,22 @@ int main() {
                         char hf = pm[6]; int fi = stoi(pm.substr(7));
                         cout << "[Fault] Received from " << (hf == 'M' ? "MASTER" : "SLAVE")
                              << ": cam " << fi << endl;
+                        g_fault_time = chrono::steady_clock::now();
                         g_fault_active.store(true); g_faulty_cam.store(fi); g_fault_on_master.store(hf == 'M');
-                        if (fi >= 0 && fi < (int)cam_ctxs.size())
-                            cam_ctxs[fi]->needs_restart.store(true);
+                        // Close all cameras
+                        for (auto& ctx : cam_ctxs) {
+                            ctx->running = false;
+                            ctx->copy_cv.notify_all();
+                        }
+                        for (auto& ctx : cam_ctxs) {
+                            if (ctx->capture_thread.joinable()) ctx->capture_thread.join();
+                            if (ctx->copy_thread.joinable()) ctx->copy_thread.join();
+                        }
+                        cout << "[Fault] All cameras stopped. Press ESC to exit." << endl;
+                    }
+                    else if (pm == "SHUTDOWN") {
+                        cout << "[System] Received SHUTDOWN from peer. Exiting." << endl;
+                        global_running = false;
                     }
                 }
             }
@@ -918,18 +915,28 @@ int main() {
                 if (chrono::duration<double>(now - cam_ctxs[i]->last_frame_time.load()).count() > 1.0) {
                     cerr << "\n[FAULT] Camera " << cam_ctxs[i]->sn
                          << " (index " << i << ") stalled!" << endl;
+                    g_fault_time = chrono::steady_clock::now();
                     g_fault_active.store(true); g_faulty_cam.store((int)i);
                     g_fault_on_master.store(g_is_master);
                     if (g_enable_net_sync)
                         fastUdpSend(g_peer_fault_addr,
                                     "FAULT:" + string(g_is_master ? "M" : "S") + to_string(i));
-                    cam_ctxs[i]->needs_restart.store(true);
+                    // Close all cameras
+                    for (auto& ctx : cam_ctxs) {
+                        ctx->running = false;
+                        ctx->copy_cv.notify_all();
+                    }
+                    for (auto& ctx : cam_ctxs) {
+                        if (ctx->capture_thread.joinable()) ctx->capture_thread.join();
+                        if (ctx->copy_thread.joinable()) ctx->copy_thread.join();
+                    }
+                    cout << "[Fault] All cameras stopped. Press ESC to exit both hosts." << endl;
                     break;
                 }
             }
         }
 
-        // ===== 2. UI 渲染 (按 ui_fps 控制) =====
+        // ===== 2. UI 渲染 =====
         if (need_ui_update) {
             if (g_fault_active.load()) {
                 showFaultOverlay(g_faulty_cam.load());
@@ -947,30 +954,19 @@ int main() {
             last_ui_time = current_time;
         }
 
-        // ===== 3. 故障恢复检查 =====
-        if (g_fault_active.load()) {
-            int fc = g_faulty_cam.load();
-            if (fc >= 0 && fc < (int)cam_ctxs.size()) {
-                auto& ctx = cam_ctxs[fc];
-                if (ctx->has_streamed.load() &&
-                    chrono::duration<double>(chrono::steady_clock::now() - ctx->last_frame_time.load()).count() < 1.0) {
-                    if (g_enable_net_sync)
-                        fastUdpSend(g_peer_fault_addr, "RESTART_DONE");
-                    g_fault_active.store(false); g_faulty_cam.store(-1);
-                    cout << "[Recovery] Camera restarted. Resuming normal operation." << endl;
-                    last_ui_time = chrono::steady_clock::now() - ui_interval;
-                }
-            }
-        }
-
-        // ===== 4. 键盘事件 (1ms 轮询 — 极速响应) =====
+        // ===== 3. 键盘事件 =====
         char key = static_cast<char>(cv::waitKey(1));
 
-        if (key == 'q' || key == 27) {
+        if (key == 27 || key == 'q') {
+            if (g_fault_active.load() && g_enable_net_sync) {
+                fastUdpSend(g_peer_fault_addr, "SHUTDOWN");
+                // Brief delay to let the message go out
+                this_thread::sleep_for(chrono::milliseconds(200));
+            }
             global_running = false;
         }
         else if (g_fault_active.load()) {
-            // Block all keys except Q/ESC during fault recovery
+            // Block all keys except ESC during fault
         }
         else if (key == ' ') {
             if (g_xfer_active) {
