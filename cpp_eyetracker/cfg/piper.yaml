@@ -1,0 +1,11 @@
+# Piper arm config (Windows side, reserved for future use)
+arms:
+  upper:
+    can_port: "piper_upper"
+  lower:
+    can_port: "piper_lower"
+
+# Network config (must match Ubuntu net.yaml)
+network:
+  ubuntu_ip: "192.168.10.4"
+  port: 49300

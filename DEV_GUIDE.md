@@ -26,3 +26,9 @@
 - cmake 4.2.1
 - vcpkg
 - configs: CMakePresets, config.yaml
+
+# Build
+```cmd
+cmake --preset vs2022-vcpkg
+cmake --build build --config Release
+```
