@@ -9,3 +9,25 @@ arms:
 network:
   ubuntu_ip: "192.168.10.4"
   port: 49300
+
+test_record_arm_data:
+  cam_indices:
+    - 40772282
+    - 40772278
+    - 40772281
+    - 40777498
+    - 40772280
+    - 40772279
+    - 40777497
+    - 40772277
+    - 40772284
+  ui_fps: 20.0
+  calib_save_dir: "D:/calib_arm"  # 标定图片保存目录（本机所有相机共用）
+  fps: 200
+  gain: 0.0
+  gamma: 1.0
+  exposure_time: 4000.0
+  window_width: 1600
+  window_height: 800
+  cam_width: 2448
+  cam_height: 2048

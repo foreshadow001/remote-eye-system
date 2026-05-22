@@ -12,4 +12,16 @@ target_link_libraries(test_calib_arm
         ${OpenCV_LIBS}
 )
 
+add_executable(test_record_arm_data
+    test_record_arm_data.cpp
+)
+
+target_link_libraries(test_record_arm_data
+    PRIVATE
+        eyetracker::cfg
+        eyetracker::cam
+        ${OpenCV_LIBS}
+)
+
 message(STATUS "test_calib_arm will be built")
+message(STATUS "test_record_arm_data will be built")
