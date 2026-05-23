@@ -81,7 +81,12 @@ int g_win_w = 1224, g_win_h = 1024;
 int g_left_w = 0, g_right_x = 0, g_right_w = 0;
 int g_thumb_w = 0, g_thumb_h = 0;
 string g_calib_save_dir;
-string g_mapping_file;
+string g_mapping_file_upper;
+string g_mapping_file_lower;
+
+const string& currentMappingFile() {
+    return (g_current_arm == "upper") ? g_mapping_file_upper : g_mapping_file_lower;
+}
 
 // ================== TCP 辅助 ==================
 
@@ -366,16 +371,15 @@ int main() {
         cout << "OK" << endl;
     }
 
-    // --- 位姿映射文件 ---
-    g_mapping_file = g_calib_save_dir + "/flange_pose_mapping.txt";
-    {
-        bool file_exists = fs::exists(g_mapping_file);
-        ofstream mf(g_mapping_file, ios::app);
-        if (!file_exists) {
-            mf << "# index arm x y z qx qy qz qw alpha beta gamma\n";
-        }
+    // --- 位姿映射文件 (upper / lower 分别存储) ---
+    g_mapping_file_upper = g_calib_save_dir + "/flange_pose_mapping_upper.txt";
+    g_mapping_file_lower = g_calib_save_dir + "/flange_pose_mapping_lower.txt";
+    for (auto& mf : {g_mapping_file_upper, g_mapping_file_lower}) {
+        bool exists = fs::exists(mf);
+        ofstream f(mf, ios::app);
+        if (!exists) f << "# index arm x y z qx qy qz qw alpha beta gamma\n";
+        cout << "[Mapping] " << mf << endl;
     }
-    cout << "[Mapping] " << g_mapping_file << endl;
 
     // --- 创建相机上下文 ---
     for (size_t i = 0; i < camera_ids.size(); ++i) {
@@ -415,16 +419,26 @@ int main() {
             renderThumbnailGrid(canvas, sel);
             renderEnlargedView(canvas, sel);
 
-            // Right panel: show current arm + pose overlay
-            cv::Rect right_roi(g_right_x, 0, g_right_w, g_win_h);
+            // Prominent arm indicator (top of right panel)
+            string arm_label = (g_current_arm == "upper") ? "UPPER" : "LOWER";
+            cv::Scalar arm_color = (g_current_arm == "upper")
+                                   ? cv::Scalar(0, 215, 255)    // gold
+                                   : cv::Scalar(200, 80, 255);   // purple
+            int arm_cx = g_right_x + g_right_w / 2;
+            cv::Size arm_sz = cv::getTextSize(arm_label, cv::FONT_HERSHEY_SIMPLEX, 1.4, 3, 0);
+            cv::putText(canvas, arm_label,
+                        cv::Point(arm_cx - arm_sz.width / 2, 55),
+                        cv::FONT_HERSHEY_SIMPLEX, 1.4, arm_color, 3, cv::LINE_AA);
+
+            // Bottom-left hints
             int tx = g_right_x + 10, ty = g_win_h - 60;
-            cv::putText(canvas, "Arm: " + g_current_arm,
-                        cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, 0.55,
-                        cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
-            ty += 22;
-            cv::putText(canvas, "[t] switch  [space] capture  [q] quit",
+            cv::putText(canvas, "[t] switch  [space] capture  [c] clear  [q] quit",
                         cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, 0.4,
                         cv::Scalar(150, 150, 150), 1, cv::LINE_AA);
+            ty += 22;
+            cv::putText(canvas, "Saving to: flange_pose_mapping_" + g_current_arm + ".txt",
+                        cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, 0.35,
+                        cv::Scalar(120, 120, 120), 1, cv::LINE_AA);
 
             cv::imshow("Record Arm Data", canvas);
             last_ui_time = current_time;
@@ -439,6 +453,20 @@ int main() {
         else if (key == 't' || key == 'T') {
             g_current_arm = (g_current_arm == "upper") ? "lower" : "upper";
             cout << "[Arm] Switched to: " << g_current_arm << endl;
+        }
+        else if (key == 'c' || key == 'C') {
+            cout << "\n[Clear] Removing all photos and mapping files..." << endl;
+            int removed = 0;
+            if (fs::exists(g_calib_save_dir)) {
+                for (auto& e : fs::directory_iterator(g_calib_save_dir)) {
+                    string ext = e.path().extension().string();
+                    if (ext == ".jpg" || ext == ".txt") {
+                        fs::remove(e.path());
+                        removed++;
+                    }
+                }
+            }
+            cout << "[Clear] Removed " << removed << " files.\n" << endl;
         }
         else if (key == ' ') {
             int counter = getNextCalibCounter(g_calib_save_dir);
@@ -487,13 +515,14 @@ int main() {
                     cout << fixed << setprecision(2);
                     cout << "        Euler ZXZ'':   [" << nums[7] << ", " << nums[8] << ", " << nums[9] << "] deg" << endl;
 
-                    // 写入映射文件
-                    ofstream mf(g_mapping_file, ios::app);
+                    // 写入当前 arm 的映射文件
+                    string mf_path = currentMappingFile();
+                    ofstream mf(mf_path, ios::app);
                     mf << fixed << setprecision(6);
                     mf << idx_str << " " << arm_name;
                     for (double v : nums) mf << " " << v;
                     mf << endl;
-                    cout << "  -> saved to " << g_mapping_file << endl;
+                    cout << "  -> saved to " << mf_path << endl;
                 }
             } else if (resp.empty()) {
                 cerr << "  [Warn] No response from arm server. "
