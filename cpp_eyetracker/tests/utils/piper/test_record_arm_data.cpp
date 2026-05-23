@@ -525,8 +525,12 @@ int main() {
             g_last_capture_arm = g_current_arm;
             cout << "\n[Capture] Index " << idx_str << " | Arm: " << g_current_arm << endl;
 
-            // 1. 保存所有相机照片
-            for (auto& ctx : cam_ctxs) {
+            // 只拍当前放大的相机（只有它能看到标定板）
+            int cam_idx = g_enlarged_cam.load();
+            if (cam_idx < 0 || cam_idx >= (int)cam_ctxs.size()) {
+                cout << "  [Warn] No camera selected. Click a thumbnail to enlarge it first." << endl;
+            } else {
+                auto& ctx = cam_ctxs[cam_idx];
                 cv::Mat snapshot;
                 {
                     lock_guard<mutex> lock(ctx->frame_mtx);
@@ -538,7 +542,7 @@ int main() {
                     else cv::cvtColor(snapshot, out_img, cv::COLOR_BayerRG2RGB);
                     string fn = g_calib_save_dir + "/calib_cam_" + ctx->sn + "_" + idx_str + ".jpg";
                     cv::imwrite(fn, out_img);
-                    cout << "  -> " << fn << endl;
+                    cout << "  -> " << fn << " (cam " << cam_idx << ": " << ctx->sn << ")" << endl;
                 }
             }
 

@@ -2,7 +2,7 @@
 cam_calib:
   input_folder: "D:/calib_images"
   calib_plane: "C:/hitsz/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
-  output_folder: "D:/calib_output"
+  output_folder: "D:/calib_output/"
   focus: 0.016 # m
   pixel_size_x: 2.74e-6 # m
   pixel_size_y: 2.74e-6 # m
