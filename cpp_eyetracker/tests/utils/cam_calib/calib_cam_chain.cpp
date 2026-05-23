@@ -117,6 +117,9 @@ void action()
     HTuple hv_ImagePath = cfg["cam_calib"]["input_folder"].as<std::string>().c_str();
     HTuple hv_CalibObjDescr = cfg["cam_calib"]["calib_plane"].as<std::string>().c_str();
     HTuple hv_OutputBaseDir = cfg["cam_calib"]["output_folder"].as<std::string>().c_str();
+    std::string center_cam_sn;
+    try { center_cam_sn = cfg["cam_calib"]["center_cam"].as<std::string>(); }
+    catch (...) { center_cam_sn = ""; }
 
     std::string output_folder= cfg["cam_calib"]["output_folder"].as<std::string>();
     std::filesystem::create_directories(output_folder);
@@ -290,22 +293,59 @@ void action()
     }
 
     // ========================================================================
-    // 5. 导出参数 (保持原逻辑不变)
+    // 5. 重基准到中心相机
+    // ========================================================================
+    std::cout << "\n--- Re-basing to Center Camera: " << center_cam_sn << " ---" << std::endl;
+
+    // 获取各相机在 cam0 坐标系下的位姿
+    std::vector<HTuple> poses_in_cam0(num_cams);
+    for (int camIdx = 0; camIdx < num_cams; ++camIdx) {
+        if (camIdx == 0)
+            CreatePose(0, 0, 0, 0, 0, 0, "Rp+T", "gba", "point", &poses_in_cam0[camIdx]);
+        else
+            GetCalibData(hv_CalibDataID, "camera", camIdx, "pose", &poses_in_cam0[camIdx]);
+    }
+
+    // 找到中心相机索引
+    int center_idx = -1;
+    for (int i = 0; i < num_cams; ++i) {
+        if (cam_sn_list[i] == center_cam_sn) { center_idx = i; break; }
+    }
+    if (center_idx < 0) {
+        std::cerr << "[Error] Center camera " << center_cam_sn << " not in camera list!" << std::endl;
+    }
+
+    // T_center_to_cam0 = pose of center camera in cam0 frame
+    // T_cam0_to_center = inv(T_center_to_cam0)
+    // T_cam_i_to_center = T_cam0_to_center * T_cam_i_to_cam0
+    HTuple T_center_to_cam0, T_cam0_to_center;
+    if (center_idx >= 0) {
+        T_center_to_cam0 = poses_in_cam0[center_idx];
+        PoseInvert(T_center_to_cam0, &T_cam0_to_center);
+    }
+
+    // 计算各相机在中心相机坐标系下的位姿
+    std::vector<HTuple> poses_in_center(num_cams);
+    for (int camIdx = 0; camIdx < num_cams; ++camIdx) {
+        if (center_idx >= 0) {
+            PoseCompose(T_cam0_to_center, poses_in_cam0[camIdx], &poses_in_center[camIdx]);
+        } else {
+            poses_in_center[camIdx] = poses_in_cam0[camIdx];  // fallback
+        }
+    }
+
+    // ========================================================================
+    // 6. 导出参数
     // ========================================================================
     std::cout << "\n--- Exporting Parameters ---" << std::endl;
-    
+
     for (int camIdx = 0; camIdx < num_cams; ++camIdx)
     {
         HTuple hv_CurrentCamParam, hv_CurrentPose, hv_StringPose;
         HTuple hv_FileHandle, hv_FullParamString;
-        
+
         GetCalibData(hv_CalibDataID, "camera", camIdx, "params", &hv_CurrentCamParam);
-        
-        if (camIdx == 0) {
-            CreatePose(0, 0, 0, 0, 0, 0, "Rp+T", "gba", "point", &hv_CurrentPose);
-        } else {
-            GetCalibData(hv_CalibDataID, "camera", camIdx, "pose", &hv_CurrentPose);
-        }
+        hv_CurrentPose = poses_in_center[camIdx];
 
         HTuple outFileName = hv_OutputBaseDir + HTuple(cam_sn_list[camIdx].c_str()) + "_Data.xml";
         OpenFile(outFileName, "output", &hv_FileHandle);

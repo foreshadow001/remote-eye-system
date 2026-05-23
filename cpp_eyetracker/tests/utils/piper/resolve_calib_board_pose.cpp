@@ -27,8 +27,7 @@ namespace fs = std::filesystem;
 struct CamCalibData {
     string sn;
     HTuple cam_param;       // internal params
-    HTuple pose_in_cam0;    // pose of this camera in cam0's frame
-    HTuple t_ref;           // pose of this camera in reference frame (computed)
+    HTuple pose_in_ref;     // pose relative to center camera (from XML)
     bool valid = false;
 };
 
@@ -161,15 +160,9 @@ bool loadCamCalibXml(const string& filepath, HTuple& cam_param, HTuple& pose) {
     double beta  = stod(xmlText(xml, "Beta"));
     double gamma = stod(xmlText(xml, "Gamma"));
 
-    if (fabs(alpha) < 1e-9 && fabs(beta) < 1e-9 && fabs(gamma) < 1e-9 &&
-        fabs(tx) < 1e-9 && fabs(ty) < 1e-9 && fabs(tz) < 1e-9) {
-        // Camera 0 → identity pose
-        CreatePose(0, 0, 0, 0, 0, 0, "Rp+T", "gba", "point", &pose);
-    } else {
-        CreatePose(tx / 1000.0, ty / 1000.0, tz / 1000.0,
-                   alpha * M_PI / 180.0, beta * M_PI / 180.0, gamma * M_PI / 180.0,
-                   "Rp+T", "gba", "point", &pose);
-    }
+    // XML 中的值是 Halcon 原生格式: 平移(m), 旋转(rad), gba 顺序
+    CreatePose(tx, ty, tz, alpha, beta, gamma,
+               "Rp+T", "gba", "point", &pose);
     return true;
 }
 
@@ -190,63 +183,51 @@ int main(int argc, char* argv[]) {
         Cfg cfg(piper_path);
 
         auto& rcfg = cfg["resolve_calib_board_pose"];
-        string ref_sn = rcfg["reference_cam_sn"].as<string>();
         string xml_dir = rcfg["cam_xml_dir"].as<string>();
         string img_dir = rcfg["input_image_dir"].as<string>();
         string out_file = rcfg["output_file"].as<string>();
         HTuple hv_calib_plane = rcfg["calib_plane"].as<string>().c_str();
-        vector<string> camera_sns = rcfg["camera_sns"].as<vector<string>>();
 
         cout << "=== Resolve Calibration Board Pose ===" << endl;
-        cout << "Reference camera: " << ref_sn << endl;
         cout << "Cam XML dir:      " << xml_dir << endl;
         cout << "Image dir:        " << img_dir << endl;
         cout << "Output file:      " << out_file << endl;
         cout << "Calib plane:      " << hv_calib_plane.S() << endl;
-        cout << "Camera chain (" << camera_sns.size() << "):" << endl;
-        for (size_t i = 0; i < camera_sns.size(); ++i)
-            cout << "  " << i << ": SN=" << camera_sns[i] << endl;
         cout << "======================================\n" << endl;
 
-        // --- 加载相机标定数据 ---
-        vector<CamCalibData> cam_data(camera_sns.size());
-        int ref_idx = -1;
+        // --- 自动扫描 XML 文件, 加载相机标定数据 ---
+        // XML 中的外参已经由 calib_cam_chain 重基准到中心相机坐标系
+        vector<CamCalibData> cam_data;
 
-        for (size_t i = 0; i < camera_sns.size(); ++i) {
-            cam_data[i].sn = camera_sns[i];
-            if (camera_sns[i] == ref_sn) ref_idx = (int)i;
+        for (auto& entry : fs::directory_iterator(xml_dir)) {
+            string fn = entry.path().filename().string();
+            if (fn.find("_Data.xml") == string::npos) continue;
+            string sn = fn.substr(0, fn.find("_Data.xml"));
 
-            string xml_path = xml_dir + "/" + camera_sns[i] + "_Data.xml";
-            if (!loadCamCalibXml(xml_path, cam_data[i].cam_param, cam_data[i].pose_in_cam0)) {
-                cout << "[Warn] Failed to load calibration XML for " << camera_sns[i]
-                     << ", discarding." << endl;
+            CamCalibData cd;
+            cd.sn = sn;
+            if (!loadCamCalibXml(entry.path().string(), cd.cam_param, cd.pose_in_ref)) {
+                cout << "[Warn] Failed to load " << fn << ", skipping." << endl;
                 continue;
             }
-            cam_data[i].valid = true;
-            cout << "[Cam " << i << "] " << camera_sns[i] << " loaded. Focus="
-                 << ((const HTuple&)cam_data[i].cam_param)[1].D() << "m" << endl;
+            cd.valid = true;
+            cam_data.push_back(cd);
         }
 
-        if (ref_idx < 0) {
-            cerr << "[Error] Reference camera " << ref_sn << " not in camera list!" << endl;
-            return 1;
-        }
-        if (!cam_data[ref_idx].valid) {
-            cerr << "[Error] Reference camera calibration data invalid!" << endl;
+        if (cam_data.empty()) {
+            cerr << "[Error] No valid camera calibration XMLs found in " << xml_dir << endl;
             return 1;
         }
 
-        // --- 计算各相机到参考坐标系的变换 ---
-        // T_cam_i_to_ref = inv(T_ref_to_cam0) * T_cam_i_to_cam0
-        HTuple T_ref_to_cam0 = cam_data[ref_idx].pose_in_cam0;
-        HTuple T_cam0_to_ref;
-        PoseInvert(T_ref_to_cam0, &T_cam0_to_ref);
+        // 按 SN 排序保证确定性
+        sort(cam_data.begin(), cam_data.end(),
+             [](const CamCalibData& a, const CamCalibData& b) { return a.sn < b.sn; });
 
-        for (size_t i = 0; i < cam_data.size(); ++i) {
-            if (!cam_data[i].valid) continue;
-            PoseCompose(T_cam0_to_ref, cam_data[i].pose_in_cam0, &cam_data[i].t_ref);
-            cout << "[Transform] Cam " << i << " (" << cam_data[i].sn << ") → ref chain built." << endl;
-        }
+        cout << "Loaded " << cam_data.size() << " cameras:" << endl;
+        for (size_t i = 0; i < cam_data.size(); ++i)
+            cout << "  " << i << ": SN=" << cam_data[i].sn
+                 << "  focus=" << ((const HTuple&)cam_data[i].cam_param)[1].D() << "m" << endl;
+        cout << "(Poses already relative to center camera from calib_cam_chain)\n" << endl;
 
         // --- 逐帧处理 ---
         ofstream fout(out_file);
@@ -323,7 +304,7 @@ int main(int argc, char* argv[]) {
 
                     // board pose in ref frame: T_cam_i_to_ref * board_in_cam_i
                     HTuple board_in_ref;
-                    PoseCompose(cam_data[ci].t_ref, board_in_cam_i, &board_in_ref);
+                    PoseCompose(cam_data[ci].pose_in_ref, board_in_cam_i, &board_in_ref);
                     poses_in_ref.push_back(board_in_ref);
 
                     ClearCalibData(hv_calib_id);

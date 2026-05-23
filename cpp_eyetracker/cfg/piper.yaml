@@ -42,18 +42,7 @@ cam_calib:
   center_cam: 40772280
 
 resolve_calib_board_pose:
-  reference_cam_sn: "40772280"
-  cam_xml_dir: "D:/calib_arm/cam_calib_output"   # calib_cam_chain 输出的 XML 所在目录
+  cam_xml_dir: "D:/calib_arm/cam_calib_output"   # calib_cam_chain 输出的 XML 所在目录 (自动扫描)
   input_image_dir: "D:/calib_arm"                 # 标定图片目录
   output_file: "D:/calib_board_pose/board_poses.txt"
   calib_plane: "D:/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
-  camera_sns:
-    - "40772282"
-    - "40772278"
-    - "40772281"
-    - "40777498"
-    - "40772280"
-    - "40772279"
-    - "40777497"
-    - "40772277"
-    - "40772284"
