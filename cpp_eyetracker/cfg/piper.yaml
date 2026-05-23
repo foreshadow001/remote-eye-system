@@ -12,9 +12,7 @@ network:
 
 test_record_arm_data:
   cam_indices:
-    - 40772282
     - 40772278
-    - 40772281
     - 40777498
     - 40772280
     - 40772279
@@ -23,17 +21,17 @@ test_record_arm_data:
     - 40772284
   ui_fps: 20.0
   calib_save_dir: "D:/calib_arm"  # 标定图片保存目录（本机所有相机共用）
-  fps: 200
+  fps: 100
   gain: 0.0
   gamma: 1.0
-  exposure_time: 4000.0
+  exposure_time: 8000.0
   window_width: 1600
   window_height: 800
   cam_width: 2448
   cam_height: 2048
 
 resolve_calib_board_pose:
-  cam_xml_dir: "D:/calib_arm/cam_calib_output"   # calib_cam_chain 输出的 XML 所在目录 (自动扫描)
+  cam_xml_dir: "D:/cam_calib_output"   # calib_cam_chain 输出的 XML 所在目录 (自动扫描)
   input_image_dir: "D:/calib_arm"                 # 标定图片目录
   output_file: "D:/calib_board_pose/board_poses.txt"
   calib_plane: "D:/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
