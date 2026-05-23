@@ -1,12 +1,15 @@
 # Camera calibration
 cam_calib:
   input_folder: "D:/calib_images"
-  calib_plane: "D:/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
+  calib_plane: "C:/hitsz/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
   output_folder: "D:/calib_output"
   focus: 0.016 # m
   pixel_size_x: 2.74e-6 # m
   pixel_size_y: 2.74e-6 # m
   center_cam: "40772280"         # 中心相机 SN，空则默认相机 0 为参考
+  focus_overrides:               # 特定相机焦距覆盖 (m), SN → focus
+    40772283: 0.075
+    40772276: 0.075
 
 # Calibration Offline Settings
 test_calib:

@@ -154,16 +154,24 @@ void action()
         HTuple hv_CurrentFile = hv_ImagePath + "/calib_cam_" + HTuple(cam_sn_list[camIdx].c_str()) + "_01";
         try {
             ReadImage(&ho_Image, hv_CurrentFile);
-            // 彩色图转为灰度，保证标定一致性
             HTuple hv_Channels;
             CountChannels(ho_Image, &hv_Channels);
             if (hv_Channels.I() == 3) {
                 Rgb1ToGray(ho_Image, &ho_Image);
             }
             GetImageSize(ho_Image, &hv_Width, &hv_Height);
-            
-            gen_cam_par_area_scan_division(focus, 0, pixel_size_x, pixel_size_y, 
-                                           hv_Width/2, hv_Height/2, hv_Width, hv_Height, 
+
+            // 检查该相机是否有特定的焦距覆盖
+            double cam_focus = focus;
+            try {
+                auto& overrides = cfg["cam_calib"]["focus_overrides"];
+                cam_focus = overrides[cam_sn_list[camIdx]].as<double>();
+                std::cout << "Camera " << camIdx << " (" << cam_sn_list[camIdx]
+                          << ") focus override: " << cam_focus * 1000.0 << "mm" << std::endl;
+            } catch (...) {}
+
+            gen_cam_par_area_scan_division(cam_focus, 0, pixel_size_x, pixel_size_y,
+                                           hv_Width/2, hv_Height/2, hv_Width, hv_Height,
                                            &hv_StartCamParam);
             
             SetCalibDataCamParam(hv_CalibDataID, camIdx, HTuple(), hv_StartCamParam);
