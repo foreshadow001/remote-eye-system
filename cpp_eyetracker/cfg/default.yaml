@@ -1,11 +1,11 @@
 # Camera calibration
 cam_calib:
-  input_folder: "D:/hitsz/projects/new_dataset/test_cam_calib/pictures/"
+  input_folder: "D:/calib_images/"
   calib_plane: "D:/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
-  output_folder: "D:/hitsz/projects/new_dataset/test_cam_calib/output/"
-  focus: 0.012 # m
-  pixel_size_x: 3.45e-6 # m
-  pixel_size_y: 3.45e-6 # m
+  output_folder: "D:/calib_output/"
+  focus: 0.016 # m
+  pixel_size_x: 2.74e-6 # m
+  pixel_size_y: 2.74e-6 # m
 
 # Calibration Offline Settings
 test_calib:
