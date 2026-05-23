@@ -163,12 +163,15 @@ void action()
 
             // 检查该相机是否有特定的焦距覆盖
             double cam_focus = focus;
-            try {
+            {
                 auto& overrides = cfg["cam_calib"]["focus_overrides"];
-                cam_focus = overrides[cam_sn_list[camIdx]].as<double>();
-                std::cout << "Camera " << camIdx << " (" << cam_sn_list[camIdx]
-                          << ") focus override: " << cam_focus * 1000.0 << "mm" << std::endl;
-            } catch (...) {}
+                double ov = overrides[cam_sn_list[camIdx]].as<double>();
+                if (ov > 1e-9) {  // as<double>() 对不存在的 key 返回 0，需判断有效性
+                    cam_focus = ov;
+                    std::cout << "Camera " << camIdx << " (" << cam_sn_list[camIdx]
+                              << ") focus override: " << cam_focus * 1000.0 << "mm" << std::endl;
+                }
+            }
 
             gen_cam_par_area_scan_division(cam_focus, 0, pixel_size_x, pixel_size_y,
                                            hv_Width/2, hv_Height/2, hv_Width, hv_Height,
