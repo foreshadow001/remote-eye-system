@@ -57,14 +57,18 @@ public:
 
     template<typename T>
     T as() const {
-        if (!is_valid_) return T{}; // 已经报错过了，直接返回空值，不再报坏转换的错
+        if (!is_valid_) {
+            throw std::runtime_error(
+                "[Cfg ERROR] Cannot read value at path: '" + path_
+                + "'. Key does not exist in config file.");
+        }
         try {
             return node_.as<T>();
         } catch (const YAML::Exception& e) {
-            Logger::error() << "[Cfg ERROR] Type mismatch at path: '" << path_ 
-                            << "'. Expected: " << typeid(T).name() 
-                            << ". Details: " << e.what();
-            return T{};
+            throw std::runtime_error(
+                "[Cfg ERROR] Type mismatch at path: '" + path_
+                + "'. Expected: " + typeid(T).name()
+                + ". Details: " + std::string(e.what()));
         }
     }
 
