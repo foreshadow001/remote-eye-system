@@ -58,6 +58,7 @@ atomic<bool> g_xfer_active{false};
 atomic<bool> g_fault_active{false};
 atomic<int> g_faulty_cam{-1};
 atomic<bool> g_fault_on_master{false};
+atomic<int> g_last_capture_index{-1};
 chrono::steady_clock::time_point g_ready_time;
 chrono::steady_clock::time_point g_fault_time;
 int g_win_w = 1224;
@@ -625,6 +626,7 @@ void udpListenerWorker(const string& bind_ip, int port) {
                 stringstream ss;
                 ss << setw(2) << setfill('0') << img_idx;
                 cout << "[Slave] PHOTO " << img_idx << endl;
+                g_last_capture_index.store(img_idx, memory_order_relaxed);
 
                 for (auto& ctx : cam_ctxs) {
                     cv::Mat snapshot;
@@ -641,6 +643,19 @@ void udpListenerWorker(const string& bind_ip, int port) {
                         cout << "  -> Saved " << fn << endl;
                     }
                 }
+            }
+            else if (cmd.rfind("UNDO:", 0) == 0) {
+                int idx = stoi(cmd.substr(5));
+                stringstream ss; ss << setw(2) << setfill('0') << idx;
+                cout << "[Slave] UNDO index " << ss.str() << endl;
+                if (fs::exists(g_calib_save_dir)) {
+                    for (auto& e : fs::directory_iterator(g_calib_save_dir)) {
+                        string stem = e.path().stem().string();
+                        if (stem.rfind("calib_cam_", 0) == 0 && stem.substr(stem.length() - 2) == ss.str())
+                            fs::remove(e.path());
+                    }
+                }
+                g_last_capture_index.store(idx - 1, memory_order_relaxed);
             }
             else if (cmd == "LIST") {
                 cout << "[Slave] LIST request" << endl;
@@ -864,6 +879,7 @@ int main() {
         cout << "  T     - Pull missing slave images" << endl;
         cout << "  C     - Clear all calibration photos (both hosts)" << endl;
     }
+    cout << "  Z     - Undo last capture (both hosts)" << endl;
     cout << "  Q/ESC - Quit\n" << endl;
 
     g_ready_time = chrono::steady_clock::now();
@@ -983,6 +999,7 @@ int main() {
                     fastUdpSend(g_slave_addr, "PHOTO:" + to_string(counter));
                 }
 
+                g_last_capture_index.store(counter, memory_order_relaxed);
                 cout << "\n[Photo] Capturing index " << counter << endl;
                 for (auto& ctx : cam_ctxs) {
                     cv::Mat snapshot;
@@ -1006,6 +1023,29 @@ int main() {
             transferMissingImages();
             // 传输期间 UI 被阻塞，返回后刷新 UI
             last_ui_time = chrono::steady_clock::now() - ui_interval;
+        }
+        else if ((key == 'z' || key == 'Z') && !g_xfer_active && !g_fault_active.load()) {
+            int last_idx = g_last_capture_index.load(memory_order_relaxed);
+            if (last_idx < 0) {
+                cout << "[Undo] No previous capture to undo." << endl;
+            } else {
+                stringstream ss; ss << setw(2) << setfill('0') << last_idx;
+                cout << "\n[Undo] Deleting capture index " << ss.str() << endl;
+                // 删除本地文件
+                if (fs::exists(g_calib_save_dir)) {
+                    for (auto& e : fs::directory_iterator(g_calib_save_dir)) {
+                        string stem = e.path().stem().string();
+                        if (stem.rfind("calib_cam_", 0) == 0 && stem.length() >= 2
+                            && stem.substr(stem.length() - 2) == ss.str())
+                            fs::remove(e.path());
+                    }
+                }
+                // 通知 slave
+                if (g_enable_net_sync && g_is_master)
+                    fastUdpSend(g_slave_addr, "UNDO:" + to_string(last_idx));
+                g_last_capture_index.store(last_idx - 1, memory_order_relaxed);
+                cout << "[Undo] Done.\n" << endl;
+            }
         }
         else if ((key == 'c' || key == 'C') && g_is_master && g_enable_net_sync && !g_xfer_active) {
             cout << "\n[Clear] Removing local calibration photos..." << endl;

@@ -75,6 +75,8 @@ struct CameraContext {
 
 vector<shared_ptr<CameraContext>> cam_ctxs;
 atomic<int> g_enlarged_cam{-1};
+int g_last_capture_index = -1;
+string g_last_capture_arm;
 
 // UI layout
 int g_win_w = 1224, g_win_h = 1024;
@@ -432,7 +434,7 @@ int main() {
 
             // Bottom-left hints
             int tx = g_right_x + 10, ty = g_win_h - 60;
-            cv::putText(canvas, "[t] switch  [space] capture  [c] clear  [q] quit",
+            cv::putText(canvas, "[t] switch  [space] capture  [z] undo  [c] clear  [q] quit",
                         cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, 0.4,
                         cv::Scalar(150, 150, 150), 1, cv::LINE_AA);
             ty += 22;
@@ -454,6 +456,51 @@ int main() {
             g_current_arm = (g_current_arm == "upper") ? "lower" : "upper";
             cout << "[Arm] Switched to: " << g_current_arm << endl;
         }
+        else if (key == 'z' || key == 'Z') {
+            if (g_last_capture_index < 0) {
+                cout << "[Undo] No previous capture to undo." << endl;
+            } else {
+                stringstream ss; ss << setw(2) << setfill('0') << g_last_capture_index;
+                string idx_str = ss.str();
+                cout << "\n[Undo] Deleting capture index " << idx_str
+                     << " (arm: " << g_last_capture_arm << ")" << endl;
+
+                // 删除所有相机的该索引照片
+                if (fs::exists(g_calib_save_dir)) {
+                    for (auto& e : fs::directory_iterator(g_calib_save_dir)) {
+                        string stem = e.path().stem().string();
+                        if (stem.rfind("calib_cam_", 0) == 0 && stem.length() >= 2
+                            && stem.substr(stem.length() - 2) == idx_str)
+                            fs::remove(e.path());
+                    }
+                }
+
+                // 从映射文件移除最后一行
+                string mf_path = (g_last_capture_arm == "upper")
+                    ? g_mapping_file_upper : g_mapping_file_lower;
+                if (fs::exists(mf_path)) {
+                    vector<string> lines;
+                    {
+                        ifstream in(mf_path);
+                        string line;
+                        while (getline(in, line)) {
+                            if (!line.empty() && line[0] != '#') lines.push_back(line);
+                        }
+                    }
+                    // 移除最后一行的数据行
+                    while (!lines.empty() && lines.back()[0] == '#') lines.pop_back();
+                    if (!lines.empty()) lines.pop_back();
+                    {
+                        ofstream out(mf_path);
+                        out << "# index arm x y z qx qy qz qw alpha beta gamma\n";
+                        for (auto& l : lines) out << l << "\n";
+                    }
+                }
+
+                g_last_capture_index--;
+                cout << "[Undo] Done.\n" << endl;
+            }
+        }
         else if (key == 'c' || key == 'C') {
             cout << "\n[Clear] Removing all photos and mapping files..." << endl;
             int removed = 0;
@@ -474,6 +521,8 @@ int main() {
             ss << setw(2) << setfill('0') << counter;
             string idx_str = ss.str();
 
+            g_last_capture_index = counter;
+            g_last_capture_arm = g_current_arm;
             cout << "\n[Capture] Index " << idx_str << " | Arm: " << g_current_arm << endl;
 
             // 1. 保存所有相机照片
