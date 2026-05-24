@@ -118,27 +118,17 @@ void tcpWorker() {
 
         while (g_running) {
             string cmd = "GET_POSE:" + g_current_arm + "\n";
-            cout << "[TCP] send: '" << cmd.substr(0, cmd.length()-1) << "'" << endl;
-            if (send(sock, cmd.c_str(), (int)cmd.length(), 0) <= 0) {
-                cout << "[TCP] send FAILED" << endl;
-                break;
-            }
+            if (send(sock, cmd.c_str(), (int)cmd.length(), 0) <= 0) break;
 
             string line;
             if (!recvLine(sock, line, 3000)) break;
 
             string arm;
             FlangePose pose;
-            cout << "[TCP] raw recv: '" << line << "'" << endl;
             if (parsePoseResponse(line, arm, pose)) {
                 lock_guard<mutex> lock(g_pose_mtx);
                 if (arm == "upper") g_upper_pose = pose;
                 else if (arm == "lower") g_lower_pose = pose;
-                cout << "[TCP] updated " << arm << " pose: "
-                     << pose.x << "," << pose.y << "," << pose.z
-                     << " | euler " << pose.alpha << "," << pose.beta << "," << pose.gamma << endl;
-            } else {
-                cout << "[TCP] parse FAILED for line: '" << line << "'" << endl;
             }
             this_thread::sleep_for(chrono::milliseconds(200));
         }
