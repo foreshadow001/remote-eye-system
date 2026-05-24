@@ -31,7 +31,12 @@ test_record_arm_data:
   cam_height: 2048
 
 resolve_calib_board_pose:
-  cam_xml_dir: "D:/cam_calib_output"   # calib_cam_chain 输出的 XML 所在目录 (自动扫描)
-  input_image_dir: "D:/calib_arm"                 # 标定图片目录
-  output_file: "D:/calib_board_pose/board_poses.txt"
-  calib_plane: "D:/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
+  input_image_dir: "D:/calib_arm"                 # 标定图片目录 (upper/ lower/ 子目录)
+  xml_dir: "D:/calib_output"                      # calib_cam_chain 输出的 *_Data.xml 所在目录
+  output_dir: "D:/calib_board_pose"               # 输出 board_poses_upper.txt, board_poses_lower.txt
+  calib_plane: "C:/hitsz/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
+  focus: 0.016                                    # 默认焦距 (m)
+  pixel_size_x: 2.74e-6
+  pixel_size_y: 2.74e-6
+  center_cam: "40772280"
+  only_use_center_cam: false                       # true = 只用中心相机, 用于对比多相机效果

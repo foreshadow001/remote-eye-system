@@ -4,11 +4,11 @@ find_package(OpenCV CONFIG REQUIRED)
 
 # ---- test_calib_arm / test_record_arm_data: 不需要 HALCON ----
 
-add_executable(test_calib_arm
-    test_calib_arm.cpp
+add_executable(get_piper_pose
+    get_piper_pose.cpp
 )
 
-target_link_libraries(test_calib_arm
+target_link_libraries(get_piper_pose
     PRIVATE
         eyetracker::cfg
         ${OpenCV_LIBS}
@@ -25,7 +25,7 @@ target_link_libraries(test_record_arm_data
         ${OpenCV_LIBS}
 )
 
-message(STATUS "test_calib_arm will be built")
+message(STATUS "get_piper_pose will be built")
 message(STATUS "test_record_arm_data will be built")
 
 # ---- resolve_calib_board_pose: 需要 HALCON ----
