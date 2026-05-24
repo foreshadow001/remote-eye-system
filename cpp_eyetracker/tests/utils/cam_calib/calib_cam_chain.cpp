@@ -357,7 +357,7 @@ void action()
         GetCalibData(hv_CalibDataID, "camera", camIdx, "params", &hv_CurrentCamParam);
         hv_CurrentPose = poses_in_center[camIdx];
 
-        HTuple outFileName = hv_OutputBaseDir + HTuple(cam_sn_list[camIdx].c_str()) + "_Data.xml";
+        HTuple outFileName = hv_OutputBaseDir + "/" + HTuple(cam_sn_list[camIdx].c_str()) + "_Data.xml";
         OpenFile(outFileName, "output", &hv_FileHandle);
         
         // Write XML Header
