@@ -26,6 +26,21 @@ Quat zxzToQuat(double alpha_deg, double beta_deg, double gamma_deg) {
     return q;
 }
 
+// ============= Quaternion → Z-X-Z'' Euler (degrees) =============
+
+static double clamp1(double v) { return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v); }
+
+PoseZxz quatToZxz(const Quat& q) {
+    double r00 = 1 - 2*q.y*q.y - 2*q.z*q.z, r01 = 2*q.x*q.y - 2*q.z*q.w, r02 = 2*q.x*q.z + 2*q.y*q.w;
+    double r12 = 2*q.y*q.z - 2*q.x*q.w, r20 = 2*q.x*q.z - 2*q.y*q.w, r21 = 2*q.y*q.z + 2*q.x*q.w;
+    double r22 = 1 - 2*q.x*q.x - 2*q.y*q.y;
+    double beta = acos(clamp1(r22)), sb = sin(beta);
+    double alpha, gamma;
+    if (fabs(sb) > 1e-6) { alpha = atan2(r02, -r12); gamma = atan2(r20, r21); }
+    else { gamma = 0.0; alpha = (beta < M_PI/2.0) ? atan2(-r01, r00) : atan2(r01, r00); }
+    return {{0,0,0}, alpha * 180.0 / M_PI, beta * 180.0 / M_PI, gamma * 180.0 / M_PI};
+}
+
 Quat quatMultiply(const Quat& q1, const Quat& q0) {
     Quat r;
     r.x = q1.w*q0.x + q1.x*q0.w + q1.y*q0.z - q1.z*q0.y;
@@ -115,6 +130,22 @@ Pose PiperToCam::convert(const std::string& arm,
                          double qx, double qy, double qz, double qw) const {
     Pose flange{{fx, fy, fz}, {qx, qy, qz, qw}};
     return convert(arm, flange);
+}
+
+// --- Z-X-Z'' Euler 接口 ---
+
+PoseZxz PiperToCam::convertZxz(const std::string& arm, const Pose& flange) const {
+    Pose p = convert(arm, flange);
+    PoseZxz r = quatToZxz(p.quat);
+    r.pos = p.pos;
+    return r;
+}
+
+PoseZxz PiperToCam::convertZxz(const std::string& arm,
+                               double fx, double fy, double fz,
+                               double qx, double qy, double qz, double qw) const {
+    Pose flange{{fx, fy, fz}, {qx, qy, qz, qw}};
+    return convertZxz(arm, flange);
 }
 
 std::vector<std::string> PiperToCam::arms() const {
