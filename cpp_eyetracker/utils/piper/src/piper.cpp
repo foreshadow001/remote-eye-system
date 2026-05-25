@@ -2,6 +2,11 @@
 #include "cfg/config.hpp"
 #include <cmath>
 #include <stdexcept>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+
+using namespace std;
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -81,13 +86,21 @@ Pose composePoses(const Pose& base, const Pose& offset) {
     return r;
 }
 
-Pose armToolToCamPose(const Pose& flange,
+// ============= 完整变换链 =============
+
+Pose computeFullChain(const Pose& flange,
                       const Pt3& tool_trans, const Pt3& tool_rot_zxz_deg,
-                      const Pt3& arm_trans,   const Pt3& arm_rot_zxz_deg) {
+                      const Pt3& arm_trans,   const Pt3& arm_rot_zxz_deg,
+                      const Pt3& board_trans, const Pt3& board_rot_zxz_deg) {
+    // T_tool_in_arm = T_flange * T_tool_offset
     Pose tool_in_arm = computeToolPose(flange, tool_trans, tool_rot_zxz_deg);
+    // T_board_in_arm = T_tool_in_arm * T_board_offset
+    Pose board_in_arm = computeToolPose(tool_in_arm, board_trans, board_rot_zxz_deg);
+    // T_arm_in_ccs
     Quat arm_q = zxzToQuat(arm_rot_zxz_deg.x, arm_rot_zxz_deg.y, arm_rot_zxz_deg.z);
     Pose arm_in_ccs{arm_trans, arm_q};
-    return composePoses(arm_in_ccs, tool_in_arm);
+    // T_board_in_ccs = T_arm_in_ccs * T_board_in_arm
+    return composePoses(arm_in_ccs, board_in_arm);
 }
 
 // ============= PiperToCam =============
@@ -96,7 +109,7 @@ static Pt3 readPt3(const CfgNode& n) {
     return {n[0].as<double>(), n[1].as<double>(), n[2].as<double>()};
 }
 
-PiperToCam::PiperToCam(const std::string& yaml_path) {
+PiperToCam::PiperToCam(const std::string& yaml_path) : path_(yaml_path) {
     Cfg cfg(yaml_path);
     for (auto& arm_name : {"upper", "lower"}) {
         try {
@@ -109,27 +122,47 @@ PiperToCam::PiperToCam(const std::string& yaml_path) {
             c.ccs_t  = readPt3(cc["translation"]);
             c.ccs_r  = readPt3(cc["rotation_zxz"]);
             cfg_[arm_name] = c;
-        } catch (const std::exception& e) {
-            // arm not configured — skip
-        }
+        } catch (const std::exception&) {}
     }
     if (cfg_.empty())
         throw std::runtime_error("[PiperToCam] No arm configs found in " + yaml_path);
 }
 
-Pose PiperToCam::convert(const std::string& arm, const Pose& flange) const {
+const ArmCfg& PiperToCam::cfg(const std::string& arm) const {
     auto it = cfg_.find(arm);
-    if (it == cfg_.end())
-        throw std::runtime_error("[PiperToCam] Unknown arm: " + arm);
-    const auto& c = it->second;
-    return armToolToCamPose(flange, c.tool_t, c.tool_r, c.ccs_t, c.ccs_r);
+    if (it == cfg_.end()) throw std::runtime_error("[PiperToCam] Unknown arm: " + arm);
+    return it->second;
+}
+
+// --- 四元数接口 (使用配置) ---
+
+Pose PiperToCam::convert(const std::string& arm, const Pose& flange) const {
+    const auto& c = cfg(arm);
+    return computeFullChain(flange, c.tool_t, c.tool_r, c.ccs_t, c.ccs_r, {0,0,0}, {0,0,0});
 }
 
 Pose PiperToCam::convert(const std::string& arm,
                          double fx, double fy, double fz,
                          double qx, double qy, double qz, double qw) const {
-    Pose flange{{fx, fy, fz}, {qx, qy, qz, qw}};
-    return convert(arm, flange);
+    return convert(arm, {{fx,fy,fz},{qx,qy,qz,qw}});
+}
+
+// --- 四元数接口 (显式参数, 供 Ceres) ---
+
+Pose PiperToCam::convertWithParams(const Pose& flange,
+                                   const Pt3& tool_trans, const Pt3& tool_rot_zxz_deg,
+                                   const Pt3& arm_trans,   const Pt3& arm_rot_zxz_deg) const {
+    return computeFullChain(flange, tool_trans, tool_rot_zxz_deg,
+                            arm_trans, arm_rot_zxz_deg, {0,0,0}, {0,0,0});
+}
+
+Pose PiperToCam::convertWithParams(const Pose& flange,
+                                   const Pt3& tool_trans, const Pt3& tool_rot_zxz_deg,
+                                   const Pt3& arm_trans,   const Pt3& arm_rot_zxz_deg,
+                                   const Pt3& board_trans, const Pt3& board_rot_zxz_deg) const {
+    return computeFullChain(flange, tool_trans, tool_rot_zxz_deg,
+                            arm_trans, arm_rot_zxz_deg,
+                            board_trans, board_rot_zxz_deg);
 }
 
 // --- Z-X-Z'' Euler 接口 ---
@@ -144,14 +177,51 @@ PoseZxz PiperToCam::convertZxz(const std::string& arm, const Pose& flange) const
 PoseZxz PiperToCam::convertZxz(const std::string& arm,
                                double fx, double fy, double fz,
                                double qx, double qy, double qz, double qw) const {
-    Pose flange{{fx, fy, fz}, {qx, qy, qz, qw}};
-    return convertZxz(arm, flange);
+    return convertZxz(arm, {{fx,fy,fz},{qx,qy,qz,qw}});
 }
 
 std::vector<std::string> PiperToCam::arms() const {
     std::vector<std::string> r;
     for (auto& kv : cfg_) r.push_back(kv.first);
     return r;
+}
+
+// --- 写回 ---
+
+void PiperToCam::writeBackArmInCcs(const std::string& arm,
+                                   const Pt3& trans, const Pt3& rot_zxz) const {
+    ifstream in(path_);
+    if (!in) throw std::runtime_error("[PiperToCam] Cannot read " + path_ + " for writeback");
+    string yaml((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    // 在 arms.<arm>.arm_in_ccs 下替换 translation 和 rotation_zxz 行
+    string key = "  " + arm + ":\n";
+    size_t pos = yaml.find(key);
+    if (pos == string::npos) throw std::runtime_error("[PiperToCam] Arm section not found");
+
+    size_t ccs_pos = yaml.find("    arm_in_ccs:", pos);
+    if (ccs_pos == string::npos) throw std::runtime_error("[PiperToCam] arm_in_ccs not found");
+
+    size_t trans_pos = yaml.find("      translation:", ccs_pos);
+    size_t rot_pos   = yaml.find("      rotation_zxz:", ccs_pos);
+    size_t nl = trans_pos;
+    while (nl < yaml.length() && yaml[nl] != '\n') nl++;
+    size_t nl2 = rot_pos;
+    while (nl2 < yaml.length() && yaml[nl2] != '\n') nl2++;
+
+    stringstream ts, rs;
+    ts << fixed << setprecision(4) << "      translation: ["
+       << trans.x << ", " << trans.y << ", " << trans.z << "]";
+    rs << fixed << setprecision(1) << "      rotation_zxz: ["
+       << rot_zxz.x << ", " << rot_zxz.y << ", " << rot_zxz.z << "]";
+
+    yaml.replace(trans_pos, nl - trans_pos, ts.str());
+    yaml.replace(rot_pos, nl2 - rot_pos, rs.str());
+
+    ofstream out(path_);
+    if (!out) throw std::runtime_error("[PiperToCam] Cannot write " + path_);
+    out << yaml;
 }
 
 } // namespace gazeestimation
