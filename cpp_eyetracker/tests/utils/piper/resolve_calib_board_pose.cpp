@@ -295,8 +295,8 @@ int main(int argc, char* argv[]) {
         Cfg cfg(piper_path);
         auto& rcfg = cfg["resolve_calib_board_pose"];
 
-        string img_base   = rcfg["input_image_dir"].as<string>();
-        string out_dir    = rcfg["output_dir"].as<string>();
+        string img_base   = cfg["test_record_arm_data"]["calib_save_dir"].as<string>();
+        string out_dir    = img_base;
         HTuple hv_cp      = rcfg["calib_plane"].as<string>().c_str();
         double focus      = rcfg["focus"].as<double>();
         double px_sx      = rcfg["pixel_size_x"].as<double>();
