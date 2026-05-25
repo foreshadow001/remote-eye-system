@@ -33,6 +33,7 @@ target_link_libraries(test_piper_to_cam
     PRIVATE
         eyetracker::piper
         eyetracker::cfg
+        ${OpenCV_LIBS}
 )
 
 message(STATUS "get_piper_pose will be built")

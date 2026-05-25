@@ -10,8 +10,11 @@ arms:
       rotation_zxz: [0.0, 90.0, 90.0]     # 度, 内旋 Z-X-Z''
     calib:
       translation:
-        init_value: 
-        bounds: []
+        init_value: [0.0, 0.0, -0.2]
+        bounds:
+          - [-0.05, 0.05]
+          - [-0.05, 0.05]
+          - [-0.1, -0.3]
       rotation_zxz:
         init_value: 
         bounds: []

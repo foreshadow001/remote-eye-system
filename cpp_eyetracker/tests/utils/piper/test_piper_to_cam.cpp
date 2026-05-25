@@ -118,35 +118,32 @@ int main() {
 
     while (g_running) {
         cv::Mat canvas = cv::Mat::zeros(480, 640, CV_8UC3);
-        int y = 28;
-        auto put = [&](const string& s, cv::Scalar c={255,255,255}, double fs=0.5) {
-            cv::putText(canvas, s, {15,y}, cv::FONT_HERSHEY_SIMPLEX, fs, c, 1, cv::LINE_AA);
-            y += (int)(22 * fs);
-        };
-
         string arm_label = (g_arm=="upper")?"UPPER":"LOWER";
         cv::Scalar ac = (g_arm=="upper")?cv::Scalar(0,215,255):cv::Scalar(200,80,255);
-        cv::putText(canvas, arm_label + "  " + g_status, {15,20}, cv::FONT_HERSHEY_SIMPLEX, 0.7,
+        cv::putText(canvas, arm_label + "  " + g_status, {15,25}, cv::FONT_HERSHEY_SIMPLEX, 0.6,
                     (g_status=="Connected"?cv::Scalar(0,255,0):ac), 2, cv::LINE_AA);
-        y = 55;
 
-        Pose fl, tq; PoseZxz tz;
+        Pose fl;
         { lock_guard<mutex> lk(g_mtx); fl = g_flange_quat; }
-
+        Pose tq; PoseZxz tz;
         try { tq = p2c.convert(g_arm, fl); tz = p2c.convertZxz(g_arm, fl); }
-        catch (...) { y+=22; put("(no data)"); }
+        catch (...) {}
 
-        char b[128];
-        put("--- FLANGE (arm frame) ---", {200,200,200}, 0.55);
-        snprintf(b,sizeof(b),"XYZ:        [%.4f, %.4f, %.4f] m", fl.pos.x,fl.pos.y,fl.pos.z); put(b);
-        snprintf(b,sizeof(b),"Quat (wxyz):[%.4f, %.4f, %.4f, %.4f]", fl.quat.w,fl.quat.x,fl.quat.y,fl.quat.z); put(b);
-        y += 8;
+        int y = 55;
+        auto put = [&](const string& s, cv::Scalar c={255,255,255}) {
+            cv::putText(canvas, s, {15,y}, cv::FONT_HERSHEY_SIMPLEX, 0.45, c, 1, cv::LINE_AA);
+            y += 22;
+        };
 
-        put("--- TOOL in CCS (center cam frame) ---", {200,200,200}, 0.55);
-        put("  [Quaternion]", {0,255,255}, 0.5);
-        snprintf(b,sizeof(b),"  XYZ:    [%.4f, %.4f, %.4f] m", tq.pos.x,tq.pos.y,tq.pos.z); put(b);
-        snprintf(b,sizeof(b),"  wxyz:   [%.4f, %.4f, %.4f, %.4f]", tq.quat.w,tq.quat.x,tq.quat.y,tq.quat.z); put(b);
-        put("  [Z-X-Z'' Euler]", {0,255,0}, 0.5);
+        char b[256];
+        put("--- FLANGE (arm frame) ---", {200,200,200});
+        snprintf(b,sizeof(b),"XYZ:         [%.4f, %.4f, %.4f] m", fl.pos.x,fl.pos.y,fl.pos.z); put(b);
+        snprintf(b,sizeof(b),"Quat (wxyz):  [%.4f, %.4f, %.4f, %.4f]", fl.quat.w,fl.quat.x,fl.quat.y,fl.quat.z); put(b);
+        y += 6;
+        put("--- TOOL in CCS (center cam frame) ---", {200,200,200});
+        snprintf(b,sizeof(b),"Quat XYZ:     [%.4f, %.4f, %.4f] m", tq.pos.x,tq.pos.y,tq.pos.z); put(b);
+        snprintf(b,sizeof(b),"Quat wxyz:    [%.4f, %.4f, %.4f, %.4f]", tq.quat.w,tq.quat.x,tq.quat.y,tq.quat.z); put(b);
+        put("Z-X-Z'' Euler:", {0,255,0});
         snprintf(b,sizeof(b),"  alpha,beta,gamma: [%.2f, %.2f, %.2f] deg", tz.alpha,tz.beta,tz.gamma); put(b);
 
         y = 450;
