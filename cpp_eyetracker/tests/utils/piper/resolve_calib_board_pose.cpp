@@ -293,16 +293,17 @@ int main(int argc, char* argv[]) {
         auto piper_path = (fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()
                            / "cfg" / "piper.yaml").string();
         Cfg cfg(piper_path);
+        Cfg default_cfg;
         auto& rcfg = cfg["resolve_calib_board_pose"];
 
         string img_base   = cfg["test_record_arm_data"]["calib_save_dir"].as<string>();
         string out_dir    = img_base;
-        HTuple hv_cp      = cfg["cam_calib"]["calib_plane"].as<string>().c_str();
+        HTuple hv_cp      = default_cfg["cam_calib"]["calib_plane"].as<string>().c_str();
         double focus      = rcfg["focus"].as<double>();
         double px_sx      = rcfg["pixel_size_x"].as<double>();
         double px_sy      = rcfg["pixel_size_y"].as<double>();
         string center_sn  = rcfg["center_cam"].as<string>();
-        string xml_dir    = cfg["cam_calib"]["output_folder"].as<string>();
+        string xml_dir    = default_cfg["cam_calib"]["output_folder"].as<string>();
 
         cout << "=== Resolve Calibration Board Pose ===" << endl;
         cout << "Image base:  " << img_base << endl;
