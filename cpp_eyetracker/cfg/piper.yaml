@@ -2,8 +2,34 @@
 arms:
   upper:
     can_port: "piper_upper"
+    tool:                                  # 末端工具/标定板 在法兰盘坐标系中的位姿
+      translation: [0.0, 0.0, 0.02]       # 米 (法兰盘坐标系)
+      rotation_zxz: [0.0, 0.0, 45.0]      # 度, 内旋 Z-X-Z''
+    arm_in_ccs:                            # 机械臂基座 在相机坐标系中的位姿
+      translation: [0.0, 0.0, 0.0]        # 米
+      rotation_zxz: [0.0, 90.0, 90.0]     # 度, 内旋 Z-X-Z''
+    calib:
+      translation:
+        init_value: 
+        bounds: []
+      rotation_zxz:
+        init_value: 
+        bounds: []
   lower:
     can_port: "piper_lower"
+    tool:
+      translation: [0.0, 0.0, 0.02]
+      rotation_zxz: [0.0, 0.0, 0.0]
+    arm_in_ccs:
+      translation: [0.0, 0.6, 0.0]
+      rotation_zxz: [0.0, 90.0, 90.0]
+    calib:
+      translation:
+        init_value: 
+        bounds: []
+      rotation_zxz:
+        init_value: 
+        bounds: []
 
 # Network config (must match Ubuntu net.yaml)
 network:

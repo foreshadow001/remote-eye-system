@@ -4,6 +4,7 @@ add_subdirectory(cam_model)
 add_subdirectory(glint_detection)
 add_subdirectory(pupil_center)
 add_subdirectory(cam)
+add_subdirectory(piper)
 
 add_library(utils STATIC
     src/gaze_estimation_types.cpp
