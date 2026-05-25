@@ -40,6 +40,18 @@ message(STATUS "get_piper_pose will be built")
 message(STATUS "test_record_arm_data will be built")
 message(STATUS "test_piper_to_cam will be built")
 
+add_executable(test_piper_calib
+    test_piper_calib.cpp
+)
+
+target_link_libraries(test_piper_calib
+    PRIVATE
+        eyetracker::piper
+        eyetracker::cfg
+)
+
+message(STATUS "test_piper_calib will be built")
+
 # ---- resolve_calib_board_pose: 需要 HALCON ----
 if(NOT DEFINED ENV{HALCONROOT})
     message(WARNING "HALCONROOT not set. Skipping resolve_calib_board_pose.")

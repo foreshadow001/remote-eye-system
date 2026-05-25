@@ -72,4 +72,43 @@ private:
     std::map<std::string, ArmCfg> cfg_;
 };
 
+// ===================== Ceres 标定求解类 =====================
+
+// 单个观测: flange 位姿 + 标定板在 CCS 中的观测位姿
+struct PiperCalibObs {
+    Pose flange;
+    PoseZxz board_in_ccs;  // 观测值 (来自 resolve_calib_board_pose 输出)
+};
+
+class PiperArmCalibrator {
+public:
+    // 从 piper.yaml 加载初始值和 bounds
+    PiperArmCalibrator(const std::string& yaml_path, const std::string& arm);
+
+    void addObservation(const Pose& flange, const PoseZxz& board_in_ccs);
+    size_t numObservations() const { return obs_.size(); }
+
+    // 求解, 返回 true 表示成功
+    bool solve();
+
+    // 获取优化后的参数
+    Pt3 armTrans()   const { return arm_t_; }
+    Pt3 armRotZxz()  const { return arm_r_; }
+
+    // 写回 arm_in_ccs 到 yaml
+    void writeBack() const;
+
+private:
+    std::string yaml_path_, arm_;
+    Pt3 tool_t_, tool_r_;       // tool_in_flange (从配置)
+    Pt3 arm_t_, arm_r_;         // arm_in_ccs 结果
+    Pt3 board_t_, board_r_;     // board_in_flange 结果 (辅助, 不保存)
+
+    // bounds: [x_lower, y_lower, z_lower], [x_upper, y_upper, z_upper]
+    Pt3 arm_t_lo_, arm_t_hi_, arm_r_lo_, arm_r_hi_;
+    Pt3 board_t_lo_, board_t_hi_, board_r_lo_, board_r_hi_;
+
+    std::vector<PiperCalibObs> obs_;
+};
+
 } // namespace gazeestimation
