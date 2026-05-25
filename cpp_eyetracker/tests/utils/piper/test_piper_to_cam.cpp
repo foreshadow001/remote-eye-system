@@ -1,17 +1,9 @@
-// 将机械臂 flange 位姿 (TCP 获取) 转换到相机坐标系 (center cam)
-// 变换链与 end_pose_monitor.py 完全一致
-#include <iostream>
-#include <iomanip>
-#include <string>
-#include <sstream>
-#include <chrono>
-#include <filesystem>
-#include <vector>
-
+// 机械臂 flange → tool-in-CCS 位姿, 输出四元数 + ZXZ'' 两种格式
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
     #include <winsock2.h>
     #include <ws2tcpip.h>
+    #include <windows.h>
     #pragma comment(lib, "ws2_32.lib")
 #else
     #include <sys/socket.h>
@@ -23,6 +15,18 @@
     #define closesocket close
 #endif
 
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <iomanip>
+#include <string>
+#include <sstream>
+#include <chrono>
+#include <filesystem>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <vector>
+
 #include "piper/piper.hpp"
 #include "cfg/config.hpp"
 
@@ -33,8 +37,12 @@ atomic<bool> g_running{true};
 string g_arm = "upper";
 string g_ip;
 int g_port = 0;
+mutex g_mtx;
+Pose    g_flange_quat;
+Pose    g_tool_quat;
+PoseZxz g_tool_zxz;
+string  g_status = "Disconnected";
 
-// 从 TCP 读一行
 bool recvLine(SOCKET s, string& line, int ms = 3000) {
 #ifdef _WIN32
     DWORD to = ms; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
@@ -51,82 +59,117 @@ bool recvLine(SOCKET s, string& line, int ms = 3000) {
     return false;
 }
 
-int main() {
-#ifdef _WIN32
-    WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
-#endif
-    namespace fs = std::filesystem;
-    auto yaml_path = (fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()
-                      / "cfg" / "piper.yaml").string();
-    PiperToCam p2c(yaml_path);
-
-    Cfg cfg(yaml_path);
-    g_ip   = cfg["network"]["ubuntu_ip"].as<string>();
-    g_port = cfg["network"]["port"].as<int>();
-
-    cout << fixed << setprecision(4);
-    cout << "=== Piper Flange → Center Cam Pose ===\n" << endl;
-    cout << "Server: " << g_ip << ":" << g_port << endl;
-    cout << "Loaded arms:";
-    for (auto& a : p2c.arms()) cout << " " << a;
-    cout << "\nKeys: t=switch arm  g=query+print  q=quit\n" << endl;
-
+void tcpWorker() {
     while (g_running) {
-        // Connect
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        sockaddr_in sv{}; sv.sin_family=AF_INET; sv.sin_port=htons(g_port);
+        sockaddr_in sv{}; sv.sin_family = AF_INET; sv.sin_port = htons(g_port);
         inet_pton(AF_INET, g_ip.c_str(), &sv.sin_addr);
+        g_status = "Connecting...";
         if (connect(s, (sockaddr*)&sv, sizeof(sv)) != 0) {
-            cerr << "Connect failed, retry..." << endl;
+            g_status = "Connect failed";
             closesocket(s);
             this_thread::sleep_for(chrono::seconds(2));
             continue;
         }
-        cout << "Connected." << endl;
-
+        g_status = "Connected";
         while (g_running) {
-            this_thread::sleep_for(chrono::milliseconds(100));
-
-            // Check keypress
-            cout << "\n[t]switch [g]query [q]quit  arm=" << g_arm << " > " << flush;
-            string input;
-            getline(cin, input);
-            if (input == "q") { g_running = false; break; }
-            if (input == "t") { g_arm = (g_arm=="upper")?"lower":"upper"; cout << "Switched to " << g_arm << endl; continue; }
-            if (input != "g") continue;
-
-            // Send GET_POSE
             string cmd = "GET_POSE:" + g_arm + "\n";
-            if (send(s, cmd.c_str(), (int)cmd.length(), 0) <= 0) { cout << "Send failed." << endl; break; }
-
+            if (send(s, cmd.c_str(), (int)cmd.length(), 0) <= 0) break;
             string resp;
-            if (!recvLine(s, resp) || resp.rfind("POSE:",0)!=0) { cout << "No pose." << endl; continue; }
-
-            // Parse: POSE:arm:x,y,z,qx,qy,qz,qw,alpha,beta,gamma
+            if (!recvLine(s, resp) || resp.rfind("POSE:",0)!=0) break;
             string data = resp.substr(5);
             size_t pp = data.find(':'); string an = data.substr(0,pp);
             string vs = data.substr(pp+1);
             vector<double> nv; stringstream vss(vs); string tok;
             while (getline(vss,tok,',')) nv.push_back(stod(tok));
             if (nv.size()<10) continue;
-
-            Pose flange;
-            flange.pos    = {nv[0], nv[1], nv[2]};
-            flange.quat   = {nv[3], nv[4], nv[5], nv[6]};
-
-            // Transform via PiperToCam
-            Pose tool_in_ccs = p2c.convert(g_arm, flange);
-
-            cout << "\n=== " << g_arm << " FLANGE (arm frame) ===" << endl;
-            cout << "Pos (m):       ["<<flange.pos.x<<", "<<flange.pos.y<<", "<<flange.pos.z<<"]" << endl;
-            cout << "Quat (wxyz):   ["<<flange.quat.w<<", "<<flange.quat.x<<", "<<flange.quat.y<<", "<<flange.quat.z<<"]" << endl;
-
-            cout << "\n=== " << g_arm << " TOOL in CCS (center cam frame) ===" << endl;
-            cout << "Pos (m):       ["<<tool_in_ccs.pos.x<<", "<<tool_in_ccs.pos.y<<", "<<tool_in_ccs.pos.z<<"]" << endl;
-            cout << "Quat (wxyz):   ["<<tool_in_ccs.quat.w<<", "<<tool_in_ccs.quat.x<<", "<<tool_in_ccs.quat.y<<", "<<tool_in_ccs.quat.z<<"]" << endl;
+            Pose flange{{nv[0],nv[1],nv[2]},{nv[3],nv[4],nv[5],nv[6]}};
+            lock_guard<mutex> lk(g_mtx);
+            g_flange_quat = flange;
+            this_thread::sleep_for(chrono::milliseconds(200));
         }
+        g_status = "Disconnected";
         closesocket(s);
+        this_thread::sleep_for(chrono::seconds(1));
     }
+}
+
+int main() {
+#ifdef _WIN32
+    WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
+#endif
+    namespace fs = std::filesystem;
+    auto yp = (fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()/"cfg"/"piper.yaml").string();
+    PiperToCam p2c(yp);
+    Cfg cfg(yp);
+    g_ip = cfg["network"]["ubuntu_ip"].as<string>();
+    g_port = cfg["network"]["port"].as<int>();
+
+    cout << "=== Piper Flange -> Tool in CCS ===" << endl;
+    cout << "Server: " << g_ip << ":" << g_port << endl;
+    cout << "Arms:";
+    for (auto& a : p2c.arms()) cout << " " << a;
+    cout << "\n[t]switch  [g]print  [q]quit\n" << endl;
+
+    thread tcp(tcpWorker);
+
+    cv::namedWindow("Piper Arm → CCS", cv::WINDOW_NORMAL);
+    cv::resizeWindow("Piper Arm → CCS", 640, 480);
+
+    while (g_running) {
+        cv::Mat canvas = cv::Mat::zeros(480, 640, CV_8UC3);
+        int y = 28;
+        auto put = [&](const string& s, cv::Scalar c={255,255,255}, double fs=0.5) {
+            cv::putText(canvas, s, {15,y}, cv::FONT_HERSHEY_SIMPLEX, fs, c, 1, cv::LINE_AA);
+            y += (int)(22 * fs);
+        };
+
+        string arm_label = (g_arm=="upper")?"UPPER":"LOWER";
+        cv::Scalar ac = (g_arm=="upper")?cv::Scalar(0,215,255):cv::Scalar(200,80,255);
+        cv::putText(canvas, arm_label + "  " + g_status, {15,20}, cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                    (g_status=="Connected"?cv::Scalar(0,255,0):ac), 2, cv::LINE_AA);
+        y = 55;
+
+        Pose fl, tq; PoseZxz tz;
+        { lock_guard<mutex> lk(g_mtx); fl = g_flange_quat; }
+
+        try { tq = p2c.convert(g_arm, fl); tz = p2c.convertZxz(g_arm, fl); }
+        catch (...) { y+=22; put("(no data)"); }
+
+        char b[128];
+        put("--- FLANGE (arm frame) ---", {200,200,200}, 0.55);
+        snprintf(b,sizeof(b),"XYZ:        [%.4f, %.4f, %.4f] m", fl.pos.x,fl.pos.y,fl.pos.z); put(b);
+        snprintf(b,sizeof(b),"Quat (wxyz):[%.4f, %.4f, %.4f, %.4f]", fl.quat.w,fl.quat.x,fl.quat.y,fl.quat.z); put(b);
+        y += 8;
+
+        put("--- TOOL in CCS (center cam frame) ---", {200,200,200}, 0.55);
+        put("  [Quaternion]", {0,255,255}, 0.5);
+        snprintf(b,sizeof(b),"  XYZ:    [%.4f, %.4f, %.4f] m", tq.pos.x,tq.pos.y,tq.pos.z); put(b);
+        snprintf(b,sizeof(b),"  wxyz:   [%.4f, %.4f, %.4f, %.4f]", tq.quat.w,tq.quat.x,tq.quat.y,tq.quat.z); put(b);
+        put("  [Z-X-Z'' Euler]", {0,255,0}, 0.5);
+        snprintf(b,sizeof(b),"  alpha,beta,gamma: [%.2f, %.2f, %.2f] deg", tz.alpha,tz.beta,tz.gamma); put(b);
+
+        y = 450;
+        cv::putText(canvas, "[t]switch  [g]print  [q]quit", {15,y}, cv::FONT_HERSHEY_SIMPLEX, 0.45, {150,150,150}, 1);
+
+        cv::imshow("Piper Arm -> CCS", canvas);
+        char key = (char)cv::waitKey(50);
+        if (key=='q'||key==27) g_running = false;
+        else if (key=='t'||key=='T') g_arm = (g_arm=="upper")?"lower":"upper";
+        else if (key=='g'||key=='G') {
+            cout << "\n=== " << g_arm << " ===" << endl;
+            cout << fixed << setprecision(4);
+            cout << "FLANGE pos: ["<<fl.pos.x<<", "<<fl.pos.y<<", "<<fl.pos.z<<"]" << endl;
+            cout << "FLANGE quat:[w="<<fl.quat.w<<", x="<<fl.quat.x<<", y="<<fl.quat.y<<", z="<<fl.quat.z<<"]"<<endl;
+            cout << "TOOL_CCS quat: ["<<tq.pos.x<<", "<<tq.pos.y<<", "<<tq.pos.z
+                 <<"]  wxyz=["<<tq.quat.w<<","<<tq.quat.x<<","<<tq.quat.y<<","<<tq.quat.z<<"]"<<endl;
+            cout << fixed << setprecision(2);
+            cout << "TOOL_CCS ZXZ'': ["<<tz.alpha<<", "<<tz.beta<<", "<<tz.gamma<<"] deg\n"<<endl;
+        }
+    }
+    g_running = false;
+    if (tcp.joinable()) tcp.join();
+    cv::destroyAllWindows();
 #ifdef _WIN32
     WSACleanup();
 #endif
