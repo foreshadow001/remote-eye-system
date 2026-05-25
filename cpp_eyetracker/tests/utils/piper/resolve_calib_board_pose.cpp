@@ -297,14 +297,12 @@ int main(int argc, char* argv[]) {
 
         string img_base   = cfg["test_record_arm_data"]["calib_save_dir"].as<string>();
         string out_dir    = img_base;
-        HTuple hv_cp      = rcfg["calib_plane"].as<string>().c_str();
+        HTuple hv_cp      = cfg["cam_calib"]["calib_plane"].as<string>().c_str();
         double focus      = rcfg["focus"].as<double>();
         double px_sx      = rcfg["pixel_size_x"].as<double>();
         double px_sy      = rcfg["pixel_size_y"].as<double>();
         string center_sn  = rcfg["center_cam"].as<string>();
-        string xml_dir;
-        try { xml_dir = rcfg["xml_dir"].as<string>(); }
-        catch (...) { xml_dir = img_base + "/cam_calib_output"; }
+        string xml_dir    = cfg["cam_calib"]["output_folder"].as<string>();
 
         cout << "=== Resolve Calibration Board Pose ===" << endl;
         cout << "Image base:  " << img_base << endl;
