@@ -1,5 +1,7 @@
 #include "piper/piper.hpp"
+#include "cfg/config.hpp"
 #include <cmath>
+#include <stdexcept>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -9,14 +11,13 @@ namespace gazeestimation {
 
 static double deg2rad(double d) { return d * M_PI / 180.0; }
 
-// ============= Z-X-Z'' Euler → quaternion (matches end_pose_monitor.py) =============
+// ============= Z-X-Z'' Euler → quaternion =============
 
 Quat zxzToQuat(double alpha_deg, double beta_deg, double gamma_deg) {
     double a = deg2rad(alpha_deg), b = deg2rad(beta_deg), g = deg2rad(gamma_deg);
     double c1 = cos(a/2), s1 = sin(a/2);
     double c2 = cos(b/2), s2 = sin(b/2);
     double c3 = cos(g/2), s3 = sin(g/2);
-    // q = q_z(α) * q_x(β) * q_z(γ)
     Quat q;
     q.w = c1*c2*c3 - s1*c2*s3;
     q.x = c1*s2*c3 + s1*s2*s3;
@@ -24,8 +25,6 @@ Quat zxzToQuat(double alpha_deg, double beta_deg, double gamma_deg) {
     q.z = s1*c2*c3 + c1*c2*s3;
     return q;
 }
-
-// ============= Hamilton product q1 * q0 =============
 
 Quat quatMultiply(const Quat& q1, const Quat& q0) {
     Quat r;
@@ -36,38 +35,26 @@ Quat quatMultiply(const Quat& q1, const Quat& q0) {
     return r;
 }
 
-// ============= Rotate vector by quaternion =============
-
 Pt3 quatRotate(const Quat& q, const Pt3& v) {
     Quat qv{v.x, v.y, v.z, 0.0};
-    Quat qc{-q.x, -q.y, -q.z, q.w}; // conjugate
+    Quat qc{-q.x, -q.y, -q.z, q.w};
     Quat t = quatMultiply(q, qv);
     Quat r = quatMultiply(t, qc);
     return {r.x, r.y, r.z};
 }
 
-// ============= computeToolPose (matches end_pose_monitor.py) =============
-// T_tool = T_flange * T_offset
-// T_offset = translate(tool_trans) * rotate(tool_rot_zxz)
-
 Pose computeToolPose(const Pose& flange, const Pt3& tool_trans,
                      const Pt3& tool_rot_zxz_deg) {
-    Quat q_offset = zxzToQuat(tool_rot_zxz_deg.x, tool_rot_zxz_deg.y, tool_rot_zxz_deg.z);
-
-    // p_tool = p_flange + R_flange * (R_offset * t)
-    Pt3 t_rotated = quatRotate(q_offset, tool_trans);
-    Pt3 t_world   = quatRotate(flange.quat, t_rotated);
-
+    Quat q_off = zxzToQuat(tool_rot_zxz_deg.x, tool_rot_zxz_deg.y, tool_rot_zxz_deg.z);
+    Pt3 t_rot  = quatRotate(q_off, tool_trans);
+    Pt3 t_w    = quatRotate(flange.quat, t_rot);
     Pose tool;
-    tool.pos.x = flange.pos.x + t_world.x;
-    tool.pos.y = flange.pos.y + t_world.y;
-    tool.pos.z = flange.pos.z + t_world.z;
-    tool.quat  = quatMultiply(flange.quat, q_offset);
+    tool.pos.x = flange.pos.x + t_w.x;
+    tool.pos.y = flange.pos.y + t_w.y;
+    tool.pos.z = flange.pos.z + t_w.z;
+    tool.quat  = quatMultiply(flange.quat, q_off);
     return tool;
 }
-
-// ============= composePoses (matches end_pose_monitor.py) =============
-// T_result = T_base * T_offset
 
 Pose composePoses(const Pose& base, const Pose& offset) {
     Pt3 p_rot = quatRotate(base.quat, offset.pos);
@@ -79,19 +66,61 @@ Pose composePoses(const Pose& base, const Pose& offset) {
     return r;
 }
 
-// ============= Full chain =============
-
 Pose armToolToCamPose(const Pose& flange,
                       const Pt3& tool_trans, const Pt3& tool_rot_zxz_deg,
                       const Pt3& arm_trans,   const Pt3& arm_rot_zxz_deg) {
     Pose tool_in_arm = computeToolPose(flange, tool_trans, tool_rot_zxz_deg);
-
-    Quat arm_quat = zxzToQuat(arm_rot_zxz_deg.x, arm_rot_zxz_deg.y, arm_rot_zxz_deg.z);
-    Pose arm_in_ccs;
-    arm_in_ccs.pos  = arm_trans;
-    arm_in_ccs.quat = arm_quat;
-
+    Quat arm_q = zxzToQuat(arm_rot_zxz_deg.x, arm_rot_zxz_deg.y, arm_rot_zxz_deg.z);
+    Pose arm_in_ccs{arm_trans, arm_q};
     return composePoses(arm_in_ccs, tool_in_arm);
+}
+
+// ============= PiperToCam =============
+
+static Pt3 readPt3(const CfgNode& n) {
+    return {n[0].as<double>(), n[1].as<double>(), n[2].as<double>()};
+}
+
+PiperToCam::PiperToCam(const std::string& yaml_path) {
+    Cfg cfg(yaml_path);
+    for (auto& arm_name : {"upper", "lower"}) {
+        try {
+            auto& a  = cfg["arms"][arm_name];
+            auto& tl = a["tool"];
+            auto& cc = a["arm_in_ccs"];
+            ArmCfg c;
+            c.tool_t = readPt3(tl["translation"]);
+            c.tool_r = readPt3(tl["rotation_zxz"]);
+            c.ccs_t  = readPt3(cc["translation"]);
+            c.ccs_r  = readPt3(cc["rotation_zxz"]);
+            cfg_[arm_name] = c;
+        } catch (const std::exception& e) {
+            // arm not configured — skip
+        }
+    }
+    if (cfg_.empty())
+        throw std::runtime_error("[PiperToCam] No arm configs found in " + yaml_path);
+}
+
+Pose PiperToCam::convert(const std::string& arm, const Pose& flange) const {
+    auto it = cfg_.find(arm);
+    if (it == cfg_.end())
+        throw std::runtime_error("[PiperToCam] Unknown arm: " + arm);
+    const auto& c = it->second;
+    return armToolToCamPose(flange, c.tool_t, c.tool_r, c.ccs_t, c.ccs_r);
+}
+
+Pose PiperToCam::convert(const std::string& arm,
+                         double fx, double fy, double fz,
+                         double qx, double qy, double qz, double qw) const {
+    Pose flange{{fx, fy, fz}, {qx, qy, qz, qw}};
+    return convert(arm, flange);
+}
+
+std::vector<std::string> PiperToCam::arms() const {
+    std::vector<std::string> r;
+    for (auto& kv : cfg_) r.push_back(kv.first);
+    return r;
 }
 
 } // namespace gazeestimation

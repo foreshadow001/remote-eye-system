@@ -4,9 +4,6 @@
 #include <iomanip>
 #include <string>
 #include <sstream>
-#include <thread>
-#include <atomic>
-#include <mutex>
 #include <chrono>
 #include <filesystem>
 #include <vector>
@@ -59,34 +56,19 @@ int main() {
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
     namespace fs = std::filesystem;
-    Cfg cfg((fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()/"cfg"/"piper.yaml").string());
+    auto yaml_path = (fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()
+                      / "cfg" / "piper.yaml").string();
+    PiperToCam p2c(yaml_path);
+
+    Cfg cfg(yaml_path);
     g_ip   = cfg["network"]["ubuntu_ip"].as<string>();
     g_port = cfg["network"]["port"].as<int>();
-
-    // 读取 arm 配置
-    auto loadArm = [&](const string& arm) {
-        Pt3 t_t{0,0,0.02}, t_r{0,0,0};
-        Pt3 a_t{0,0,0},  a_r{0,90,90};
-        try {
-            auto& a = cfg["arms"][arm];
-            auto& tool = a["tool"];
-            auto& ccs  = a["arm_in_ccs"];
-            auto& tt = tool["translation"];  t_t = {tt[0].as<double>(), tt[1].as<double>(), tt[2].as<double>()};
-            auto& tr = tool["rotation_zxz"]; t_r = {tr[0].as<double>(), tr[1].as<double>(), tr[2].as<double>()};
-            auto& at = ccs["translation"];   a_t = {at[0].as<double>(), at[1].as<double>(), at[2].as<double>()};
-            auto& ar = ccs["rotation_zxz"];  a_r = {ar[0].as<double>(), ar[1].as<double>(), ar[2].as<double>()};
-        } catch (...) { cerr << "[Warn] Using default arm config for " << arm << endl; }
-        return make_tuple(t_t, t_r, a_t, a_r);
-    };
-
-    auto [ut_t, ut_r, ua_t, ua_r] = loadArm("upper");
-    auto [lt_t, lt_r, la_t, la_r] = loadArm("lower");
 
     cout << fixed << setprecision(4);
     cout << "=== Piper Flange → Center Cam Pose ===\n" << endl;
     cout << "Server: " << g_ip << ":" << g_port << endl;
-    cout << "Upper arm_in_ccs: t=(" << ua_t.x<<","<<ua_t.y<<","<<ua_t.z<<") r_zxz=("<<ua_r.x<<","<<ua_r.y<<","<<ua_r.z<<")deg" << endl;
-    cout << "Lower arm_in_ccs: t=(" << la_t.x<<","<<la_t.y<<","<<la_t.z<<") r_zxz=("<<la_r.x<<","<<la_r.y<<","<<la_r.z<<")deg" << endl;
+    cout << "Loaded arms:";
+    for (auto& a : p2c.arms()) cout << " " << a;
     cout << "\nKeys: t=switch arm  g=query+print  q=quit\n" << endl;
 
     while (g_running) {
@@ -132,12 +114,8 @@ int main() {
             flange.pos    = {nv[0], nv[1], nv[2]};
             flange.quat   = {nv[3], nv[4], nv[5], nv[6]};
 
-            // Transform
-            Pt3 t_t, t_r, a_t, a_r;
-            if (g_arm=="upper") { t_t=ut_t; t_r=ut_r; a_t=ua_t; a_r=ua_r; }
-            else                { t_t=lt_t; t_r=lt_r; a_t=la_t; a_r=la_r; }
-
-            Pose tool_in_ccs = armToolToCamPose(flange, t_t, t_r, a_t, a_r);
+            // Transform via PiperToCam
+            Pose tool_in_ccs = p2c.convert(g_arm, flange);
 
             cout << "\n=== " << g_arm << " FLANGE (arm frame) ===" << endl;
             cout << "Pos (m):       ["<<flange.pos.x<<", "<<flange.pos.y<<", "<<flange.pos.z<<"]" << endl;
