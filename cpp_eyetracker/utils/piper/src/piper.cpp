@@ -348,14 +348,48 @@ bool PiperArmCalibrator::solve() {
         problem.AddResidualBlock(c2, nullptr, vars);
     }
 
+    // --- 调试: 打印初始值和 bounds ---
+    cout << fixed << setprecision(4);
+    cout << "\n[Ceres] " << obs_.size() << " observations, " << (obs_.size() * 6) << " residuals" << endl;
+    cout << "[Ceres] Initial values:" << endl;
+    cout << "  arm_t:     " << arm_t_.x   << " " << arm_t_.y   << " " << arm_t_.z   << endl;
+    cout << "  arm_r:     " << arm_r_.x   << " " << arm_r_.y   << " " << arm_r_.z   << endl;
+    cout << "  board_t:   " << board_t_.x << " " << board_t_.y << " " << board_t_.z << endl;
+    cout << "  board_r:   " << board_r_.x << " " << board_r_.y << " " << board_r_.z << endl;
+
+    // 打印第一帧的前向计算结果
+    {
+        double* p0[4] = {vars[0], vars[1], vars[2], vars[3]};
+        vector<double> r0(6);
+        PiperCalibResidual res0(obs_[0].flange, obs_[0].board_in_ccs, tool_t_, tool_r_);
+        res0(p0, r0.data());
+        cout << "[Ceres] Frame 0 residual: t_err=[" << r0[0] << " " << r0[1] << " " << r0[2]
+             << "] r_err=[" << r0[3] << " " << r0[4] << " " << r0[5] << "]" << endl;
+        // 打印观测值和预测值
+        PoseZxz ob = obs_[0].board_in_ccs;
+        Pose pred = computeFullChain(obs_[0].flange, tool_t_, tool_r_, arm_t_, arm_r_, board_t_, board_r_);
+        PoseZxz prz = quatToZxz(pred.quat); prz.pos = pred.pos;
+        cout << "[Ceres] Frame 0 obs:   t=[" << ob.pos.x << " " << ob.pos.y << " " << ob.pos.z
+             << "] r=[" << ob.alpha << " " << ob.beta << " " << ob.gamma << "]" << endl;
+        cout << "[Ceres] Frame 0 pred:  t=[" << prz.pos.x << " " << prz.pos.y << " " << prz.pos.z
+             << "] r=[" << prz.alpha << " " << prz.beta << " " << prz.gamma << "]" << endl;
+    }
+
     ceres::Solver::Options opts;
-    opts.minimizer_progress_to_stdout = false;
+    opts.minimizer_progress_to_stdout = true;
     opts.linear_solver_type = ceres::DENSE_QR;
     opts.max_num_iterations = 1000;
 
     ceres::Solver::Summary summary;
     ceres::Solve(opts, &problem, &summary);
-    cout << summary.BriefReport() << endl;
+    cout << summary.FullReport() << endl;
+
+    cout << "[Ceres] Final values:" << endl;
+    cout << "  arm_t:     " << vars[0][0] << " " << vars[0][1] << " " << vars[0][2] << endl;
+    cout << "  arm_r:     " << vars[1][0] << " " << vars[1][1] << " " << vars[1][2] << endl;
+    cout << "  board_t:   " << vars[2][0] << " " << vars[2][1] << " " << vars[2][2] << endl;
+    cout << "  board_r:   " << vars[3][0] << " " << vars[3][1] << " " << vars[3][2] << endl;
+    cout << "[Ceres] Termination: " << summary.BriefReport() << endl;
 
     arm_t_   = {vars[0][0], vars[0][1], vars[0][2]};
     arm_r_   = {vars[1][0], vars[1][1], vars[1][2]};
