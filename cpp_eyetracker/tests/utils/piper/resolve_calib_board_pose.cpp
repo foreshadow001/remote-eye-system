@@ -334,7 +334,7 @@ int processArm(const string& arm, const string& img_dir, const string& out_dir,
     string out_path = out_dir + "/board_poses_" + arm + ".txt";
     ofstream fout(out_path);
     fout << fixed << setprecision(6);
-    fout << "# frame x y z alpha beta gamma n_cams\n";
+    fout << "# frame x y z qw qx qy qz n_cams\n";
 
     int valid = 0;
     for (int fi = 0; fi <= max_frames; ++fi) {
@@ -354,21 +354,14 @@ int processArm(const string& arm, const string& img_dir, const string& out_dir,
         double nq=sqrt(aqx*aqx+aqy*aqy+aqz*aqz+aqw*aqw);
         aqx/=nq; aqy/=nq; aqz/=nq; aqw/=nq;
 
-        double r00=1-2*aqy*aqy-2*aqz*aqz, r01=2*aqx*aqy-2*aqz*aqw, r02=2*aqx*aqz+2*aqy*aqw;
-        double r12=2*aqy*aqz-2*aqx*aqw, r20=2*aqx*aqz-2*aqy*aqw, r21=2*aqy*aqz+2*aqx*aqw;
-        double r22=1-2*aqx*aqx-2*aqy*aqy;
-        double beta=acos(clamp(r22,-1.0,1.0)), sb=sin(beta), alpha, gamma;
-        if(fabs(sb)>1e-6){alpha=atan2(r02,-r12); gamma=atan2(r20,r21);}
-        else{gamma=0; alpha=(beta<M_PI/2)?atan2(-r01,r00):atan2(r01,r00);}
-        alpha*=180.0/M_PI; beta*=180.0/M_PI; gamma*=180.0/M_PI;
-
         stringstream ssf; ssf << setw(2) << setfill('0') << fi;
         fout << ssf.str() << " " << ax << " " << ay << " " << az << " "
-             << alpha << " " << beta << " " << gamma << " " << np << endl;
+             << aqw << " " << aqx << " " << aqy << " " << aqz << " " << np << endl;
 
         cout << "[Arm " << arm << " frame " << ssf.str() << "] " << np << "/" << n_cams
              << " cams  pos=(" << setprecision(3) << ax << "," << ay << "," << az
-             << ")m  euler=(" << fixed << setprecision(1) << alpha << "," << beta << "," << gamma << ")deg" << endl;
+             << ")m  quat(wxyz)=(" << fixed << setprecision(4)
+             << aqw << "," << aqx << "," << aqy << "," << aqz << ")" << endl;
     }
     fout.close();
     cout << "[Arm " << arm << "] " << valid << " valid frames → " << out_path << endl;

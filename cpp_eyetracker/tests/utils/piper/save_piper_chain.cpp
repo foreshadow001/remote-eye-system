@@ -42,9 +42,9 @@ static map<int, Pose> loadBoardGT(const string& path) {
         if (line.empty() || line[0] == '#') continue;
         stringstream ss(line); string is; ss >> is;
         int idx = stoi(is);
-        double x, y, z, a, b, g; int nc;
-        ss >> x >> y >> z >> a >> b >> g >> nc;
-        m[idx] = {{x, y, z}, zxzToQuat(a, b, g)};
+        double x, y, z, qw, qx, qy, qz; int nc;
+        ss >> x >> y >> z >> qw >> qx >> qy >> qz >> nc;
+        m[idx] = {{x, y, z}, {qx, qy, qz, qw}};
     }
     return m;
 }
