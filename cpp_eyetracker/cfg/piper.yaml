@@ -5,9 +5,9 @@ arms:
     tool:                                  # 末端工具/标定板 在法兰盘坐标系中的位姿
       translation: [0.0, 0.0, 0.02]       # 米 (法兰盘坐标系)
       rotation_zxz: [0.0, 0.0, 0.0]      # 度, 内旋 Z-X-Z''
-    arm_in_ccs:                            # 机械臂基座 在相机坐标系中的位姿
-      translation: [0.0, 0.0, -0.2]        # 米
-      rotation_zxz: [0.0, 90.0, 90.0]     # 度, 内旋 Z-X-Z''
+    arm_in_ccs:                            # 机械臂基座 在相机坐
+      translation: [-0.0136, -0.1000, -0.1817]
+      rotation_zxz: [-20.0, 70.7, 90.9]
     calib_arm_in_ccs:
       translation:
         init_value: [0.0, 0.0, -0.2]
@@ -23,15 +23,15 @@ arms:
           - [70.0, 110.0]
     calib_board_in_flange: 
       translation:
-        init_value: [0.0, 0.15, 0.05]
+        init_value: [-0.15, 0.0, 0.05]
         bounds:
-          - [-0.05, 0.05]
-          - [0.10, 0.20]
+          - [-0.25, -0.05]
+          - [-0.10, 0.10]
           - [0.0, 0.10]
       rotation_zxz:
-        init_value: [180.0, 0.0, 0.0]
+        init_value: [-90.0, 0.0, 0.0]
         bounds: 
-          - [160.0, 200.0]
+          - [-110.0, -70.0]
           - [-20.0, 20.0]
           - [-20.0, 20.0]
   lower:
@@ -40,15 +40,15 @@ arms:
       translation: [0.0, 0.0, 0.02]
       rotation_zxz: [0.0, 0.0, 0.0]
     arm_in_ccs:
-      translation: [0.0, 0.6, -0.2]
-      rotation_zxz: [0.0, 90.0, 90.0]
+      translation: [0.1000, 0.6323, -0.1000]
+      rotation_zxz: [-20.0, 110.0, 110.0]
     calib_arm_in_ccs:
       translation:
         init_value: [0.0, 0.6, -0.2]
         bounds: 
           - [-0.10, 0.10]
           - [0.50, 0.70]
-          - [-0.10, -0.30]
+          - [-0.30, -0.10]
       rotation_zxz:
         init_value: [0.0, 90.0, 90.0]
         bounds: 
@@ -57,15 +57,15 @@ arms:
           - [70.0, 110.0]
     calib_board_in_flange: 
       translation:
-        init_value: [0.0, 0.15, 0.05]
+        init_value: [-0.15, 0.0, 0.05]
         bounds:
-          - [-0.05, 0.05]
-          - [0.10, 0.20]
+          - [-0.25, -0.05]
+          - [-0.10, 0.10]
           - [0.0, 0.10]
       rotation_zxz:
-        init_value: [180.0, 0.0, 0.0]
+        init_value: [-90.0, 0.0, 0.0]
         bounds: 
-          - [160.0, 200.0]
+          - [-110.0, -70.0]
           - [-20.0, 20.0]
           - [-20.0, 20.0]
 

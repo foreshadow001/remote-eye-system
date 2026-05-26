@@ -170,69 +170,157 @@ int processArm(const string& arm, const string& img_dir, const string& out_dir,
     for (int ci = 0; ci < n_cams; ++ci) {
         cout << "\n--- Cam " << ci << " (" << sns[ci] << ") calibrating ---" << endl;
 
-        // 读第一张图获取尺寸
-        HTuple hv_w, hv_h;
-        HObject ho_tmp;
-        string first_img;
-        for (int fi = 0; fi <= max_frames; ++fi) {
-            stringstream ssf; ssf << setw(2) << setfill('0') << fi;
-            first_img = img_dir + "/calib_cam_" + sns[ci] + "_" + ssf.str() + ".jpg";
-            if (fs::exists(first_img)) break;
+        // 检查是否有专用标定图片: <img_dir>/<arm>/<SN>/calib_*.jpg
+        string dc_dir = img_dir + "/" + arm + "/" + sns[ci];
+        bool has_dedicated = fs::exists(dc_dir);
+        if (has_dedicated) {
+            // 统计专用图片数量
+            int dc_count = 0;
+            for (auto& e : fs::directory_iterator(dc_dir))
+                if (e.path().extension() == ".jpg") dc_count++;
+            if (dc_count == 0) has_dedicated = false;
         }
-        ReadImage(&ho_tmp, HTuple(first_img.c_str()));
-        GetImageSize(ho_tmp, &hv_w, &hv_h);
 
-        HTuple calib_id, start_param;
-        CreateCalibData("calibration_object", 1, 1, &calib_id);
-        SetCalibDataCalibObject(calib_id, 0, hv_cp);
-        genCamPar(focus, px_sx, px_sy, hv_w.D(), hv_h.D(), &start_param);
-        SetCalibDataCamParam(calib_id, 0, HTuple(), start_param);
+        HTuple cam_params;  // calibrated intrinsics
 
-        map<int, int> f2o;  // frame → obs_idx
-        int obs_idx = 0;
-        for (int fi = 0; fi <= max_frames; ++fi) {
-            if (!arm_frames.count(fi)) continue;  // 只处理当前 arm 的帧
-            stringstream ssf; ssf << setw(2) << setfill('0') << fi;
-            string ip = img_dir + "/calib_cam_" + sns[ci] + "_" + ssf.str() + ".jpg";
-            if (!fs::exists(ip)) continue;
-            HObject ho_img;
-            ReadImage(&ho_img, HTuple(ip.c_str()));
-            HTuple ch; CountChannels(ho_img, &ch);
-            if (ch.I() == 3) Rgb1ToGray(ho_img, &ho_img);
+        // --- Step A: 内参标定 ---
+        if (has_dedicated) {
+            cout << "  Using dedicated calib images from " << dc_dir << endl;
+            // 读第一张获取尺寸
+            HTuple hv_w, hv_h;
+            HObject ho_tmp;
+            string first_img;
+            for (auto& e : fs::directory_iterator(dc_dir))
+                if (e.path().extension() == ".jpg") { first_img = e.path().string(); break; }
+            ReadImage(&ho_tmp, HTuple(first_img.c_str()));
+            GetImageSize(ho_tmp, &hv_w, &hv_h);
+
+            HTuple calib_id, start_param;
+            CreateCalibData("calibration_object", 1, 1, &calib_id);
+            SetCalibDataCalibObject(calib_id, 0, hv_cp);
+            genCamPar(focus, px_sx, px_sy, hv_w.D(), hv_h.D(), &start_param);
+            SetCalibDataCamParam(calib_id, 0, HTuple(), start_param);
+
+            int obs_idx = 0;
+            for (auto& e : fs::directory_iterator(dc_dir)) {
+                if (e.path().extension() != ".jpg") continue;
+                HObject ho_img;
+                ReadImage(&ho_img, HTuple(e.path().string().c_str()));
+                HTuple ch; CountChannels(ho_img, &ch);
+                if (ch.I() == 3) Rgb1ToGray(ho_img, &ho_img);
+                try {
+                    FindCalibObject(ho_img, calib_id, 0, 0, obs_idx,
+                                    (HTuple("alpha").Append("sigma")),
+                                    (HTuple(0.5).Append(1.0)));
+                    obs_idx++;
+                } catch (HException&) { continue; }
+            }
+
+            if (obs_idx < 3) {
+                cout << "  Too few dedicated marks, skipping." << endl;
+                ClearCalibData(calib_id);
+                continue;
+            }
+
+            HTuple errors;
             try {
-                FindCalibObject(ho_img, calib_id, 0, 0, obs_idx,
-                                (HTuple("alpha").Append("sigma")),
-                                (HTuple(0.5).Append(1.0)));
-                f2o[fi] = obs_idx;
-                obs_idx++;
-            } catch (HException&) { continue; }
-        }
-
-        if (obs_idx == 0) {
-            cout << "  No marks found, skipping." << endl;
+                CalibrateCameras(calib_id, &errors);
+                cout << "  Calibrated: " << obs_idx << " obs, error=" << errors.D() << "px" << endl;
+            } catch (HException& ex) {
+                cerr << "  Calib failed: " << ex.ErrorMessage().TextA() << endl;
+                ClearCalibData(calib_id);
+                continue;
+            }
+            GetCalibData(calib_id, "camera", 0, "params", &cam_params);
             ClearCalibData(calib_id);
-            continue;
-        }
 
-        HTuple errors;
-        try {
-            CalibrateCameras(calib_id, &errors);
-            cout << "  Calibrated: " << obs_idx << " obs, error=" << errors.D() << "px" << endl;
-        } catch (HException& ex) {
-            cerr << "  Calib failed: " << ex.ErrorMessage().TextA() << endl;
+            // Step B: 用标定好的内参提取每帧标定板位姿
+            for (int fi = 0; fi <= max_frames; ++fi) {
+                if (!arm_frames.count(fi)) continue;
+                stringstream ssf; ssf << setw(2) << setfill('0') << fi;
+                string ip = img_dir + "/calib_cam_" + sns[ci] + "_" + ssf.str() + ".jpg";
+                if (!fs::exists(ip)) continue;
+                try {
+                    HObject ho_img, ho_ct;
+                    ReadImage(&ho_img, HTuple(ip.c_str()));
+                    HTuple ch; CountChannels(ho_img, &ch);
+                    if (ch.I() == 3) Rgb1ToGray(ho_img, &ho_img);
+                    HTuple board_pose, cam_out;
+                    FindMarksAndPose(ho_img, hv_cp, cam_params, HTuple(),
+                                     HTuple(), HTuple(),
+                                     &board_pose, &cam_out, &ho_ct);
+                    HTuple board_in_ref;
+                    PoseCompose(T_cam_to_ref[ci], board_pose, &board_in_ref);
+                    frame_poses[fi].push_back(board_in_ref);
+                } catch (HException&) { continue; }
+            }
+
+        } else {
+            // --- 原始路径: 用 arm 帧图像同时标定和提取 ---
+            HTuple hv_w, hv_h;
+            HObject ho_tmp;
+            string first_img;
+            for (int fi = 0; fi <= max_frames; ++fi) {
+                stringstream ssf; ssf << setw(2) << setfill('0') << fi;
+                if (!arm_frames.count(fi)) continue;
+                first_img = img_dir + "/calib_cam_" + sns[ci] + "_" + ssf.str() + ".jpg";
+                if (fs::exists(first_img)) break;
+            }
+            ReadImage(&ho_tmp, HTuple(first_img.c_str()));
+            GetImageSize(ho_tmp, &hv_w, &hv_h);
+
+            HTuple calib_id, start_param;
+            CreateCalibData("calibration_object", 1, 1, &calib_id);
+            SetCalibDataCalibObject(calib_id, 0, hv_cp);
+            genCamPar(focus, px_sx, px_sy, hv_w.D(), hv_h.D(), &start_param);
+            SetCalibDataCamParam(calib_id, 0, HTuple(), start_param);
+
+            map<int, int> f2o;
+            int obs_idx = 0;
+            for (int fi = 0; fi <= max_frames; ++fi) {
+                if (!arm_frames.count(fi)) continue;
+                stringstream ssf; ssf << setw(2) << setfill('0') << fi;
+                string ip = img_dir + "/calib_cam_" + sns[ci] + "_" + ssf.str() + ".jpg";
+                if (!fs::exists(ip)) continue;
+                HObject ho_img;
+                ReadImage(&ho_img, HTuple(ip.c_str()));
+                HTuple ch; CountChannels(ho_img, &ch);
+                if (ch.I() == 3) Rgb1ToGray(ho_img, &ho_img);
+                try {
+                    FindCalibObject(ho_img, calib_id, 0, 0, obs_idx,
+                                    (HTuple("alpha").Append("sigma")),
+                                    (HTuple(0.5).Append(1.0)));
+                    f2o[fi] = obs_idx;
+                    obs_idx++;
+                } catch (HException&) { continue; }
+            }
+
+            if (obs_idx == 0) {
+                cout << "  No marks found, skipping." << endl;
+                ClearCalibData(calib_id);
+                continue;
+            }
+
+            HTuple errors;
+            try {
+                CalibrateCameras(calib_id, &errors);
+                cout << "  Calibrated: " << obs_idx << " obs, error=" << errors.D() << "px" << endl;
+            } catch (HException& ex) {
+                cerr << "  Calib failed: " << ex.ErrorMessage().TextA() << endl;
+                ClearCalibData(calib_id);
+                continue;
+            }
+
+            for (auto& kv : f2o) {
+                int fi = kv.first, oi = kv.second;
+                HTuple board_in_cam;
+                GetCalibDataObservPose(calib_id, 0, 0, oi, &board_in_cam);
+                HTuple board_in_ref;
+                PoseCompose(T_cam_to_ref[ci], board_in_cam, &board_in_ref);
+                frame_poses[fi].push_back(board_in_ref);
+            }
             ClearCalibData(calib_id);
-            continue;
         }
-
-        for (auto& kv : f2o) {
-            int fi = kv.first, oi = kv.second;
-            HTuple board_in_cam;
-            GetCalibDataObservPose(calib_id, 0, 0, oi, &board_in_cam);
-            HTuple board_in_ref;
-            PoseCompose(T_cam_to_ref[ci], board_in_cam, &board_in_ref);
-            frame_poses[fi].push_back(board_in_ref);
-        }
-        ClearCalibData(calib_id);
     }
 
     // --- 输出 ---

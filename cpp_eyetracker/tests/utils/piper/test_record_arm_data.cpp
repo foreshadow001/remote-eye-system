@@ -77,6 +77,9 @@ vector<shared_ptr<CameraContext>> cam_ctxs;
 atomic<int> g_enlarged_cam{-1};
 int g_last_capture_index = -1;
 string g_last_capture_arm;
+bool g_calib_mode = false;      // 内参标定模式
+string g_calib_cam_sn;          // 标定模式下的相机 SN
+int g_calib_counter = 0;        // 标定模式计数器
 
 // UI layout
 int g_win_w = 1224, g_win_h = 1024;
@@ -432,15 +435,27 @@ int main() {
                         cv::Point(arm_cx - arm_sz.width / 2, 55),
                         cv::FONT_HERSHEY_SIMPLEX, 1.4, arm_color, 3, cv::LINE_AA);
 
+            // Calib mode banner
+            if (g_calib_mode) {
+                string cb = "INTRINSIC CALIB  Cam:" + g_calib_cam_sn
+                          + "  cnt:" + to_string(g_calib_counter);
+                cv::putText(canvas, cb, cv::Point(arm_cx - 200, 85),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+            }
+
             // Bottom-left hints
             int tx = g_right_x + 10, ty = g_win_h - 60;
-            cv::putText(canvas, "[t] switch  [space] capture  [z] undo  [c] clear  [q] quit",
-                        cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, 0.4,
-                        cv::Scalar(150, 150, 150), 1, cv::LINE_AA);
+            string hints = g_calib_mode
+                ? "[c] exit  [space] capture  Camera: " + g_calib_cam_sn
+                : "[t] switch  [space] capture  [z] undo  [c] calib  [C] clear  [q] quit";
+            cv::putText(canvas, hints, cv::Point(tx, ty),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(150, 150, 150), 1, cv::LINE_AA);
             ty += 22;
-            cv::putText(canvas, "Saving to: flange_pose_mapping_" + g_current_arm + ".txt",
-                        cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, 0.35,
-                        cv::Scalar(120, 120, 120), 1, cv::LINE_AA);
+            string saving = g_calib_mode
+                ? ("-> " + g_calib_save_dir + "/" + g_current_arm + "/" + g_calib_cam_sn + "/calib_XX.jpg")
+                : ("Saving to: flange_pose_mapping_" + g_current_arm + ".txt");
+            cv::putText(canvas, saving, cv::Point(tx, ty),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(120, 120, 120), 1, cv::LINE_AA);
 
             cv::imshow("Record Arm Data", canvas);
             last_ui_time = current_time;
@@ -501,11 +516,35 @@ int main() {
                 cout << "[Undo] Done.\n" << endl;
             }
         }
-        else if (key == 'c' || key == 'C') {
+        else if (key == 'c' && !g_calib_mode) {
+            // 进入内参标定模式
+            int cam_idx = g_enlarged_cam.load();
+            if (cam_idx < 0 || cam_idx >= (int)cam_ctxs.size()) {
+                cout << "[Calib] No camera selected. Click a thumbnail first." << endl;
+            } else {
+                g_calib_mode = true;
+                g_calib_cam_sn = cam_ctxs[cam_idx]->sn;
+                // 扫描已有标定图片确定起始计数器
+                string calib_dir = g_calib_save_dir + "/" + g_current_arm + "/" + g_calib_cam_sn;
+                fs::create_directories(calib_dir);
+                g_calib_counter = getNextCalibCounter(calib_dir);
+                cout << "\n[Calib Mode] ON — Camera: " << g_calib_cam_sn
+                     << "  Arm: " << g_current_arm
+                     << "  Starting at: " << setfill('0') << setw(2) << g_calib_counter
+                     << "  (c=exit, space=capture)" << endl;
+            }
+        }
+        else if (key == 'c' && g_calib_mode) {
+            // 退出内参标定模式
+            g_calib_mode = false;
+            cout << "[Calib Mode] OFF — " << g_calib_counter << " photos captured for "
+                 << g_calib_cam_sn << endl;
+        }
+        else if (key == 'C') {
             cout << "\n[Clear] Removing all photos and mapping files..." << endl;
             int removed = 0;
             if (fs::exists(g_calib_save_dir)) {
-                for (auto& e : fs::directory_iterator(g_calib_save_dir)) {
+                for (auto& e : fs::recursive_directory_iterator(g_calib_save_dir)) {
                     string ext = e.path().extension().string();
                     if (ext == ".jpg" || ext == ".txt") {
                         fs::remove(e.path());
@@ -516,59 +555,73 @@ int main() {
             cout << "[Clear] Removed " << removed << " files.\n" << endl;
         }
         else if (key == ' ') {
-            int counter = getNextCalibCounter(g_calib_save_dir);
-            stringstream ss;
-            ss << setw(2) << setfill('0') << counter;
-            string idx_str = ss.str();
-
-            g_last_capture_index = counter;
-            g_last_capture_arm = g_current_arm;
-            cout << "\n[Capture] Index " << idx_str << " | Arm: " << g_current_arm << endl;
-
-            // 只拍当前放大的相机（只有它能看到标定板）
-            int cam_idx = g_enlarged_cam.load();
-            if (cam_idx < 0 || cam_idx >= (int)cam_ctxs.size()) {
-                cout << "  [Warn] No camera selected. Click a thumbnail to enlarge it first." << endl;
-            } else {
-                auto& ctx = cam_ctxs[cam_idx];
-                cv::Mat snapshot;
-                {
-                    lock_guard<mutex> lock(ctx->frame_mtx);
-                    snapshot = ctx->latest_frame.clone();
+            if (g_calib_mode) {
+                // 内参标定模式: 保存到 save_dir/<arm>/<SN>/calib_<NN>.jpg
+                string calib_dir = g_calib_save_dir + "/" + g_current_arm + "/" + g_calib_cam_sn;
+                fs::create_directories(calib_dir);
+                stringstream ss; ss << setw(2) << setfill('0') << g_calib_counter;
+                int cam_idx = -1;
+                for (int i = 0; i < (int)cam_ctxs.size(); ++i)
+                    if (cam_ctxs[i]->sn == g_calib_cam_sn) { cam_idx = i; break; }
+                if (cam_idx < 0) { cout << "[Calib] Camera not found!" << endl; }
+                else {
+                    cv::Mat snapshot;
+                    { lock_guard<mutex> lock(cam_ctxs[cam_idx]->frame_mtx);
+                      snapshot = cam_ctxs[cam_idx]->latest_frame.clone(); }
+                    if (!snapshot.empty()) {
+                        cv::Mat out_img;
+                        if (cam_ctxs[cam_idx]->is_mono) out_img = snapshot.clone();
+                        else cv::cvtColor(snapshot, out_img, cv::COLOR_BayerRG2RGB);
+                        string fn = calib_dir + "/calib_" + ss.str() + ".jpg";
+                        cv::imwrite(fn, out_img);
+                        cout << "  [Calib " << ss.str() << "] -> " << fn << endl;
+                        g_calib_counter++;
+                    }
                 }
-                if (!snapshot.empty()) {
-                    cv::Mat out_img;
-                    if (ctx->is_mono) out_img = snapshot.clone();
-                    else cv::cvtColor(snapshot, out_img, cv::COLOR_BayerRG2RGB);
-                    string fn = g_calib_save_dir + "/calib_cam_" + ctx->sn + "_" + idx_str + ".jpg";
-                    cv::imwrite(fn, out_img);
-                    cout << "  -> " << fn << " (cam " << cam_idx << ": " << ctx->sn << ")" << endl;
+            } else {
+                int counter = getNextCalibCounter(g_calib_save_dir);
+                stringstream ss;
+                ss << setw(2) << setfill('0') << counter;
+                string idx_str = ss.str();
+
+                g_last_capture_index = counter;
+                g_last_capture_arm = g_current_arm;
+                cout << "\n[Capture] Index " << idx_str << " | Arm: " << g_current_arm << endl;
+
+                int cam_idx = g_enlarged_cam.load();
+                if (cam_idx < 0 || cam_idx >= (int)cam_ctxs.size()) {
+                    cout << "  [Warn] No camera selected. Click a thumbnail to enlarge it first." << endl;
+                } else {
+                    auto& ctx = cam_ctxs[cam_idx];
+                    cv::Mat snapshot;
+                    { lock_guard<mutex> lock(ctx->frame_mtx);
+                      snapshot = ctx->latest_frame.clone(); }
+                    if (!snapshot.empty()) {
+                        cv::Mat out_img;
+                        if (ctx->is_mono) out_img = snapshot.clone();
+                        else cv::cvtColor(snapshot, out_img, cv::COLOR_BayerRG2RGB);
+                        string fn = g_calib_save_dir + "/calib_cam_" + ctx->sn + "_" + idx_str + ".jpg";
+                        cv::imwrite(fn, out_img);
+                        cout << "  -> " << fn << " (cam " << cam_idx << ": " << ctx->sn << ")" << endl;
+                    }
                 }
             }
 
             // 2. 查询当前机械臂 flange 位姿
             string resp = queryFlangePose(g_current_arm);
             if (!resp.empty() && resp.rfind("POSE:", 0) == 0) {
-                // 格式: POSE:<arm>:<x>,<y>,<z>,<qx>,<qy>,<qz>,<qw>,<alpha>,<beta>,<gamma>
-                string data = resp.substr(5);  // after "POSE:"
+                string data = resp.substr(5);
                 size_t p = data.find(':');
                 string arm_name = data.substr(0, p);
                 string vals = data.substr(p + 1);
-
-                vector<double> nums;
-                stringstream vss(vals);
-                string token;
-                while (getline(vss, token, ','))
-                    nums.push_back(stod(token));
-
+                vector<double> nums; stringstream vss(vals); string token;
+                while (getline(vss, token, ',')) nums.push_back(stod(token));
                 if (nums.size() == 10) {
                     cout << fixed << setprecision(4);
                     cout << "  Pose  XYZ (m):      [" << nums[0] << ", " << nums[1] << ", " << nums[2] << "]" << endl;
                     cout << "        Quat (wxyz):   [" << nums[6] << ", " << nums[3] << ", " << nums[4] << ", " << nums[5] << "]" << endl;
                     cout << fixed << setprecision(2);
                     cout << "        Euler ZXZ'':   [" << nums[7] << ", " << nums[8] << ", " << nums[9] << "] deg" << endl;
-
-                    // 写入当前 arm 的映射文件
                     string mf_path = currentMappingFile();
                     ofstream mf(mf_path, ios::app);
                     mf << fixed << setprecision(6);
@@ -578,13 +631,12 @@ int main() {
                     cout << "  -> saved to " << mf_path << endl;
                 }
             } else if (resp.empty()) {
-                cerr << "  [Warn] No response from arm server. "
-                     << "Pose NOT recorded." << endl;
+                cerr << "  [Warn] No response from arm server. Pose NOT recorded." << endl;
             } else {
                 cerr << "  [Warn] Arm server: " << resp << endl;
             }
-        }
-    }
+            }  // end else (!g_calib_mode)
+        }  // end SPACE handler
 
     // ================== 清理 ==================
     cout << "[System] Shutting down..." << endl;
