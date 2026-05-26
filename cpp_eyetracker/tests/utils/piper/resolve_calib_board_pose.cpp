@@ -183,10 +183,10 @@ int processArm(const string& arm, const string& img_dir, const string& out_dir,
 
         HTuple cam_params;  // calibrated intrinsics
 
-        // --- Step A: 内参标定 ---
+        // --- 内参标定 + 位姿提取 ---
         if (has_dedicated) {
             cout << "  Using dedicated calib images from " << dc_dir << endl;
-            // 读第一张获取尺寸
+            // Phase 1: 用专用图片标定内参
             HTuple hv_w, hv_h;
             HObject ho_tmp;
             string first_img;
@@ -195,13 +195,14 @@ int processArm(const string& arm, const string& img_dir, const string& out_dir,
             ReadImage(&ho_tmp, HTuple(first_img.c_str()));
             GetImageSize(ho_tmp, &hv_w, &hv_h);
 
-            HTuple calib_id, start_param;
-            CreateCalibData("calibration_object", 1, 1, &calib_id);
-            SetCalibDataCalibObject(calib_id, 0, hv_cp);
-            genCamPar(focus, px_sx, px_sy, hv_w.D(), hv_h.D(), &start_param);
-            SetCalibDataCamParam(calib_id, 0, HTuple(), start_param);
+            HTuple dc_calib;
+            CreateCalibData("calibration_object", 1, 1, &dc_calib);
+            SetCalibDataCalibObject(dc_calib, 0, hv_cp);
+            HTuple dc_param;
+            genCamPar(focus, px_sx, px_sy, hv_w.D(), hv_h.D(), &dc_param);
+            SetCalibDataCamParam(dc_calib, 0, HTuple(), dc_param);
 
-            int obs_idx = 0;
+            int dc_obs = 0;
             for (auto& e : fs::directory_iterator(dc_dir)) {
                 if (e.path().extension() != ".jpg") continue;
                 HObject ho_img;
@@ -209,58 +210,66 @@ int processArm(const string& arm, const string& img_dir, const string& out_dir,
                 HTuple ch; CountChannels(ho_img, &ch);
                 if (ch.I() == 3) Rgb1ToGray(ho_img, &ho_img);
                 try {
-                    FindCalibObject(ho_img, calib_id, 0, 0, obs_idx,
+                    FindCalibObject(ho_img, dc_calib, 0, 0, dc_obs,
                                     (HTuple("alpha").Append("sigma")),
                                     (HTuple(0.5).Append(1.0)));
-                    obs_idx++;
+                    dc_obs++;
                 } catch (HException&) { continue; }
             }
-
-            if (obs_idx < 3) {
+            if (dc_obs < 3) {
                 cout << "  Too few dedicated marks, skipping." << endl;
-                ClearCalibData(calib_id);
+                ClearCalibData(dc_calib);
                 continue;
             }
+            HTuple dc_err;
+            CalibrateCameras(dc_calib, &dc_err);
+            cout << "  Dedicated calib: " << dc_obs << " obs, error=" << dc_err.D() << "px" << endl;
+            GetCalibData(dc_calib, "camera", 0, "params", &cam_params);
+            ClearCalibData(dc_calib);
 
-            HTuple errors;
-            try {
-                CalibrateCameras(calib_id, &errors);
-                cout << "  Calibrated: " << obs_idx << " obs, error=" << errors.D() << "px" << endl;
-            } catch (HException& ex) {
-                cerr << "  Calib failed: " << ex.ErrorMessage().TextA() << endl;
-                ClearCalibData(calib_id);
-                continue;
-            }
-            GetCalibData(calib_id, "camera", 0, "params", &cam_params);
-            ClearCalibData(calib_id);
+            // Phase 2: 用精准内参作为起点, 帧图片 + CalibData 批量提取位姿 (与 fallback 路径一致)
+            HTuple frm_calib;
+            CreateCalibData("calibration_object", 1, 1, &frm_calib);
+            SetCalibDataCalibObject(frm_calib, 0, hv_cp);
+            SetCalibDataCamParam(frm_calib, 0, HTuple(), cam_params);  // 精准内参作为起点
 
-            // Step B: 用标定好的内参提取每帧标定板位姿
+            map<int, int> f2o;
+            int obs_idx = 0;
             for (int fi = 0; fi <= max_frames; ++fi) {
                 if (!arm_frames.count(fi)) continue;
                 stringstream ssf; ssf << setw(2) << setfill('0') << fi;
                 string ip = img_dir + "/calib_cam_" + sns[ci] + "_" + ssf.str() + ".jpg";
                 if (!fs::exists(ip)) continue;
+                HObject ho_img;
+                ReadImage(&ho_img, HTuple(ip.c_str()));
+                HTuple ch; CountChannels(ho_img, &ch);
+                if (ch.I() == 3) Rgb1ToGray(ho_img, &ho_img);
                 try {
-                    HObject ho_img;
-                    ReadImage(&ho_img, HTuple(ip.c_str()));
-                    HTuple ch; CountChannels(ho_img, &ch);
-                    if (ch.I() == 3) Rgb1ToGray(ho_img, &ho_img);
-                    // CalibData + FindCalibObject with fixed accurate intrinsics
-                    HTuple fid;
-                    CreateCalibData("calibration_object", 1, 1, &fid);
-                    SetCalibDataCalibObject(fid, 0, hv_cp);
-                    SetCalibDataCamParam(fid, 0, HTuple(), cam_params);
-                    FindCalibObject(ho_img, fid, 0, 0, 0,
+                    FindCalibObject(ho_img, frm_calib, 0, 0, obs_idx,
                                     (HTuple("alpha").Append("sigma")),
                                     (HTuple(0.5).Append(1.0)));
-                    HTuple board_pose;
-                    GetCalibData(fid, "calib_obj", 0, "pose", &board_pose);
-                    HTuple board_in_ref;
-                    PoseCompose(T_cam_to_ref[ci], board_pose, &board_in_ref);
-                    frame_poses[fi].push_back(board_in_ref);
-                    ClearCalibData(fid);
+                    f2o[fi] = obs_idx;
+                    obs_idx++;
                 } catch (HException&) { continue; }
             }
+            if (obs_idx == 0) {
+                cout << "  No frame marks found, skipping." << endl;
+                ClearCalibData(frm_calib);
+                continue;
+            }
+            HTuple frm_err;
+            CalibrateCameras(frm_calib, &frm_err);
+            cout << "  Frame calib: " << obs_idx << " obs, error=" << frm_err.D() << "px" << endl;
+
+            for (auto& kv : f2o) {
+                int fi = kv.first, oi = kv.second;
+                HTuple board_in_cam;
+                GetCalibDataObservPose(frm_calib, 0, 0, oi, &board_in_cam);
+                HTuple board_in_ref;
+                PoseCompose(T_cam_to_ref[ci], board_in_cam, &board_in_ref);
+                frame_poses[fi].push_back(board_in_ref);
+            }
+            ClearCalibData(frm_calib);
 
         } else {
             // --- 原始路径: 用 arm 帧图像同时标定和提取 ---
