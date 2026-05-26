@@ -241,17 +241,24 @@ int processArm(const string& arm, const string& img_dir, const string& out_dir,
                 string ip = img_dir + "/calib_cam_" + sns[ci] + "_" + ssf.str() + ".jpg";
                 if (!fs::exists(ip)) continue;
                 try {
-                    HObject ho_img, ho_ct;
+                    HObject ho_img;
                     ReadImage(&ho_img, HTuple(ip.c_str()));
                     HTuple ch; CountChannels(ho_img, &ch);
                     if (ch.I() == 3) Rgb1ToGray(ho_img, &ho_img);
-                    HTuple board_pose, cam_out;
-                    FindMarksAndPose(ho_img, hv_cp, cam_params, HTuple(),
-                                     HTuple(), HTuple(),
-                                     &board_pose, &cam_out, &ho_ct);
+                    // CalibData + FindCalibObject with fixed accurate intrinsics
+                    HTuple fid;
+                    CreateCalibData("calibration_object", 1, 1, &fid);
+                    SetCalibDataCalibObject(fid, 0, hv_cp);
+                    SetCalibDataCamParam(fid, 0, HTuple(), cam_params);
+                    FindCalibObject(ho_img, fid, 0, 0, 0,
+                                    (HTuple("alpha").Append("sigma")),
+                                    (HTuple(0.5).Append(1.0)));
+                    HTuple board_pose;
+                    GetCalibData(fid, "calib_obj", 0, "pose", &board_pose);
                     HTuple board_in_ref;
                     PoseCompose(T_cam_to_ref[ci], board_pose, &board_in_ref);
                     frame_poses[fi].push_back(board_in_ref);
+                    ClearCalibData(fid);
                 } catch (HException&) { continue; }
             }
 

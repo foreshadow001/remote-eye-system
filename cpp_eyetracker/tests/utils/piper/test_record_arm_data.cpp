@@ -605,38 +605,38 @@ int main() {
                         cout << "  -> " << fn << " (cam " << cam_idx << ": " << ctx->sn << ")" << endl;
                     }
                 }
-            }
 
-            // 2. 查询当前机械臂 flange 位姿
-            string resp = queryFlangePose(g_current_arm);
-            if (!resp.empty() && resp.rfind("POSE:", 0) == 0) {
-                string data = resp.substr(5);
-                size_t p = data.find(':');
-                string arm_name = data.substr(0, p);
-                string vals = data.substr(p + 1);
-                vector<double> nums; stringstream vss(vals); string token;
-                while (getline(vss, token, ',')) nums.push_back(stod(token));
-                if (nums.size() == 10) {
-                    cout << fixed << setprecision(4);
-                    cout << "  Pose  XYZ (m):      [" << nums[0] << ", " << nums[1] << ", " << nums[2] << "]" << endl;
-                    cout << "        Quat (wxyz):   [" << nums[6] << ", " << nums[3] << ", " << nums[4] << ", " << nums[5] << "]" << endl;
-                    cout << fixed << setprecision(2);
-                    cout << "        Euler ZXZ'':   [" << nums[7] << ", " << nums[8] << ", " << nums[9] << "] deg" << endl;
-                    string mf_path = currentMappingFile();
-                    ofstream mf(mf_path, ios::app);
-                    mf << fixed << setprecision(6);
-                    mf << idx_str << " " << arm_name;
-                    for (double v : nums) mf << " " << v;
-                    mf << endl;
-                    cout << "  -> saved to " << mf_path << endl;
+                // 查询当前机械臂 flange 位姿
+                string resp = queryFlangePose(g_current_arm);
+                if (!resp.empty() && resp.rfind("POSE:", 0) == 0) {
+                    string data = resp.substr(5);
+                    size_t p = data.find(':');
+                    string arm_name = data.substr(0, p);
+                    string vals = data.substr(p + 1);
+                    vector<double> nums; stringstream vss(vals); string token;
+                    while (getline(vss, token, ',')) nums.push_back(stod(token));
+                    if (nums.size() == 10) {
+                        cout << fixed << setprecision(4);
+                        cout << "  Pose  XYZ (m):      [" << nums[0] << ", " << nums[1] << ", " << nums[2] << "]" << endl;
+                        cout << "        Quat (wxyz):   [" << nums[6] << ", " << nums[3] << ", " << nums[4] << ", " << nums[5] << "]" << endl;
+                        cout << fixed << setprecision(2);
+                        cout << "        Euler ZXZ'':   [" << nums[7] << ", " << nums[8] << ", " << nums[9] << "] deg" << endl;
+                        string mf_path = currentMappingFile();
+                        ofstream mf(mf_path, ios::app);
+                        mf << fixed << setprecision(6);
+                        mf << idx_str << " " << arm_name;
+                        for (double v : nums) mf << " " << v;
+                        mf << endl;
+                        cout << "  -> saved to " << mf_path << endl;
+                    }
+                } else if (resp.empty()) {
+                    cerr << "  [Warn] No response from arm server. Pose NOT recorded." << endl;
+                } else {
+                    cerr << "  [Warn] Arm server: " << resp << endl;
                 }
-            } else if (resp.empty()) {
-                cerr << "  [Warn] No response from arm server. Pose NOT recorded." << endl;
-            } else {
-                cerr << "  [Warn] Arm server: " << resp << endl;
-            }
             }  // end else (!g_calib_mode)
         }  // end SPACE handler
+    }  // end while (global_running)
 
     // ================== 清理 ==================
     cout << "[System] Shutting down..." << endl;
