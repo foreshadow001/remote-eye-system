@@ -1,6 +1,7 @@
 # tests/utils/piper/CMakeLists.txt
 
 find_package(OpenCV CONFIG REQUIRED)
+find_package(Ceres CONFIG REQUIRED)
 
 # ---- test_calib_arm / test_record_arm_data: 不需要 HALCON ----
 
@@ -51,6 +52,20 @@ target_link_libraries(save_piper_chain
 )
 
 message(STATUS "save_piper_chain will be built")
+
+# ---- test_piper_hand_eye_calib: 需要 Ceres ----
+add_executable(test_piper_hand_eye_calib
+    test_piper_hand_eye_calib.cpp
+)
+
+target_link_libraries(test_piper_hand_eye_calib
+    PRIVATE
+        eyetracker::piper
+        eyetracker::cfg
+        Ceres::ceres
+)
+
+message(STATUS "test_piper_hand_eye_calib will be built")
 
 # ---- resolve_calib_board_pose: 需要 HALCON ----
 if(NOT DEFINED ENV{HALCONROOT})

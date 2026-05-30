@@ -2,6 +2,8 @@
 #include "cfg/config.hpp"
 #include <cmath>
 #include <stdexcept>
+#include <cassert>
+#include <ceres/ceres.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -49,6 +51,8 @@ Quat quatMultiply(const Quat& q1, const Quat& q0) {
     r.w = q1.w*q0.w - q1.x*q0.x - q1.y*q0.y - q1.z*q0.z;
     return r;
 }
+
+Quat quatConjugate(const Quat& q) { return {-q.x, -q.y, -q.z, q.w}; }
 
 Pt3 quatRotate(const Quat& q, const Pt3& v) {
     Quat qv{v.x, v.y, v.z, 0.0};
@@ -165,6 +169,158 @@ std::vector<std::string> PiperToCam::arms() const {
     std::vector<std::string> r;
     for (auto& kv : cfg_) r.push_back(kv.first);
     return r;
+}
+
+// ============= PiperHandEyeCalib =============
+
+static std::vector<double> readVec(const CfgNode& n) {
+    return {n[0].as<double>(), n[1].as<double>(), n[2].as<double>()};
+}
+
+namespace {
+
+class HandEyeErrorFunctor {
+public:
+    HandEyeErrorFunctor(const std::vector<HandEyeDataPoint>* data)
+        : data_(data) {}
+
+    bool operator()(double const* const* vars, double* residual) const {
+        const double* ccs = vars[0];   // [tx,ty,tz, rx,ry,rz] (m, deg ZXZ)
+        const double* cb  = vars[1];   // [tx,ty,tz, rx,ry,rz] (m, deg ZXZ)
+
+        Pt3 ccs_t{ccs[0], ccs[1], ccs[2]}, ccs_r{ccs[3], ccs[4], ccs[5]};
+        Pt3 cb_t{cb[0], cb[1], cb[2]}, cb_r{cb[3], cb[4], cb[5]};
+
+        Quat arm_q = zxzToQuat(ccs_r.x, ccs_r.y, ccs_r.z);
+        Pose arm_in_ccs{ccs_t, arm_q};
+
+        int idx = 0;
+        for (auto& dp : *data_) {
+            Pose calib_in_flange = computeToolPoseTransFirst(dp.flange, cb_t, cb_r);
+            Pose pred = composePoses(arm_in_ccs, calib_in_flange);
+
+            residual[idx++] = pred.pos.x - dp.board_gt_ccs.pos.x;
+            residual[idx++] = pred.pos.y - dp.board_gt_ccs.pos.y;
+            residual[idx++] = pred.pos.z - dp.board_gt_ccs.pos.z;
+
+            Quat q_err = quatMultiply(quatConjugate(pred.quat), dp.board_gt_ccs.quat);
+            residual[idx++] = q_err.x;
+            residual[idx++] = q_err.y;
+            residual[idx++] = q_err.z;
+        }
+        return true;
+    }
+
+private:
+    const std::vector<HandEyeDataPoint>* data_;
+};
+
+} // anonymous namespace
+
+PiperHandEyeCalib::PiperHandEyeCalib(const std::string& yaml_path)
+    : yaml_path_(yaml_path)
+{
+    Cfg cfg(yaml_path);
+    for (auto& arm_name : {"upper", "lower"}) {
+        try {
+            auto& a = cfg["arms"][arm_name];
+            auto& ca = a["calib_arm_in_ccs"];
+            auto& cb = a["calib_board_in_flange"];
+
+            ArmInit ai;
+            ai.ct = readVec(ca["translation"]["init_value"]);
+            ai.cr = readVec(ca["rotation_zxz"]["init_value"]);
+            ai.bt = readVec(cb["translation"]["init_value"]);
+            ai.br = readVec(cb["rotation_zxz"]["init_value"]);
+
+            auto readBnd = [](const CfgNode& n) -> std::vector<std::pair<double,double>> {
+                std::vector<std::pair<double,double>> r;
+                for (size_t i = 0; i < 3; ++i) {
+                    auto& b = n[i];
+                    r.emplace_back(b[0].as<double>(), b[1].as<double>());
+                }
+                return r;
+            };
+            Bounds cbnd, abnd;
+            abnd.t = readBnd(ca["translation"]["bounds"]);
+            abnd.r = readBnd(ca["rotation_zxz"]["bounds"]);
+            cbnd.t = readBnd(cb["translation"]["bounds"]);
+            cbnd.r = readBnd(cb["rotation_zxz"]["bounds"]);
+
+            configs_[arm_name] = {ai, {abnd, cbnd}};
+        } catch (...) {}
+    }
+    if (configs_.empty())
+        throw std::runtime_error("[PiperHandEyeCalib] No arm configs in " + yaml_path);
+}
+
+std::vector<double> PiperHandEyeCalib::calibrate(
+    const std::string& arm, const std::vector<HandEyeDataPoint>& data) const
+{
+    auto it = configs_.find(arm);
+    if (it == configs_.end())
+        throw std::runtime_error("[PiperHandEyeCalib] Unknown arm: " + arm);
+
+    const auto& ai = it->second.first;
+    const auto& [abnd, cbnd] = it->second.second;
+
+    std::vector<double> ccs_init = ai.ct; ccs_init.insert(ccs_init.end(), ai.cr.begin(), ai.cr.end());
+    std::vector<double> cb_init  = ai.bt; cb_init.insert(cb_init.end(), ai.br.begin(), ai.br.end());
+    assert(ccs_init.size() == 6 && cb_init.size() == 6);
+
+    ceres::Problem problem;
+
+    auto* cost_func = new ceres::DynamicNumericDiffCostFunction<HandEyeErrorFunctor, ceres::CENTRAL>(
+        new HandEyeErrorFunctor(&data));
+    cost_func->AddParameterBlock(6);
+    cost_func->AddParameterBlock(6);
+    cost_func->SetNumResiduals(static_cast<int>(data.size()) * 6);
+
+    auto* ccs_var = new double[6]; memcpy(ccs_var, ccs_init.data(), 6 * sizeof(double));
+    auto* cb_var  = new double[6]; memcpy(cb_var,  cb_init.data(),  6 * sizeof(double));
+
+    std::vector<double*> vars{ccs_var, cb_var};
+    problem.AddResidualBlock(cost_func, nullptr, vars);
+
+    for (int j = 0; j < 3; ++j) {
+        problem.SetParameterLowerBound(ccs_var, j, abnd.t[j].first);
+        problem.SetParameterUpperBound(ccs_var, j, abnd.t[j].second);
+        problem.SetParameterLowerBound(cb_var, j, cbnd.t[j].first);
+        problem.SetParameterUpperBound(cb_var, j, cbnd.t[j].second);
+    }
+    for (int j = 3; j < 6; ++j) {
+        int rj = j - 3;
+        problem.SetParameterLowerBound(ccs_var, j, abnd.r[rj].first);
+        problem.SetParameterUpperBound(ccs_var, j, abnd.r[rj].second);
+        problem.SetParameterLowerBound(cb_var, j, cbnd.r[rj].first);
+        problem.SetParameterUpperBound(cb_var, j, cbnd.r[rj].second);
+    }
+
+    ceres::Solver::Options opts;
+    opts.minimizer_progress_to_stdout = true;
+    opts.linear_solver_type = ceres::DENSE_QR;
+    opts.max_num_iterations = 1000;
+
+    ceres::Solver::Summary sum;
+    ceres::Solve(opts, &problem, &sum);
+    std::cout << sum.BriefReport() << "\n";
+
+    std::vector<double> result(ccs_var, ccs_var + 6);
+    delete[] ccs_var; delete[] cb_var;
+    return result;
+}
+
+void PiperHandEyeCalib::saveArmInCcs(const std::string& arm,
+                                      const std::vector<double>& result) const {
+    Cfg cfg(yaml_path_);
+    std::string base = "arms." + arm + ".calib_arm_in_ccs.";
+    cfg.setVector<double>(base + "translation.init_value",
+                          {result[0], result[1], result[2]}, 4);
+    cfg.setVector<double>(base + "rotation_zxz.init_value",
+                          {result[3], result[4], result[5]}, 4);
+    cfg.save();
+    std::cout << "[PiperHandEyeCalib] " << arm << " arm_in_ccs saved to "
+              << yaml_path_ << std::endl;
 }
 
 } // namespace gazeestimation
