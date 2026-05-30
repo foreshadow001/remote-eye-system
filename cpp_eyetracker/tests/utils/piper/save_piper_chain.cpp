@@ -59,16 +59,24 @@ int main() {
     for (auto& arm_name : {"upper", "lower"}) {
         cout << "\n===== Arm: " << arm_name << " =====" << endl;
 
-        // 读取 calib_board_in_flange + calib_arm_in_ccs (init_value)
+        // arm_in_ccs: 根据配置读取标定前/后; calib_board_in_flange: init_value (固定)
+        bool use_calib = false;
+        try { use_calib = cfg["resolve_calib_board_pose"]["use_calibrated_arm_in_ccs"].as<bool>(); }
+        catch (...) {}
         Pt3 cb_t{0,0,0}, cb_r{0,0,0}, ccs_t{0,0,0}, ccs_r{0,0,0};
         try {
             auto& a = cfg["arms"][arm_name];
             auto& cb = a["calib_board_in_flange"];
-            auto& ca = a["calib_arm_in_ccs"];
             cb_t = readPt3(cb["translation"]["init_value"]);
             cb_r = readPt3(cb["rotation_zxz"]["init_value"]);
-            ccs_t = readPt3(ca["translation"]["init_value"]);
-            ccs_r = readPt3(ca["rotation_zxz"]["init_value"]);
+            if (use_calib) {
+                ccs_t = readPt3(a["arm_in_ccs"]["translation"]);
+                ccs_r = readPt3(a["arm_in_ccs"]["rotation_zxz"]);
+            } else {
+                ccs_t = readPt3(a["calib_arm_in_ccs"]["translation"]["init_value"]);
+                ccs_r = readPt3(a["calib_arm_in_ccs"]["rotation_zxz"]["init_value"]);
+            }
+            cout << "  arm_in_ccs: " << (use_calib ? "calibrated" : "init_value") << endl;
         } catch (...) { cout << "Not configured, skipping." << endl; continue; }
 
         Pose arm_in_ccs = {{ccs_t.x, ccs_t.y, ccs_t.z},

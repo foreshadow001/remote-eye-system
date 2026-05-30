@@ -313,10 +313,10 @@ std::vector<double> PiperHandEyeCalib::calibrate(
 void PiperHandEyeCalib::saveArmInCcs(const std::string& arm,
                                       const std::vector<double>& result) const {
     Cfg cfg(yaml_path_);
-    std::string base = "arms." + arm + ".calib_arm_in_ccs.";
-    cfg.setVector<double>(base + "translation.init_value",
+    std::string base = "arms." + arm + ".arm_in_ccs.";
+    cfg.setVector<double>(base + "translation",
                           {result[0], result[1], result[2]}, 4);
-    cfg.setVector<double>(base + "rotation_zxz.init_value",
+    cfg.setVector<double>(base + "rotation_zxz",
                           {result[3], result[4], result[5]}, 4);
     cfg.save();
     std::cout << "[PiperHandEyeCalib] " << arm << " arm_in_ccs saved to "
