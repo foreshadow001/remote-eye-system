@@ -10,13 +10,13 @@ arms:
       rotation_zxz: [-20.0, 70.7, 90.9]
     calib_arm_in_ccs:
       translation:
-        init_value: [0.0, 0.0, -0.2]
+        init_value: [0.0000, 0.0000, -0.2000]
         bounds:
           - [-0.10, 0.10]
           - [-0.10, 0.10]
           - [-0.10, -0.30]
       rotation_zxz:
-        init_value: [0.0, 90.0, 90.0]
+        init_value: [0.0000, 90.0000, 90.0000]
         bounds: 
           - [-20.0, 20.0]
           - [70.0, 110.0]
@@ -44,13 +44,13 @@ arms:
       rotation_zxz: [-20.0, 110.0, 110.0]
     calib_arm_in_ccs:
       translation:
-        init_value: [0.0, 0.6, -0.2]
+        init_value: [0.1000, 0.6016, -0.1528]
         bounds: 
           - [-0.10, 0.10]
           - [0.50, 0.70]
           - [-0.30, -0.10]
       rotation_zxz:
-        init_value: [0.0, 90.0, 90.0]
+        init_value: [-20.0000, 90.8461, 89.7047]
         bounds: 
           - [-20.0, 20.0]
           - [70.0, 110.0]

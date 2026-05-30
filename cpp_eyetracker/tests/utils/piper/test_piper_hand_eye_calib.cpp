@@ -47,7 +47,7 @@ int main() {
                / "cfg" / "piper.yaml").string();
     Cfg cfg(yp);
     string data_dir  = cfg["test_record_arm_data"]["calib_save_dir"].as<string>();
-    string board_dir = cfg["resolve_calib_board_pose"]["output_dir"].as<string>();
+    string board_dir = data_dir;
 
     PiperHandEyeCalib calib(yp);
 
