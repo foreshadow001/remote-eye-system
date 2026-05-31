@@ -161,7 +161,17 @@ void onMouse(int event, int x, int y, int, void*) {
         int n = static_cast<int>(cam_ctxs.size());
         if (idx >= 0 && idx < n) {
             int prev = g_enlarged_cam.load();
-            g_enlarged_cam.store((prev == idx) ? -1 : idx);
+            if (prev != idx) {
+                // 切换到不同相机 → 退出标定模式
+                if (g_calib_mode) {
+                    g_calib_mode = false;
+                    g_calib_counter = 0;
+                    cout << "[Calib Mode] OFF — camera switched." << endl;
+                }
+                g_enlarged_cam.store(idx);
+            } else {
+                g_enlarged_cam.store(-1);  // deselect
+            }
         }
     }
 }
