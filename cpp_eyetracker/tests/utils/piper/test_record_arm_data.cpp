@@ -550,12 +550,23 @@ int main() {
             cout << "\n[Clear] Removing all photos and mapping files..." << endl;
             int removed = 0;
             if (fs::exists(g_calib_save_dir)) {
-                for (auto& e : fs::recursive_directory_iterator(g_calib_save_dir)) {
-                    string ext = e.path().extension().string();
-                    if (ext == ".jpg" || ext == ".txt") {
-                        fs::remove(e.path());
-                        removed++;
+                try {
+                    for (auto& e : fs::recursive_directory_iterator(g_calib_save_dir)) {
+                        string ext = e.path().extension().string();
+                        if (ext == ".jpg" || ext == ".txt") {
+                            fs::remove(e.path());
+                            removed++;
+                        }
                     }
+                    // 删除空子目录
+                    for (auto& e : fs::directory_iterator(g_calib_save_dir)) {
+                        if (e.is_directory()) {
+                            error_code ec;
+                            fs::remove_all(e.path(), ec);
+                        }
+                    }
+                } catch (const fs::filesystem_error& e) {
+                    cerr << "[Clear] Error: " << e.what() << endl;
                 }
             }
             g_calib_counter = 0;
