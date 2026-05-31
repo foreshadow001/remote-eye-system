@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <vector>
 #include <map>
+#include <utility>
 #include <cmath>
 #include "piper/piper.hpp"
 #include "cfg/config.hpp"
@@ -77,26 +78,58 @@ int main() {
         cout << "\n===== " << arm << ": " << data.size() << " pairs =====" << endl;
         if (data.size() < 3) { cout << "Too few pairs, skipping." << endl; continue; }
 
-        auto result = calib.calibrate(arm, data);
+        auto [ccs_result, cb_result] = calib.calibrate(arm, data);
         cout << fixed << setprecision(4);
-        cout << "arm_in_ccs: t=[" << result[0] << "," << result[1] << "," << result[2]
-             << "]m  r_zxz=[" << result[3] << "," << result[4] << "," << result[5] << "]deg" << endl;
+        cout << "arm_in_ccs:       t=[" << ccs_result[0] << "," << ccs_result[1] << "," << ccs_result[2]
+             << "]m  r_zxz=[" << ccs_result[3] << "," << ccs_result[4] << "," << ccs_result[5] << "]deg" << endl;
+        cout << "calib_board_flange: t=[" << cb_result[0] << "," << cb_result[1] << "," << cb_result[2]
+             << "]m  r_zxz=[" << cb_result[3] << "," << cb_result[4] << "," << cb_result[5] << "]deg" << endl;
 
-        // 计算平均误差
+        // 检查结果是否在 bounds 内
+        auto chkBnd = [&](const string& label, const vector<double>& v,
+                          const vector<pair<double,double>>& tb,
+                          const vector<pair<double,double>>& rb) {
+            for (int j = 0; j < 3; ++j) {
+                double lo = tb[j].first, hi = tb[j].second;
+                if (lo > hi) swap(lo, hi);
+                bool ok = (v[j] >= lo - 1e-6 && v[j] <= hi + 1e-6);
+                cerr << "[CHK] " << arm << " " << label << "_t[" << j << "]=" << v[j]
+                     << " in [" << lo << "," << hi << "] " << (ok ? "OK" : "VIOLATED") << endl;
+            }
+            for (int j = 3; j < 6; ++j) {
+                int rj = j - 3;
+                double lo = rb[rj].first, hi = rb[rj].second;
+                if (lo > hi) swap(lo, hi);
+                bool ok = (v[j] >= lo - 1e-6 && v[j] <= hi + 1e-6);
+                cerr << "[CHK] " << arm << " " << label << "_r[" << rj << "]=" << v[j]
+                     << " in [" << lo << "," << hi << "] " << (ok ? "OK" : "VIOLATED") << endl;
+            }
+        };
+        auto readBnd = [](const CfgNode& n) -> vector<pair<double,double>> {
+            vector<pair<double,double>> r;
+            for (size_t i = 0; i < 3; ++i) r.emplace_back(n[i][0].as<double>(), n[i][1].as<double>());
+            return r;
+        };
+        bool ca_ok = false, cb_ok = false;
+        try {
+            auto& ca = cfg["arms"][arm]["calib_arm_in_ccs"];
+            chkBnd("arm_ccs", ccs_result, readBnd(ca["translation"]["bounds"]),
+                   readBnd(ca["rotation_zxz"]["bounds"]));
+            ca_ok = true;
+        } catch (...) { cerr << "[CHK] " << arm << " calib_arm_in_ccs NOT FOUND in yaml" << endl; }
+        try {
+            auto& cb = cfg["arms"][arm]["calib_board_in_flange"];
+            chkBnd("board", cb_result, readBnd(cb["translation"]["bounds"]),
+                   readBnd(cb["rotation_zxz"]["bounds"]));
+            cb_ok = true;
+        } catch (...) { cerr << "[CHK] " << arm << " calib_board_in_flange NOT FOUND in yaml" << endl; }
+
+        // 计算平均误差（用优化后的参数）
         double sum_xyz = 0, sum_rot_deg = 0;
-        Pt3 ccs_t{result[0], result[1], result[2]}, ccs_r{result[3], result[4], result[5]};
+        Pt3 ccs_t{ccs_result[0], ccs_result[1], ccs_result[2]}, ccs_r{ccs_result[3], ccs_result[4], ccs_result[5]};
         Quat arm_q = zxzToQuat(ccs_r.x, ccs_r.y, ccs_r.z);
         Pose arm_in_ccs{ccs_t, arm_q};
-        // calib_board params from config (fixed per arm)
-        Pt3 cb_t{0,0,0}, cb_r{0,0,0};
-        try {
-            auto& a = cfg["arms"][arm]["calib_board_in_flange"];
-            auto& tt = a["translation"]["init_value"];
-            auto& tr = a["rotation_zxz"]["init_value"];
-            cb_t = {tt[0].as<double>(), tt[1].as<double>(), tt[2].as<double>()};
-            cb_r = {tr[0].as<double>(), tr[1].as<double>(), tr[2].as<double>()};
-        } catch (...) {}
-
+        Pt3 cb_t{cb_result[0], cb_result[1], cb_result[2]}, cb_r{cb_result[3], cb_result[4], cb_result[5]};
         for (auto& dp : data) {
             Pose calib_in_flange = computeToolPoseTransFirst(dp.flange, cb_t, cb_r);
             Pose pred = composePoses(arm_in_ccs, calib_in_flange);
@@ -105,14 +138,17 @@ int main() {
             double dz = pred.pos.z - dp.board_gt_ccs.pos.z;
             sum_xyz += sqrt(dx*dx + dy*dy + dz*dz) * 1000.0;  // mm
             Quat qe = quatMultiply(quatConjugate(pred.quat), dp.board_gt_ccs.quat);
-            double angle = 2.0 * acos(clamp(qe.w, -1.0, 1.0));
+            // Rotation angle from error quaternion: R_err trace = 4*w² - 1, angle = acos((tr-1)/2)
+            double tr = 4.0 * qe.w * qe.w - 1.0;
+            double angle = acos(clamp((tr - 1.0) / 2.0, -1.0, 1.0));
             if (!isnan(angle)) sum_rot_deg += angle * 180.0 / M_PI;
         }
         cout << fixed << setprecision(2);
         cout << "Avg pos error: " << (sum_xyz / data.size()) << " mm  |  "
              << "Avg rot error: " << (sum_rot_deg / data.size()) << " deg" << endl;
 
-        calib.saveArmInCcs(arm, result);
+        calib.saveArmInCcs(arm, ccs_result);
+        calib.saveCalibBoard(arm, cb_result);
     }
     return 0;
 }

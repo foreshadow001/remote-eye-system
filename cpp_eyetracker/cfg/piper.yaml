@@ -5,16 +5,19 @@ arms:
     tool:                                  # 末端工具/标定板 在法兰盘坐标系中的位姿
       translation: [0.0, 0.0, 0.02]       # 米 (法兰盘坐标系)
       rotation_zxz: [0.0, 0.0, 0.0]      # 度, 内旋 Z-X-Z''
-    arm_in_ccs:                            # 机械臂基座 在相机坐
-      translation: [-0.0136, -0.1000, -0.1817]
-      rotation_zxz: [-20.0, 70.7, 90.9]
+    arm_in_ccs:
+      translation: [-0.0163, 0.0358, -0.1736]
+      rotation_zxz: [1.2795, 89.6744, 85.8849]
+    board_in_flange:
+      translation: [-0.1570, 0.0069, 0.0415]
+      rotation_zxz: [-87.0021, -3.6760, -4.5942]
     calib_arm_in_ccs:
       translation:
         init_value: [0.0000, 0.0000, -0.2000]
         bounds:
           - [-0.10, 0.10]
           - [-0.10, 0.10]
-          - [-0.10, -0.30]
+          - [-0.30, -0.10]
       rotation_zxz:
         init_value: [0.0000, 90.0000, 90.0000]
         bounds: 
@@ -40,32 +43,35 @@ arms:
       translation: [0.0, 0.0, 0.02]
       rotation_zxz: [0.0, 0.0, 0.0]
     arm_in_ccs:
-      translation: [0.1000, 0.6323, -0.1000]
-      rotation_zxz: [-20.0, 110.0, 110.0]
+      translation: [-0.0166, 0.6478, -0.2616]
+      rotation_zxz: [0.4473, 90.0659, 87.5038]
+    board_in_flange:
+      translation: [0.0064, 0.1967, 0.0827]
+      rotation_zxz: [200.0000, -1.9653, -19.2026]
     calib_arm_in_ccs:
       translation:
-        init_value: [0.1000, 0.6016, -0.1528]
+        init_value: [0.0, 0.60, -0.20]
         bounds: 
           - [-0.10, 0.10]
           - [0.50, 0.70]
           - [-0.30, -0.10]
       rotation_zxz:
-        init_value: [-20.0000, 90.8461, 89.7047]
+        init_value: [0.0000, 90.0000, 90.0000]
         bounds: 
           - [-20.0, 20.0]
           - [70.0, 110.0]
           - [70.0, 110.0]
     calib_board_in_flange: 
       translation:
-        init_value: [-0.15, 0.0, 0.05]
+        init_value: [0.0, 0.15, 0.05]
         bounds:
-          - [-0.25, -0.05]
           - [-0.10, 0.10]
+          - [0.05, 0.25]
           - [0.0, 0.10]
       rotation_zxz:
-        init_value: [-90.0, 0.0, 0.0]
+        init_value: [180.0, 0.0, 0.0]
         bounds: 
-          - [-110.0, -70.0]
+          - [160.0, 200.0]
           - [-20.0, 20.0]
           - [-20.0, 20.0]
 

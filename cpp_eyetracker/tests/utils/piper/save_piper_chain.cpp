@@ -66,9 +66,15 @@ int main() {
         Pt3 cb_t{0,0,0}, cb_r{0,0,0}, ccs_t{0,0,0}, ccs_r{0,0,0};
         try {
             auto& a = cfg["arms"][arm_name];
-            auto& cb = a["calib_board_in_flange"];
-            cb_t = readPt3(cb["translation"]["init_value"]);
-            cb_r = readPt3(cb["rotation_zxz"]["init_value"]);
+            if (use_calib) {
+                auto& cb = a["board_in_flange"];
+                cb_t = readPt3(cb["translation"]);
+                cb_r = readPt3(cb["rotation_zxz"]);
+            } else {
+                auto& cb = a["calib_board_in_flange"];
+                cb_t = readPt3(cb["translation"]["init_value"]);
+                cb_r = readPt3(cb["rotation_zxz"]["init_value"]);
+            }
             if (use_calib) {
                 ccs_t = readPt3(a["arm_in_ccs"]["translation"]);
                 ccs_r = readPt3(a["arm_in_ccs"]["rotation_zxz"]);

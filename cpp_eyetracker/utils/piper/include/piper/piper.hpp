@@ -58,13 +58,14 @@ public:
     // 从 piper.yaml 加载 init_value + bounds (arm_in_ccs + calib_board_in_flange)
     explicit PiperHandEyeCalib(const std::string& yaml_path);
 
-    // 标定: 返回 {tx,ty,tz, rx,ry,rz} — arm_in_ccs (m, deg Z-X-Z'')
-    // calib_board 也参与优化但仅作为辅助, 不返回
-    std::vector<double> calibrate(const std::string& arm,
-                                   const std::vector<HandEyeDataPoint>& data) const;
+    // 标定: 返回 {arm_in_ccs(6), calib_board(6)} — (m, deg Z-X-Z'')
+    using CalibResult = std::pair<std::vector<double>, std::vector<double>>;
+    CalibResult calibrate(const std::string& arm,
+                          const std::vector<HandEyeDataPoint>& data) const;
 
-    // 将标定结果写回 piper.yaml (calib_arm_in_ccs.translation.init_value + rotation_zxz.init_value)
+    // 写回 piper.yaml
     void saveArmInCcs(const std::string& arm, const std::vector<double>& result) const;
+    void saveCalibBoard(const std::string& arm, const std::vector<double>& result) const;
 
 private:
     std::string yaml_path_;
