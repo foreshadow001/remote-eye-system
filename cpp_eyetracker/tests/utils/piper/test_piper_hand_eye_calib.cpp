@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <vector>
 #include <map>
+#include <set>
 #include <utility>
 #include <cmath>
 #include "piper/piper.hpp"
@@ -67,10 +68,29 @@ int main() {
             continue;
         }
 
-        // Build data pairs (matching frame indices)
+        // 读取该 arm 允许的相机 SN 列表
+        vector<string> allowed_sns;
+        try { allowed_sns = cfg["hand_eye_calib"][arm].as<vector<string>>(); }
+        catch (...) {}
+        // 构建允许帧集合: 任一 allowed SN 有照片的帧索引
+        set<int> allowed_frames;
+        if (!allowed_sns.empty()) {
+            for (auto& kv : fl) {
+                int fi = kv.first;
+                stringstream ssf; ssf << setw(2) << setfill('0') << fi;
+                for (auto& sn : allowed_sns) {
+                    string ip = data_dir + "/calib_cam_" + sn + "_" + ssf.str() + ".jpg";
+                    if (fs::exists(ip)) { allowed_frames.insert(fi); break; }
+                }
+            }
+            cout << "  Allowed cameras: " << allowed_sns.size()
+                 << " → " << allowed_frames.size() << " valid frames" << endl;
+        }
+
         vector<HandEyeDataPoint> data;
         for (auto& kv : fl) {
             int fi = kv.first;
+            if (!allowed_sns.empty() && !allowed_frames.count(fi)) continue;
             auto git = gt.find(fi);
             if (git == gt.end()) continue;
             data.push_back({kv.second, git->second});

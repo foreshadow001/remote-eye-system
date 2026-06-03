@@ -182,7 +182,8 @@ namespace {
 
 class SinglePtError {
 public:
-    SinglePtError(const Pose& f, const Pose& g) : flange_(f), gt_(g) {}
+    SinglePtError(const Pose& f, const Pose& g, double rw)
+        : flange_(f), gt_(g), rot_weight_(rw) {}
 
     bool operator()(const double* ccs, const double* cb, double* residual) const {
         Pt3 ccs_t{ccs[0],ccs[1],ccs[2]}, ccs_r{ccs[3],ccs[4],ccs[5]};
@@ -195,13 +196,14 @@ public:
         residual[1] = pred.pos.y - gt_.pos.y;
         residual[2] = pred.pos.z - gt_.pos.z;
         Quat qe = quatMultiply(quatConjugate(pred.quat), gt_.quat);
-        residual[3] = qe.x;
-        residual[4] = qe.y;
-        residual[5] = qe.z;
+        residual[3] = qe.x * rot_weight_;
+        residual[4] = qe.y * rot_weight_;
+        residual[5] = qe.z * rot_weight_;
         return true;
     }
 private:
     Pose flange_, gt_;
+    double rot_weight_;
 };
 
 } // anonymous namespace
@@ -253,13 +255,19 @@ PiperHandEyeCalib::CalibResult PiperHandEyeCalib::calibrate(
     const auto& ai = it->second.first;
     const auto& [abnd, cbnd] = it->second.second;
 
+    // 读取旋转权重
+    Cfg cfg(yaml_path_);
+    double rot_weight = 0.3;
+    try { rot_weight = cfg["hand_eye_calib"]["rotation_weight"].as<double>(); }
+    catch (...) {}
+
     std::vector<double> ccs_init = ai.ct; ccs_init.insert(ccs_init.end(), ai.cr.begin(), ai.cr.end());
     std::vector<double> cb_init  = ai.bt; cb_init.insert(cb_init.end(), ai.br.begin(), ai.br.end());
     assert(ccs_init.size() == 6 && cb_init.size() == 6);
 
     // Quick sanity: evaluate single-point functor at init
     {
-        SinglePtError tester(data[0].flange, data[0].board_gt_ccs);
+        SinglePtError tester(data[0].flange, data[0].board_gt_ccs, rot_weight);
         double res[6];
         bool ok = tester(ccs_init.data(), cb_init.data(), res);
         std::cout << "[HE pre] arm=" << arm << " ok=" << ok
@@ -275,7 +283,7 @@ PiperHandEyeCalib::CalibResult PiperHandEyeCalib::calibrate(
     // Per-point: NumericDiffCostFunction<Functor, Method, kRes, kBlock0, kBlock1>
     for (size_t i = 0; i < data.size(); ++i) {
         auto* cf = new ceres::NumericDiffCostFunction<SinglePtError, ceres::CENTRAL, 6, 6, 6>(
-            new SinglePtError(data[i].flange, data[i].board_gt_ccs));
+            new SinglePtError(data[i].flange, data[i].board_gt_ccs, rot_weight));
         problem.AddResidualBlock(cf, nullptr, ccs_var, cb_var);
     }
 
