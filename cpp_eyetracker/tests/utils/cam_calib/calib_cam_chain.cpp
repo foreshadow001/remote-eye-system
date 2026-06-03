@@ -198,50 +198,54 @@ void action()
     int num_threads = (std::max)(1u, std::thread::hardware_concurrency());
     std::cout << "Using " << num_threads << " threads." << std::endl;
 
-    std::mutex halcon_mtx, cout_mtx;
-    std::vector<std::thread> workers;
-    for (int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&]() {
-            HObject img;
-            while (true) {
-                int fi = next_frame.fetch_add(1);
-                if (fi >= num_images) break;
+    // Phase 1a: 多线程预加载所有图片到内存
+    std::vector<std::vector<HObject>> preloaded(num_images,
+        std::vector<HObject>(num_cams));
+    std::vector<std::vector<bool>> img_ok(num_images, std::vector<bool>(num_cams, false));
+    std::mutex cout_mtx;
 
-                HTuple fiStr = HTuple(fi).TupleString("02d");
-                bool any_found = false;
-                for (int ci = 0; ci < num_cams; ++ci) {
-                    HTuple fname = hv_ImagePath + "/calib_cam_"
-                                 + HTuple(cam_sn_list[ci].c_str()) + "_" + fiStr;
-                    bool found = false;
-                    try {
-                        ReadImage(&img, fname);
-                        HTuple ch; CountChannels(img, &ch);
-                        if (ch.I() == 3) Rgb1ToGray(img, &img);
-                    } catch (HException&) { continue; }
-
-                    {
-                        std::lock_guard<std::mutex> lk(halcon_mtx);
+    {
+        std::atomic<int> next_frame{0};
+        std::vector<std::thread> loaders;
+        for (int t = 0; t < num_threads; ++t) {
+            loaders.emplace_back([&]() {
+                while (true) {
+                    int fi = next_frame.fetch_add(1);
+                    if (fi >= num_images) break;
+                    HTuple fiStr = HTuple(fi).TupleString("02d");
+                    for (int ci = 0; ci < num_cams; ++ci) {
+                        HTuple fname = hv_ImagePath + "/calib_cam_"
+                                     + HTuple(cam_sn_list[ci].c_str()) + "_" + fiStr;
                         try {
-                            FindCalibObject(img, hv_CalibDataID, ci, 0, fi,
-                                            (HTuple("alpha").Append("sigma")),
-                                            (HTuple(0.5).Append(1.0)));
-                            found = true;
+                            ReadImage(&preloaded[fi][ci], fname);
+                            HTuple ch; CountChannels(preloaded[fi][ci], &ch);
+                            if (ch.I() == 3) Rgb1ToGray(preloaded[fi][ci], &preloaded[fi][ci]);
+                            img_ok[fi][ci] = true;
                         } catch (HException&) {}
                     }
-                    if (found) {
-                        frame_observations[fi].push_back(ci);
-                        any_found = true;
-                    }
                 }
-                if (any_found) {
-                    std::lock_guard<std::mutex> lk(cout_mtx);
-                    std::cout << "Frame " << fi << ": " << frame_observations[fi].size()
-                              << " cams" << std::endl;
-                }
-            }
-        });
+            });
+        }
+        for (auto& t : loaders) t.join();
+        std::cout << "Images preloaded." << std::endl;
     }
-    for (auto& t : workers) t.join();
+
+    // Phase 1b: 串行 FindCalibObject (Halcon CalibData 非线程安全)
+    for (int fi = 0; fi < num_images; ++fi) {
+        for (int ci = 0; ci < num_cams; ++ci) {
+            if (!img_ok[fi][ci]) continue;
+            try {
+                FindCalibObject(preloaded[fi][ci], hv_CalibDataID, ci, 0, fi,
+                                (HTuple("alpha").Append("sigma")),
+                                (HTuple(0.5).Append(1.0)));
+                frame_observations[fi].push_back(ci);
+            } catch (HException&) { continue; }
+        }
+        if (!frame_observations[fi].empty()) {
+            std::cout << "Frame " << fi << ": " << frame_observations[fi].size()
+                      << " cams" << std::endl;
+        }
+    }
 
     // ========================================================================
     // 3. 阶段二：连通图校验 (Graph Connectivity Validation)
