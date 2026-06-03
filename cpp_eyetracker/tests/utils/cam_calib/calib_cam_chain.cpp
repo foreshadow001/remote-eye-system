@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <queue> // 引入队列，用于BFS图论校验
 #include <thread>
+#include <mutex>
 #include <atomic>
 
 #include "HalconCpp.h"
@@ -197,6 +198,7 @@ void action()
     int num_threads = (std::max)(1u, std::thread::hardware_concurrency());
     std::cout << "Using " << num_threads << " threads." << std::endl;
 
+    std::mutex halcon_mtx, cout_mtx;
     std::vector<std::thread> workers;
     for (int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&]() {
@@ -206,20 +208,33 @@ void action()
                 if (fi >= num_images) break;
 
                 HTuple fiStr = HTuple(fi).TupleString("02d");
+                bool any_found = false;
                 for (int ci = 0; ci < num_cams; ++ci) {
                     HTuple fname = hv_ImagePath + "/calib_cam_"
                                  + HTuple(cam_sn_list[ci].c_str()) + "_" + fiStr;
+                    bool found = false;
                     try {
                         ReadImage(&img, fname);
                         HTuple ch; CountChannels(img, &ch);
                         if (ch.I() == 3) Rgb1ToGray(img, &img);
-                        FindCalibObject(img, hv_CalibDataID, ci, 0, fi,
-                                        (HTuple("alpha").Append("sigma")),
-                                        (HTuple(0.5).Append(1.0)));
-                        frame_observations[fi].push_back(ci);
                     } catch (HException&) { continue; }
+
+                    {
+                        std::lock_guard<std::mutex> lk(halcon_mtx);
+                        try {
+                            FindCalibObject(img, hv_CalibDataID, ci, 0, fi,
+                                            (HTuple("alpha").Append("sigma")),
+                                            (HTuple(0.5).Append(1.0)));
+                            found = true;
+                        } catch (HException&) {}
+                    }
+                    if (found) {
+                        frame_observations[fi].push_back(ci);
+                        any_found = true;
+                    }
                 }
-                if (!frame_observations[fi].empty()) {
+                if (any_found) {
+                    std::lock_guard<std::mutex> lk(cout_mtx);
                     std::cout << "Frame " << fi << ": " << frame_observations[fi].size()
                               << " cams" << std::endl;
                 }
