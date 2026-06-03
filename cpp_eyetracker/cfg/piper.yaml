@@ -6,11 +6,11 @@ arms:
       translation: [0.0, 0.0, 0.02]       # 米 (法兰盘坐标系)
       rotation_zxz: [0.0, 0.0, 0.0]      # 度, 内旋 Z-X-Z''
     arm_in_ccs:
-      translation: [-0.0118, 0.0261, -0.1739]
-      rotation_zxz: [0.8491, 89.7286, 86.4605]
+      translation: [-0.0062, 0.0255, -0.1726]
+      rotation_zxz: [0.0439, 89.8106, 86.9554]
     board_in_flange:
-      translation: [0.0024, 0.1638, 0.0543]
-      rotation_zxz: [192.4646, -2.7116, -12.8071]
+      translation: [-0.0013, 0.1620, 0.0549]
+      rotation_zxz: [198.1467, -2.7239, -17.5655]
     calib_arm_in_ccs:
       translation:
         init_value: [0.0000, 0.0000, -0.2000]
@@ -43,11 +43,11 @@ arms:
       translation: [0.0, 0.0, 0.02]
       rotation_zxz: [0.0, 0.0, 0.0]
     arm_in_ccs:
-      translation: [0.0002, 0.6690, -0.1917]
-      rotation_zxz: [-1.2477, 92.4161, 89.8052]
+      translation: [-0.1000, 0.5836, -0.1000]
+      rotation_zxz: [20.0000, 70.0000, 110.0000]
     board_in_flange:
-      translation: [0.0134, 0.2020, 0.0389]
-      rotation_zxz: [172.9377, 2.3036, 10.3385]
+      translation: [-0.1000, 0.2500, 0.1000]
+      rotation_zxz: [191.8083, 20.0000, 20.0000]
     calib_arm_in_ccs:
       translation:
         init_value: [0.0, 0.60, -0.20]
@@ -108,10 +108,10 @@ hand_eye_calib:
     - 40772280
     - 40772279
   lower:
-    #- 40772280
+    - 40772280
     - 40777497
     - 40772277
-    #- 40772284
+    - 40772284
 
 resolve_calib_board_pose:
   focus: 0.016                                    # 默认焦距 (m)

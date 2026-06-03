@@ -5,6 +5,8 @@
 #include <map>
 #include <stdexcept>
 #include <queue> // 引入队列，用于BFS图论校验
+#include <thread>
+#include <atomic>
 
 #include "HalconCpp.h"
 #include "cfg/config.hpp"
@@ -186,48 +188,45 @@ void action()
     }
 
     // ========================================================================
-    // 2. 阶段一：完全解耦的特征提取 (Independent Observation)
+    // 2. 阶段一：多线程特征提取
     // ========================================================================
-    std::cout << "\n--- Processing Frames (Decoupled Observation) ---" << std::endl;
-    
-    // 数据结构：记录每一帧有哪些相机成功检测到了标定板
+    std::cout << "\n--- Processing Frames (Multi-threaded) ---" << std::endl;
+
     std::vector<std::vector<int>> frame_observations(num_images);
+    std::atomic<int> next_frame{0};
+    int num_threads = (std::max)(1u, std::thread::hardware_concurrency());
+    std::cout << "Using " << num_threads << " threads." << std::endl;
 
-    for (int imgIdx = 0; imgIdx < num_images; ++imgIdx)
-    {
-        HTuple imgIdxStr = HTuple(imgIdx).TupleString("02d");
-        
-        for (int camIdx = 0; camIdx < num_cams; ++camIdx)
-        {
-            HTuple currentFileName = hv_ImagePath + "/calib_cam_" + HTuple(cam_sn_list[camIdx].c_str()) + "_" + imgIdxStr;
-            try {
-                ReadImage(&ho_Image, currentFileName);
+    std::vector<std::thread> workers;
+    for (int t = 0; t < num_threads; ++t) {
+        workers.emplace_back([&]() {
+            HObject img;
+            while (true) {
+                int fi = next_frame.fetch_add(1);
+                if (fi >= num_images) break;
 
-                // 彩色图转为灰度，保证标定一致性
-                HTuple hv_Channels;
-                CountChannels(ho_Image, &hv_Channels);
-                if (hv_Channels.I() == 3) {
-                    Rgb1ToGray(ho_Image, &ho_Image);
+                HTuple fiStr = HTuple(fi).TupleString("02d");
+                for (int ci = 0; ci < num_cams; ++ci) {
+                    HTuple fname = hv_ImagePath + "/calib_cam_"
+                                 + HTuple(cam_sn_list[ci].c_str()) + "_" + fiStr;
+                    try {
+                        ReadImage(&img, fname);
+                        HTuple ch; CountChannels(img, &ch);
+                        if (ch.I() == 3) Rgb1ToGray(img, &img);
+                        FindCalibObject(img, hv_CalibDataID, ci, 0, fi,
+                                        (HTuple("alpha").Append("sigma")),
+                                        (HTuple(0.5).Append(1.0)));
+                        frame_observations[fi].push_back(ci);
+                    } catch (HException&) { continue; }
                 }
-
-                // 尝试提取特征并直接添加到模型
-                FindCalibObject(ho_Image, hv_CalibDataID, camIdx, 0, imgIdx,
-                                (HTuple("alpha").Append("sigma")), 
-                                (HTuple(0.5).Append(1.0)));
-                
-                // 走到这里说明提取成功，记录该相机观测到了当前帧
-                frame_observations[imgIdx].push_back(camIdx);
-                
-            } catch (HException &) {
-                // 静默跳过：该相机在这帧没拍到或读图失败，不影响其他相机
-                continue; 
+                if (!frame_observations[fi].empty()) {
+                    std::cout << "Frame " << fi << ": " << frame_observations[fi].size()
+                              << " cams" << std::endl;
+                }
             }
-        }
-        
-        if (!frame_observations[imgIdx].empty()) {
-            std::cout << "Frame " << imgIdx << " processed. Cams found: " << frame_observations[imgIdx].size() << std::endl;
-        }
+        });
     }
+    for (auto& t : workers) t.join();
 
     // ========================================================================
     // 3. 阶段二：连通图校验 (Graph Connectivity Validation)
