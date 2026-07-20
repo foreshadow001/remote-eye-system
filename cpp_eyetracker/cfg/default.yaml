@@ -105,16 +105,16 @@ test_net:
 # Test Multi Cam
 test_multi_cam:
   cam_indices:
-    - 40772282 
-    - 40772278
-    - 40772281
-    - 40777498
-    - 40772280
-    - 40772279
-    - 40777497
-    - 40772277
-    - 40772284
-    - 40772276
+    - 40768742 
+    - 40774056
+    - 40768741
+    - 40774063
+    - 40774057
+    - 40774064
+    - 40768744
+    - 40768743
+    - 40773101
+    - 40772283
   hardware_trigger: true
   write_jpg: true
   debug_time: true
@@ -146,7 +146,7 @@ test_multi_cam:
   record_time: 1.0       # 录制的核心秒数 (代码会自动加20%余量)
   margin_frames_ratio: 0.05
   write_delay_ms: 0      # 录制结束后，写硬盘阶段每帧的延时(毫秒)，用以控制CPU和硬盘峰值压力，0为全速
-  is_master: true             # 主机设为 true，从机设为 false
+  is_master: false             # 主机设为 true，从机设为 false
   master_ip: "192.168.10.1"
   slave_ip: "192.168.10.2"
   port: 49200             # 使用刚刚打通的安全端口
