@@ -744,7 +744,8 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
 
 // ================== 结构化报告写入 ==================
 void writeReport(const string& timestr, int rec_num, double target_fps, int total_frames,
-                 double dump_wall_s, double jpg_wall_s, bool write_jpg, bool hw_trigger) {
+                 double dump_wall_s, double jpg_wall_s, bool write_jpg, bool hw_trigger,
+                 const vector<double>& bw_samples) {
     if (!g_session_log.is_open()) return;
 
     g_session_log << "\n=== Recording #" << rec_num << ": " << timestr << " ===\n";
@@ -820,9 +821,18 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     }
 
     // --- Bandwidth Samples ---
-    // (populated by bandwidth sampling thread, placeholder)
-    g_session_log << "\n--- Dump Bandwidth Samples (500ms interval) ---\n";
-    g_session_log << "  (see below for bandwidth samples)\n";
+    if (!bw_samples.empty()) {
+        g_session_log << "\n--- Dump Bandwidth Samples (500ms interval) ---\n";
+        double peak_bw = 0; int peak_idx = 0;
+        for (size_t k = 0; k < bw_samples.size(); ++k)
+            if (bw_samples[k] > peak_bw) { peak_bw = bw_samples[k]; peak_idx = (int)k; }
+        for (size_t k = 0; k < bw_samples.size(); ++k) {
+            g_session_log << fixed << setprecision(1) << "  " << (k * 0.5) << "s  "
+                          << setw(8) << bw_samples[k] << " MB/s"
+                          << (k == (size_t)peak_idx ? "  <- peak" : "") << "\n";
+        }
+        // Bandwidth stats moved to Summary below
+    }
 
     // --- Summary ---
     g_session_log << "\n--- Summary ---\n";
@@ -885,6 +895,9 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     g_session_log << "max_trigger_latency_spread : " << (max_lat - min_lat) << " ms\n";
     g_session_log << "peak_queue_pressure  : " << peak_q << " (cam " << peak_q_cam << ": " << (peak_q_cam >= 0 ? cam_ctxs[peak_q_cam]->id : "?") << ")\n";
     g_session_log << "max_jitter           : " << max_jitter << " us (cam " << max_jitter_cam << ": " << (max_jitter_cam >= 0 ? cam_ctxs[max_jitter_cam]->id : "?") << ")\n";
+    double peak_bw = 0;
+    for (auto v : bw_samples) if (v > peak_bw) peak_bw = v;
+    g_session_log << "dump_bandwidth_peak  : " << peak_bw << " MB/s\n";
     g_session_log << "dump_bandwidth_avg   : " << avg_bw << " MB/s\n";
     g_session_log << "dump_balance         : (see per-camera DumpTime_ms)\n";
     g_session_log << "max_recording_overflow : " << max_overflow << " ms\n";
@@ -1269,27 +1282,9 @@ int main() {
                     jpg_duration = chrono::duration<double>(chrono::steady_clock::now() - jpg_start).count();
                 }
 
-                // Write bandwidth samples to session log
-                if (g_session_log.is_open() && !bw_samples.empty()) {
-                    g_session_log << "\n--- Dump Bandwidth Samples (500ms interval) ---\n";
-                    double peak_bw = 0; int peak_idx = 0;
-                    for (size_t k = 0; k < bw_samples.size(); ++k) {
-                        if (bw_samples[k] > peak_bw) { peak_bw = bw_samples[k]; peak_idx = (int)k; }
-                    }
-                    for (size_t k = 0; k < bw_samples.size(); ++k) {
-                        g_session_log << fixed << setprecision(1) << "  " << (k * 0.5) << "s  "
-                                      << setw(8) << bw_samples[k] << " MB/s"
-                                      << (k == (size_t)peak_idx ? "  <- peak" : "") << "\n";
-                    }
-                    g_session_log << "\n--- Summary ---\n";
-                    double total_gb_bw = (double)total_record_frames * cam_ctxs[0]->ram_buffer[0].total() * cam_ctxs.size() / (1024.0*1024.0*1024.0);
-                    g_session_log << "dump_bandwidth_peak  : " << fixed << setprecision(1) << peak_bw << " MB/s\n";
-                    g_session_log << "dump_bandwidth_avg   : " << (dump_duration > 0 ? total_gb_bw * 1024.0 / dump_duration : 0) << " MB/s\n";
-                }
-
-                // Write report
+                // Write report (includes bandwidth samples inside recording block)
                 writeReport(current_record_timestr, g_recording_number, target_fps, total_record_frames,
-                            dump_duration, jpg_duration, write_jpg, use_hw_trigger);
+                            dump_duration, jpg_duration, write_jpg, use_hw_trigger, bw_samples);
 
                 cout << "[Recording #" << g_recording_number << "] Done in " << fixed << setprecision(1)
                      << dump_duration + jpg_duration << "s (appended to session log)" << endl;
