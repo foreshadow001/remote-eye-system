@@ -13,6 +13,8 @@ bool local_debug = false;
 
 namespace gazeestimation {
 
+static std::mutex g_print_mtx;  // serialize console output across threads
+
 BaslerCamera::BaslerCamera(const std::string& serialNumber)
     : serialNumber_(serialNumber), isOpen_(false), recording_(false), writerInitialized_(false) {
     try {
@@ -41,14 +43,14 @@ bool BaslerCamera::open(TriggerMode mode) {
             CEnumerationPtr(nodemap.GetNode("LineMode"))->FromString("Input");
             CEnumerationPtr(nodemap.GetNode("TriggerSelector"))->FromString("FrameStart");
             CEnumerationPtr(nodemap.GetNode("TriggerMode"))->FromString("On");
-            CEnumerationPtr(nodemap.GetNode("TriggerSource"))->FromString("Line2"); 
-            CEnumerationPtr(nodemap.GetNode("TriggerActivation"))->FromString("RisingEdge"); 
+            CEnumerationPtr(nodemap.GetNode("TriggerSource"))->FromString("Line2");
+            CEnumerationPtr(nodemap.GetNode("TriggerActivation"))->FromString("RisingEdge");
             CBooleanPtr frameRateEnable(nodemap.GetNode("AcquisitionFrameRateEnable"));
             if (IsWritable(frameRateEnable)) frameRateEnable->SetValue(false);
-            cout << "[Basler] " << serialNumber_ << " set to HARDWARE Trigger." << endl;
+            { lock_guard<mutex> lk(g_print_mtx); cout << "[Basler] " << serialNumber_ << " set to HARDWARE Trigger." << endl; }
         } else {
             CEnumerationPtr(nodemap.GetNode("TriggerMode"))->FromString("Off");
-            cout << "[Basler] " << serialNumber_ << " set to CONTINUOUS/SOFTWARE mode." << endl;
+            { lock_guard<mutex> lk(g_print_mtx); cout << "[Basler] " << serialNumber_ << " set to CONTINUOUS/SOFTWARE mode." << endl; }
         }
 
         // ================= 【核心修改区】 =================
@@ -58,41 +60,35 @@ bool BaslerCamera::open(TriggerMode mode) {
             
             // 1. 相机端设置为 BayerRG8 (省带宽)，转换器端设置为 BGR8packed (供 OpenCV 直接使用)
             try {
-                pixelFormatNode->FromString("BayerRG8"); 
-                
-                // 【核心修复】不要设为 PixelType_BayerRG8，让 Pylon 自动解马赛克成 BGR
-                converter_.OutputPixelFormat = PixelType_BGR8packed; 
-                
+                pixelFormatNode->FromString("BayerRG8");
+                converter_.OutputPixelFormat = PixelType_BGR8packed;
                 isMono_ = false;
                 formatSet = true;
-                cout << "[Basler] SN: " << serialNumber_ << " detected as COLOR. Camera: BayerRG8 -> Output: BGR8." << endl;
+                { lock_guard<mutex> lk(g_print_mtx); cout << "[Basler] SN: " << serialNumber_ << " detected as COLOR. Camera: BayerRG8 -> Output: BGR8." << endl; }
             } catch (const GenICam::GenericException& e) {
-                cerr << ">>> [Debug] Failed to set BayerRG8: " << e.GetDescription() << endl;
+                { lock_guard<mutex> lk(g_print_mtx); cerr << ">>> [Debug] Failed to set BayerRG8: " << e.GetDescription() << endl; }
             } catch (...) {}
 
-            // 2. 如果 BayerRG8 失败，尝试让相机直接输出 RGB8
             if (!formatSet) {
                 try {
-                    pixelFormatNode->FromString("RGB8"); 
-                    // 如果用 RGB8，Pylon 转换器最好输出 BGR8 方便直接给 OpenCV cv::Mat 使用
-                    converter_.OutputPixelFormat = PixelType_BGR8packed; 
+                    pixelFormatNode->FromString("RGB8");
+                    converter_.OutputPixelFormat = PixelType_BGR8packed;
                     isMono_ = false;
                     formatSet = true;
-                    cout << "[Basler] SN: " << serialNumber_ << " detected as COLOR. Set to RGB8." << endl;
+                    { lock_guard<mutex> lk(g_print_mtx); cout << "[Basler] SN: " << serialNumber_ << " detected as COLOR. Set to RGB8." << endl; }
                 } catch (const GenICam::GenericException& e) {
-                    cerr << ">>> [Debug] Failed to set RGB8: " << e.GetDescription() << endl;
+                    { lock_guard<mutex> lk(g_print_mtx); cerr << ">>> [Debug] Failed to set RGB8: " << e.GetDescription() << endl; }
                 } catch (...) {}
             }
 
-            // 3. 如果以上彩色格式都不支持，回退到 Mono8
             if (!formatSet) {
                 try {
                     pixelFormatNode->FromString("Mono8");
                     converter_.OutputPixelFormat = PixelType_Mono8;
                     isMono_ = true;
-                    cout << "[Basler] SN: " << serialNumber_ << " detected as MONO. Set to Mono8." << endl;
+                    { lock_guard<mutex> lk(g_print_mtx); cout << "[Basler] SN: " << serialNumber_ << " detected as MONO. Set to Mono8." << endl; }
                 } catch (const GenICam::GenericException& e) {
-                    cerr << "[Basler Error] Cannot set Mono8 for SN: " << serialNumber_ << " - " << e.GetDescription() << endl;
+                    { lock_guard<mutex> lk(g_print_mtx); cerr << "[Basler Error] Cannot set Mono8 for SN: " << serialNumber_ << " - " << e.GetDescription() << endl; }
                 } catch (...) {}
             }
         }
