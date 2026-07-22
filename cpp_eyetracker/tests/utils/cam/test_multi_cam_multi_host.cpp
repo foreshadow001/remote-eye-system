@@ -143,8 +143,8 @@ string g_session_log_path;
 int g_recording_number = 0;
 ofstream g_session_log;
 
-// ================== 落盘带宽采样 ==================
-atomic<int64_t> g_dump_bytes_written{0};  // 各 dumpToDiskWorker 累加
+// ================== 跨主机同步偏移 ==================
+int64_t g_peer_first_block_id = -1;  // other host's first BlockID (from TCP exchange)
 
 // ================== UI 布局全局变量 ==================
 atomic<int> g_enlarged_cam{-1};
@@ -209,7 +209,8 @@ bool syncGlobalBlockIDTCP(bool is_master, const string& master_ip, int port, int
         
         // 1. 接收 Slave 的边界
         recv(client_sock, (char*)other_range, sizeof(other_range), 0);
-        
+        g_peer_first_block_id = other_range[0];  // cross-host sync offset
+
         // 2. Master 计算真正的全局交集
         my_range[0] = std::max(my_range[0], other_range[0]);
         my_range[1] = std::min(my_range[1], other_range[1]);
@@ -237,7 +238,8 @@ bool syncGlobalBlockIDTCP(bool is_master, const string& master_ip, int port, int
         send(sock, (const char*)my_range, sizeof(my_range), 0);
         // 2. 接收 Master 计算好的全局边界
         recv(sock, (char*)other_range, sizeof(other_range), 0);
-        
+        g_peer_first_block_id = other_range[0];  // cross-host sync offset (intersection start)
+
         local_start = other_range[0];
         local_end = other_range[1];
     }
@@ -656,8 +658,11 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
 
             lock_guard<mutex> lock(ctx->copy_mtx);
             if (ctx->recording) {
-                ctx->copy_queue.push({ptr, meta});
-                ctx->copy_cv.notify_one();
+                if ((int)ctx->copy_queue.size() < ctx->total_record_frames) {
+                    ctx->copy_queue.push({ptr, meta});
+                    ctx->copy_cv.notify_one();
+                }
+                // else: queue full, frame silently dropped (will show as BlockID gap)
             } else {
                 if (ctx->copy_queue.size() < 2) {
                     ctx->copy_queue.push({ptr, meta});
@@ -678,7 +683,6 @@ void dumpToDiskWorker(shared_ptr<CameraContext> ctx, int write_delay_ms, atomic<
     ctx->dump_start_time = chrono::steady_clock::now();
     ctx->log_stream.open(ctx->log_file_path);
     int frames_to_dump = ctx->recorded_frames.load();
-    int64_t bytes_written = 0;
 
     for (int i = 0; i < frames_to_dump; ++i) {
         cv::Mat& img = ctx->ram_buffer[i];
@@ -687,11 +691,8 @@ void dumpToDiskWorker(shared_ptr<CameraContext> ctx, int write_delay_ms, atomic<
         string filename = ctx->temp_dir + "/" + to_string(meta.blockID) + ".raw";
 
         std::ofstream out_raw(filename, std::ios::binary);
-        if (out_raw) {
-            size_t sz = img.total() * img.elemSize();
-            out_raw.write(reinterpret_cast<const char*>(img.data), sz);
-            bytes_written += sz;
-        }
+        if (out_raw)
+            out_raw.write(reinterpret_cast<const char*>(img.data), img.total() * img.elemSize());
 
         if (ctx->log_stream.is_open()) {
             ctx->log_stream << fs::path(filename).filename().string() << ","
@@ -702,7 +703,6 @@ void dumpToDiskWorker(shared_ptr<CameraContext> ctx, int write_delay_ms, atomic<
     }
     if (ctx->log_stream.is_open()) ctx->log_stream.close();
     ctx->dump_end_time = chrono::steady_clock::now();
-    g_dump_bytes_written += bytes_written;
     finished_cams++;
 }
 
@@ -747,8 +747,7 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
 
 // ================== 结构化报告写入 ==================
 void writeReport(const string& timestr, int rec_num, double target_fps, int total_frames,
-                 double dump_wall_s, double jpg_wall_s, bool write_jpg, bool hw_trigger,
-                 const vector<double>& bw_samples) {
+                 double dump_wall_s, double jpg_wall_s, bool write_jpg, bool hw_trigger) {
     if (!g_session_log.is_open()) return;
 
     g_session_log << "\n---\n\n"
@@ -767,11 +766,11 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     if (write_jpg) {
         g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | FirstBlk | LastBlk | SyncOff | Jitter(us) | RecOver2RAM(s) | Wait4Disk(s) | Ram2Disk(s) | RecOver2Disk(s) | Wait4JPG(s) | JPGTime(s) | RecOver2JPG(s) |\n";
         g_session_log << "|---|-----|------|-------|------|-----|-------|---------|----------|----------|---------|------------|----------------|--------------|-------------|-----------------|--------------|------------|-----------------|\n";
-        g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列总长峰值(出队前) | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | HW触发下与cam0的BlockID差 | Pylon时间戳间隔标准差(us) | RAM写完−理论完成 | RAM写完→DISK开始 | DISK开始→DISK结束 | ①+②+③ | DISK完成→JPG开始 | JPG耗时 | ①②③+④+⑤ |\n";
+        g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列峰值/总帧数 | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | 跨主机BlockID差(本机首帧-对端首帧) | Pylon时间戳间隔标准差(us) | RAM写完−理论完成 | RAM写完→DISK开始 | DISK开始→DISK结束 | ①+②+③ | DISK完成→JPG开始 | JPG耗时 | ①②③+④+⑤ |\n";
     } else {
         g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | FirstBlk | LastBlk | SyncOff | Jitter(us) | RecOver2RAM(s) | Wait4Disk(s) | Ram2Disk(s) | RecOver2Disk(s) |\n";
         g_session_log << "|---|-----|------|-------|------|-----|-------|---------|----------|----------|---------|------------|----------------|--------------|-------------|-----------------|\n";
-        g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列总长峰值(出队前) | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | HW触发下与cam0的BlockID差 | Pylon时间戳间隔标准差(us) | RAM写完−理论完成 | RAM写完→DISK开始 | DISK开始→DISK结束 | ①+②+③ |\n";
+        g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列峰值/总帧数 | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | 跨主机BlockID差(本机首帧-对端首帧) | Pylon时间戳间隔标准差(us) | RAM写完−理论完成 | RAM写完→DISK开始 | DISK开始→DISK结束 | ①+②+③ |\n";
     }
 
     int64_t ref_first_blk = -1;
@@ -807,7 +806,8 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
         // Ram2Disk(s) = dump_end - dump_start (actual disk write duration)
         ctx->ram2disk_s = chrono::duration<double>(ctx->dump_end_time - ctx->dump_start_time).count();
 
-        int64_t sync_off = (ref_first_blk >= 0 && hw_trigger) ? (ctx->first_recorded_block_id - ref_first_blk) : 0;
+        int64_t sync_off = (hw_trigger && g_peer_first_block_id >= 0 && ctx->first_recorded_block_id >= 0)
+                         ? (ctx->first_recorded_block_id - g_peer_first_block_id) : 0;
         string sync_str = hw_trigger ? to_string(sync_off) : "N/A";
 
         auto fmt3 = [] (double v) { ostringstream oss; oss << fixed << setprecision(3) << v; return oss.str(); };
@@ -818,7 +818,7 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
                       << (ctx->is_mono ? "mono" : "color") << " | "
                       << saved << " | " << dropped << " | "
                       << fixed << setprecision(1) << fps << " | "
-                      << ctx->max_queue_size.load() << " | "
+                      << ctx->max_queue_size.load() << "/" << total_frames << " | "
                       << fixed << setprecision(1) << lat_ms << " | "
                       << ctx->first_recorded_block_id << " | " << ctx->last_recorded_block_id << " | "
                       << sync_str << " | "
@@ -842,22 +842,6 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
         g_session_log << defaultfloat;
     }
     g_session_log << "\n";
-
-    // --- Bandwidth Samples ---
-    if (!bw_samples.empty()) {
-        g_session_log << "\n### Dump Bandwidth Samples (500ms interval)\n\n";
-        g_session_log << "```\n";
-        double peak_bw = 0; int peak_idx = 0;
-        for (size_t k = 0; k < bw_samples.size(); ++k)
-            if (bw_samples[k] > peak_bw) { peak_bw = bw_samples[k]; peak_idx = (int)k; }
-        for (size_t k = 0; k < bw_samples.size(); ++k) {
-            g_session_log << fixed << setprecision(1) << "  " << (k * 0.5) << "s  "
-                          << setw(8) << bw_samples[k] << " MB/s"
-                          << (k == (size_t)peak_idx ? "  <- peak" : "") << "\n";
-        }
-        // Bandwidth stats moved to Summary below
-        g_session_log << "```\n";
-    }
 
     // --- Summary ---
     g_session_log << "\n### Summary\n\n```\n";
@@ -893,15 +877,13 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
             for (int k = 1; k < s; ++k) { double dt = (ctx->meta_buffer[k].timestamp - ctx->meta_buffer[k-1].timestamp) / 10.0; sum += dt; sum_sq += dt * dt; }
             if (n > 0) { double mean = sum / n; double j = sqrt(sum_sq / n - mean * mean); if (j > max_jitter) { max_jitter = j; max_jitter_cam = ctx->index; } }
         }
-        if (hw_trigger && ref_first_blk >= 0) {
-            int64_t off = ctx->first_recorded_block_id - ref_first_blk;
+        if (hw_trigger && ref_first_blk >= 0 && g_peer_first_block_id >= 0) {
+            int64_t off = ctx->first_recorded_block_id - g_peer_first_block_id;
             if (llabs(off) > max_sync) max_sync = llabs(off);
         }
     }
 
     double completion = total_expected > 0 ? 100.0 * total_saved / total_expected : 0;
-    double total_gb = total_saved * (double)cam_ctxs[0]->ram_buffer[0].total() / (1024.0*1024.0*1024.0);
-    double avg_bw = dump_wall_s > 0 ? total_gb * 1024.0 / dump_wall_s : 0;
 
     g_session_log << fixed << setprecision(2);
     g_session_log << "total_expected       : " << total_expected << "\n";
@@ -909,7 +891,8 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     g_session_log << "total_dropped        : " << total_dropped << "\n";
     g_session_log << "completion_rate      : " << completion << "%\n";
     g_session_log << "bottleneck_fps       : " << min_fps << " (cam " << min_fps_cam << ": " << (min_fps_cam >= 0 ? cam_ctxs[min_fps_cam]->id : "?") << ")\n";
-    g_session_log << "max_sync_offset      : " << max_sync << " BlockID" << (hw_trigger ? "" : " (N/A - SW trigger)") << "\n";
+    g_session_log << "max_sync_offset      : " << max_sync << " BlockID"
+                  << (hw_trigger ? " (cross-host)" : " (N/A - SW trigger)") << "\n";
     double min_lat = 1e9, max_lat = 0;
     for (auto& ctx : cam_ctxs) {
         if (ctx->first_frame_time.time_since_epoch().count() > 0) {
@@ -920,10 +903,6 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     g_session_log << "max_trigger_latency_spread : " << (max_lat - min_lat) << " ms\n";
     g_session_log << "peak_queue_pressure  : " << peak_q << " (cam " << peak_q_cam << ": " << (peak_q_cam >= 0 ? cam_ctxs[peak_q_cam]->id : "?") << ")\n";
     g_session_log << "max_jitter           : " << max_jitter << " us (cam " << max_jitter_cam << ": " << (max_jitter_cam >= 0 ? cam_ctxs[max_jitter_cam]->id : "?") << ")\n";
-    double peak_bw = 0;
-    for (auto v : bw_samples) if (v > peak_bw) peak_bw = v;
-    g_session_log << "dump_bandwidth_peak  : " << peak_bw << " MB/s\n";
-    g_session_log << "dump_bandwidth_avg   : " << avg_bw << " MB/s\n";
     g_session_log << "max_ram2disk         : " << max_ram2disk << " s (cam " << max_ram2disk_cam << ": " << (max_ram2disk_cam >= 0 ? cam_ctxs[max_ram2disk_cam]->id : "?") << ")\n";
     g_session_log << "max_end_to_end       : " << max_total << " s (RecOver2RAM+Wait4Disk+Ram2Disk, cam " << max_total_cam << ": " << (max_total_cam >= 0 ? cam_ctxs[max_total_cam]->id : "?") << ")\n";
     bool healthy = (max_sync <= 2) && (min_fps >= target_fps * 0.95) && (total_dropped <= total_expected * 0.01);
@@ -1188,32 +1167,12 @@ int main() {
                 is_recording = false;
                 is_dumping = true;
                 g_recording_number++;
-                g_dump_bytes_written = 0;
 
                 auto dump_start_time = std::chrono::steady_clock::now();
                 atomic<int> finished_cams{0};
                 vector<thread> dump_threads;
 
                 for (auto& ctx : cam_ctxs) dump_threads.emplace_back(dumpToDiskWorker, ctx, write_delay_ms, std::ref(finished_cams));
-
-                // Bandwidth sampling thread (500ms interval)
-                atomic<bool> bw_stop{false};
-                vector<double> bw_samples;
-                thread bw_thread([&]() {
-                    int64_t prev_bytes = 0;
-                    auto prev_time = dump_start_time;
-                    while (!bw_stop) {
-                        this_thread::sleep_for(chrono::milliseconds(500));
-                        if (bw_stop) break;
-                        int64_t cur_bytes = g_dump_bytes_written.load();
-                        auto cur_time = chrono::steady_clock::now();
-                        double dt = chrono::duration<double>(cur_time - prev_time).count();
-                        double bw = dt > 0 ? (cur_bytes - prev_bytes) / dt / (1024.0 * 1024.0) : 0;
-                        bw_samples.push_back(bw);
-                        prev_bytes = cur_bytes;
-                        prev_time = cur_time;
-                    }
-                });
 
                 while (finished_cams < cam_ctxs.size()) {
                     cv::Mat loading = cv::Mat::zeros(400, 600, CV_8UC3);
@@ -1222,8 +1181,6 @@ int main() {
                     cv::waitKey(50);
                 }
                 for (auto& t : dump_threads) if (t.joinable()) t.join();
-                bw_stop = true;
-                if (bw_thread.joinable()) bw_thread.join();
 
                 double dump_duration = std::chrono::duration<double>(std::chrono::steady_clock::now() - dump_start_time).count();
 
@@ -1310,9 +1267,9 @@ int main() {
                     jpg_duration = chrono::duration<double>(chrono::steady_clock::now() - jpg_start).count();
                 }
 
-                // Write report (includes bandwidth samples inside recording block)
+                // Write report
                 writeReport(current_record_timestr, g_recording_number, target_fps, total_record_frames,
-                            dump_duration, jpg_duration, write_jpg, use_hw_trigger, bw_samples);
+                            dump_duration, jpg_duration, write_jpg, use_hw_trigger);
 
                 cout << "[Recording #" << g_recording_number << "] Done in " << fixed << setprecision(1)
                      << dump_duration + jpg_duration << "s (appended to session log)" << endl;
