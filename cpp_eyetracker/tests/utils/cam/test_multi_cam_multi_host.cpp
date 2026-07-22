@@ -843,8 +843,8 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     }
     g_session_log << "\n";
 
-    // --- Summary ---
-    g_session_log << "\n### Summary\n\n```\n";
+    // --- Summary (Markdown table) ---
+    g_session_log << "\n### Summary\n\n";
     int total_expected = (int)cam_ctxs.size() * total_frames;
     int total_saved = 0, total_dropped = 0;
     double min_fps = 1e9; int min_fps_cam = -1;
@@ -867,9 +867,8 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
         if (q > peak_q) { peak_q = q; peak_q_cam = ctx->index; }
         if (ctx->ram2disk_s > max_ram2disk) { max_ram2disk = ctx->ram2disk_s; max_ram2disk_cam = ctx->index; }
         double total_s = ctx->recover2ram_s + ctx->wait4disk_s + ctx->ram2disk_s;
-        if (write_jpg && ctx->jpg_start_time.time_since_epoch().count() > 0 && ctx->jpg_end_time.time_since_epoch().count() > 0) {
+        if (write_jpg && ctx->jpg_start_time.time_since_epoch().count() > 0 && ctx->jpg_end_time.time_since_epoch().count() > 0)
             total_s += chrono::duration<double>(ctx->jpg_end_time - ctx->dump_end_time).count();
-        }
         if (total_s > max_total) { max_total = total_s; max_total_cam = ctx->index; }
 
         if (s > 1) {
@@ -877,22 +876,13 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
             for (int k = 1; k < s; ++k) { double dt = (ctx->meta_buffer[k].timestamp - ctx->meta_buffer[k-1].timestamp) / 10.0; sum += dt; sum_sq += dt * dt; }
             if (n > 0) { double mean = sum / n; double j = sqrt(sum_sq / n - mean * mean); if (j > max_jitter) { max_jitter = j; max_jitter_cam = ctx->index; } }
         }
-        if (hw_trigger && ref_first_blk >= 0 && g_peer_first_block_id >= 0) {
+        if (hw_trigger && g_peer_first_block_id >= 0 && ctx->first_recorded_block_id >= 0) {
             int64_t off = ctx->first_recorded_block_id - g_peer_first_block_id;
             if (llabs(off) > max_sync) max_sync = llabs(off);
         }
     }
 
     double completion = total_expected > 0 ? 100.0 * total_saved / total_expected : 0;
-
-    g_session_log << fixed << setprecision(2);
-    g_session_log << "total_expected       : " << total_expected << "\n";
-    g_session_log << "total_saved          : " << total_saved << " (" << completion << "%)\n";
-    g_session_log << "total_dropped        : " << total_dropped << "\n";
-    g_session_log << "completion_rate      : " << completion << "%\n";
-    g_session_log << "bottleneck_fps       : " << min_fps << " (cam " << min_fps_cam << ": " << (min_fps_cam >= 0 ? cam_ctxs[min_fps_cam]->id : "?") << ")\n";
-    g_session_log << "max_sync_offset      : " << max_sync << " BlockID"
-                  << (hw_trigger ? " (cross-host)" : " (N/A - SW trigger)") << "\n";
     double min_lat = 1e9, max_lat = 0;
     for (auto& ctx : cam_ctxs) {
         if (ctx->first_frame_time.time_since_epoch().count() > 0) {
@@ -900,15 +890,22 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
             if (lat < min_lat) min_lat = lat; if (lat > max_lat) max_lat = lat;
         }
     }
-    g_session_log << "max_trigger_latency_spread : " << (max_lat - min_lat) << " ms\n";
-    g_session_log << "peak_queue_pressure  : " << peak_q << " (cam " << peak_q_cam << ": " << (peak_q_cam >= 0 ? cam_ctxs[peak_q_cam]->id : "?") << ")\n";
-    g_session_log << "max_jitter           : " << max_jitter << " us (cam " << max_jitter_cam << ": " << (max_jitter_cam >= 0 ? cam_ctxs[max_jitter_cam]->id : "?") << ")\n";
-    g_session_log << "max_ram2disk         : " << max_ram2disk << " s (cam " << max_ram2disk_cam << ": " << (max_ram2disk_cam >= 0 ? cam_ctxs[max_ram2disk_cam]->id : "?") << ")\n";
-    g_session_log << "max_end_to_end       : " << max_total << " s (RecOver2RAM+Wait4Disk+Ram2Disk, cam " << max_total_cam << ": " << (max_total_cam >= 0 ? cam_ctxs[max_total_cam]->id : "?") << ")\n";
     bool healthy = (max_sync <= 2) && (min_fps >= target_fps * 0.95) && (total_dropped <= total_expected * 0.01);
-    g_session_log << "system_healthy       : " << (healthy ? "PASS" : "FAIL") << "\n";
-    g_session_log << "```\n";
-    g_session_log.flush();
+
+    g_session_log << "| 指标 | 值 | 说明 |\n";
+    g_session_log << "|------|-----|------|\n";
+    g_session_log << "| total_expected | " << total_expected << " | 预期总帧数 |\n";
+    g_session_log << "| total_saved | " << total_saved << " (" << fixed << setprecision(1) << completion << "%) | 实际保存总帧数 |\n";
+    g_session_log << "| total_dropped | " << total_dropped << " | 累计丢帧数 |\n";
+    g_session_log << "| bottleneck_fps | " << fixed << setprecision(1) << min_fps << " | 最慢相机 (cam " << min_fps_cam << ": " << (min_fps_cam >= 0 ? cam_ctxs[min_fps_cam]->id : "?") << ") |\n";
+    g_session_log << "| max_sync_offset | " << max_sync << " BlockID | 跨主机 BlockID 差" << (hw_trigger ? "" : " (N/A)") << " |\n";
+    g_session_log << "| trigger_latency_spread | " << fixed << setprecision(1) << (max_lat - min_lat) << " ms | 最快/最慢相机首帧延迟差 |\n";
+    g_session_log << "| peak_queue_pressure | " << peak_q << " | 队列峰值 (cam " << peak_q_cam << ": " << (peak_q_cam >= 0 ? cam_ctxs[peak_q_cam]->id : "?") << ") |\n";
+    g_session_log << "| max_jitter | " << fixed << setprecision(1) << max_jitter << " us | 时间戳抖动峰值 (cam " << max_jitter_cam << ": " << (max_jitter_cam >= 0 ? cam_ctxs[max_jitter_cam]->id : "?") << ") |\n";
+    g_session_log << "| max_ram2disk | " << fixed << setprecision(3) << max_ram2disk << " s | DISK写入最长 (cam " << max_ram2disk_cam << ": " << (max_ram2disk_cam >= 0 ? cam_ctxs[max_ram2disk_cam]->id : "?") << ") |\n";
+    g_session_log << "| max_end_to_end | " << fixed << setprecision(3) << max_total << " s | 端到端最长 (cam " << max_total_cam << ": " << (max_total_cam >= 0 ? cam_ctxs[max_total_cam]->id : "?") << ") |\n";
+    g_session_log << "| system_healthy | **" << (healthy ? "PASS" : "FAIL") << "** | sync≤2 && fps≥95% && drop≤1% |\n";
+    g_session_log << defaultfloat << flush;
 }
 
 int main() {
