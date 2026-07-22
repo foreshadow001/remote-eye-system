@@ -107,6 +107,20 @@ struct CameraContext {
     atomic<chrono::steady_clock::time_point> last_frame_time{chrono::steady_clock::now()};
     atomic<bool> has_streamed{false};
 
+    // ---- Metrics (new) ----
+    atomic<int> max_queue_size{0};
+    int64_t first_recorded_block_id = -1;
+    int64_t last_recorded_block_id = -1;
+    chrono::steady_clock::time_point first_frame_time;
+    atomic<int> dropped_frames{0};
+    int64_t prev_block_id = -1;
+    chrono::steady_clock::time_point recording_end_time;  // t_last: when last frame written to RAM
+    double recording_overflow_ms = 0.0;
+    double ram_to_disk_latency_ms = 0.0;
+    chrono::steady_clock::time_point dump_start_time;     // per-camera dump start
+    chrono::steady_clock::time_point dump_end_time;       // per-camera dump end
+    chrono::steady_clock::time_point jpg_end_time;        // per-camera JPG end (if write_jpg)
+
     CameraContext(int idx, string cam_id, string save_dir) : index(idx), id(cam_id), save_base_dir(save_dir), cam(cam_id) {}
 };
 
@@ -122,6 +136,14 @@ atomic<bool> g_fault_on_master{false};
 chrono::steady_clock::time_point g_ready_time;
 chrono::steady_clock::time_point g_fault_time;
 
+// ================== 会话日志 ==================
+string g_session_log_path;
+int g_recording_number = 0;
+ofstream g_session_log;
+
+// ================== 落盘带宽采样 ==================
+atomic<int64_t> g_dump_bytes_written{0};  // 各 dumpToDiskWorker 累加
+
 // ================== UI 布局全局变量 ==================
 atomic<int> g_enlarged_cam{-1};
 int g_win_w = 1224, g_win_h = 1024;
@@ -133,14 +155,21 @@ void instantTrigger() {
     global_record_start_time = std::chrono::steady_clock::now();
     for (auto& ctx : cam_ctxs) {
         {
-            // 瞬间清空残余队列
             lock_guard<mutex> lock(ctx->copy_mtx);
             while (!ctx->copy_queue.empty()) ctx->copy_queue.pop();
         }
         ctx->recorded_frames.store(0, std::memory_order_relaxed);
         ctx->dump_ready.store(false, std::memory_order_relaxed);
-        // 核心：直接开启内存拷贝，彻底绕过 UI 线程！
-        ctx->recording.store(true, std::memory_order_release); 
+        ctx->recording.store(true, std::memory_order_release);
+
+        // ---- reset per-camera metrics ----
+        ctx->max_queue_size = 0;
+        ctx->first_recorded_block_id = -1;
+        ctx->last_recorded_block_id = -1;
+        ctx->dropped_frames = 0;
+        ctx->prev_block_id = -1;
+        ctx->recording_overflow_ms = 0.0;
+        ctx->ram_to_disk_latency_ms = 0.0;
     }
 }
 
@@ -458,6 +487,16 @@ void renderEnlargedView(cv::Mat& canvas, int cam_idx, bool is_recording,
                     cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
         cv::putText(resized, string(buf), cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3);
         cv::putText(resized, string(buf), cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+
+        // Live FPS (show after 10+ frames to avoid startup jitter)
+        if (current_frame > 10 && elapsed_s > 0.01) {
+            double live_fps = current_frame / elapsed_s;
+            char fps_buf[32]; snprintf(fps_buf, sizeof(fps_buf), "%.1f fps", live_fps);
+            cv::putText(resized, string(fps_buf), cv::Point(10, 90),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3);
+            cv::putText(resized, string(fps_buf), cv::Point(10, 90),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+        }
     }
 
     canvas(right_roi) = cv::Scalar(0, 0, 0);
@@ -501,20 +540,37 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
             ctx->copy_queue.pop();
         }
 
+        // ---- queue pressure (both branches) ----
+        int qs = (int)ctx->copy_queue.size();
+        if (qs > ctx->max_queue_size.load()) ctx->max_queue_size = qs;
+
         if (ctx->recording) {
             int seq = ctx->recorded_frames.load(std::memory_order_relaxed);
             if (seq < ctx->total_record_frames) {
                 void* pBuffer = task.first->GetBuffer();
                 size_t payload_size = task.first->GetWidth() * task.first->GetHeight();
-                
+
                 memcpy(ctx->ram_buffer[seq].data, pBuffer, payload_size);
                 ctx->meta_buffer[seq] = task.second;
-                
+
                 {
                     lock_guard<mutex> lock(ctx->frame_mtx);
-                    ctx->latest_frame = ctx->ram_buffer[seq]; 
+                    ctx->latest_frame = ctx->ram_buffer[seq];
                     ctx->latest_meta = task.second;
                 }
+
+                // ---- metrics: first frame ----
+                if (seq == 0) {
+                    ctx->first_recorded_block_id = task.second.blockID;
+                    ctx->first_frame_time = chrono::steady_clock::now();
+                }
+                // ---- metrics: last frame + drop detection ----
+                ctx->last_recorded_block_id = task.second.blockID;
+                if (ctx->prev_block_id != -1) {
+                    int64_t diff = task.second.blockID - ctx->prev_block_id;
+                    if (diff > 1) ctx->dropped_frames += (int)(diff - 1);
+                }
+                ctx->prev_block_id = task.second.blockID;
 
                 int next_seq = seq + 1;
                 ctx->recorded_frames.store(next_seq, std::memory_order_relaxed);
@@ -522,6 +578,7 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
                 if (next_seq == ctx->total_record_frames) {
                     ctx->recording = false;
                     ctx->dump_ready = true;
+                    ctx->recording_end_time = chrono::steady_clock::now();  // t_last
                 }
             }
             ctx->last_block_id.store(task.second.blockID, memory_order_relaxed);
@@ -616,27 +673,34 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
 }
 
 void dumpToDiskWorker(shared_ptr<CameraContext> ctx, int write_delay_ms, atomic<int>& finished_cams) {
+    ctx->dump_start_time = chrono::steady_clock::now();
     ctx->log_stream.open(ctx->log_file_path);
     int frames_to_dump = ctx->recorded_frames.load();
-    
+    int64_t bytes_written = 0;
+
     for (int i = 0; i < frames_to_dump; ++i) {
         cv::Mat& img = ctx->ram_buffer[i];
         FrameMeta& meta = ctx->meta_buffer[i];
-        
-        // [修改] 使用 meta.blockID 作为 raw 的文件名
+
         string filename = ctx->temp_dir + "/" + to_string(meta.blockID) + ".raw";
-        
+
         std::ofstream out_raw(filename, std::ios::binary);
-        if (out_raw) out_raw.write(reinterpret_cast<const char*>(img.data), img.total() * img.elemSize());
+        if (out_raw) {
+            size_t sz = img.total() * img.elemSize();
+            out_raw.write(reinterpret_cast<const char*>(img.data), sz);
+            bytes_written += sz;
+        }
 
         if (ctx->log_stream.is_open()) {
-            ctx->log_stream << fs::path(filename).filename().string() << "," 
+            ctx->log_stream << fs::path(filename).filename().string() << ","
                             << meta.blockID << "," << meta.timestamp << ","
                             << meta.blockID << "," << img.cols << "," << img.rows << "\n";
         }
         if (write_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(write_delay_ms));
     }
     if (ctx->log_stream.is_open()) ctx->log_stream.close();
+    ctx->dump_end_time = chrono::steady_clock::now();
+    g_dump_bytes_written += bytes_written;
     finished_cams++;
 }
 
@@ -652,8 +716,8 @@ vector<LogEntry> parseLogFile(const string& log_path) {
     return entries;
 }
 
-void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEntry> valid_entries, atomic<int>& global_processed, bool is_mono) {
-    if (valid_entries.empty()) return;
+void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEntry> valid_entries, atomic<int>& global_processed, bool is_mono, chrono::steady_clock::time_point* jpg_end = nullptr) {
+    if (valid_entries.empty()) { if (jpg_end) *jpg_end = chrono::steady_clock::now(); return; }
     fs::create_directories(out_jpg_dir);
     for (const auto& entry : valid_entries) {
         string raw_path = temp_raw_dir + "/" + entry.filename;
@@ -662,7 +726,7 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
         if (in_raw) {
             in_raw.read(reinterpret_cast<char*>(raw_img.data), raw_img.total() * raw_img.elemSize());
             in_raw.close();
-            
+
             cv::Mat final_img;
             if (is_mono) {
                 final_img = raw_img.clone();
@@ -675,6 +739,159 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
         }
         global_processed++;
     }
+    if (jpg_end) *jpg_end = chrono::steady_clock::now();
+}
+
+// ================== 结构化报告写入 ==================
+void writeReport(const string& timestr, int rec_num, double target_fps, int total_frames,
+                 double dump_wall_s, double jpg_wall_s, bool write_jpg, bool hw_trigger) {
+    if (!g_session_log.is_open()) return;
+
+    g_session_log << "\n=== Recording #" << rec_num << ": " << timestr << " ===\n";
+    g_session_log << "Config: " << cam_ctxs.size() << " cams, "
+                  << (hw_trigger ? "HW" : "SW") << " trigger, "
+                  << fixed << setprecision(1) << target_fps << " fps, "
+                  << total_frames << " total frames\n";
+    g_session_log << "write_jpg: " << (write_jpg ? "true" : "false") << "\n";
+
+    // --- Per-Camera Metrics ---
+    g_session_log << "\n--- Per-Camera Metrics ---\n";
+    g_session_log << "Cam,SN,Type,Saved,Dropped,FPS,QPeak,Lat_ms,FirstBlk,LastBlk,SyncOff,Jitter_us,RecOverflow_ms,RamToDisk_ms,DumpTime_ms\n";
+
+    double theoretical_ms = total_frames / target_fps * 1000.0;
+    int64_t ref_first_blk = -1;
+    if (!cam_ctxs.empty()) ref_first_blk = cam_ctxs[0]->first_recorded_block_id;
+
+    for (auto& ctx : cam_ctxs) {
+        int saved = ctx->recorded_frames.load();
+        int dropped = ctx->dropped_frames.load();
+        double fps = 0.0, jitter_us = 0.0;
+
+        // FPS from meta_buffer timestamps
+        if (saved > 1) {
+            double dur_s = (ctx->meta_buffer[saved-1].timestamp - ctx->meta_buffer[0].timestamp) / 10000000.0;
+            if (dur_s > 0) fps = (saved - 1) / dur_s;
+
+            // Jitter
+            double sum = 0, sum_sq = 0; int n = saved - 1;
+            for (int k = 1; k < saved; ++k) {
+                double dt = (ctx->meta_buffer[k].timestamp - ctx->meta_buffer[k-1].timestamp) / 10.0; // us
+                sum += dt; sum_sq += dt * dt;
+            }
+            if (n > 0) { double mean = sum / n; double var = sum_sq / n - mean * mean; if (var > 0) jitter_us = sqrt(var); }
+        }
+
+        // Trigger latency
+        double lat_ms = 0.0;
+        if (ctx->first_frame_time.time_since_epoch().count() > 0) {
+            lat_ms = chrono::duration<double, milli>(ctx->first_frame_time - global_record_start_time).count();
+        }
+
+        // Recording overflow
+        ctx->recording_overflow_ms = chrono::duration<double, milli>(ctx->recording_end_time - ctx->first_frame_time).count() - theoretical_ms;
+
+        // Ram to disk latency
+        if (write_jpg && ctx->jpg_end_time.time_since_epoch().count() > 0) {
+            ctx->ram_to_disk_latency_ms = chrono::duration<double, milli>(ctx->jpg_end_time - ctx->recording_end_time).count();
+        } else if (!write_jpg && ctx->dump_end_time.time_since_epoch().count() > 0) {
+            ctx->ram_to_disk_latency_ms = chrono::duration<double, milli>(ctx->dump_end_time - ctx->recording_end_time).count();
+        }
+
+        // Per-camera dump time
+        double dump_ms = chrono::duration<double, milli>(ctx->dump_end_time - ctx->dump_start_time).count();
+
+        // Sync offset
+        int64_t sync_off = (ref_first_blk >= 0 && hw_trigger) ? (ctx->first_recorded_block_id - ref_first_blk) : 0;
+        string sync_str = hw_trigger ? to_string(sync_off) : "N/A";
+
+        g_session_log << ctx->index << "," << ctx->id << ","
+                      << (ctx->is_mono ? "mono" : "color") << ","
+                      << saved << "," << dropped << ","
+                      << fixed << setprecision(1) << fps << ","
+                      << ctx->max_queue_size.load() << ","
+                      << fixed << setprecision(1) << lat_ms << ","
+                      << ctx->first_recorded_block_id << "," << ctx->last_recorded_block_id << ","
+                      << sync_str << ","
+                      << fixed << setprecision(1) << jitter_us << ","
+                      << fixed << setprecision(1) << ctx->recording_overflow_ms << ","
+                      << (write_jpg ? ([] (double v) { ostringstream oss; oss << fixed << setprecision(1) << v; return oss.str(); }(ctx->ram_to_disk_latency_ms)) : string("N/A")) << ","
+                      << fixed << setprecision(1) << dump_ms << "\n";
+        g_session_log << defaultfloat;
+    }
+
+    // --- Bandwidth Samples ---
+    // (populated by bandwidth sampling thread, placeholder)
+    g_session_log << "\n--- Dump Bandwidth Samples (500ms interval) ---\n";
+    g_session_log << "  (see below for bandwidth samples)\n";
+
+    // --- Summary ---
+    g_session_log << "\n--- Summary ---\n";
+    int total_expected = (int)cam_ctxs.size() * total_frames;
+    int total_saved = 0, total_dropped = 0;
+    double min_fps = 1e9; int min_fps_cam = -1;
+    int peak_q = 0, peak_q_cam = -1;
+    double max_jitter = 0; int max_jitter_cam = -1;
+    double max_overflow = -1e9;
+    double max_ram_disk = 0;
+    int64_t max_sync = 0;
+
+    for (auto& ctx : cam_ctxs) {
+        int s = ctx->recorded_frames.load();
+        int d = ctx->dropped_frames.load();
+        total_saved += s; total_dropped += d;
+        if (s > 1) {
+            double dur = (ctx->meta_buffer[s-1].timestamp - ctx->meta_buffer[0].timestamp) / 10000000.0;
+            double f = dur > 0 ? (s - 1) / dur : 0;
+            if (f < min_fps) { min_fps = f; min_fps_cam = ctx->index; }
+        }
+        int q = ctx->max_queue_size.load();
+        if (q > peak_q) { peak_q = q; peak_q_cam = ctx->index; }
+        if (ctx->recording_overflow_ms > max_overflow) max_overflow = ctx->recording_overflow_ms;
+        if (ctx->ram_to_disk_latency_ms > max_ram_disk) max_ram_disk = ctx->ram_to_disk_latency_ms;
+
+        // jitter
+        if (s > 1) {
+            double sum = 0, sum_sq = 0; int n = s - 1;
+            for (int k = 1; k < s; ++k) { double dt = (ctx->meta_buffer[k].timestamp - ctx->meta_buffer[k-1].timestamp) / 10.0; sum += dt; sum_sq += dt * dt; }
+            if (n > 0) { double mean = sum / n; double j = sqrt(sum_sq / n - mean * mean); if (j > max_jitter) { max_jitter = j; max_jitter_cam = ctx->index; } }
+        }
+
+        if (hw_trigger && ref_first_blk >= 0) {
+            int64_t off = ctx->first_recorded_block_id - ref_first_blk;
+            if (llabs(off) > max_sync) max_sync = llabs(off);
+        }
+    }
+
+    double completion = total_expected > 0 ? 100.0 * total_saved / total_expected : 0;
+    double total_gb = total_saved * (double)cam_ctxs[0]->ram_buffer[0].total() / (1024.0*1024.0*1024.0);
+    double avg_bw = dump_wall_s > 0 ? total_gb * 1024.0 / dump_wall_s : 0;
+
+    g_session_log << fixed << setprecision(2);
+    g_session_log << "total_expected       : " << total_expected << "\n";
+    g_session_log << "total_saved          : " << total_saved << " (" << completion << "%)\n";
+    g_session_log << "total_dropped        : " << total_dropped << "\n";
+    g_session_log << "completion_rate      : " << completion << "%\n";
+    g_session_log << "bottleneck_fps       : " << min_fps << " (cam " << min_fps_cam << ": " << (min_fps_cam >= 0 ? cam_ctxs[min_fps_cam]->id : "?") << ")\n";
+    g_session_log << "max_sync_offset      : " << max_sync << " BlockID" << (hw_trigger ? "" : " (N/A - SW trigger)") << "\n";
+    // trigger latency spread
+    double min_lat = 1e9, max_lat = 0;
+    for (auto& ctx : cam_ctxs) {
+        if (ctx->first_frame_time.time_since_epoch().count() > 0) {
+            double lat = chrono::duration<double, milli>(ctx->first_frame_time - global_record_start_time).count();
+            if (lat < min_lat) min_lat = lat;
+            if (lat > max_lat) max_lat = lat;
+        }
+    }
+    g_session_log << "max_trigger_latency_spread : " << (max_lat - min_lat) << " ms\n";
+    g_session_log << "peak_queue_pressure  : " << peak_q << " (cam " << peak_q_cam << ": " << (peak_q_cam >= 0 ? cam_ctxs[peak_q_cam]->id : "?") << ")\n";
+    g_session_log << "max_jitter           : " << max_jitter << " us (cam " << max_jitter_cam << ": " << (max_jitter_cam >= 0 ? cam_ctxs[max_jitter_cam]->id : "?") << ")\n";
+    g_session_log << "dump_bandwidth_avg   : " << avg_bw << " MB/s\n";
+    g_session_log << "dump_balance         : (see per-camera DumpTime_ms)\n";
+    g_session_log << "max_recording_overflow : " << max_overflow << " ms\n";
+    g_session_log << "max_ram_to_disk_latency : " << (write_jpg ? to_string(max_ram_disk) + " ms" : "N/A (write_jpg=false)") << "\n";
+    bool healthy = (max_sync <= 2) && (min_fps >= target_fps * 0.95) && (total_dropped <= total_expected * 0.01);
+    g_session_log << "system_healthy       : " << (healthy ? "PASS" : "FAIL") << "\n";
+    g_session_log.flush();
 }
 
 int main() {
@@ -806,6 +1023,21 @@ int main() {
     updateLayout();
     cv::setMouseCallback("Multi-Cam Preview", onMouse);
 
+    // --- Session log ---
+    {
+        auto t = chrono::system_clock::to_time_t(chrono::system_clock::now());
+        char tb[64]; strftime(tb, sizeof(tb), "%Y%m%d_%H%M%S", localtime(&t));
+        fs::create_directories("log/capture");
+        g_session_log_path = string("log/capture/session_") + tb + ".txt";
+        g_session_log.open(g_session_log_path, ios::out | ios::app);
+        if (g_session_log.is_open())
+            g_session_log << "=== Session started: " << tb << " ===\n"
+                          << "Cameras: " << camera_ids.size() << ", "
+                          << (use_hw_trigger ? "HW" : "SW") << " trigger, "
+                          << target_fps << " fps\n" << flush;
+        cout << "[Log] Session log: " << g_session_log_path << endl;
+    }
+
     if (is_master_pc) cout << "Press 'r' to START REC across ALL nodes, 'space' to photo, 'q' to quit.\n";
     else cout << "Waiting for Master trigger... Press 'space' to photo, 'q' to quit.\n";
 
@@ -915,111 +1147,85 @@ int main() {
             if (all_done) {
                 is_recording = false;
                 is_dumping = true;
-                
-                cout << "\n[Info] Auto-Stop Reached. Processing Disk Dump in background..." << endl;
-                
+                g_recording_number++;
+                g_dump_bytes_written = 0;
+
                 auto dump_start_time = std::chrono::steady_clock::now();
                 atomic<int> finished_cams{0};
                 vector<thread> dump_threads;
 
                 for (auto& ctx : cam_ctxs) dump_threads.emplace_back(dumpToDiskWorker, ctx, write_delay_ms, std::ref(finished_cams));
 
+                // Bandwidth sampling thread (500ms interval)
+                atomic<bool> bw_stop{false};
+                vector<double> bw_samples;
+                thread bw_thread([&]() {
+                    int64_t prev_bytes = 0;
+                    auto prev_time = dump_start_time;
+                    while (!bw_stop) {
+                        this_thread::sleep_for(chrono::milliseconds(500));
+                        if (bw_stop) break;
+                        int64_t cur_bytes = g_dump_bytes_written.load();
+                        auto cur_time = chrono::steady_clock::now();
+                        double dt = chrono::duration<double>(cur_time - prev_time).count();
+                        double bw = dt > 0 ? (cur_bytes - prev_bytes) / dt / (1024.0 * 1024.0) : 0;
+                        bw_samples.push_back(bw);
+                        prev_bytes = cur_bytes;
+                        prev_time = cur_time;
+                    }
+                });
+
                 while (finished_cams < cam_ctxs.size()) {
                     cv::Mat loading = cv::Mat::zeros(400, 600, CV_8UC3);
                     cv::putText(loading, "DUMPING RAM TO DISK... (" + to_string(finished_cams.load()) + "/" + to_string(cam_ctxs.size()) + ")", cv::Point(50, 200), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
                     cv::imshow("Multi-Cam Preview", loading);
-                    cv::waitKey(50); 
+                    cv::waitKey(50);
                 }
                 for (auto& t : dump_threads) if (t.joinable()) t.join();
+                bw_stop = true;
+                if (bw_thread.joinable()) bw_thread.join();
 
                 double dump_duration = std::chrono::duration<double>(std::chrono::steady_clock::now() - dump_start_time).count();
-                cout << "\n=================================================" << endl;
-                cout << "[Performance] Disk Dump Finished! Time: " << fixed << setprecision(3) << dump_duration << "s" << endl;
-                cout << "=================================================" << endl;
 
-                cout << "\n[Info] Calculating frame drop and actual FPS statistics..." << endl;
+                // Parse logs for JPG processing
                 vector<vector<LogEntry>> all_logs;
-                vector<vector<LogEntry>> core_sliced_logs; 
-                
-                // 【需替换的部分：统计与报告打印】
                 for (int i = 0; i < cam_ctxs.size(); ++i) {
-                    auto logs = parseLogFile(cam_ctxs[i]->log_file_path);
-                    all_logs.push_back(logs);
-                    
-                    int total_saved = logs.size();
-                    int dropped_frames = 0;
-                    double actual_fps = 0.0;
-                    double duration_s = 0.0;
-                    int64_t start_block_id = logs.empty() ? -1 : logs.front().blockID; // 获取起始 blockID
-                    
-                    if (total_saved > 1) {
-                        for (size_t k = 1; k < logs.size(); ++k) {
-                            int64_t diff = logs[k].blockID - logs[k-1].blockID;
-                            if (diff > 1) dropped_frames += (diff - 1);
-                        }
-                        duration_s = static_cast<double>(logs.back().timestamp - logs.front().timestamp) / 10000000.0; 
-                        if (duration_s > 0) actual_fps = (total_saved - 1) / duration_s;
-                    }
-                    
-                    char report_buf[256];
-                    if (dropped_frames > 0) {
-                        snprintf(report_buf, sizeof(report_buf), "[Warning] Cam %s | StartID: %6lld | Saved: %4d | Drop: %d | Actual FPS: %.4f", 
-                                 cam_ctxs[i]->id.c_str(), start_block_id, total_saved, dropped_frames, actual_fps);
-                    } else {
-                        snprintf(report_buf, sizeof(report_buf), "[OK]      Cam %s | StartID: %6lld | Saved: %4d | Drop: 0 | Actual FPS: %.4f", 
-                                 cam_ctxs[i]->id.c_str(), start_block_id, total_saved, actual_fps);
-                    }
-                    cout << report_buf << endl;
+                    all_logs.push_back(parseLogFile(cam_ctxs[i]->log_file_path));
                 }
 
+                double jpg_duration = 0.0;
                 if (write_jpg) {
-                    cout << "\n[Info] Generating Sync JPGs for Core Frames..." << endl;
-                    
-                    vector<vector<LogEntry>> final_entries_lists(cam_ctxs.size()); 
+                    auto jpg_start = chrono::steady_clock::now();
+                    vector<vector<LogEntry>> final_entries_lists(cam_ctxs.size());
                     int total_frames_all_cams = 0;
 
                     if (use_hw_trigger || enable_intersection) {
                         int64_t global_start_idx = 0;
-                        int64_t global_end_idx = 9999999999LL; 
-
-                        // 1. 在完整的 raw 数据集 (all_logs) 上寻找【本机】交集边界
+                        int64_t global_end_idx = 9999999999LL;
                         for (const auto& logs : all_logs) {
                             if (logs.empty()) continue;
                             if (logs.front().blockID > global_start_idx) global_start_idx = logs.front().blockID;
                             if (logs.back().blockID < global_end_idx) global_end_idx = logs.back().blockID;
                         }
-
-                        // ============ [新增] 跨主机 BlockID 交换 ============
                         if (enable_net_sync) {
-                            cout << "[Alignment] Local Range: [" << global_start_idx << ", " << global_end_idx << "]. Syncing with " << (is_master_pc ? "Slave" : "Master") << "..." << endl;
+                            cout << "[Alignment] Local Range: [" << global_start_idx << ", " << global_end_idx << "]. Syncing..." << endl;
                             syncGlobalBlockIDTCP(is_master_pc, master_ip, net_port, global_start_idx, global_end_idx);
-                            cout << "[Alignment] Final Global Intersection Range: [" << global_start_idx << ", " << global_end_idx << "]" << endl;
-                        } else {
-                            cout << "[Alignment] Net Sync OFF. Using Local Intersection Range: [" << global_start_idx << ", " << global_end_idx << "]" << endl;
+                            cout << "[Alignment] Final Range: [" << global_start_idx << ", " << global_end_idx << "]" << endl;
                         }
-                        // ====================================================
-                        
-                        // 2. 先取出交集，再从中截取 core_frames
                         for (int i = 0; i < cam_ctxs.size(); ++i) {
                             vector<LogEntry> intersected;
-                            for (const auto& entry : all_logs[i]) {
-                                if (entry.blockID >= global_start_idx && entry.blockID <= global_end_idx) {
-                                    intersected.push_back(entry); 
-                                }
-                            } 
-
-                            // 3. 从交集中取最中间的 core_frames
+                            for (const auto& entry : all_logs[i])
+                                if (entry.blockID >= global_start_idx && entry.blockID <= global_end_idx)
+                                    intersected.push_back(entry);
                             if (intersected.size() >= core_frames) {
                                 int start_offset = (intersected.size() - core_frames) / 2;
                                 final_entries_lists[i] = vector<LogEntry>(intersected.begin() + start_offset, intersected.begin() + start_offset + core_frames);
                             } else {
-                                cout << "[Warning] Cam " << cam_ctxs[i]->index << " intersected frames (" << intersected.size() << ") < core_frames (" << core_frames << ")." << endl;
-                                final_entries_lists[i] = intersected; // 数量不够则全量保留
+                                final_entries_lists[i] = intersected;
                             }
-                            total_frames_all_cams += final_entries_lists[i].size(); 
+                            total_frames_all_cams += final_entries_lists[i].size();
                         }
                     } else {
-                        // 如果不开启对齐，直接在每台相机自己的 raw 数组中切取中间的 core_frames
                         for (int i = 0; i < cam_ctxs.size(); ++i) {
                             if (all_logs[i].size() >= core_frames) {
                                 int start_offset = (all_logs[i].size() - core_frames) / 2;
@@ -1032,54 +1238,65 @@ int main() {
                     }
 
                     if (total_frames_all_cams > 0) {
-                        std::atomic<int> global_processed{0};
-                        
-                        auto draw_progress_ui = [&]() {
-                            cv::Mat loading = cv::Mat::zeros(400, 600, CV_8UC3);
-                            int processed = global_processed.load();
-                            cv::putText(loading, "Saving JPGs... " + to_string(processed) + "/" + to_string(total_frames_all_cams), cv::Point(50, 180), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
-                            float ratio = total_frames_all_cams > 0 ? (std::min)(1.0f, (float)processed / total_frames_all_cams) : 0.0f;
-                            cv::rectangle(loading, cv::Point(50, 220), cv::Point(550, 240), cv::Scalar(255, 255, 255), 1);
-                            if (ratio > 0) cv::rectangle(loading, cv::Point(50, 220), cv::Point(50 + (int)(500 * ratio), 240), cv::Scalar(0, 255, 0), -1);
-                            cv::imshow("Multi-Cam Preview", loading);
-                            cv::waitKey(1);
-                        };
-                        
+                        atomic<int> global_processed{0};
                         vector<thread> compile_threads;
                         for (int i = 0; i < cam_ctxs.size(); ++i) {
                             string out_jpg_dir = cam_ctxs[i]->save_base_dir + "/record_" + current_record_timestr + "/" + cam_ctxs[i]->id;
                             compile_threads.emplace_back(
-                                convertRawToJpgWorker, 
-                                cam_ctxs[i]->temp_dir, 
-                                out_jpg_dir, 
-                                final_entries_lists[i], 
-                                std::ref(global_processed), 
-                                cam_ctxs[i]->is_mono
+                                convertRawToJpgWorker,
+                                cam_ctxs[i]->temp_dir,
+                                out_jpg_dir,
+                                final_entries_lists[i],
+                                std::ref(global_processed),
+                                cam_ctxs[i]->is_mono,
+                                &cam_ctxs[i]->jpg_end_time
                             );
                         }
-                        
-                        int last_processed = 0, same_count = 0;  
+                        int last_processed = 0, same_count = 0;
                         while (true) {
-                            draw_progress_ui();
-                            int current_processed = global_processed.load();
-                            if (current_processed >= total_frames_all_cams) break;
-                            if (current_processed == last_processed) {
-                                if (++same_count > 100) break;
-                            } else { same_count = 0; last_processed = current_processed; }
+                            cv::Mat loading = cv::Mat::zeros(400, 600, CV_8UC3);
+                            int processed = global_processed.load();
+                            cv::putText(loading, "Saving JPGs... " + to_string(processed) + "/" + to_string(total_frames_all_cams), cv::Point(50, 180), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
+                            cv::imshow("Multi-Cam Preview", loading);
+                            cv::waitKey(1);
+                            if (processed >= total_frames_all_cams) break;
+                            if (processed == last_processed) { if (++same_count > 100) break; }
+                            else { same_count = 0; last_processed = processed; }
                             this_thread::sleep_for(chrono::milliseconds(50));
                         }
                         for (auto& t : compile_threads) if (t.joinable()) t.join();
-                        global_processed = total_frames_all_cams;  
-                        draw_progress_ui();
-                        cv::waitKey(500);
                     }
+                    jpg_duration = chrono::duration<double>(chrono::steady_clock::now() - jpg_start).count();
                 }
 
-                cout << "\n[Info] Ready for next capture." << endl;
+                // Write bandwidth samples to session log
+                if (g_session_log.is_open() && !bw_samples.empty()) {
+                    g_session_log << "\n--- Dump Bandwidth Samples (500ms interval) ---\n";
+                    double peak_bw = 0; int peak_idx = 0;
+                    for (size_t k = 0; k < bw_samples.size(); ++k) {
+                        if (bw_samples[k] > peak_bw) { peak_bw = bw_samples[k]; peak_idx = (int)k; }
+                    }
+                    for (size_t k = 0; k < bw_samples.size(); ++k) {
+                        g_session_log << fixed << setprecision(1) << "  " << (k * 0.5) << "s  "
+                                      << setw(8) << bw_samples[k] << " MB/s"
+                                      << (k == (size_t)peak_idx ? "  <- peak" : "") << "\n";
+                    }
+                    g_session_log << "\n--- Summary ---\n";
+                    double total_gb_bw = (double)total_record_frames * cam_ctxs[0]->ram_buffer[0].total() * cam_ctxs.size() / (1024.0*1024.0*1024.0);
+                    g_session_log << "dump_bandwidth_peak  : " << fixed << setprecision(1) << peak_bw << " MB/s\n";
+                    g_session_log << "dump_bandwidth_avg   : " << (dump_duration > 0 ? total_gb_bw * 1024.0 / dump_duration : 0) << " MB/s\n";
+                }
+
+                // Write report
+                writeReport(current_record_timestr, g_recording_number, target_fps, total_record_frames,
+                            dump_duration, jpg_duration, write_jpg, use_hw_trigger);
+
+                cout << "[Recording #" << g_recording_number << "] Done in " << fixed << setprecision(1)
+                     << dump_duration + jpg_duration << "s (appended to session log)" << endl;
+
                 is_dumping = false;
-                
-                while (cv::waitKey(1) >= 0); 
-                last_ui_time = std::chrono::steady_clock::now(); 
+                while (cv::waitKey(1) >= 0);
+                last_ui_time = chrono::steady_clock::now();
             }
         }
 
@@ -1177,6 +1394,7 @@ int main() {
         listener_thread.join();
     }
 
+    if (g_session_log.is_open()) g_session_log.close();
     cv::destroyAllWindows();
     Pylon::PylonTerminate();
     if (master_udp_sock != INVALID_SOCKET) closesocket(master_udp_sock);
