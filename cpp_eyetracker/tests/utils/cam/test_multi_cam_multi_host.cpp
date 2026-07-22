@@ -120,6 +120,7 @@ struct CameraContext {
     double ram2disk_s = 0.0;            // dump_end - dump_start, unit: seconds
     chrono::steady_clock::time_point dump_start_time;
     chrono::steady_clock::time_point dump_end_time;
+    chrono::steady_clock::time_point jpg_start_time;      // JPG start (if write_jpg)
     chrono::steady_clock::time_point jpg_end_time;        // JPG end (if write_jpg)
 
     CameraContext(int idx, string cam_id, string save_dir) : index(idx), id(cam_id), save_base_dir(save_dir), cam(cam_id) {}
@@ -717,7 +718,8 @@ vector<LogEntry> parseLogFile(const string& log_path) {
     return entries;
 }
 
-void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEntry> valid_entries, atomic<int>& global_processed, bool is_mono, chrono::steady_clock::time_point* jpg_end = nullptr) {
+void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEntry> valid_entries, atomic<int>& global_processed, bool is_mono, chrono::steady_clock::time_point* jpg_start = nullptr, chrono::steady_clock::time_point* jpg_end = nullptr) {
+    if (jpg_start) *jpg_start = chrono::steady_clock::now();
     if (valid_entries.empty()) { if (jpg_end) *jpg_end = chrono::steady_clock::now(); return; }
     fs::create_directories(out_jpg_dir);
     for (const auto& entry : valid_entries) {
@@ -762,9 +764,15 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
 
     double theoretical_s = total_frames / target_fps;  // seconds
 
-    g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | FirstBlk | LastBlk | SyncOff | Jitter(us) | RecOver2RAM(s) | Wait4Disk(s) | Ram2Disk(s) |\n";
-    g_session_log << "|---|-----|------|-------|------|-----|-------|---------|----------|----------|---------|------------|----------------|--------------|-------------|\n";
-    g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列总长峰值(出队前) | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | HW触发下与cam0的BlockID差 | Pylon时间戳间隔标准差(us) | RAM写完−理论完成(s) | RAM写完→DISK开始(s) | DISK开始→DISK结束(s) |\n";
+    if (write_jpg) {
+        g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | FirstBlk | LastBlk | SyncOff | Jitter(us) | RecOver2RAM(s) | Wait4Disk(s) | Ram2Disk(s) | Wait4JPG(s) | JPGTime(s) | RecOver2Disk(s) |\n";
+        g_session_log << "|---|-----|------|-------|------|-----|-------|---------|----------|----------|---------|------------|----------------|--------------|-------------|--------------|------------|-----------------|\n";
+        g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列总长峰值(出队前) | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | HW触发下与cam0的BlockID差 | Pylon时间戳间隔标准差(us) | RAM写完−理论完成 | RAM写完→DISK开始 | DISK开始→DISK结束 | DISK完成→JPG开始 | JPG耗时 | ①②③(+④+⑤)总和 |\n";
+    } else {
+        g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | FirstBlk | LastBlk | SyncOff | Jitter(us) | RecOver2RAM(s) | Wait4Disk(s) | Ram2Disk(s) | RecOver2Disk(s) |\n";
+        g_session_log << "|---|-----|------|-------|------|-----|-------|---------|----------|----------|---------|------------|----------------|--------------|-------------|-----------------|\n";
+        g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列总长峰值(出队前) | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | HW触发下与cam0的BlockID差 | Pylon时间戳间隔标准差(us) | RAM写完−理论完成 | RAM写完→DISK开始 | DISK开始→DISK结束 | ①+②+③总和 |\n";
+    }
 
     int64_t ref_first_blk = -1;
     if (!cam_ctxs.empty()) ref_first_blk = cam_ctxs[0]->first_recorded_block_id;
@@ -804,6 +812,8 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
 
         auto fmt3 = [] (double v) { ostringstream oss; oss << fixed << setprecision(3) << v; return oss.str(); };
 
+        double rec_over2disk = ctx->recover2ram_s + ctx->wait4disk_s + ctx->ram2disk_s;
+
         g_session_log << "| " << ctx->index << " | " << ctx->id << " | "
                       << (ctx->is_mono ? "mono" : "color") << " | "
                       << saved << " | " << dropped << " | "
@@ -815,7 +825,19 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
                       << fixed << setprecision(1) << jitter_us << " | "
                       << fmt3(ctx->recover2ram_s) << " | "
                       << fmt3(ctx->wait4disk_s) << " | "
-                      << fmt3(ctx->ram2disk_s) << " |\n";
+                      << fmt3(ctx->ram2disk_s) << " | ";
+
+        if (write_jpg) {
+            double wait4jpg = 0, jpg_time = 0;
+            if (ctx->jpg_start_time.time_since_epoch().count() > 0 && ctx->dump_end_time.time_since_epoch().count() > 0)
+                wait4jpg = chrono::duration<double>(ctx->jpg_start_time - ctx->dump_end_time).count();
+            if (ctx->jpg_end_time.time_since_epoch().count() > 0 && ctx->jpg_start_time.time_since_epoch().count() > 0)
+                jpg_time = chrono::duration<double>(ctx->jpg_end_time - ctx->jpg_start_time).count();
+            rec_over2disk += wait4jpg + jpg_time;
+            g_session_log << fmt3(wait4jpg) << " | " << fmt3(jpg_time) << " | ";
+        }
+
+        g_session_log << fmt3(rec_over2disk) << " |\n";
         g_session_log << defaultfloat;
     }
     g_session_log << "\n";
@@ -860,6 +882,9 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
         if (q > peak_q) { peak_q = q; peak_q_cam = ctx->index; }
         if (ctx->ram2disk_s > max_ram2disk) { max_ram2disk = ctx->ram2disk_s; max_ram2disk_cam = ctx->index; }
         double total_s = ctx->recover2ram_s + ctx->wait4disk_s + ctx->ram2disk_s;
+        if (write_jpg && ctx->jpg_start_time.time_since_epoch().count() > 0 && ctx->jpg_end_time.time_since_epoch().count() > 0) {
+            total_s += chrono::duration<double>(ctx->jpg_end_time - ctx->dump_end_time).count();
+        }
         if (total_s > max_total) { max_total = total_s; max_total_cam = ctx->index; }
 
         if (s > 1) {
@@ -1263,6 +1288,7 @@ int main() {
                                 final_entries_lists[i],
                                 std::ref(global_processed),
                                 cam_ctxs[i]->is_mono,
+                                &cam_ctxs[i]->jpg_start_time,
                                 &cam_ctxs[i]->jpg_end_time
                             );
                         }
