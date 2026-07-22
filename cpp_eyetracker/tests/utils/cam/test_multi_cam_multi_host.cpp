@@ -115,11 +115,12 @@ struct CameraContext {
     atomic<int> dropped_frames{0};
     int64_t prev_block_id = -1;
     chrono::steady_clock::time_point recording_end_time;  // t_last: when last frame written to RAM
-    double recording_overflow_ms = 0.0;
-    double ram_to_disk_latency_ms = 0.0;
-    chrono::steady_clock::time_point dump_start_time;     // per-camera dump start
-    chrono::steady_clock::time_point dump_end_time;       // per-camera dump end
-    chrono::steady_clock::time_point jpg_end_time;        // per-camera JPG end (if write_jpg)
+    double recover2ram_s = 0.0;         // (t_last - t_first) - theoretical, unit: seconds
+    double wait4disk_s = 0.0;           // dump_start - recording_end_time, unit: seconds
+    double ram2disk_s = 0.0;            // dump_end - dump_start, unit: seconds
+    chrono::steady_clock::time_point dump_start_time;
+    chrono::steady_clock::time_point dump_end_time;
+    chrono::steady_clock::time_point jpg_end_time;        // JPG end (if write_jpg)
 
     CameraContext(int idx, string cam_id, string save_dir) : index(idx), id(cam_id), save_base_dir(save_dir), cam(cam_id) {}
 };
@@ -168,8 +169,9 @@ void instantTrigger() {
         ctx->last_recorded_block_id = -1;
         ctx->dropped_frames = 0;
         ctx->prev_block_id = -1;
-        ctx->recording_overflow_ms = 0.0;
-        ctx->ram_to_disk_latency_ms = 0.0;
+        ctx->recover2ram_s = 0.0;
+        ctx->wait4disk_s = 0.0;
+        ctx->ram2disk_s = 0.0;
     }
 }
 
@@ -536,13 +538,12 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
             unique_lock<mutex> lock(ctx->copy_mtx);
             ctx->copy_cv.wait(lock, [&]{ return !ctx->copy_queue.empty() || !ctx->running; });
             if (!ctx->running && ctx->copy_queue.empty()) break;
+            // ---- queue pressure: record BEFORE pop (total queue length) ----
+            int qs = (int)ctx->copy_queue.size();
+            if (qs > ctx->max_queue_size.load()) ctx->max_queue_size = qs;
             task = ctx->copy_queue.front();
             ctx->copy_queue.pop();
         }
-
-        // ---- queue pressure (both branches) ----
-        int qs = (int)ctx->copy_queue.size();
-        if (qs > ctx->max_queue_size.load()) ctx->max_queue_size = qs;
 
         if (ctx->recording) {
             int seq = ctx->recorded_frames.load(std::memory_order_relaxed);
@@ -758,11 +759,13 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
 
     // --- Per-Camera Metrics (Markdown table) ---
     g_session_log << "### Per-Camera Metrics\n\n";
-    g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | FirstBlk | LastBlk | SyncOff | Jitter(us) | RecOver(ms) | Ram2Disk(ms) | Dump(ms) |\n";
-    g_session_log << "|---|-----|------|-------|------|-----|-------|---------|----------|----------|---------|------------|-------------|--------------|----------|\n";
-    g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | copy_queue峰值 | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | HW触发下与cam0的BlockID差 | 相邻帧Pylon时间戳间隔标准差 | 理论计时-实际完成 | RAM写完→硬盘写完 | dumpToDiskWorker函数耗时 |\n";
 
-    double theoretical_ms = total_frames / target_fps * 1000.0;
+    double theoretical_s = total_frames / target_fps;  // seconds
+
+    g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | FirstBlk | LastBlk | SyncOff | Jitter(us) | RecOver2RAM(s) | Wait4Disk(s) | Ram2Disk(s) |\n";
+    g_session_log << "|---|-----|------|-------|------|-----|-------|---------|----------|----------|---------|------------|----------------|--------------|-------------|\n";
+    g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列总长峰值(出队前) | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | HW触发下与cam0的BlockID差 | Pylon时间戳间隔标准差(us) | RAM写完−理论完成(s) | RAM写完→DISK开始(s) | DISK开始→DISK结束(s) |\n";
+
     int64_t ref_first_blk = -1;
     if (!cam_ctxs.empty()) ref_first_blk = cam_ctxs[0]->first_recorded_block_id;
 
@@ -774,7 +777,6 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
         if (saved > 1) {
             double dur_s = (ctx->meta_buffer[saved-1].timestamp - ctx->meta_buffer[0].timestamp) / 10000000.0;
             if (dur_s > 0) fps = (saved - 1) / dur_s;
-
             double sum = 0, sum_sq = 0; int n = saved - 1;
             for (int k = 1; k < saved; ++k) {
                 double dt = (ctx->meta_buffer[k].timestamp - ctx->meta_buffer[k-1].timestamp) / 10.0;
@@ -787,32 +789,33 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
         if (ctx->first_frame_time.time_since_epoch().count() > 0)
             lat_ms = chrono::duration<double, milli>(ctx->first_frame_time - global_record_start_time).count();
 
-        ctx->recording_overflow_ms = chrono::duration<double, milli>(ctx->recording_end_time - ctx->first_frame_time).count() - theoretical_ms;
+        // RecOver2RAM(s) = actual RAM duration - theoretical
+        double actual_ram_s = chrono::duration<double>(ctx->recording_end_time - ctx->first_frame_time).count();
+        ctx->recover2ram_s = actual_ram_s - theoretical_s;
 
-        if (write_jpg && ctx->jpg_end_time.time_since_epoch().count() > 0)
-            ctx->ram_to_disk_latency_ms = chrono::duration<double, milli>(ctx->jpg_end_time - ctx->recording_end_time).count();
-        else if (!write_jpg && ctx->dump_end_time.time_since_epoch().count() > 0)
-            ctx->ram_to_disk_latency_ms = chrono::duration<double, milli>(ctx->dump_end_time - ctx->recording_end_time).count();
+        // Wait4Disk(s) = dump_start - recording_end_time (how long this camera waited before disk write started)
+        ctx->wait4disk_s = chrono::duration<double>(ctx->dump_start_time - ctx->recording_end_time).count();
 
-        double dump_ms = chrono::duration<double, milli>(ctx->dump_end_time - ctx->dump_start_time).count();
+        // Ram2Disk(s) = dump_end - dump_start (actual disk write duration)
+        ctx->ram2disk_s = chrono::duration<double>(ctx->dump_end_time - ctx->dump_start_time).count();
 
         int64_t sync_off = (ref_first_blk >= 0 && hw_trigger) ? (ctx->first_recorded_block_id - ref_first_blk) : 0;
         string sync_str = hw_trigger ? to_string(sync_off) : "N/A";
 
-        auto fmt = [] (double v) { ostringstream oss; oss << fixed << setprecision(1) << v; return oss.str(); };
+        auto fmt3 = [] (double v) { ostringstream oss; oss << fixed << setprecision(3) << v; return oss.str(); };
 
         g_session_log << "| " << ctx->index << " | " << ctx->id << " | "
                       << (ctx->is_mono ? "mono" : "color") << " | "
                       << saved << " | " << dropped << " | "
                       << fixed << setprecision(1) << fps << " | "
                       << ctx->max_queue_size.load() << " | "
-                      << fmt(lat_ms) << " | "
+                      << fixed << setprecision(1) << lat_ms << " | "
                       << ctx->first_recorded_block_id << " | " << ctx->last_recorded_block_id << " | "
                       << sync_str << " | "
-                      << fmt(jitter_us) << " | "
-                      << fmt(ctx->recording_overflow_ms) << " | "
-                      << (write_jpg ? fmt(ctx->ram_to_disk_latency_ms) : string("N/A")) << " | "
-                      << fmt(dump_ms) << " |\n";
+                      << fixed << setprecision(1) << jitter_us << " | "
+                      << fmt3(ctx->recover2ram_s) << " | "
+                      << fmt3(ctx->wait4disk_s) << " | "
+                      << fmt3(ctx->ram2disk_s) << " |\n";
         g_session_log << defaultfloat;
     }
     g_session_log << "\n";
@@ -840,8 +843,8 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     double min_fps = 1e9; int min_fps_cam = -1;
     int peak_q = 0, peak_q_cam = -1;
     double max_jitter = 0; int max_jitter_cam = -1;
-    double max_overflow = -1e9;
-    double max_ram_disk = 0;
+    double max_ram2disk = 0; int max_ram2disk_cam = -1;
+    double max_total = 0; int max_total_cam = -1;
     int64_t max_sync = 0;
 
     for (auto& ctx : cam_ctxs) {
@@ -855,16 +858,15 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
         }
         int q = ctx->max_queue_size.load();
         if (q > peak_q) { peak_q = q; peak_q_cam = ctx->index; }
-        if (ctx->recording_overflow_ms > max_overflow) max_overflow = ctx->recording_overflow_ms;
-        if (ctx->ram_to_disk_latency_ms > max_ram_disk) max_ram_disk = ctx->ram_to_disk_latency_ms;
+        if (ctx->ram2disk_s > max_ram2disk) { max_ram2disk = ctx->ram2disk_s; max_ram2disk_cam = ctx->index; }
+        double total_s = ctx->recover2ram_s + ctx->wait4disk_s + ctx->ram2disk_s;
+        if (total_s > max_total) { max_total = total_s; max_total_cam = ctx->index; }
 
-        // jitter
         if (s > 1) {
             double sum = 0, sum_sq = 0; int n = s - 1;
             for (int k = 1; k < s; ++k) { double dt = (ctx->meta_buffer[k].timestamp - ctx->meta_buffer[k-1].timestamp) / 10.0; sum += dt; sum_sq += dt * dt; }
             if (n > 0) { double mean = sum / n; double j = sqrt(sum_sq / n - mean * mean); if (j > max_jitter) { max_jitter = j; max_jitter_cam = ctx->index; } }
         }
-
         if (hw_trigger && ref_first_blk >= 0) {
             int64_t off = ctx->first_recorded_block_id - ref_first_blk;
             if (llabs(off) > max_sync) max_sync = llabs(off);
@@ -882,13 +884,11 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     g_session_log << "completion_rate      : " << completion << "%\n";
     g_session_log << "bottleneck_fps       : " << min_fps << " (cam " << min_fps_cam << ": " << (min_fps_cam >= 0 ? cam_ctxs[min_fps_cam]->id : "?") << ")\n";
     g_session_log << "max_sync_offset      : " << max_sync << " BlockID" << (hw_trigger ? "" : " (N/A - SW trigger)") << "\n";
-    // trigger latency spread
     double min_lat = 1e9, max_lat = 0;
     for (auto& ctx : cam_ctxs) {
         if (ctx->first_frame_time.time_since_epoch().count() > 0) {
             double lat = chrono::duration<double, milli>(ctx->first_frame_time - global_record_start_time).count();
-            if (lat < min_lat) min_lat = lat;
-            if (lat > max_lat) max_lat = lat;
+            if (lat < min_lat) min_lat = lat; if (lat > max_lat) max_lat = lat;
         }
     }
     g_session_log << "max_trigger_latency_spread : " << (max_lat - min_lat) << " ms\n";
@@ -898,9 +898,8 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     for (auto v : bw_samples) if (v > peak_bw) peak_bw = v;
     g_session_log << "dump_bandwidth_peak  : " << peak_bw << " MB/s\n";
     g_session_log << "dump_bandwidth_avg   : " << avg_bw << " MB/s\n";
-    g_session_log << "dump_balance         : (see per-camera DumpTime_ms)\n";
-    g_session_log << "max_recording_overflow : " << max_overflow << " ms\n";
-    g_session_log << "max_ram_to_disk_latency : " << (write_jpg ? to_string(max_ram_disk) + " ms" : "N/A (write_jpg=false)") << "\n";
+    g_session_log << "max_ram2disk         : " << max_ram2disk << " s (cam " << max_ram2disk_cam << ": " << (max_ram2disk_cam >= 0 ? cam_ctxs[max_ram2disk_cam]->id : "?") << ")\n";
+    g_session_log << "max_end_to_end       : " << max_total << " s (RecOver2RAM+Wait4Disk+Ram2Disk, cam " << max_total_cam << ": " << (max_total_cam >= 0 ? cam_ctxs[max_total_cam]->id : "?") << ")\n";
     bool healthy = (max_sync <= 2) && (min_fps >= target_fps * 0.95) && (total_dropped <= total_expected * 0.01);
     g_session_log << "system_healthy       : " << (healthy ? "PASS" : "FAIL") << "\n";
     g_session_log << "```\n";
