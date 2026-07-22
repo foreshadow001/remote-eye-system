@@ -8,3 +8,5 @@ cpp_eyetracker/build/
 # cpp_eyetracker/CMakePresets.json
 
 /.claude/
+
+/log/
