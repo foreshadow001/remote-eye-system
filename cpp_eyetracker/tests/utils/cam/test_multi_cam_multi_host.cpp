@@ -748,15 +748,16 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
                  const vector<double>& bw_samples) {
     if (!g_session_log.is_open()) return;
 
-    g_session_log << "\n=== Recording #" << rec_num << ": " << timestr << " ===\n";
-    g_session_log << "Config: " << cam_ctxs.size() << " cams, "
-                  << (hw_trigger ? "HW" : "SW") << " trigger, "
-                  << fixed << setprecision(1) << target_fps << " fps, "
-                  << total_frames << " total frames\n";
-    g_session_log << "write_jpg: " << (write_jpg ? "true" : "false") << "\n";
+    g_session_log << "\n---\n\n"
+                  << "## Recording #" << rec_num << ": " << timestr << "\n\n"
+                  << "- **Cameras**: " << cam_ctxs.size() << "\n"
+                  << "- **Trigger**: " << (hw_trigger ? "HW" : "SW") << "\n"
+                  << "- **Target FPS**: " << fixed << setprecision(1) << target_fps << "\n"
+                  << "- **Total frames**: " << total_frames << "\n"
+                  << "- **write_jpg**: " << (write_jpg ? "true" : "false") << "\n\n";
 
     // --- Per-Camera Metrics (Markdown table) ---
-    g_session_log << "\n--- Per-Camera Metrics ---\n\n";
+    g_session_log << "### Per-Camera Metrics\n\n";
     g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | FirstBlk | LastBlk | SyncOff | Jitter(us) | RecOver(ms) | Ram2Disk(ms) | Dump(ms) |\n";
     g_session_log << "|---|-----|------|-------|------|-----|-------|---------|----------|----------|---------|------------|-------------|--------------|----------|\n";
     g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | copy_queue峰值 | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | HW触发下与cam0的BlockID差 | 相邻帧Pylon时间戳间隔标准差 | 理论计时-实际完成 | RAM写完→硬盘写完 | dumpToDiskWorker函数耗时 |\n";
@@ -818,7 +819,8 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
 
     // --- Bandwidth Samples ---
     if (!bw_samples.empty()) {
-        g_session_log << "\n--- Dump Bandwidth Samples (500ms interval) ---\n";
+        g_session_log << "\n### Dump Bandwidth Samples (500ms interval)\n\n";
+        g_session_log << "```\n";
         double peak_bw = 0; int peak_idx = 0;
         for (size_t k = 0; k < bw_samples.size(); ++k)
             if (bw_samples[k] > peak_bw) { peak_bw = bw_samples[k]; peak_idx = (int)k; }
@@ -828,10 +830,11 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
                           << (k == (size_t)peak_idx ? "  <- peak" : "") << "\n";
         }
         // Bandwidth stats moved to Summary below
+        g_session_log << "```\n";
     }
 
     // --- Summary ---
-    g_session_log << "\n--- Summary ---\n";
+    g_session_log << "\n### Summary\n\n```\n";
     int total_expected = (int)cam_ctxs.size() * total_frames;
     int total_saved = 0, total_dropped = 0;
     double min_fps = 1e9; int min_fps_cam = -1;
@@ -900,6 +903,7 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     g_session_log << "max_ram_to_disk_latency : " << (write_jpg ? to_string(max_ram_disk) + " ms" : "N/A (write_jpg=false)") << "\n";
     bool healthy = (max_sync <= 2) && (min_fps >= target_fps * 0.95) && (total_dropped <= total_expected * 0.01);
     g_session_log << "system_healthy       : " << (healthy ? "PASS" : "FAIL") << "\n";
+    g_session_log << "```\n";
     g_session_log.flush();
 }
 
@@ -1040,10 +1044,12 @@ int main() {
         g_session_log_path = string("log/capture/session_") + tb + ".md";
         g_session_log.open(g_session_log_path, ios::out | ios::app);
         if (g_session_log.is_open())
-            g_session_log << "=== Session started: " << tb << " ===\n"
-                          << "Cameras: " << camera_ids.size() << ", "
-                          << (use_hw_trigger ? "HW" : "SW") << " trigger, "
-                          << target_fps << " fps\n" << flush;
+            g_session_log << "# Session: " << tb << "\n\n"
+                          << "- **Cameras**: " << camera_ids.size() << "\n"
+                          << "- **Trigger**: " << (use_hw_trigger ? "HW" : "SW") << "\n"
+                          << "- **Target FPS**: " << target_fps << "\n"
+                          << "- **write_jpg**: " << (write_jpg ? "true" : "false") << "\n"
+                          << "\n---\n" << flush;
         cout << "[Log] Session log: " << g_session_log_path << endl;
     }
 
