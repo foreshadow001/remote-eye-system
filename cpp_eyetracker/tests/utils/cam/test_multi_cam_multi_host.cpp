@@ -765,13 +765,13 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     double theoretical_s = total_frames / target_fps;  // seconds
 
     if (write_jpg) {
-        g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | FirstBlk | LastBlk | SyncOff | Jitter(us) | RecOver2RAM(s) | Wait4Disk(s) | Ram2Disk(s) | Wait4JPG(s) | JPGTime(s) | RecOver2Disk(s) |\n";
-        g_session_log << "|---|-----|------|-------|------|-----|-------|---------|----------|----------|---------|------------|----------------|--------------|-------------|--------------|------------|-----------------|\n";
-        g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列总长峰值(出队前) | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | HW触发下与cam0的BlockID差 | Pylon时间戳间隔标准差(us) | RAM写完−理论完成 | RAM写完→DISK开始 | DISK开始→DISK结束 | DISK完成→JPG开始 | JPG耗时 | ①②③(+④+⑤)总和 |\n";
+        g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | FirstBlk | LastBlk | SyncOff | Jitter(us) | RecOver2RAM(s) | Wait4Disk(s) | Ram2Disk(s) | RecOver2Disk(s) | Wait4JPG(s) | JPGTime(s) | RecOver2JPG(s) |\n";
+        g_session_log << "|---|-----|------|-------|------|-----|-------|---------|----------|----------|---------|------------|----------------|--------------|-------------|-----------------|--------------|------------|-----------------|\n";
+        g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列总长峰值(出队前) | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | HW触发下与cam0的BlockID差 | Pylon时间戳间隔标准差(us) | RAM写完−理论完成 | RAM写完→DISK开始 | DISK开始→DISK结束 | ①+②+③ | DISK完成→JPG开始 | JPG耗时 | ①②③+④+⑤ |\n";
     } else {
         g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | FirstBlk | LastBlk | SyncOff | Jitter(us) | RecOver2RAM(s) | Wait4Disk(s) | Ram2Disk(s) | RecOver2Disk(s) |\n";
         g_session_log << "|---|-----|------|-------|------|-----|-------|---------|----------|----------|---------|------------|----------------|--------------|-------------|-----------------|\n";
-        g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列总长峰值(出队前) | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | HW触发下与cam0的BlockID差 | Pylon时间戳间隔标准差(us) | RAM写完−理论完成 | RAM写完→DISK开始 | DISK开始→DISK结束 | ①+②+③总和 |\n";
+        g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列总长峰值(出队前) | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | HW触发下与cam0的BlockID差 | Pylon时间戳间隔标准差(us) | RAM写完−理论完成 | RAM写完→DISK开始 | DISK开始→DISK结束 | ①+②+③ |\n";
     }
 
     int64_t ref_first_blk = -1;
@@ -825,7 +825,8 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
                       << fixed << setprecision(1) << jitter_us << " | "
                       << fmt3(ctx->recover2ram_s) << " | "
                       << fmt3(ctx->wait4disk_s) << " | "
-                      << fmt3(ctx->ram2disk_s) << " | ";
+                      << fmt3(ctx->ram2disk_s) << " | "
+                      << fmt3(rec_over2disk) << " | ";
 
         if (write_jpg) {
             double wait4jpg = 0, jpg_time = 0;
@@ -833,11 +834,11 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
                 wait4jpg = chrono::duration<double>(ctx->jpg_start_time - ctx->dump_end_time).count();
             if (ctx->jpg_end_time.time_since_epoch().count() > 0 && ctx->jpg_start_time.time_since_epoch().count() > 0)
                 jpg_time = chrono::duration<double>(ctx->jpg_end_time - ctx->jpg_start_time).count();
-            rec_over2disk += wait4jpg + jpg_time;
-            g_session_log << fmt3(wait4jpg) << " | " << fmt3(jpg_time) << " | ";
+            double rec_over2jpg = rec_over2disk + wait4jpg + jpg_time;
+            g_session_log << fmt3(wait4jpg) << " | " << fmt3(jpg_time) << " | " << fmt3(rec_over2jpg) << " |\n";
+        } else {
+            g_session_log << "\n";
         }
-
-        g_session_log << fmt3(rec_over2disk) << " |\n";
         g_session_log << defaultfloat;
     }
     g_session_log << "\n";
