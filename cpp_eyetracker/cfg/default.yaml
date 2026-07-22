@@ -1,0 +1,444 @@
+# Camera calibration
+cam_calib:
+  input_folder: "D:/calib_images"
+  calib_plane: "C:/hitsz/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
+  output_folder: "D:/calib_output"
+  focus: 0.016 # m
+  pixel_size_x: 2.74e-6 # m
+  pixel_size_y: 2.74e-6 # m
+  center_cam: "40772280"         # 中心相机 SN，空则默认相机 0 为参考
+  focus_overrides:               # 特定相机焦距覆盖 (m), SN → focus
+    40772283: 0.075
+    40772276: 0.075
+
+# Calibration Offline Settings
+test_calib:
+  record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/ylx"
+  num_images_per_folder: 20
+  output_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/ylx"
+
+test_jitter:
+  record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/ylx"
+  output_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/ylx"
+  num_images_per_folder: 20
+  
+  # 新增：对每个干净样本生成的噪声样本数量
+  num_noise_samples: 10
+  
+  # Pupil Jitter 遍历配置 (单位: pixel std)
+  pupil_jitter_start: 0.0
+  pupil_jitter_step: 0.25
+  pupil_jitter_end: 2.0
+  
+  # Glint Jitter 遍历配置 (单位: pixel std)
+  glint_jitter_start: 0.0
+  glint_jitter_step: 0.25
+  glint_jitter_end: 2.0
+
+# Gaze Tracker Settings
+gaze_tracker:
+  use_chen_noise_reduction: true   # 是否使用 Chen 降噪算法
+  cc_filter:
+    enable: false
+    window_size: 5
+  pc_filter:
+    enable: false
+    window_size: 5
+
+# Camera Settings
+cam_xml_path:
+  - "D:/hitsz/projects/new_dataset/eyetracker_test/ylx/cam_calib/output/Camera0_Data.xml"
+#  - "D:/ylx/calib/cams/Camera1_Data.xml"
+#  - "D:/ylx/calib/cams/Camera2_Data.xml"
+
+# Lights Settings
+lights_pos:
+ - [-21.7, 0.0, 0.0]
+ - [18.5, 0.0, 0.0]
+ - [0.0, 8.0, 5.0]
+
+# Calibration General Settings
+calib_init_values:
+  left:
+    alpha: 5
+    beta: -1.5
+    R: 0.78
+    K: 0.42
+    n1: 1.3375
+    n2: 1.0
+    D: 0.53
+  right:
+    alpha: -5
+    beta: -1.5
+    R: 0.78
+    K: 0.42
+    n1: 1.3375
+    n2: 1.0
+    D: 0.53
+  eye_cam_dist_init: 70.0
+
+calib_values_bounds:
+  alpha: [-5, 5]
+  beta: [-5, 5]
+  R: [0.4, 1.5]
+  K: [0.1, 1.0]
+
+# Screen Settings
+screen_width_px: 3840
+screen_height_px: 2160
+screen_width_cm: 59.6
+screen_height_cm: 33.7
+screen_center: [0.00, -18.14, -8.62]
+screen_horizontal_direction: [-1.0, 0.0, 0.0]
+screen_vertical_direction: [0.00, 0.91, -0.42]
+
+# Visualization Settings
+viz: true
+viz_output_dir: "D:/ylx/calib_viz"
+
+test_net:
+  is_master: false          # 在 PC A 上设为 true，在 PC B 上设为 false
+  master_ip: "192.168.10.1"
+  slave_ip: "192.168.10.2"
+  port: 49200
+
+# Test Multi Cam
+test_multi_cam:
+  cam_indices:
+    - 40768742 
+    - 40774056
+    - 40768741
+    - 40774063
+    - 40774057
+    - 40774064
+    - 40768744
+    - 40768743
+    - 40773101
+    - 40772283
+  hardware_trigger: true
+  write_jpg: true
+  debug_time: true
+  ui_fps: 20.0
+  enable_offset: false
+  enable_intersection: false
+  enable_net_sync: true
+  calib_save_dir: "D:/calib_images"  # 标定图片保存目录（本机所有相机共用）
+  save_dir:
+    - "D:/test_cam"
+    - "D:/test_cam"
+    - "D:/test_cam"
+    - "D:/test_cam"
+    - "D:/test_cam"
+    - "E:/test_cam"
+    - "E:/test_cam"
+    - "E:/test_cam"
+    - "E:/test_cam"
+    - "E:/test_cam"
+  fps: 200
+  gain: 0.0
+  gamma: 1.0
+  exposure_time: 4000.0
+  calib_mono_exp_ext: 1.0
+  window_width: 1600
+  window_height: 800
+  cam_width: 2448
+  cam_height: 2048
+  record_time: 1.0       # 录制的核心秒数 (代码会自动加20%余量)
+  margin_frames_ratio: 0.05
+  write_delay_ms: 0      # 录制结束后，写硬盘阶段每帧的延时(毫秒)，用以控制CPU和硬盘峰值压力，0为全速
+  is_master: false             # 主机设为 true，从机设为 false
+  master_ip: "192.168.10.1"
+  slave_ip: "192.168.10.2"
+  port: 49200             # 使用刚刚打通的安全端口
+
+test_single_cam:
+  sn: "40768741"
+  hardware_trigger: false # 设为 false 就是软件触发，设为 true 就是硬件触发
+  fps: 30.0
+  gain: 0.0
+  gamma: 1.0
+  exposure_time: 20000.0 # 20ms
+
+test_record:
+  save_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/ylx"
+  write_jpg: true
+  target_frames: 200
+  remove_false: true
+
+# Calib Points Settings
+calib_points:
+  rows: 4
+  cols: 5
+  margin_x: 200
+  margin_y: 300
+  save_dir: "D:/hitsz/projects/new_dataset/calib_points"
+  marker_scale: 3
+  theme: "dark"
+
+# Test inference
+test_two_eye:
+  record_dir: "D:/hitsz/projects/new_dataset/debug_gaze"
+  output_dir: "D:/hitsz/projects/new_dataset/debug_gaze"
+  num_images_per_folder: 1
+
+# Test Glint Detection
+test_glint:
+  local_debug: false
+  debug_time: false
+  debug_geometry: false
+  param_type: "relaxed"
+  is_collecting: false
+  viz: true
+  viz_threshold: true
+  num_images: 200000
+  input_folder: "D:/hitsz/projects/new_dataset/eyetracker_test/sby/record_20260408_152345/cam_0"
+  use_record: false
+  record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/ylx"
+  gaussian_kernel_size: 3
+  laplacian_kernel_size: 1
+  init_threshold_value: 110
+  threshold_step: 30
+  mini_threshold: 20
+  use_glint_sr: true
+
+# Collect Potential Glint Triangles
+collect_glint:
+  use_record: true
+  record_dir: "D:/hitsz/projects/new_dataset/eyetracker_test/ylx"
+  num_images: 100
+  input_folder: "D:/hitsz/projects/new_dataset/test_record/debug/collect_input"
+  output_folder: "D:/hitsz/projects/new_dataset/test_record/collect_output"
+
+recommended_specific_hyperparameter:
+  pupil:
+    searchPupilInROI:
+      kAdaptiveThreshOffset: 10.0
+      kAdaptiveThreshMax: 7.0
+      kMinPupilArea: 84
+      kMaxPupilArea: 660
+      kMinPupilContourPoints: 5
+      kMaxPupilAxis: 41.1702
+      kMaxAxisRatio: 2.96595
+      kMinSolidity: 0.543367
+      kMinFitRatio: 0.597502
+      kMaxAvgResidual: 0.564495
+      kMaxDarkness: 13.331
+  
+  glint:
+    isPupilNearby:
+      kExclusionRadiusRatio: 1.95559
+      
+    checkGlintGeometry:
+      kBrightnessThreshold: 23.9765
+
+    horizontal_pair:
+      lr_y_min: 0
+      lr_y_max: 6.5
+      lr_x_min: 7
+      lr_x_max: 15
+
+    middle_point:
+      conditions:
+        - [0, 2, 0.2, 0.8, 0.05, 0.55, 0.2, 0.8, 0.05, 0.55]
+        - [2, 3, 0.45, 0.7, 0.05, 0.25, 0.3, 0.55, 0.25, 0.5]
+        - [3, 5, 0.45, 0.85, 0.04, 0.25, 0.15, 0.55, 0.3, 0.65]
+
+recommended_specific_hyperparameter:
+  pupil:
+    searchPupilInROI:
+      kAdaptiveThreshOffset: 10.027100
+      kAdaptiveThreshMax: 10.027100
+      kMinPupilArea: 89.500000
+      kMaxPupilArea: 868.000000
+      kMinPupilContourPoints: 5.000000
+      kMaxPupilAxis: 52.677296
+      kMaxAxisRatio: 2.873369
+      kMinSolidity: 0.663522
+      kMinFitRatio: 0.658251
+      kMaxAvgResidual: 0.628213
+      kMaxDarkness: 10.027100
+  
+  glint:
+    isPupilNearby:
+      kExclusionRadiusRatio: 6.919400
+      
+    checkAndPushGlintGeometry:
+      kBrightnessThreshold: 16.349558
+
+    horizontal_pair:
+      lr_y_min: 0.000000
+      lr_y_max: 6.500000
+      lr_x_min: 7.000000
+      lr_x_max: 14.749939
+
+    middle_point:
+      conditions:
+        - [0, 2, 0.366667, 0.615217, 0.11, 0.322727, 0.384783, 0.633333, 0.158333, 0.341667]
+        - [2, 3, 0.45, 0.65, 0.05, 0.216667, 0.35, 0.55, 0.283333, 0.5]
+        - [3, 5, 0.476316, 0.686364, 0.00263158, 0.186364, 0.313636, 0.523684, 0.404545, 0.605556]
+relaxed_specific_hyperparameter:
+  pupil:
+    searchPupilInROI:
+      kAdaptiveThreshOffset: 10.0
+      kAdaptiveThreshMax: 7.0
+      kMinPupilArea: 50
+      kMaxPupilArea: 1000
+      kMinPupilContourPoints: 5
+      kMaxPupilAxis: 50.0
+      kMaxAxisRatio: 2.5
+      kMinSolidity: 0.50
+      kMinFitRatio: 0.55
+      kMaxAvgResidual: 0.50
+      kMaxDarkness: 15.0
+  
+  glint:
+    isPupilNearby:
+      kExclusionRadiusRatio: 2.5
+
+    checkGlintGeometry:
+      kBrightnessThreshold: 25.0
+
+    horizontal_pair:
+      lr_y_min: 0
+
+empirical_hyperparameter:
+  getSearchRegionSideAndMid:
+    kOffsetX: 1
+    kOffsetY: 1
+    kMinRemainderArea: 5
+
+  getSearchRegionSideAndSide:
+    kOffsetY: 0
+    kMinRemainderArea: 5
+
+  searchPupilInROI:
+    kMorphKernelSize: 5
+    kMorphCloseIterations: 2
+    kValidResidualRatio: 0.60
+    kAxisRatioTolerance: 1.75
+    kMaxAngleAbs: 35
+
+  searchGlassReflections:
+    kMinContourArea: 50.0
+    kMaxContourArea: 500.0
+    kRoiPadding: 10
+    kHoughDp: 1.0
+    kHoughMinDistDivisor: 3.0
+    kHoughParam1: 100.0
+    kHoughParam2: 5.0
+    kHoughMinRadius: 3
+    kHoughMaxRadius: 25
+    kDistTransformMaskSize: 5
+    kMinDtRadius: 1.0
+    kDtRadiusCentroidThresh: 3.0
+    kFrameReflectionRatioThresh: 3.0
+    kMagEpsilon: 1e-3
+  isInsideGlassExclusion:
+    kExclusionRadiusRatio: 1.2
+
+  findNeighborInDirection:
+    kDefaultSearchScaleLenRatio: 3.0
+    kDefaultSearchScaleWidRatio: 2.0
+    kMinContourArea: 2.0
+    kMinDistRatio: 0.5
+    kMinReliableLenRatio: 0.6
+    kAngleSwapMin: 45.0
+    kAngleSwapMax: 135.0
+  searchReflectionChains:
+    kMinNormEpsilon: 0.1
+    kMaxChainLength: 20
+  searchFrameReflections:
+    kMinArea: 10.0
+    kMaxArea: 50.0
+    kMinLengthWidthRatio: 2.0
+    kSearchScaleLenRatio: 3.0
+    kSearchScaleWidRatio: 2.0
+    kAngleSwapMin: 45.0
+    kAngleSwapMax: 135.0
+    kMinChainSizeToDraw: 3
+
+  buildExclusionMask:
+    kGlassExclusionScale: 1.2
+    kFrameExclusionScale: 1.5
+    kChainExclusionScale: 1.5
+
+  shrinkRoiToValidGlints:
+    kMaxNoiseArea: 3.0
+    kClusterDistThresh: 80.0
+    kMinClusterSize: 2
+    kPadding: 30
+    kDefaultLowSensitivityThresh: 50.0
+
+  excludeIrisReflectionsFromROIs:
+    kIrisReflectionThreshold: 100
+    kMinIrisReflectionArea: 10
+    kPadding: 2
+
+  determineCornealReflectionROI:
+    kMinExpandedRoiArea: 50
+    kShrinkRatio: 0.05
+    kMinRemainderArea: 10
+
+  splitGlintsGeometry:
+    kDistanceThresholdX: 100.0
+
+  findBestPupilForCluster:
+    kDarknessTolerance: 5.0
+
+  selectBestGlintsPerCluster:
+    kDistTolerance: 5.0
+    kBrightTolerance: 5.0
+
+  detectCluster:
+    kMaxClusterResults: 2
+
+  findGeometry:
+    kMaxMissingPointsToFind: 2
+
+  isGlintRepeated:
+    kMinGlintDist: 4.0
+
+  isGlintGeometryRepeated:
+    kPointMatchTolerance: 3.0
+
+  checkGlintGeometry:
+    kDangerMaskThresh: 50.0
+    kMinPadding: 5
+    kPaddingRatio: 0.20
+    kDilateKernelSize: 3
+    kDilateIterations: 1
+    kMinValidPixels: 5
+    kTrimRatio: 0.10
+
+  samplePupilEdgesByRayCasting:
+    kRayCount: 72
+    kRayMaxRadiusRatio: 1.5
+    kMaxGlintBrightness: 200
+    kGradientGap: 3
+    kMinGradient: 2
+
+  refinePupil:
+    kGlintExclusionRadius: 15.0
+    kMaxDistanceDeviationRatio: 0.2
+    kRansacIterations: 100
+    kRansacTolerance: 2.0
+    kMinInlierRatio: 0.4
+    kMaxGlintBrightness: 50
+
+  refineGlintPoint:
+    viz_mult: 5
+    # --- ROI 提取与超分设置 ---
+    kWindowSize: 6            # ROI 基础窗口大小（原图像素）。Glint 通常在 3~8 个像素左右，16 足够包围它并提供背景上下文。
+    kPaddingRatio: 0.0        # ROI 扩展比例（按你要求设置为 0.1）。
+    sr_scale: 4               # 超分辨率放大倍数。推荐 4 倍（Lanczos4 在 4 倍放大时平滑度与计算耗时的平衡最佳）。
+    
+    # --- 边缘射线采样设置 ---
+    kRayCount: 36             # 射线发射数量。36 意味着每 10 度采样一次，对于极小圆的拟合来说点数刚刚好，再多容易引入临近噪声。
+    kGradientGap: 2           # 梯度计算步长（SR 图像像素跨度）。配合 Lanczos4 的平滑特性，跨度设为 2 能有效捕获由于衍射产生的平缓下降沿。
+    kMinGradient: 10          # 判定为边缘的最小梯度阈值。Glint 相比背景亮度落差很大，5.0 能滤除底噪同时保留微弱的真实边缘。
+    kMinBrightness: 30.0    # 边缘点靠光斑内侧的最低亮度限制
+    kRadiusMargin: 2.0      # 距离中点的一半后，附加的微小安全冗余半径 (原图像素级)
+
+    # --- RANSAC 拟合设置 ---
+    kRansacIterations: 100    # RANSAC 迭代次数。候选点最多只有 36 个，100 次迭代足够覆盖绝大多数有效组合（置信度 > 99%）。
+    kInlierTolerance: 2.0     # 内点容差（SR 图像像素）。在 sr_scale=4 的情况下，2.0 代表原图的 0.5 个像素，这是一个非常严格且准确的正圆约束条件。
