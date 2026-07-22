@@ -755,9 +755,11 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
                   << total_frames << " total frames\n";
     g_session_log << "write_jpg: " << (write_jpg ? "true" : "false") << "\n";
 
-    // --- Per-Camera Metrics ---
-    g_session_log << "\n--- Per-Camera Metrics ---\n";
-    g_session_log << "Cam,SN,Type,Saved,Dropped,FPS,QPeak,Lat_ms,FirstBlk,LastBlk,SyncOff,Jitter_us,RecOverflow_ms,RamToDisk_ms,DumpTime_ms\n";
+    // --- Per-Camera Metrics (Markdown table) ---
+    g_session_log << "\n--- Per-Camera Metrics ---\n\n";
+    g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | FirstBlk | LastBlk | SyncOff | Jitter(us) | RecOver(ms) | Ram2Disk(ms) | Dump(ms) |\n";
+    g_session_log << "|---|-----|------|-------|------|-----|-------|---------|----------|----------|---------|------------|-------------|--------------|----------|\n";
+    g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | copy_queue峰值 | 首帧触发延迟 | 录制首帧BlockID | 录制末帧BlockID | HW触发下与cam0的BlockID差 | 相邻帧Pylon时间戳间隔标准差 | 理论计时-实际完成 | RAM写完→硬盘写完 | dumpToDiskWorker函数耗时 |\n";
 
     double theoretical_ms = total_frames / target_fps * 1000.0;
     int64_t ref_first_blk = -1;
@@ -768,57 +770,51 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
         int dropped = ctx->dropped_frames.load();
         double fps = 0.0, jitter_us = 0.0;
 
-        // FPS from meta_buffer timestamps
         if (saved > 1) {
             double dur_s = (ctx->meta_buffer[saved-1].timestamp - ctx->meta_buffer[0].timestamp) / 10000000.0;
             if (dur_s > 0) fps = (saved - 1) / dur_s;
 
-            // Jitter
             double sum = 0, sum_sq = 0; int n = saved - 1;
             for (int k = 1; k < saved; ++k) {
-                double dt = (ctx->meta_buffer[k].timestamp - ctx->meta_buffer[k-1].timestamp) / 10.0; // us
+                double dt = (ctx->meta_buffer[k].timestamp - ctx->meta_buffer[k-1].timestamp) / 10.0;
                 sum += dt; sum_sq += dt * dt;
             }
             if (n > 0) { double mean = sum / n; double var = sum_sq / n - mean * mean; if (var > 0) jitter_us = sqrt(var); }
         }
 
-        // Trigger latency
         double lat_ms = 0.0;
-        if (ctx->first_frame_time.time_since_epoch().count() > 0) {
+        if (ctx->first_frame_time.time_since_epoch().count() > 0)
             lat_ms = chrono::duration<double, milli>(ctx->first_frame_time - global_record_start_time).count();
-        }
 
-        // Recording overflow
         ctx->recording_overflow_ms = chrono::duration<double, milli>(ctx->recording_end_time - ctx->first_frame_time).count() - theoretical_ms;
 
-        // Ram to disk latency
-        if (write_jpg && ctx->jpg_end_time.time_since_epoch().count() > 0) {
+        if (write_jpg && ctx->jpg_end_time.time_since_epoch().count() > 0)
             ctx->ram_to_disk_latency_ms = chrono::duration<double, milli>(ctx->jpg_end_time - ctx->recording_end_time).count();
-        } else if (!write_jpg && ctx->dump_end_time.time_since_epoch().count() > 0) {
+        else if (!write_jpg && ctx->dump_end_time.time_since_epoch().count() > 0)
             ctx->ram_to_disk_latency_ms = chrono::duration<double, milli>(ctx->dump_end_time - ctx->recording_end_time).count();
-        }
 
-        // Per-camera dump time
         double dump_ms = chrono::duration<double, milli>(ctx->dump_end_time - ctx->dump_start_time).count();
 
-        // Sync offset
         int64_t sync_off = (ref_first_blk >= 0 && hw_trigger) ? (ctx->first_recorded_block_id - ref_first_blk) : 0;
         string sync_str = hw_trigger ? to_string(sync_off) : "N/A";
 
-        g_session_log << ctx->index << "," << ctx->id << ","
-                      << (ctx->is_mono ? "mono" : "color") << ","
-                      << saved << "," << dropped << ","
-                      << fixed << setprecision(1) << fps << ","
-                      << ctx->max_queue_size.load() << ","
-                      << fixed << setprecision(1) << lat_ms << ","
-                      << ctx->first_recorded_block_id << "," << ctx->last_recorded_block_id << ","
-                      << sync_str << ","
-                      << fixed << setprecision(1) << jitter_us << ","
-                      << fixed << setprecision(1) << ctx->recording_overflow_ms << ","
-                      << (write_jpg ? ([] (double v) { ostringstream oss; oss << fixed << setprecision(1) << v; return oss.str(); }(ctx->ram_to_disk_latency_ms)) : string("N/A")) << ","
-                      << fixed << setprecision(1) << dump_ms << "\n";
+        auto fmt = [] (double v) { ostringstream oss; oss << fixed << setprecision(1) << v; return oss.str(); };
+
+        g_session_log << "| " << ctx->index << " | " << ctx->id << " | "
+                      << (ctx->is_mono ? "mono" : "color") << " | "
+                      << saved << " | " << dropped << " | "
+                      << fixed << setprecision(1) << fps << " | "
+                      << ctx->max_queue_size.load() << " | "
+                      << fmt(lat_ms) << " | "
+                      << ctx->first_recorded_block_id << " | " << ctx->last_recorded_block_id << " | "
+                      << sync_str << " | "
+                      << fmt(jitter_us) << " | "
+                      << fmt(ctx->recording_overflow_ms) << " | "
+                      << (write_jpg ? fmt(ctx->ram_to_disk_latency_ms) : string("N/A")) << " | "
+                      << fmt(dump_ms) << " |\n";
         g_session_log << defaultfloat;
     }
+    g_session_log << "\n";
 
     // --- Bandwidth Samples ---
     if (!bw_samples.empty()) {
@@ -1041,7 +1037,7 @@ int main() {
         auto t = chrono::system_clock::to_time_t(chrono::system_clock::now());
         char tb[64]; strftime(tb, sizeof(tb), "%Y%m%d_%H%M%S", localtime(&t));
         fs::create_directories("log/capture");
-        g_session_log_path = string("log/capture/session_") + tb + ".txt";
+        g_session_log_path = string("log/capture/session_") + tb + ".md";
         g_session_log.open(g_session_log_path, ios::out | ios::app);
         if (g_session_log.is_open())
             g_session_log << "=== Session started: " << tb << " ===\n"
