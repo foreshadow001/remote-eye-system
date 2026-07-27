@@ -1161,7 +1161,7 @@ int main() {
                 } else if (enable_net_sync && !is_master_pc) {
                     hints = "[r][space][q] disabled (Slave)  |  Waiting for Master...";
                 } else {
-                    hints = "[r] record  [space] photo  [q] quit";
+                    hints = "[r] record  [space] photo  [ESC/q] quit";
                 }
                 cv::putText(canvas, hints, cv::Point(hx, hy),
                             cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
@@ -1171,6 +1171,13 @@ int main() {
                     : "Role: STANDALONE  |  Net Sync: OFF";
                 cv::putText(canvas, status, cv::Point(hx, hy),
                             cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(110, 110, 110), 1, cv::LINE_AA);
+
+                // Crosshair at center of enlarged area
+                int cx = g_right_x + g_right_w / 2;
+                int cy = g_win_h / 2;
+                int cl = 20;
+                cv::line(canvas, cv::Point(cx - cl, cy), cv::Point(cx + cl, cy), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
+                cv::line(canvas, cv::Point(cx, cy - cl), cv::Point(cx, cy + cl), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
 
                 cv::imshow("Multi-Cam Preview", canvas);
             }
