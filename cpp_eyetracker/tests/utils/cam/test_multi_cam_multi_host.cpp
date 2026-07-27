@@ -1282,13 +1282,21 @@ int main() {
         bool trigger_start = false;
 
         if (key == 'q' || key == 27) {
-            if (g_fault_active.load() && enable_net_sync && g_fault_sock != INVALID_SOCKET) {
-                string sm = "SHUTDOWN";
-                sendto(g_fault_sock, sm.c_str(), (int)sm.length(), 0,
-                       (sockaddr*)&g_peer_fault_addr, sizeof(g_peer_fault_addr));
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            if (enable_net_sync) {
+                if (is_master_pc) {
+                    // Master: send SHUTDOWN to slave, then quit both
+                    if (g_fault_sock != INVALID_SOCKET) {
+                        string sm = "SHUTDOWN";
+                        sendto(g_fault_sock, sm.c_str(), (int)sm.length(), 0,
+                               (sockaddr*)&g_peer_fault_addr, sizeof(g_peer_fault_addr));
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    }
+                    global_running = false;
+                }
+                // Slave: ignore ESC/q when net sync is on (only master can quit)
+            } else {
+                global_running = false;
             }
-            global_running = false;
         } else if (g_fault_active.load()) {
             // Block all keys except ESC during fault
         } else if (key == 'r' && !is_recording && !is_dumping) {
@@ -1311,7 +1319,9 @@ int main() {
                 trigger_start = true;
             }
         } else if (key == ' ') {
-            if (!is_recording && !is_dumping) { 
+            if (enable_net_sync && !is_master_pc) {
+                // Slave: ignore SPACE when net sync is on
+            } else if (!is_recording && !is_dumping) {
                 int counter = 0;
                 if (!cam_ctxs.empty()) counter = getNextCalibCounter(cam_ctxs[0]->save_base_dir);
                 std::stringstream ss; ss << std::setw(2) << std::setfill('0') << counter;
