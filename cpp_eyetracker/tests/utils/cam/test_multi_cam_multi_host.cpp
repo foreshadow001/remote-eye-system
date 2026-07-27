@@ -1151,8 +1151,8 @@ int main() {
                 cv::line(canvas, cv::Point(g_left_w, 0), cv::Point(g_left_w, g_win_h),
                          cv::Scalar(60, 60, 60), 2);
 
-                // Bottom-left hints watermark
-                int hx = 8, hy = g_win_h - 45;
+                // Bottom-left hints watermark (in enlarged view area)
+                int hx = g_right_x + 10, hy = g_win_h - 45;
                 string hints;
                 if (is_recording) {
                     hints = "[REC] Recording in progress...";
