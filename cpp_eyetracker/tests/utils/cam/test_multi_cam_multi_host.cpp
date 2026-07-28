@@ -605,9 +605,10 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
 
 // ================== Pylon 回调触发线程 ==================
 // [修改] 增加 enable_offset 参数
-void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time, bool use_hw_trigger, bool enable_offset) {
+void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time, bool use_hw_trigger, bool enable_offset, int max_num_buffer) {
     TriggerMode mode = use_hw_trigger ? TriggerMode::Hardware : TriggerMode::Software;
     if (!ctx->cam.open(mode)) { ctx->status = CamStatus::ERROR_; return; }
+    ctx->cam.setMaxNumBuffer(max_num_buffer);
 
     ctx->is_mono = ctx->cam.isMono();
 
@@ -963,6 +964,8 @@ int main() {
     double margin_frames_ratio = cfg["test_multi_cam"]["margin_frames_ratio"].as<double>();
     int margin_frames = static_cast<int>(std::ceil(core_frames * margin_frames_ratio));
     int total_record_frames = core_frames + 2 * margin_frames;
+    int max_num_buffer = 30;
+    try { max_num_buffer = cfg["test_multi_cam"]["max_num_buffer"].as<int>(); } catch (...) {}
 
     cout << "\n--- Network Sync Configuration ---" << endl;
     cout << "Role             : " << (is_master_pc ? "MASTER (Sender)" : "SLAVE (Receiver)") << endl;
@@ -973,6 +976,7 @@ int main() {
     cout << "SW Offset Init   : " << (enable_offset ? "ON" : "OFF") << endl;
     cout << "Intersection Crop: " << (enable_intersection ? "ON" : "OFF") << endl;
     cout << "Net Sync         : " << (enable_net_sync ? "ON" : "OFF (Local Mode)") << endl;
+    cout << "MaxNumBuffer     : " << max_num_buffer << endl;
     cout << "----------------------------------\n" << endl;
 
     g_use_hw_trigger = use_hw_trigger;
@@ -1029,7 +1033,7 @@ int main() {
         ctx->offset_initialized = false;
         ctx->copy_thread = thread(copyWorker, ctx);
         // [修改] 传递 enable_offset 参数
-        ctx->capture_thread = thread(captureWorker, ctx, target_fps, gain, gamma, exp_time, use_hw_trigger, enable_offset);
+        ctx->capture_thread = thread(captureWorker, ctx, target_fps, gain, gamma, exp_time, use_hw_trigger, enable_offset, max_num_buffer);
     }
 
     cv::namedWindow("Multi-Cam Preview", cv::WINDOW_NORMAL);
@@ -1300,6 +1304,8 @@ int main() {
                 cout << "[Recording #" << g_recording_number << "] Done in " << fixed << setprecision(1)
                      << dump_duration + jpg_duration << "s (appended to session log)" << endl;
 
+                auto now = chrono::steady_clock::now();
+                for (auto& ctx : cam_ctxs) ctx->last_frame_time.store(now);
                 is_dumping = false;
                 while (cv::waitKey(1) >= 0);
                 last_ui_time = chrono::steady_clock::now();

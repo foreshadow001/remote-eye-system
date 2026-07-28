@@ -145,6 +145,7 @@ test_multi_cam:
   cam_height: 2048
   record_time: 1.0       # 录制的核心秒数 (代码会自动加20%余量)
   margin_frames_ratio: 0.05
+  max_num_buffer: 30  # Pylon buffer pool size
   write_delay_ms: 0      # 录制结束后，写硬盘阶段每帧的延时(毫秒)，用以控制CPU和硬盘峰值压力，0为全速
   is_master: false             # 主机设为 true，从机设为 false
   master_ip: "192.168.10.1"

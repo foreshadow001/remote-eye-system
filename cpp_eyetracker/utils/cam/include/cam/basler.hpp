@@ -42,6 +42,7 @@ public:
     void setGain(double gain);
     void setGamma(double gamma);
     void setExposureTime(double microseconds);
+    void setMaxNumBuffer(int n) { maxNumBuffer_ = n; }
 
     std::string getSerialNumber() const { return serialNumber_; }
     bool isMono() const { return isMono_; }
@@ -55,8 +56,9 @@ private:
     TriggerMode currentMode_ = TriggerMode::Software;
 
     Pylon::CImageFormatConverter converter_;
-    
-    bool recording_;          
+    int maxNumBuffer_ = 150;
+
+    bool recording_;    
     bool writerInitialized_;  
     std::string videoFilename_; 
     double videoFps_;           

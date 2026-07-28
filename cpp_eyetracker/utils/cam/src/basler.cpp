@@ -115,7 +115,7 @@ bool BaslerCamera::start() {
         if (!camera_.IsOpen()) return false;
         
         // 【核心修改】提供 150 帧的硬件缓冲弹性池，彻底吸收操作系统级抖动，且绝不会触发 DMA 上限！
-        camera_.MaxNumBuffer.SetValue(150); 
+        camera_.MaxNumBuffer.SetValue(maxNumBuffer_);
 
         camera_.RegisterImageEventHandler(this, RegistrationMode_ReplaceAll, Cleanup_None);
         camera_.StartGrabbing(GrabStrategy_OneByOne, Pylon::GrabLoop_ProvidedByInstantCamera);
