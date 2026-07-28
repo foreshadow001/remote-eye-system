@@ -1334,6 +1334,9 @@ int main() {
                 cout << "[Recording #" << g_recording_number << "] Done in " << fixed << setprecision(1)
                      << dump_duration + jpg_duration << "s (appended to session log)" << endl;
 
+                // Reset health timers so post-dump health check doesn't false-trigger
+                auto now = chrono::steady_clock::now();
+                for (auto& ctx : cam_ctxs) ctx->last_frame_time.store(now);
                 is_dumping = false;
                 while (cv::waitKey(1) >= 0);
                 last_ui_time = chrono::steady_clock::now();
