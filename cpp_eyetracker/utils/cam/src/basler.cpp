@@ -113,11 +113,7 @@ bool BaslerCamera::open(TriggerMode mode) {
 bool BaslerCamera::start() {
     try {
         if (!camera_.IsOpen()) return false;
-        
-<<<<<<< HEAD
-        // 【核心修改】提供 150 帧的硬件缓冲弹性池，彻底吸收操作系统级抖动，且绝不会触发 DMA 上限！
-=======
->>>>>>> eb6bc4fb0298cbaddd25bdc9f23d8f2e51499278
+
         camera_.MaxNumBuffer.SetValue(maxNumBuffer_);
 
         camera_.RegisterImageEventHandler(this, RegistrationMode_ReplaceAll, Cleanup_None);

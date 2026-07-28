@@ -57,7 +57,6 @@ private:
     TriggerMode currentMode_ = TriggerMode::Software;
 
     Pylon::CImageFormatConverter converter_;
-    int maxNumBuffer_ = 150;
 
     bool recording_;    
     bool writerInitialized_;  
