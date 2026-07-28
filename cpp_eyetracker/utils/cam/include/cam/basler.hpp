@@ -48,6 +48,7 @@ public:
     bool isMono() const { return isMono_; }
 
 private:
+    int maxNumBuffer_ = 150;  // default, overridden via config
     Pylon::PylonAutoInitTerm autoInit_;
     Pylon::CBaslerUniversalInstantCamera camera_;
     std::string serialNumber_;
