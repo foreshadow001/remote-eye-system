@@ -1,7 +1,7 @@
 # test_multi_cam_multi_host.cpp 指标采集与监控优化计划
 
 > 目标文件：`cpp_eyetracker/tests/utils/cam/test_multi_cam_multi_host.cpp`（1190 行）
-> 最后更新：2026-07-21
+> 最后更新：2026-07-28
 
 ---
 
@@ -361,7 +361,7 @@ worst_jitter_cam = argmax( timestamp_jitter[i] )   // 抖动最大的相机编�
 
 落盘是并行的（每台相机一个线程），带宽随时间变化——启动时各线程同时开始写，带宽高；末尾只剩慢线程在写，带宽低。因此不能只看最终平均值。
 
-**采集方式**：落盘期间用一个独立的采样线程，每隔 `500ms` 读取各相机的已写入字节数，计算瞬时带宽：
+**采集方式**：落盘期间用一个独立的采样线程，每隔 `50ms` 读取各相机的已写入字节数，计算瞬时带宽：
 
 ```
 第 k 次采样：
@@ -553,7 +553,7 @@ Cam,SN,Type,Saved,Dropped,FPS,QPeak,Lat_ms,FirstBlk,LastBlk,SyncOff,Jitter_us,Re
 9,40772283,color,238,0,198.3,2,0.9,1001,1238,-2,18.1,-0.8,N/A,3980.5
 ...
 
---- Dump Bandwidth Samples (500ms interval) ---
+--- Dump Bandwidth Samples (50ms interval) ---
    0.0s     0.0 MB/s
    0.5s   612.3 MB/s
    1.0s   623.5 MB/s  <- peak
@@ -620,7 +620,7 @@ system_healthy       : PASS
 | 3 | **instantTrigger() 触发时间戳 + 指标重置**：清零所有 per-camera 指标 | `instantTrigger()` | 低 | 5min |
 | 4 | **renderEnlargedView() 实时 FPS**：`recorded_frames / elapsed_s`，>=10 帧后显示 | `renderEnlargedView()` | 低 | 10min |
 | 5 | **dumpToDiskWorker() / convertRawToJpgWorker() 单相机耗时**：入口出口 chrono 差值，写入 atomic 变量 | 两个 worker 函数 | 低 | 5min |
-| 6 | **落盘带宽周期采样线程**：每 500ms 读取各线程写入进度，计算瞬时带宽，追踪峰值 | `main()` 落盘等待段 | 中 | 20min |
+| 6 | **落盘带宽周期采样线程**：每 50ms 读取各线程写入进度，计算瞬时带宽，追踪峰值 | `main()` 落盘等待段 | 中 | 20min |
 | 7 | **会话日志文件**：启动时创建 `log/capture/session_<ts>.txt`（追加模式），记录 `[Log] Session log: ...` | `main()` 启动段，+10 行 | 低 | 5min |
 | 8 | **writeReport() 追加写入**：每次录制完成后按 6.3 格式追加写入会话日志文件（`=== Recording #N ===` 区块 + Per-Camera 表 + 带宽采样 + Summary） | `main()` 后处理段，+120 行 | 中 | 35min |
 | 9 | **清理旧控制台输出**：删除旧 cout 行，录制完成改为输出 `[Recording #N] Done in X.Xs (appended to session log)` | `main()`，-35 行 | 低 | 10min |
@@ -656,7 +656,7 @@ system_healthy       : PASS
 - [ ] 全部列完整：Cam,SN,Type,Saved,Dropped,FPS,QPeak,Lat_ms,FirstBlk,LastBlk,SyncOff,Jitter_us,RecOverflow_ms,RamToDisk_ms,DumpTime_ms
 - [ ] `write_jpg=false` 时 RamToDisk_ms 显示 `N/A`
 - [ ] `write_jpg=true` 时 RamToDisk_ms 有合理正值
-- [ ] Dump Bandwidth Samples 区域：每 500ms 一行，含 `<- peak` 标记
+- [ ] Dump Bandwidth Samples 区域：每 50ms 一行，含 `<- peak` 标记
 - [ ] Summary 区域包含全部全局指标，值与原始数据一致
 
 ### 数据一致性
@@ -677,7 +677,253 @@ system_healthy       : PASS
 
 ---
 
-## 九、不做（留给后续阶段）
+## 九、CPU 占用率监控（新增）
+
+### 9.1 可行性
+
+Windows 提供 `GetProcessTimes()` API，获取进程累计 kernel + user CPU 时间。通过**周期采样**计算两次采样之间的 CPU 占用百分比。多核并行下可超过 100%。
+
+**API**：
+```cpp
+GetProcessTimes(GetCurrentProcess(), &create, &exit, &kernel, &user);
+// kernel + user = 进程启动以来的累计 CPU 时间 (100ns 单位)
+```
+
+**计算**：
+```
+cpu% = (cpu_time_delta) / (wall_time_delta) × 100%
+```
+
+### 9.2 采集方式
+
+独立采样线程，每 50ms 一次 `GetProcessTimes`，计算瞬时 CPU%。录制开始时启动，落盘+JPG 全部完成后停止。
+
+| 阶段 | 触发 | 采样目标 |
+|------|------|----------|
+| RAM 阶段 | `instantTrigger()` | copyWorker 密集 memcpy，CPU 较高 |
+| DISK 阶段 | `dump_ready`（所有相机） | dumpToDiskWorker + JPG，I/O 为主 |
+
+### 9.3 存储
+
+四个全局 `double`：`g_cpu_ram_avg`、`g_cpu_ram_peak`、`g_cpu_disk_avg`、`g_cpu_disk_peak`。每次录制重置。
+
+### 9.4 报告输出
+
+在会话日志 Summary 表格中新增 4 行：
+
+```
+| cpu_ram_avg  | 45.2% | RAM写入阶段平均 CPU 占用 |
+| cpu_ram_peak | 68.1% | RAM写入阶段峰值 CPU 占用 |
+| cpu_disk_avg | 12.3% | DISK写入阶段平均 CPU 占用 |
+| cpu_disk_peak | 25.7% | DISK写入阶段峰值 CPU 占用 |
+```
+
+### 9.5 实施步骤
+
+| 序号 | 步骤 | 位置 |
+|------|------|------|
+| 1 | 添加 `filetimeToMs()` 和 `sampleCpuPct()` 辅助函数 | main() 之前 |
+| 2 | 添加 4 个 CPU 全局变量 + `g_cpu_sampling`/`g_cpu_phase` | 文件顶部全局区 |
+| 3 | 录制开始时启动采样线程（`g_cpu_phase=1`） | `is_recording=true` 处 |
+| 4 | 落盘开始时切换阶段（`g_cpu_phase=2`） | `is_dumping=true` 处 |
+| 5 | 报告前停止采样 + 等待线程完成 | `writeReport` 调用前 |
+| 6 | Summary 表格追加 4 行 CPU 指标 | `writeReport` 内 |
+
+---
+
+## 十、实施完成情况
+
+> 记录时间：2026-07-28，从 `6492b52 Fix QPeak Metric` 起累计
+
+### 已完成
+
+| 计划章节 | 内容 | 状态 |
+|----------|------|------|
+| 二/三 | CameraContext 新增 13 个 metrics 字段 | ✅ |
+| 三 | copyWorker() 实时采集：队列压力、首/末 BlockID、首帧时刻、丢帧检测、末帧时刻 | ✅ |
+| 三 | instantTrigger() 每录制前重置所有 per-camera 指标 | ✅ |
+| 四 | renderEnlargedView() 实时 FPS（≥10 帧后显示） | ✅ |
+| 三 | dumpToDiskWorker() 入口/出口时间戳 | ✅ |
+| 三 | convertRawToJpgWorker() jpg_start/jpg_end 时间戳 | ✅ |
+| 六 | 会话日志 `log/capture/session_*.md`，启动时创建，多次录制追加写入 | ✅ |
+| 六 | writeReport()：Per-Camera Markdown 表格 + Summary 表格 | ✅ |
+| 六 | 控制台清理：旧 cout 统计行替换为一行文件路径提示 | ✅ |
+| 三 | captureWorker 队列容量上限 = `total_record_frames` | ✅ |
+| 三 | max_sync_offset 基于跨主机 BlockID 交换（`syncGlobalBlockIDTCP` 记录 `g_peer_first_block_id`） | ✅ |
+| 三 | Per-Camera 表格列调整：QPeak=`num/total`、RecOver2RAM(s)、Wait4Disk(s)、Ram2Disk(s)、RecOver2Disk(s) | ✅ |
+| 三 | write_jpg 时新增 Wait4JPG(s)、JPGTime(s)、RecOver2JPG(s) 列 | ✅ |
+| 三 | Summary 表格包含全部全局指标 | ✅ |
+| — | 网络同步下 Slave 键盘屏蔽（ESC/q/SPACE），Master ESC 发 SHUTDOWN 退出两台主机 | ✅ |
+| — | UI 右下角操作提示水印 + 放大区域中心十字线 | ✅ |
+| — | max_num_buffer 从 yaml 动态加载（默认 30） | ✅ |
+| — | basler.cpp 控制台输出互斥锁（多线程并发打开相机不乱码） | ✅ |
+| 九 | CPU 占用率监控（RAM/DISK 两阶段，avg/peak） | ✅ |
+
+### 计划中已排除
+
+| 内容 | 原因 |
+|------|------|
+| 落盘带宽采样 | 用户反馈"远远没有达到瓶颈" |
+| `drop` UI 实时告警符（红色 `!`） | 用户改为事后输出 |
+| `QPeak` UI 实时指示点（绿/黄/红） | 用户改为事后输出 |
+
+### 待验证
+
+- [ ] 10 相机完整录制→落盘→JPG→报告→等待下次录制 完整循环
+- [ ] 连续两次录制追加写入同一会话日志
+- [ ] 网络同步下 Master/Slave 联动（CMD_START、SHUTDOWN、BlockID 交换）
+- [ ] 故障检测 + 跨主机故障通知
+
+---
+
+## 十一、异常处理分析与增强
+
+### 11.1 阶段 1：初始化（程序启动 → 相机推流）
+
+| # | 异常场景 | 处理方式 | 风险 | 代码位置 |
+|---|----------|----------|------|----------|
+| | WSAStartup 失败 | 打印错误，`return 1` 退出 | — | `main()` 开头 |
+| | YAML 配置字段缺失 | `try-catch`，使用默认值，`[WARN]` 后继续 | — | `main()` 配置段 |
+| | `save_dirs.size() != camera_ids.size()` | `cerr` 打印，`return -1` 退出 | — | `main()` 启动段 |
+| | 相机 `open()` 失败 | 设置 `status=ERROR_`，线程返回 | — | `captureWorker()` |
+| | 相机 `start()` 失败 | 设置 `status=ERROR_`，线程返回 | — | `captureWorker()` |
+| **E1** | 所有相机 `open()` 都失败 | 线程全部返回，UI 黑底，用户不知情 | **中** | 30s 内无 `has_streamed` → 弹"No cameras available" |
+| **E2** | `max_num_buffer` 配置为 0 或负数 | Pylon 行为未定义 | **低** | `max_num_buffer = max(val, 10)` |
+| **E3** | `log/capture/` 目录创建失败 | 报告静默丢失 | **高** | 检查返回值，失败则 `cerr` + 禁用日志 |
+| | Slave 网络监听 `bind` 失败 | `cerr` 打印，线程返回 | — | `udpListenerWorker()` |
+
+### 11.2 阶段 2：待机/预览（推流运行 → 按 'r'）
+
+| # | 异常场景 | 处理方式 | 风险 | 代码位置 |
+|---|----------|----------|------|----------|
+| | Pylon 帧抓取失败 | `cerr` 打印后 `return`（跳过该帧） | — | `basler.cpp` |
+| | 相机停流（1s 无帧） | 健康检查 → 故障 → 关所有相机 → 发 FAULT → 故障 UI | — | `main()` 主循环 |
+| | 对端 FAULT 通知 | 关所有相机 → 故障 UI → 等待 ESC | — | `main()` 故障轮询 |
+| **E4** | FAULT 消息 `fi` 越界 | `cam_ctxs[fi]` 访问崩溃 | **高** | `if (fi >= 0 && fi < size)` 守卫 |
+| | `renderingThumbnail/Enlarged` 中帧为空 | 显示黑底+状态文字 | — | UI 渲染函数 |
+| | `captureWorker` 中 `setFrameRate/setGain/...` 失败 | `try-catch(...)` 静默吞掉 | — | `captureWorker()` |
+| | 跨主机 TCP `connect` 失败 | `while` 循环重试，间隔 500ms | — | `syncGlobalBlockIDTCP()` |
+
+### 11.3 阶段 3：录制（按 'r' → ram_buffer 写满）
+
+| # | 异常场景 | 处理方式 | 风险 | 代码位置 |
+|---|----------|----------|------|----------|
+| | 录制中 `seq >= total_record_frames` | `if (seq < total)` 守卫，超出跳过 | — | `copyWorker()` |
+| | `copy_queue` 满（达到 `total_record_frames`） | 静默丢弃新帧（BlockID 跳变体现丢帧） | — | Pylon 回调 |
+| | SHUTDOWN 通知（录制中） | `global_running = false`，主循环退出 | — | 故障轮询 |
+| **E5** | CMD_START 时间戳格式异常 | `cmd.substr(10)` 可能越界 | **低** | `cmd.length() > 10` 检查 |
+| **E6** | 相机 `open()` 失败后 copyWorker 空等 | 线程空转直到 `running=false` | **低** | captureWorker 返回前 `notify_all()` |
+| **E7** | `sampleCpuPct` 中 `QueryPerformanceFrequency=0` | 除零崩溃 | **低** | `freq.QuadPart > 0` 检查 |
+
+### 11.4 阶段 4：落盘（dump_ready → raw 文件写完）
+
+| # | 异常场景 | 处理方式 | 风险 | 代码位置 |
+|---|----------|----------|------|----------|
+| **E8** | 磁盘满（`ofstream::write` 失败） | **无检查**，帧数据静默丢失 | **高** | `dumpToDiskWorker()` |
+| **E9** | `fs::create_directories` 失败 | **无检查**，后续写文件全失败 | **高** | `main()` 录制准备段 |
+| | `ofstream::open` 失败 | **无检查**，`is_open()` 为假时跳过写入 | — | `dumpToDiskWorker()` |
+| | SHUTDOWN 通知（落盘中） | `global_running = false` | — | 故障轮询 |
+
+### 11.5 阶段 5：后处理（JPG 转换 → 报告写入 → 清理）
+
+| # | 异常场景 | 处理方式 | 风险 | 代码位置 |
+|---|----------|----------|------|----------|
+| **E10** | 磁盘满（`cv::imwrite` 失败） | **无检查** | **中** | `convertRawToJpgWorker()` |
+| **E11** | `recorded_frames=0` 时 `meta_buffer[0]` 越界 | 访问越界 → 崩溃 | **高** | `writeReport()` FPS/jitter 计算 |
+| **E12** | `writeReport` 中除零（`total_expected=0`） | 已有守卫 | 低 | `writeReport()` |
+| | `g_session_log` 未打开就写入 | `is_open()` 守卫 | — | `writeReport()` |
+| | `BaslerCamera::close()` 内部异常 | `try-catch(...)` 静默吞掉 | — | `basler.cpp` |
+| | 线程 `join()` 失败 | `if (joinable())` 守卫 | — | `main()` 退出段 |
+| | Master ESC 发 SHUTDOWN | 发 UDP 消息，等 200ms，退出 | — | `main()` 键盘处理 |
+
+### 11.6 新增异常汇总
+
+| # | 所属阶段 | 异常场景 | 风险 |
+|---|----------|----------|------|
+| **E1** | 1-初始化 | 所有相机 open() 失败 | 中 |
+| **E2** | 1-初始化 | max_num_buffer ≤ 0 | 低 |
+| **E3** | 1-初始化 | log/capture/ 目录创建失败 | 高 |
+| **E4** | 2-待机 | FAULT 消息 fi 越界 | 高 |
+| **E5** | 3-录制 | CMD_START 消息越界 | 低 |
+| **E6** | 3-录制 | open() 失败后 copyWorker 空转 | 低 |
+| **E7** | 3-录制 | QueryPerformanceFrequency=0 | 低 |
+| **E8** | 4-落盘 | 磁盘满 ofstream::write 失败 | 高 |
+| **E9** | 4-落盘 | create_directories 失败 | 高 |
+| **E10** | 5-后处理 | 磁盘满 cv::imwrite 失败 | 中 |
+| **E11** | 5-后处理 | recorded_frames=0 时越界 | 高 |
+| **E12** | 5-后处理 | total_expected=0 除零 | 低 |
+
+### 11.7 实施步骤（按阶段排序）
+
+| 序号 | 阶段 | 编号 | 内容 | 预计 |
+|------|------|------|------|------|
+| 1 | 1 | E3 | `log/capture` 目录创建失败 → `cerr` + 禁用日志 | 5min |
+| 2 | 1 | E1 | 30s 内无 `has_streamed` → 弹"No cameras available" | 10min |
+| 3 | 1 | E2 | `max_num_buffer = max(val, 10)` | 2min |
+| 4 | 2 | E4 | FAULT 消息 `fi` 越界检查 | 2min |
+| 5 | 3 | E5 | CMD_START `cmd.length() > 10` 检查 | 2min |
+| 6 | 3 | E6 | captureWorker 返回前 `notify_all()` | 2min |
+| 7 | 3 | E7 | `QueryPerformanceFrequency` 零值检查 | 2min |
+| 8 | 4 | E8 | `dumpToDiskWorker` 检查 `out_raw.good()`，失败标记 | 10min |
+| 9 | 4 | E9 | `create_directories` 返回值检查 | 5min |
+| 10 | 5 | E10 | `convertRawToJpgWorker` 检查 `cv::imwrite` 返回值 | 5min |
+| 11 | 5 | E11 | `writeReport` 中 `saved > 0` 守卫 | 3min |
+| 12 | 5 | E12 | `total_expected > 0` 已有守卫，确认即可 | 1min |
+
+**总预计：~50 分钟**
+
+### 11.8 异常日志写入规范
+
+所有运行时异常（`cerr` / 控制台输出）**同时追加写入会话日志**，确保事后可追溯。
+
+#### 日志格式
+
+每次异常写入一个独立的 Markdown 引用块，包含时间戳、级别、来源和描述：
+
+```markdown
+> **[LEVEL]** `HH:MM:SS.mmm` | source | message
+```
+
+#### 级别定义
+
+| 级别 | 标识 | 颜色（渲染） | 适用场景 |
+|------|------|-------------|----------|
+| **FATAL** | `[FATAL]` | 红 | 程序即将退出（WSAStartup 失败、配置错误无法继续） |
+| **ERROR** | `[ERROR]` | 红 | 功能受损但可继续（磁盘满、相机 open 失败、目录创建失败） |
+| **WARN** | `[WARN]` | 黄 | 降级运行（配置缺失用默认值、max_num_buffer 修正、单相机丢帧过多） |
+| **INFO** | `[INFO]` | 默认 | 关键状态变更（录制开始/完成、相机重连、网络事件） |
+
+#### 示例
+
+```markdown
+> **[WARN]** `14:31:29.123` | cfg | enable_offset missing, using default=true
+> **[ERROR]** `14:32:05.678` | dump:cam3:40768742 | Disk full: failed to write raw frame #145 (D:/test_cam/temp_raw_.../145.raw)
+> **[ERROR]** `14:32:05.891` | dump:cam3:40768742 | Dump incomplete: 145/220 frames saved
+> **[FATAL]** `14:30:01.002` | sys | WSAStartup failed, exiting
+```
+
+#### 实施方式
+
+1. 新增辅助函数 `logException(const string& level, const string& source, const string& msg)`：
+   - 自动获取当前时间戳（`HH:MM:SS.mmm`）
+   - 同时写入 `cerr`/`cout` **和** `g_session_log`（若已打开）
+   - 若 `g_session_log` 未打开（启动阶段），仅输出控制台
+
+2. 替换现有裸 `cerr`/`cout` 异常输出为 `logException` 调用
+
+3. 新增的 E1-E12 异常处理也使用 `logException` 统一输出
+
+| 步骤 | 内容 | 预计 |
+|------|------|------|
+| L1 | 实现 `logException()` 函数 | 10min |
+| L2 | 替换现有 `cerr`/`cout` 异常输出（~15 处） | 15min |
+| L3 | E1-E12 新增异常处理使用 `logException` | 并入 11.7 步骤 1-12 |
+
+**总计（11.7 + 11.8）：~1 小时 15 分钟**
+
+---
+
+## 十二、不做（留给后续阶段）
 
 - 跨主机同步延迟测量（需协议扩展）
 - 自动化质量门控（PASS/WARN/FAIL 阈值）

@@ -42,11 +42,13 @@ public:
     void setGain(double gain);
     void setGamma(double gamma);
     void setExposureTime(double microseconds);
+    void setMaxNumBuffer(int n) { maxNumBuffer_ = n; }
 
     std::string getSerialNumber() const { return serialNumber_; }
     bool isMono() const { return isMono_; }
 
 private:
+    int maxNumBuffer_ = 150;  // default, overridden via config
     Pylon::PylonAutoInitTerm autoInit_;
     Pylon::CBaslerUniversalInstantCamera camera_;
     std::string serialNumber_;
