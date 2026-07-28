@@ -1150,6 +1150,30 @@ int main() {
                 renderEnlargedView(canvas, sel, is_recording, record_start_time, total_record_frames);
                 cv::line(canvas, cv::Point(g_left_w, 0), cv::Point(g_left_w, g_win_h),
                          cv::Scalar(60, 60, 60), 2);
+
+                // Watermark hints in enlarged area (bottom-left of right panel)
+                int hx = g_right_x + 10, hy = g_win_h - 45;
+                string hints;
+                if (is_recording) hints = "[REC] Recording in progress...";
+                else if (is_dumping) hints = "[DUMP] Writing to disk...";
+                else if (enable_net_sync && !is_master_pc) hints = "[r][space][q] disabled (Slave)  |  Waiting for Master...";
+                else hints = "[r] record  [space] photo  [ESC/q] quit";
+                cv::putText(canvas, hints, cv::Point(hx, hy),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
+                hy += 18;
+                string status = enable_net_sync
+                    ? (is_master_pc ? "Role: MASTER  |  Net Sync: ON" : "Role: SLAVE  |  Net Sync: ON")
+                    : "Role: STANDALONE  |  Net Sync: OFF";
+                cv::putText(canvas, status, cv::Point(hx, hy),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(110, 110, 110), 1, cv::LINE_AA);
+
+                // Crosshair at center of enlarged area
+                int cx = g_right_x + g_right_w / 2;
+                int cy = g_win_h / 2;
+                int cl = 20;
+                cv::line(canvas, cv::Point(cx - cl, cy), cv::Point(cx + cl, cy), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
+                cv::line(canvas, cv::Point(cx, cy - cl), cv::Point(cx, cy + cl), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
+
                 cv::imshow("Multi-Cam Preview", canvas);
             }
             last_ui_time = current_time;
