@@ -605,10 +605,9 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
 
 // ================== Pylon 回调触发线程 ==================
 // [修改] 增加 enable_offset 参数
-void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time, bool use_hw_trigger, bool enable_offset, int max_num_buffer) {
+void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time, bool use_hw_trigger, bool enable_offset) {
     TriggerMode mode = use_hw_trigger ? TriggerMode::Hardware : TriggerMode::Software;
     if (!ctx->cam.open(mode)) { ctx->status = CamStatus::ERROR_; return; }
-    ctx->cam.setMaxNumBuffer(max_num_buffer);
 
     ctx->is_mono = ctx->cam.isMono();
 
@@ -745,12 +744,6 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
     }
     if (jpg_end) *jpg_end = chrono::steady_clock::now();
 }
-
-// ================== CPU 占用率 ==================
-double g_cpu_ram_avg = 0, g_cpu_ram_peak = 0;
-double g_cpu_disk_avg = 0, g_cpu_disk_peak = 0;
-atomic<bool> g_cpu_sampling{false};
-atomic<int> g_cpu_phase{0};
 
 // ================== 结构化报告写入 ==================
 void writeReport(const string& timestr, int rec_num, double target_fps, int total_frames,
@@ -912,28 +905,7 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     g_session_log << "| max_ram2disk | " << fixed << setprecision(3) << max_ram2disk << " s | DISK写入最长 (cam " << max_ram2disk_cam << ": " << (max_ram2disk_cam >= 0 ? cam_ctxs[max_ram2disk_cam]->id : "?") << ") |\n";
     g_session_log << "| max_end_to_end | " << fixed << setprecision(3) << max_total << " s | 端到端最长 (cam " << max_total_cam << ": " << (max_total_cam >= 0 ? cam_ctxs[max_total_cam]->id : "?") << ") |\n";
     g_session_log << "| system_healthy | **" << (healthy ? "PASS" : "FAIL") << "** | sync≤2 && fps≥95% && drop≤1% |\n";
-    g_session_log << "| cpu_ram_avg | " << fixed << setprecision(1) << g_cpu_ram_avg << "% | RAM写入阶段平均 CPU 占用 |\n";
-    g_session_log << "| cpu_ram_peak | " << g_cpu_ram_peak << "% | RAM写入阶段峰值 CPU 占用 |\n";
-    g_session_log << "| cpu_disk_avg | " << g_cpu_disk_avg << "% | DISK写入阶段平均 CPU 占用 |\n";
-    g_session_log << "| cpu_disk_peak | " << g_cpu_disk_peak << "% | DISK写入阶段峰值 CPU 占用 |\n";
     g_session_log << defaultfloat << flush;
-}
-
-// ================== CPU 占用率采样 ==================
-struct CpuPhase { double avg_pct = 0, peak_pct = 0; };
-static double filetimeToMs(const FILETIME& ft) {
-    ULARGE_INTEGER ul; ul.LowPart = ft.dwLowDateTime; ul.HighPart = ft.dwHighDateTime;
-    return ul.QuadPart / 10000.0;  // 100ns -> ms
-}
-static double sampleCpuPct(FILETIME& prev_kernel, FILETIME& prev_user, LARGE_INTEGER& prev_wall) {
-    FILETIME ct, et, kt, ut;
-    GetProcessTimes(GetCurrentProcess(), &ct, &et, &kt, &ut);
-    LARGE_INTEGER wall; QueryPerformanceCounter(&wall);
-    LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
-    double cpu_delta = (filetimeToMs(kt) - filetimeToMs(prev_kernel)) + (filetimeToMs(ut) - filetimeToMs(prev_user));
-    double wall_delta = (wall.QuadPart - prev_wall.QuadPart) * 1000.0 / freq.QuadPart;
-    prev_kernel = kt; prev_user = ut; prev_wall = wall;
-    return wall_delta > 0 ? cpu_delta / wall_delta * 100.0 : 0;
 }
 
 int main() {
@@ -961,15 +933,15 @@ int main() {
     
     // [新增] 读取对齐相关控制开关
     // 请确保您的 yaml/json 配置文件中含有 enable_offset 和 enable_intersection 这两项布尔值
-    bool enable_offset = true;
+    bool enable_offset = true; 
     bool enable_intersection = true;
-    bool enable_net_sync = true;
+    bool enable_net_sync = true; // [新增]
     try {
         enable_offset = cfg["test_multi_cam"]["enable_offset"].as<bool>();
         enable_intersection = cfg["test_multi_cam"]["enable_intersection"].as<bool>();
-        enable_net_sync = cfg["test_multi_cam"]["enable_net_sync"].as<bool>();
+        enable_net_sync = cfg["test_multi_cam"]["enable_net_sync"].as<bool>(); // [新增]
     } catch (...) {
-        cout << "[WARN] Some configs missing, using defaults" << endl;
+        cout << "[WARN] Sync configs missing, defaulting to TRUE" << endl;
     }
 
     double target_fps = cfg["test_multi_cam"]["fps"].as<double>();
@@ -991,8 +963,6 @@ int main() {
     double margin_frames_ratio = cfg["test_multi_cam"]["margin_frames_ratio"].as<double>();
     int margin_frames = static_cast<int>(std::ceil(core_frames * margin_frames_ratio));
     int total_record_frames = core_frames + 2 * margin_frames;
-    int max_num_buffer = 30;
-    try { max_num_buffer = cfg["test_multi_cam"]["max_num_buffer"].as<int>(); } catch (...) {}
 
     cout << "\n--- Network Sync Configuration ---" << endl;
     cout << "Role             : " << (is_master_pc ? "MASTER (Sender)" : "SLAVE (Receiver)") << endl;
@@ -1003,7 +973,6 @@ int main() {
     cout << "SW Offset Init   : " << (enable_offset ? "ON" : "OFF") << endl;
     cout << "Intersection Crop: " << (enable_intersection ? "ON" : "OFF") << endl;
     cout << "Net Sync         : " << (enable_net_sync ? "ON" : "OFF (Local Mode)") << endl;
-    cout << "MaxNumBuffer     : " << max_num_buffer << endl;
     cout << "----------------------------------\n" << endl;
 
     g_use_hw_trigger = use_hw_trigger;
@@ -1060,7 +1029,7 @@ int main() {
         ctx->offset_initialized = false;
         ctx->copy_thread = thread(copyWorker, ctx);
         // [修改] 传递 enable_offset 参数
-        ctx->capture_thread = thread(captureWorker, ctx, target_fps, gain, gamma, exp_time, use_hw_trigger, enable_offset, max_num_buffer);
+        ctx->capture_thread = thread(captureWorker, ctx, target_fps, gain, gamma, exp_time, use_hw_trigger, enable_offset);
     }
 
     cv::namedWindow("Multi-Cam Preview", cv::WINDOW_NORMAL);
@@ -1181,35 +1150,6 @@ int main() {
                 renderEnlargedView(canvas, sel, is_recording, record_start_time, total_record_frames);
                 cv::line(canvas, cv::Point(g_left_w, 0), cv::Point(g_left_w, g_win_h),
                          cv::Scalar(60, 60, 60), 2);
-
-                // Bottom-left hints watermark (in enlarged view area)
-                int hx = g_right_x + 10, hy = g_win_h - 45;
-                string hints;
-                if (is_recording) {
-                    hints = "[REC] Recording in progress...";
-                } else if (is_dumping) {
-                    hints = "[DUMP] Writing to disk...";
-                } else if (enable_net_sync && !is_master_pc) {
-                    hints = "[r][space][q] disabled (Slave)  |  Waiting for Master...";
-                } else {
-                    hints = "[r] record  [space] photo  [ESC/q] quit";
-                }
-                cv::putText(canvas, hints, cv::Point(hx, hy),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
-                hy += 18;
-                string status = enable_net_sync
-                    ? (is_master_pc ? "Role: MASTER  |  Net Sync: ON" : "Role: SLAVE  |  Net Sync: ON")
-                    : "Role: STANDALONE  |  Net Sync: OFF";
-                cv::putText(canvas, status, cv::Point(hx, hy),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(110, 110, 110), 1, cv::LINE_AA);
-
-                // Crosshair at center of enlarged area
-                int cx = g_right_x + g_right_w / 2;
-                int cy = g_win_h / 2;
-                int cl = 20;
-                cv::line(canvas, cv::Point(cx - cl, cy), cv::Point(cx + cl, cy), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
-                cv::line(canvas, cv::Point(cx, cy - cl), cv::Point(cx, cy + cl), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
-
                 cv::imshow("Multi-Cam Preview", canvas);
             }
             last_ui_time = current_time;
@@ -1224,7 +1164,6 @@ int main() {
                 is_recording = false;
                 is_dumping = true;
                 g_recording_number++;
-                g_cpu_phase = 2;  // switch CPU sampling to DISK phase
 
                 auto dump_start_time = std::chrono::steady_clock::now();
                 atomic<int> finished_cams{0};
@@ -1326,16 +1265,12 @@ int main() {
                 }
 
                 // Write report
-                g_cpu_sampling = false;
-                this_thread::sleep_for(chrono::milliseconds(100));  // wait for last sample + compute
                 writeReport(current_record_timestr, g_recording_number, target_fps, total_record_frames,
                             dump_duration, jpg_duration, write_jpg, use_hw_trigger);
 
                 cout << "[Recording #" << g_recording_number << "] Done in " << fixed << setprecision(1)
                      << dump_duration + jpg_duration << "s (appended to session log)" << endl;
 
-                auto now = chrono::steady_clock::now();
-                for (auto& ctx : cam_ctxs) ctx->last_frame_time.store(now);
                 is_dumping = false;
                 while (cv::waitKey(1) >= 0);
                 last_ui_time = chrono::steady_clock::now();
@@ -1347,21 +1282,13 @@ int main() {
         bool trigger_start = false;
 
         if (key == 'q' || key == 27) {
-            if (enable_net_sync) {
-                if (is_master_pc) {
-                    // Master: send SHUTDOWN to slave, then quit both
-                    if (g_fault_sock != INVALID_SOCKET) {
-                        string sm = "SHUTDOWN";
-                        sendto(g_fault_sock, sm.c_str(), (int)sm.length(), 0,
-                               (sockaddr*)&g_peer_fault_addr, sizeof(g_peer_fault_addr));
-                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                    }
-                    global_running = false;
-                }
-                // Slave: ignore ESC/q when net sync is on (only master can quit)
-            } else {
-                global_running = false;
+            if (g_fault_active.load() && enable_net_sync && g_fault_sock != INVALID_SOCKET) {
+                string sm = "SHUTDOWN";
+                sendto(g_fault_sock, sm.c_str(), (int)sm.length(), 0,
+                       (sockaddr*)&g_peer_fault_addr, sizeof(g_peer_fault_addr));
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
+            global_running = false;
         } else if (g_fault_active.load()) {
             // Block all keys except ESC during fault
         } else if (key == 'r' && !is_recording && !is_dumping) {
@@ -1384,9 +1311,7 @@ int main() {
                 trigger_start = true;
             }
         } else if (key == ' ') {
-            if (enable_net_sync && !is_master_pc) {
-                // Slave: ignore SPACE when net sync is on
-            } else if (!is_recording && !is_dumping) {
+            if (!is_recording && !is_dumping) { 
                 int counter = 0;
                 if (!cam_ctxs.empty()) counter = getNextCalibCounter(cam_ctxs[0]->save_base_dir);
                 std::stringstream ss; ss << std::setw(2) << std::setfill('0') << counter;
@@ -1431,34 +1356,6 @@ int main() {
             
             is_recording = true; // 更新主线程 UI 状态
             cout << "[Info] I/O PREPARED FOR: " << current_record_timestr << endl;
-
-            // Start CPU sampling (RAM phase)
-            g_cpu_phase = 1;
-            g_cpu_sampling = true;
-            g_cpu_ram_avg = 0; g_cpu_ram_peak = 0;
-            g_cpu_disk_avg = 0; g_cpu_disk_peak = 0;
-            thread cpu_thread([]() {
-                FILETIME pk, pu; LARGE_INTEGER pw;
-                GetProcessTimes(GetCurrentProcess(), nullptr, nullptr, &pk, &pu);
-                QueryPerformanceCounter(&pw);
-                vector<double> ram_samples, disk_samples;
-                while (g_cpu_sampling) {
-                    this_thread::sleep_for(chrono::milliseconds(50));
-                    if (!g_cpu_sampling) break;
-                    double pct = sampleCpuPct(pk, pu, pw);
-                    if (g_cpu_phase == 1) ram_samples.push_back(pct);
-                    else if (g_cpu_phase == 2) disk_samples.push_back(pct);
-                }
-                auto compute = [](vector<double>& v, double& avg, double& peak) {
-                    if (v.empty()) return;
-                    double sum = 0; peak = 0;
-                    for (auto x : v) { sum += x; if (x > peak) peak = x; }
-                    avg = sum / v.size();
-                };
-                compute(ram_samples, g_cpu_ram_avg, g_cpu_ram_peak);
-                compute(disk_samples, g_cpu_disk_avg, g_cpu_disk_peak);
-            });
-            cpu_thread.detach();
         }
     }
 
