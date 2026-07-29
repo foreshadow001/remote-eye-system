@@ -1214,10 +1214,17 @@ int main() {
 
         // ===== 2. 落盘等待逻辑 =====
         if (is_recording && !is_dumping) {
+            static int rec_check_count = 0; rec_check_count++;
             bool all_done = true;
             for (auto& ctx : cam_ctxs) if (!ctx->dump_ready.load()) { all_done = false; break; }
+            if (rec_check_count % 20 == 0 || all_done) {
+                cout << "[DEBUG] Recording check #" << rec_check_count << " all_done=" << all_done;
+                if (!all_done) { cout << " recorded: "; for (auto& c : cam_ctxs) cout << c->recorded_frames.load() << " "; }
+                cout << endl;
+            }
 
             if (all_done) {
+                rec_check_count = 0;
                 is_recording = false;
                 is_dumping = true;
                 g_recording_number++;
@@ -1438,22 +1445,28 @@ int main() {
             cout << "[Info] I/O PREPARED FOR: " << current_record_timestr << endl;
 
             // Start CPU sampling (RAM phase)
+            cout << "[DEBUG] Starting CPU sampling thread..." << endl;
             g_cpu_phase = 1;
             g_cpu_sampling = true;
             g_cpu_ram_avg = 0; g_cpu_ram_peak = 0;
             g_cpu_disk_avg = 0; g_cpu_disk_peak = 0;
             thread cpu_thread([]() {
+                cout << "[DEBUG] CPU thread running" << endl;
                 FILETIME pk, pu; LARGE_INTEGER pw;
                 GetProcessTimes(GetCurrentProcess(), nullptr, nullptr, &pk, &pu);
                 QueryPerformanceCounter(&pw);
                 vector<double> ram_samples, disk_samples;
+                int sample_count = 0;
                 while (g_cpu_sampling) {
                     this_thread::sleep_for(chrono::milliseconds(50));
                     if (!g_cpu_sampling) break;
                     double pct = sampleCpuPct(pk, pu, pw);
                     if (g_cpu_phase == 1) ram_samples.push_back(pct);
                     else if (g_cpu_phase == 2) disk_samples.push_back(pct);
+                    sample_count++;
+                    if (sample_count % 20 == 0) cout << "[DEBUG] CPU sample #" << sample_count << " pct=" << fixed << setprecision(1) << pct << "%" << endl;
                 }
+                cout << "[DEBUG] CPU thread stopping, ram=" << ram_samples.size() << " disk=" << disk_samples.size() << " samples" << endl;
                 auto compute = [](vector<double>& v, double& avg, double& peak) {
                     if (v.empty()) return;
                     double sum = 0; peak = 0;
@@ -1462,8 +1475,10 @@ int main() {
                 };
                 compute(ram_samples, g_cpu_ram_avg, g_cpu_ram_peak);
                 compute(disk_samples, g_cpu_disk_avg, g_cpu_disk_peak);
+                cout << "[DEBUG] CPU stats: ram_avg=" << g_cpu_ram_avg << "% ram_peak=" << g_cpu_ram_peak << "% disk_avg=" << g_cpu_disk_avg << "% disk_peak=" << g_cpu_disk_peak << "%" << endl;
             });
             cpu_thread.detach();
+            cout << "[DEBUG] CPU thread detached" << endl;
         }
     }
 
