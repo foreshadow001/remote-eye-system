@@ -138,6 +138,12 @@ atomic<bool> g_fault_on_master{false};
 chrono::steady_clock::time_point g_ready_time;
 chrono::steady_clock::time_point g_fault_time;
 
+// ================== CPU 占用率采样 ==================
+double g_cpu_ram_avg = 0, g_cpu_ram_peak = 0;
+double g_cpu_disk_avg = 0, g_cpu_disk_peak = 0;
+atomic<bool> g_cpu_sampling{false};
+atomic<int> g_cpu_phase{0};  // 0=idle, 1=RAM, 2=DISK
+
 // ================== 会话日志 ==================
 string g_session_log_path;
 int g_recording_number = 0;
@@ -745,6 +751,28 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
     if (jpg_end) *jpg_end = chrono::steady_clock::now();
 }
 
+// ================== CPU 采样辅助函数 ==================
+static double filetimeToMs(const FILETIME& ft) {
+    ULARGE_INTEGER ul;
+    ul.LowPart = ft.dwLowDateTime;
+    ul.HighPart = ft.dwHighDateTime;
+    return ul.QuadPart / 10000.0;
+}
+
+static double sampleCpuPct(FILETIME& prev_kernel, FILETIME& prev_user, LARGE_INTEGER& prev_wall) {
+    FILETIME ct, et, kt, ut;
+    GetProcessTimes(GetCurrentProcess(), &ct, &et, &kt, &ut);
+    LARGE_INTEGER wall, freq;
+    QueryPerformanceCounter(&wall);
+    QueryPerformanceFrequency(&freq);
+    if (freq.QuadPart == 0) return 0;
+    double cpu_delta = (filetimeToMs(kt) - filetimeToMs(prev_kernel))
+                     + (filetimeToMs(ut) - filetimeToMs(prev_user));
+    double wall_delta = (wall.QuadPart - prev_wall.QuadPart) * 1000.0 / freq.QuadPart;
+    prev_kernel = kt; prev_user = ut; prev_wall = wall;
+    return wall_delta > 0 ? cpu_delta / wall_delta * 100.0 : 0;
+}
+
 // ================== 结构化报告写入 ==================
 void writeReport(const string& timestr, int rec_num, double target_fps, int total_frames,
                  double dump_wall_s, double jpg_wall_s, bool write_jpg, bool hw_trigger) {
@@ -905,6 +933,10 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     g_session_log << "| max_ram2disk | " << fixed << setprecision(3) << max_ram2disk << " s | DISK写入最长 (cam " << max_ram2disk_cam << ": " << (max_ram2disk_cam >= 0 ? cam_ctxs[max_ram2disk_cam]->id : "?") << ") |\n";
     g_session_log << "| max_end_to_end | " << fixed << setprecision(3) << max_total << " s | 端到端最长 (cam " << max_total_cam << ": " << (max_total_cam >= 0 ? cam_ctxs[max_total_cam]->id : "?") << ") |\n";
     g_session_log << "| system_healthy | **" << (healthy ? "PASS" : "FAIL") << "** | sync≤2 && fps≥95% && drop≤1% |\n";
+    g_session_log << "| cpu_ram_avg | " << fixed << setprecision(1) << g_cpu_ram_avg << "% | RAM写入阶段平均 CPU 占用 |\n";
+    g_session_log << "| cpu_ram_peak | " << g_cpu_ram_peak << "% | RAM写入阶段峰值 CPU 占用 |\n";
+    g_session_log << "| cpu_disk_avg | " << g_cpu_disk_avg << "% | DISK写入阶段平均 CPU 占用 |\n";
+    g_session_log << "| cpu_disk_peak | " << g_cpu_disk_peak << "% | DISK写入阶段峰值 CPU 占用 |\n";
     g_session_log << defaultfloat << flush;
 }
 
@@ -1188,6 +1220,7 @@ int main() {
                 is_recording = false;
                 is_dumping = true;
                 g_recording_number++;
+                g_cpu_phase = 2;  // switch CPU sampling to DISK phase
 
                 auto dump_start_time = std::chrono::steady_clock::now();
                 atomic<int> finished_cams{0};
@@ -1287,6 +1320,10 @@ int main() {
                     }
                     jpg_duration = chrono::duration<double>(chrono::steady_clock::now() - jpg_start).count();
                 }
+
+                // Stop CPU sampling and wait for final stats
+                g_cpu_sampling = false;
+                this_thread::sleep_for(chrono::milliseconds(100));
 
                 // Write report
                 writeReport(current_record_timestr, g_recording_number, target_fps, total_record_frames,
@@ -1390,6 +1427,34 @@ int main() {
             
             is_recording = true; // 更新主线程 UI 状态
             cout << "[Info] I/O PREPARED FOR: " << current_record_timestr << endl;
+
+            // Start CPU sampling (RAM phase)
+            g_cpu_phase = 1;
+            g_cpu_sampling = true;
+            g_cpu_ram_avg = 0; g_cpu_ram_peak = 0;
+            g_cpu_disk_avg = 0; g_cpu_disk_peak = 0;
+            thread cpu_thread([]() {
+                FILETIME pk, pu; LARGE_INTEGER pw;
+                GetProcessTimes(GetCurrentProcess(), nullptr, nullptr, &pk, &pu);
+                QueryPerformanceCounter(&pw);
+                vector<double> ram_samples, disk_samples;
+                while (g_cpu_sampling) {
+                    this_thread::sleep_for(chrono::milliseconds(50));
+                    if (!g_cpu_sampling) break;
+                    double pct = sampleCpuPct(pk, pu, pw);
+                    if (g_cpu_phase == 1) ram_samples.push_back(pct);
+                    else if (g_cpu_phase == 2) disk_samples.push_back(pct);
+                }
+                auto compute = [](vector<double>& v, double& avg, double& peak) {
+                    if (v.empty()) return;
+                    double sum = 0; peak = 0;
+                    for (auto x : v) { sum += x; if (x > peak) peak = x; }
+                    avg = sum / v.size();
+                };
+                compute(ram_samples, g_cpu_ram_avg, g_cpu_ram_peak);
+                compute(disk_samples, g_cpu_disk_avg, g_cpu_disk_peak);
+            });
+            cpu_thread.detach();
         }
     }
 

@@ -679,85 +679,183 @@ system_healthy       : PASS
 
 ## 九、CPU 占用率监控（新增）
 
-### 9.1 可行性
+### 9.1 原理
 
-Windows 提供 `GetProcessTimes()` API，获取进程累计 kernel + user CPU 时间。通过**周期采样**计算两次采样之间的 CPU 占用百分比。多核并行下可超过 100%。
+Windows `GetProcessTimes(GetCurrentProcess(), ...)` 返回进程启动以来的累计 CPU 时间（KernelTime + UserTime，单位 100ns）。两次采样之间：
 
-**API**：
+```
+瞬时CPU% = (本次累计CPU - 上次累计CPU) / (本次墙上时间 - 上次墙上时间) × 100%
+```
+
+墙上时间用 `QueryPerformanceCounter` 获取，精度远高于 `GetTickCount`。多核并行下 CPU% 可超过 100%。
+
+### 9.2 新增代码清单（按文件中的位置排列）
+
+#### A. 全局变量（文件顶部，`g_fault_time` 之后）
+
 ```cpp
-GetProcessTimes(GetCurrentProcess(), &create, &exit, &kernel, &user);
-// kernel + user = 进程启动以来的累计 CPU 时间 (100ns 单位)
+// ================== CPU 占用率采样 ==================
+double g_cpu_ram_avg = 0, g_cpu_ram_peak = 0;
+double g_cpu_disk_avg = 0, g_cpu_disk_peak = 0;
+atomic<bool> g_cpu_sampling{false};
+atomic<int> g_cpu_phase{0};  // 0=idle, 1=RAM, 2=DISK
 ```
 
-**计算**：
-```
-cpu% = (cpu_time_delta) / (wall_time_delta) × 100%
-```
+#### B. 辅助函数（`writeReport` 之前，`main` 之前）
 
-### 9.2 采集方式
+```cpp
+// CPU sampling helpers
+static double filetimeToMs(const FILETIME& ft) {
+    ULARGE_INTEGER ul;
+    ul.LowPart = ft.dwLowDateTime;
+    ul.HighPart = ft.dwHighDateTime;
+    return ul.QuadPart / 10000.0;  // 100ns → ms
+}
 
-独立采样线程，每 50ms 一次 `GetProcessTimes`，计算瞬时 CPU%。录制开始时启动，落盘+JPG 全部完成后停止。
-
-| 阶段 | 触发 | 采样目标 |
-|------|------|----------|
-| RAM 阶段 | `instantTrigger()` | copyWorker 密集 memcpy，CPU 较高 |
-| DISK 阶段 | `dump_ready`（所有相机） | dumpToDiskWorker + JPG，I/O 为主 |
-
-### 9.3 存储
-
-四个全局 `double`：`g_cpu_ram_avg`、`g_cpu_ram_peak`、`g_cpu_disk_avg`、`g_cpu_disk_peak`。每次录制重置。
-
-### 9.4 报告输出
-
-在会话日志 Summary 表格中新增 4 行：
-
-```
-| cpu_ram_avg  | 45.2% | RAM写入阶段平均 CPU 占用 |
-| cpu_ram_peak | 68.1% | RAM写入阶段峰值 CPU 占用 |
-| cpu_disk_avg | 12.3% | DISK写入阶段平均 CPU 占用 |
-| cpu_disk_peak | 25.7% | DISK写入阶段峰值 CPU 占用 |
+static double sampleCpuPct(FILETIME& prev_kernel, FILETIME& prev_user, LARGE_INTEGER& prev_wall) {
+    FILETIME ct, et, kt, ut;
+    GetProcessTimes(GetCurrentProcess(), &ct, &et, &kt, &ut);
+    LARGE_INTEGER wall, freq;
+    QueryPerformanceCounter(&wall);
+    QueryPerformanceFrequency(&freq);
+    double cpu_delta = (filetimeToMs(kt) - filetimeToMs(prev_kernel))
+                     + (filetimeToMs(ut) - filetimeToMs(prev_user));
+    double wall_delta = (wall.QuadPart - prev_wall.QuadPart) * 1000.0 / freq.QuadPart;
+    prev_kernel = kt; prev_user = ut; prev_wall = wall;
+    return wall_delta > 0 ? cpu_delta / wall_delta * 100.0 : 0;
+}
 ```
 
-### 9.5 实施步骤
+#### C. 启动采样线程（`is_recording = true` 之后，当前约 line 1380）
 
-| 序号 | 步骤 | 位置 |
-|------|------|------|
-| 1 | 添加 `filetimeToMs()` 和 `sampleCpuPct()` 辅助函数 | main() 之前 |
-| 2 | 添加 4 个 CPU 全局变量 + `g_cpu_sampling`/`g_cpu_phase` | 文件顶部全局区 |
-| 3 | 录制开始时启动采样线程（`g_cpu_phase=1`） | `is_recording=true` 处 |
-| 4 | 落盘开始时切换阶段（`g_cpu_phase=2`） | `is_dumping=true` 处 |
-| 5 | 报告前停止采样 + 等待线程完成 | `writeReport` 调用前 |
-| 6 | Summary 表格追加 4 行 CPU 指标 | `writeReport` 内 |
+在 `is_recording = true; cout << "[Info] I/O PREPARED FOR..."` 之后插入：
+
+```cpp
+// Start CPU sampling thread (RAM phase)
+g_cpu_phase = 1;
+g_cpu_sampling = true;
+g_cpu_ram_avg = 0; g_cpu_ram_peak = 0;
+g_cpu_disk_avg = 0; g_cpu_disk_peak = 0;
+thread cpu_thread([]() {
+    FILETIME pk, pu; LARGE_INTEGER pw;
+    GetProcessTimes(GetCurrentProcess(), nullptr, nullptr, &pk, &pu);
+    QueryPerformanceCounter(&pw);
+    vector<double> ram_samples, disk_samples;
+    while (g_cpu_sampling) {
+        this_thread::sleep_for(chrono::milliseconds(50));
+        if (!g_cpu_sampling) break;
+        double pct = sampleCpuPct(pk, pu, pw);
+        if (g_cpu_phase == 1) ram_samples.push_back(pct);
+        else if (g_cpu_phase == 2) disk_samples.push_back(pct);
+    }
+    // Compute final stats
+    auto compute = [](vector<double>& v, double& avg, double& peak) {
+        if (v.empty()) return;
+        double sum = 0; peak = 0;
+        for (auto x : v) { sum += x; if (x > peak) peak = x; }
+        avg = sum / v.size();
+    };
+    compute(ram_samples, g_cpu_ram_avg, g_cpu_ram_peak);
+    compute(disk_samples, g_cpu_disk_avg, g_cpu_disk_peak);
+});
+cpu_thread.detach();
+```
+
+**注意**：`thread` 需要 `<thread>` 头文件，文件顶部已包含。`cpu_thread.detach()` 让采样线程独立运行，主线程不等待它 join。
+
+#### D. 阶段切换（`is_dumping = true` 之后，当前约 line 1195）
+
+在 `g_recording_number++;` 之后插入：
+
+```cpp
+g_cpu_phase = 2;  // switch to DISK phase
+```
+
+#### E. 停止采样（`writeReport` 调用前，当前约 line 1295）
+
+在 `writeReport(...)` 之前插入：
+
+```cpp
+g_cpu_sampling = false;
+this_thread::sleep_for(chrono::milliseconds(100));  // wait for final sample + compute
+```
+
+#### F. 报告输出（`writeReport` 函数内，Summary 表格末尾，`system_healthy` 行之后）
+
+```cpp
+g_session_log << "| cpu_ram_avg | " << fixed << setprecision(1) << g_cpu_ram_avg << "% | RAM写入阶段平均 CPU 占用 |\n";
+g_session_log << "| cpu_ram_peak | " << g_cpu_ram_peak << "% | RAM写入阶段峰值 CPU 占用 |\n";
+g_session_log << "| cpu_disk_avg | " << g_cpu_disk_avg << "% | DISK写入阶段平均 CPU 占用 |\n";
+g_session_log << "| cpu_disk_peak | " << g_cpu_disk_peak << "% | DISK写入阶段峰值 CPU 占用 |\n";
+```
+
+### 9.3 数据流时序
+
+```
+instantTrigger()
+  └─► g_cpu_phase = 1, g_cpu_sampling = true
+      └─► cpu_thread 启动（detach），每50ms采样 → ram_samples[]
+
+...录制中（~1.2s @ 200fps）...
+
+all_done = true
+  └─► g_cpu_phase = 2
+      └─► 后续采样 → disk_samples[]
+
+...落盘中（~4s）+ JPG（~8s）...
+
+g_cpu_sampling = false
+  └─► cpu_thread 退出循环，计算 avg/peak
+  └─► sleep(100ms) 等待计算完成
+
+writeReport()
+  └─► 读取 g_cpu_ram_avg/peak, g_cpu_disk_avg/peak → 写入 Summary 表格
+```
+
+### 9.4 边界情况
+
+| 场景 | 行为 |
+|------|------|
+| RAM 阶段 < 50ms（极短录制） | `ram_samples` 可能为空，avg/peak 保持 0 |
+| 录制触发后立即退出程序 | `detach` 的线程被 OS 回收，无副作用 |
+| 两次录制连续触发 | 第二次录制启动时重置全局变量 + 启动新线程，旧线程的 detach 线程 50ms 内会检测到 `g_cpu_sampling=false` 退出 |
+| `QueryPerformanceFrequency` 返回 0 | `wall_delta > 0` 守卫防止除零 |
+
+### 9.5 实施顺序
+
+| 步骤 | 内容 | 位置 | 预计 |
+|------|------|------|------|
+| 1 | 添加全局变量（6 行） | `g_fault_time` 之后 | 1min |
+| 2 | 添加辅助函数（~20 行） | `writeReport` 前 | 3min |
+| 3 | 启动采样线程（~25 行） | `is_recording = true` 后 | 5min |
+| 4 | 阶段切换（1 行） | `g_recording_number++` 后 | 1min |
+| 5 | 停止采样（2 行） | `writeReport` 前 | 1min |
+| 6 | Summary 表格追加（4 行） | `writeReport` 内 `system_healthy` 后 | 1min |
+| 7 | 编译检查 | — | 2min |
+
+**总预计：~15 分钟**
 
 ---
 
 ## 十、实施完成情况
 
-> 记录时间：2026-07-28，从 `6492b52 Fix QPeak Metric` 起累计
+> 记录时间：2026-07-28，从 `b14a2c0 Fix Summary Format` 起累计
 
 ### 已完成
 
-| 计划章节 | 内容 | 状态 |
-|----------|------|------|
-| 二/三 | CameraContext 新增 13 个 metrics 字段 | ✅ |
-| 三 | copyWorker() 实时采集：队列压力、首/末 BlockID、首帧时刻、丢帧检测、末帧时刻 | ✅ |
-| 三 | instantTrigger() 每录制前重置所有 per-camera 指标 | ✅ |
-| 四 | renderEnlargedView() 实时 FPS（≥10 帧后显示） | ✅ |
-| 三 | dumpToDiskWorker() 入口/出口时间戳 | ✅ |
-| 三 | convertRawToJpgWorker() jpg_start/jpg_end 时间戳 | ✅ |
-| 六 | 会话日志 `log/capture/session_*.md`，启动时创建，多次录制追加写入 | ✅ |
-| 六 | writeReport()：Per-Camera Markdown 表格 + Summary 表格 | ✅ |
-| 六 | 控制台清理：旧 cout 统计行替换为一行文件路径提示 | ✅ |
-| 三 | captureWorker 队列容量上限 = `total_record_frames` | ✅ |
-| 三 | max_sync_offset 基于跨主机 BlockID 交换（`syncGlobalBlockIDTCP` 记录 `g_peer_first_block_id`） | ✅ |
-| 三 | Per-Camera 表格列调整：QPeak=`num/total`、RecOver2RAM(s)、Wait4Disk(s)、Ram2Disk(s)、RecOver2Disk(s) | ✅ |
-| 三 | write_jpg 时新增 Wait4JPG(s)、JPGTime(s)、RecOver2JPG(s) 列 | ✅ |
-| 三 | Summary 表格包含全部全局指标 | ✅ |
-| — | 网络同步下 Slave 键盘屏蔽（ESC/q/SPACE），Master ESC 发 SHUTDOWN 退出两台主机 | ✅ |
-| — | UI 右下角操作提示水印 + 放大区域中心十字线 | ✅ |
-| — | max_num_buffer 从 yaml 动态加载（默认 30） | ✅ |
-| — | basler.cpp 控制台输出互斥锁（多线程并发打开相机不乱码） | ✅ |
-| 九 | CPU 占用率监控（RAM/DISK 两阶段，avg/peak） | ✅ |
+| 内容 | 状态 |
+|------|------|
+| b14a2c0 全部功能（metrics、session log、writeReport、水印、同步键盘等） | ✅ |
+| 网络同步下 Slave 键盘屏蔽（ESC/q/SPACE），Master ESC 发 SHUTDOWN 退出两台主机 | ✅ |
+| UI 右下角操作提示水印 + 放大区域中心十字线 | ✅ |
+
+### 待实施
+
+| 内容 | 计划章节 |
+|------|----------|
+| CPU 占用率监控（RAM/DISK 两阶段，avg/peak，50ms 采样） | 九 |
+| max_num_buffer 从 yaml 动态加载 | — |
+| 异常处理增强（E1-E12）+ 日志写入规范 | 十一 |
 
 ### 计划中已排除
 
