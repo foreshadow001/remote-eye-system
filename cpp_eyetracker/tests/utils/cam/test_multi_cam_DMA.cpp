@@ -579,11 +579,6 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
 
         if (ctx->recording) {
             int seq = ctx->recorded_frames.load(std::memory_order_relaxed);
-            if (seq >= ctx->total_record_frames) {
-                static atomic<int> overflow_log{0};
-                if (overflow_log++ < 3)
-                    cout << "[DEBUG-CPW-OVF] cam" << ctx->index << " seq=" << seq << " >= total=" << ctx->total_record_frames << endl;
-            }
             if (seq < ctx->total_record_frames) {
                 // DMA: store GrabResultPtr — keeps Pylon DMA buffer alive, zero CPU copy
                 ctx->dma_frames[seq] = task.first;
@@ -596,11 +591,6 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
                                                 CV_8UC1, task.first->GetBuffer()).clone();
                     ctx->latest_meta = task.second;
                 }
-
-                // DEBUG
-                if (seq <= 3 || seq % 50 == 0)
-                    cout << "[DEBUG-CPW] cam" << ctx->index << " seq=" << seq
-                         << " blk=" << task.second.blockID << " q=" << ctx->copy_queue.size() << endl;
 
                 if (seq == 0) {
                     ctx->first_recorded_block_id = task.second.blockID;
@@ -627,10 +617,6 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
             ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
             ctx->has_streamed.store(true, memory_order_relaxed);
         } else {
-            // DEBUG: why is recording false?
-            static atomic<int> notrec_log{0};
-            if (notrec_log++ < 3)
-                cout << "[DEBUG-CPW-NR] cam" << ctx->index << " NOT recording, q=" << ctx->copy_queue.size() << endl;
             // Standby: clone single frame for UI preview
             cv::Mat temp(task.first->GetHeight(), task.first->GetWidth(), CV_8UC1, task.first->GetBuffer());
             {
@@ -698,11 +684,6 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
             meta.blockID = meta.blockID - ctx->frame_offset;
             ctx->captured_frames++;
 
-            // DEBUG
-            static atomic<int> cb_count{0}; int n = ++cb_count;
-            if (n <= 5 || n % 100 == 0)
-                cout << "[DEBUG-CB] cam" << ctx->index << " frame #" << n
-                     << " blk=" << meta.blockID << " q=" << ctx->copy_queue.size() << endl;
 
             lock_guard<mutex> lock(ctx->copy_mtx);
             if (ctx->recording) {
@@ -1034,8 +1015,8 @@ int main() {
     int margin_frames = static_cast<int>(std::ceil(core_frames * margin_frames_ratio));
     int total_record_frames = core_frames + 2 * margin_frames;
     // DMA mode: must hold all frames as GrabResultPtr, need 1 Pylon buffer per frame
+    // NOT overridden by yaml — yaml's max_num_buffer:30 is too small for DMA
     int max_num_buffer = total_record_frames + 10;
-    try { max_num_buffer = cfg["test_multi_cam"]["max_num_buffer"].as<int>(); } catch (...) {}
 
     cout << "\n--- Network Sync Configuration ---" << endl;
     cout << "Role             : " << (is_master_pc ? "MASTER (Sender)" : "SLAVE (Receiver)") << endl;
@@ -1143,13 +1124,7 @@ int main() {
 
     g_ready_time = std::chrono::steady_clock::now();
 
-    static int loop_cnt = 0;
     while (global_running) {
-        loop_cnt++;
-        if (loop_cnt <= 5 || loop_cnt % 200 == 0)
-            cout << "[DEBUG-MAIN] iter=" << loop_cnt << " rec=" << is_recording
-                 << " dump=" << is_dumping << " fault=" << g_fault_active.load() << endl;
-
         // E1: check if no camera has started streaming within 30s
         static bool startup_checked = false;
         if (!startup_checked && chrono::duration<double>(chrono::steady_clock::now() - g_ready_time).count() > 30.0) {
@@ -1201,8 +1176,8 @@ int main() {
             }
         }
 
-        // ===== 1. 相机健康检查 (TEMPORARILY DISABLED) =====
-        if (false && !g_fault_active.load() && !is_dumping.load()) {
+        // ===== 1. 相机健康检查 =====
+        if (!g_fault_active.load() && !is_dumping.load()) {
             auto now = std::chrono::steady_clock::now();
             for (size_t i = 0; i < cam_ctxs.size(); ++i) {
                 if (!cam_ctxs[i]->has_streamed.load()) continue;
