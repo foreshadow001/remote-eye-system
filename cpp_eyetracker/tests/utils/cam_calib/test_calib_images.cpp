@@ -653,6 +653,7 @@ void udpListenerWorker(const string& bind_ip, int port) {
                 ss << setw(2) << setfill('0') << img_idx;
                 cout << "[Slave] PHOTO " << img_idx << endl;
                 g_last_capture_index.store(img_idx, memory_order_relaxed);
+                g_capture_count++;
 
                 for (auto& ctx : cam_ctxs) {
                     cv::Mat snapshot;
@@ -1032,11 +1033,18 @@ int main() {
                             cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
                 hy += 18;
                 string status = g_enable_net_sync
-                    ? (g_is_master ? "Role: MASTER  |  Net Sync: ON  |  Captures: " + to_string(g_capture_count)
-                                   : "Role: SLAVE  |  Net Sync: ON  |  Captures: " + to_string(g_capture_count))
-                    : "Role: STANDALONE  |  Net Sync: OFF  |  Captures: " + to_string(g_capture_count);
+                    ? (g_is_master ? "Role: MASTER  |  Net Sync: ON"
+                                   : "Role: SLAVE  |  Net Sync: ON")
+                    : "Role: STANDALONE  |  Net Sync: OFF";
                 cv::putText(canvas, status, cv::Point(hx, hy),
                             cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(110, 110, 110), 1, cv::LINE_AA);
+
+                // Capture count in top-right of enlarged area
+                string cnt = "Captures: " + to_string(g_capture_count);
+                cv::Size cnt_sz = cv::getTextSize(cnt, cv::FONT_HERSHEY_SIMPLEX, 0.8, 2, 0);
+                cv::putText(canvas, cnt,
+                            cv::Point(g_right_x + g_right_w - cnt_sz.width - 15, 35),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 215, 255), 2, cv::LINE_AA);
 
                 // Crosshair at center of enlarged area
                 int cx = g_right_x + g_right_w / 2, cy = g_win_h / 2, cl = 20;
@@ -1157,6 +1165,7 @@ int main() {
                 }
             }
             cout << "[Clear] Local photos removed." << endl;
+            g_capture_count = 0;
 
             fastUdpSend(g_slave_addr, "CLEAR");
             this_thread::sleep_for(chrono::milliseconds(200));
