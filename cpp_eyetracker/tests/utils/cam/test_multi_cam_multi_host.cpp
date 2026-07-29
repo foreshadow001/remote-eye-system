@@ -31,6 +31,7 @@
 #include <functional>
 #include <fstream>
 #include <algorithm> // [新增] 用于 std::min / std::max
+#include <system_error>
 #include <pylon/PylonIncludes.h>
 
 #include "cam/basler.hpp"
@@ -143,6 +144,26 @@ string g_session_log_path;
 int g_recording_number = 0;
 ofstream g_session_log;
 
+// ================== 异常计数器 ==================
+atomic<int> g_exc_fatal{0}, g_exc_error{0}, g_exc_warn{0}, g_exc_info{0};
+
+void logException(const string& level, const string& source, const string& msg) {
+    auto t = chrono::system_clock::now();
+    auto tt = chrono::system_clock::to_time_t(t);
+    auto ms = chrono::duration_cast<chrono::milliseconds>(t.time_since_epoch()) % 1000;
+    char tb[16]; strftime(tb, sizeof(tb), "%H:%M:%S", localtime(&tt));
+    string ts = string(tb) + "." + to_string(ms.count() / 100) + to_string((ms.count() / 10) % 10) + to_string(ms.count() % 10);
+
+    string line = "> **[" + level + "]** `" + ts + "` | " + source + " | " + msg;
+
+    if (level == "FATAL") { g_exc_fatal++; cerr << line << endl; }
+    else if (level == "ERROR") { g_exc_error++; cerr << line << endl; }
+    else if (level == "WARN") { g_exc_warn++; cout << line << endl; }
+    else { g_exc_info++; cout << line << endl; }
+
+    if (g_session_log.is_open()) g_session_log << line << "\n" << flush;
+}
+
 // ================== 跨主机同步偏移 ==================
 int64_t g_peer_first_block_id = -1;  // other host's first BlockID (from TCP exchange)
 
@@ -155,6 +176,7 @@ int g_thumb_w = 0, g_thumb_h = 0;
 // ================== [新增] 核心：极速零延迟触发函数 ==================
 void instantTrigger() {
     global_record_start_time = std::chrono::steady_clock::now();
+    g_exc_fatal = 0; g_exc_error = 0; g_exc_warn = 0; g_exc_info = 0;
     for (auto& ctx : cam_ctxs) {
         {
             lock_guard<mutex> lock(ctx->copy_mtx);
@@ -296,12 +318,18 @@ void udpListenerWorker(const string& bind_ip, int port) {
             string cmd(buffer);
             // [修改] 识别带时间戳的指令，瞬间开火
             if (cmd.rfind("CMD_START:", 0) == 0) {
+                if (cmd.length() <= 10) { logException("WARN", "slave", "CMD_START truncated"); continue; }
                 instantTrigger();
                 shared_record_timestr = cmd.substr(10);
                 net_cmd_record = true;
             }
             else if (cmd.rfind("FAULT:", 0) == 0 && !g_fault_active.load()) {
+                if (cmd.length() <= 7) continue;
                 char hf = cmd[6]; int fi = stoi(cmd.substr(7));
+                if (fi < 0 || fi >= (int)cam_ctxs.size()) {
+                    logException("WARN", "slave", "FAULT cam idx out of bounds: " + to_string(fi));
+                    continue;
+                }
                 cout << "[Slave] Fault from MASTER: cam " << fi << endl;
                 g_fault_time = chrono::steady_clock::now();
                 g_fault_active.store(true); g_faulty_cam.store(fi); g_fault_on_master.store(true);
@@ -607,7 +635,7 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
 // [修改] 增加 enable_offset 参数
 void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time, bool use_hw_trigger, bool enable_offset) {
     TriggerMode mode = use_hw_trigger ? TriggerMode::Hardware : TriggerMode::Software;
-    if (!ctx->cam.open(mode)) { ctx->status = CamStatus::ERROR_; return; }
+    if (!ctx->cam.open(mode)) { ctx->status = CamStatus::ERROR_; ctx->copy_cv.notify_all(); return; }
 
     ctx->is_mono = ctx->cam.isMono();
 
@@ -672,7 +700,7 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
         }
     });
 
-    if (!ctx->cam.start()) { ctx->status = CamStatus::ERROR_; return; }
+    if (!ctx->cam.start()) { ctx->status = CamStatus::ERROR_; ctx->copy_cv.notify_all(); return; }
     ctx->status_msg = use_hw_trigger ? "HW WAITING" : "STREAMING";
 
     while (ctx->running) std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -691,8 +719,18 @@ void dumpToDiskWorker(shared_ptr<CameraContext> ctx, int write_delay_ms, atomic<
         string filename = ctx->temp_dir + "/" + to_string(meta.blockID) + ".raw";
 
         std::ofstream out_raw(filename, std::ios::binary);
-        if (out_raw)
+        if (out_raw) {
             out_raw.write(reinterpret_cast<const char*>(img.data), img.total() * img.elemSize());
+            if (!out_raw.good()) {
+                logException("ERROR", "dump:cam" + to_string(ctx->index) + ":" + ctx->id,
+                             "Disk write failed at frame " + to_string(i));
+                break;
+            }
+        } else {
+            logException("ERROR", "dump:cam" + to_string(ctx->index) + ":" + ctx->id,
+                         "Cannot create raw file: " + filename);
+            break;
+        }
 
         if (ctx->log_stream.is_open()) {
             ctx->log_stream << fs::path(filename).filename().string() << ","
@@ -738,7 +776,8 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
             }
 
             string jpg_filename = to_string(entry.blockID) + ".jpg";
-            cv::imwrite(out_jpg_dir + "/" + jpg_filename, final_img);
+            if (!cv::imwrite(out_jpg_dir + "/" + jpg_filename, final_img))
+                logException("ERROR", "jpg", "cv::imwrite failed: " + out_jpg_dir + "/" + jpg_filename);
         }
         global_processed++;
     }
@@ -905,6 +944,12 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     g_session_log << "| max_ram2disk | " << fixed << setprecision(3) << max_ram2disk << " s | DISK写入最长 (cam " << max_ram2disk_cam << ": " << (max_ram2disk_cam >= 0 ? cam_ctxs[max_ram2disk_cam]->id : "?") << ") |\n";
     g_session_log << "| max_end_to_end | " << fixed << setprecision(3) << max_total << " s | 端到端最长 (cam " << max_total_cam << ": " << (max_total_cam >= 0 ? cam_ctxs[max_total_cam]->id : "?") << ") |\n";
     g_session_log << "| system_healthy | **" << (healthy ? "PASS" : "FAIL") << "** | sync≤2 && fps≥95% && drop≤1% |\n";
+    int ef = g_exc_fatal.load(), ee = g_exc_error.load(), ew = g_exc_warn.load(), ei = g_exc_info.load();
+    auto b = [](int v) { return v > 0 ? "**" + to_string(v) + "**" : to_string(v); };
+    g_session_log << "| exceptions_fatal | " << b(ef) << " | FATAL 异常计数 |\n";
+    g_session_log << "| exceptions_error | " << b(ee) << " | ERROR 异常计数 |\n";
+    g_session_log << "| exceptions_warn  | " << b(ew) << " | WARN 异常计数 |\n";
+    g_session_log << "| exceptions_info  | " << b(ei) << " | INFO 异常计数 |\n";
     g_session_log << defaultfloat << flush;
 }
 
@@ -1041,9 +1086,14 @@ int main() {
     {
         auto t = chrono::system_clock::to_time_t(chrono::system_clock::now());
         char tb[64]; strftime(tb, sizeof(tb), "%Y%m%d_%H%M%S", localtime(&t));
-        fs::create_directories("log/capture");
-        g_session_log_path = string("log/capture/session_") + tb + ".md";
-        g_session_log.open(g_session_log_path, ios::out | ios::app);
+        error_code ec;
+        fs::create_directories("log/capture", ec);
+        if (ec) {
+            logException("ERROR", "init", "Cannot create log/capture/: " + ec.message());
+        } else {
+            g_session_log_path = string("log/capture/session_") + tb + ".md";
+            g_session_log.open(g_session_log_path, ios::out | ios::app);
+        }
         if (g_session_log.is_open())
             g_session_log << "# Session: " << tb << "\n\n"
                           << "- **Cameras**: " << camera_ids.size() << "\n"
@@ -1069,6 +1119,14 @@ int main() {
     g_ready_time = std::chrono::steady_clock::now();
 
     while (global_running) {
+        // E1: check if no camera has started streaming within 30s
+        static bool startup_checked = false;
+        if (!startup_checked && chrono::duration<double>(chrono::steady_clock::now() - g_ready_time).count() > 30.0) {
+            startup_checked = true;
+            bool any_streaming = false;
+            for (auto& ctx : cam_ctxs) if (ctx->has_streamed.load()) { any_streaming = true; break; }
+            if (!any_streaming) logException("ERROR", "startup", "No camera streaming after 30s");
+        }
         auto current_time = std::chrono::steady_clock::now();
         bool need_ui_update = (current_time - last_ui_time) >= ui_interval;
 
@@ -1083,7 +1141,12 @@ int main() {
                 if (nb > 0) {
                     poll_buf[nb] = '\0'; string pm(poll_buf);
                     if (pm.rfind("FAULT:", 0) == 0 && !g_fault_active.load()) {
+                        if (pm.length() <= 7) continue;
                         char hf = pm[6]; int fi = stoi(pm.substr(7));
+                        if (fi < 0 || fi >= (int)cam_ctxs.size()) {
+                            logException("WARN", "main", "FAULT cam idx out of bounds: " + to_string(fi));
+                            continue;
+                        }
                         cout << "[Fault] Received from " << (hf == 'M' ? "MASTER" : "SLAVE")
                              << ": cam " << fi << endl;
                         g_fault_time = std::chrono::steady_clock::now();
@@ -1383,7 +1446,9 @@ int main() {
             // 慢慢建文件夹，完全不影响底层的图像拷贝
             for (auto& ctx : cam_ctxs) {
                 string batch_raw = ctx->save_base_dir + "/temp_raw_" + current_record_timestr + "/" + ctx->id;
-                fs::create_directories(batch_raw);
+                error_code ec;
+                fs::create_directories(batch_raw, ec);
+                if (ec) logException("ERROR", "io:cam" + to_string(ctx->index), "Cannot create " + batch_raw + ": " + ec.message());
                 ctx->temp_dir = batch_raw;
                 ctx->log_file_path = ctx->save_base_dir + "/record_" + current_record_timestr + "_" + ctx->id + ".txt";
             }
