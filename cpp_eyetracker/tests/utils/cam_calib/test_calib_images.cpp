@@ -34,6 +34,7 @@
 #include <map>
 #include <set>
 #include <functional>
+#include <system_error>
 
 #include "cam/basler.hpp"
 #include "cfg/config.hpp"
@@ -42,8 +43,32 @@ namespace fs = std::filesystem;
 using namespace std;
 using namespace gazeestimation;
 
+// ================== 异常计数器与日志 ==================
+atomic<int> g_exc_fatal{0}, g_exc_error{0}, g_exc_warn{0}, g_exc_info{0};
+
+void logException(const string& level, const string& source, const string& msg) {
+    auto t = chrono::system_clock::now();
+    auto tt = chrono::system_clock::to_time_t(t);
+    auto ms = chrono::duration_cast<chrono::milliseconds>(t.time_since_epoch()) % 1000;
+    char tb[16]; strftime(tb, sizeof(tb), "%H:%M:%S", localtime(&tt));
+    string ts = string(tb) + "." + to_string(ms.count() / 100) + to_string((ms.count() / 10) % 10) + to_string(ms.count() % 10);
+    string line = "> **[" + level + "]** `" + ts + "` | " + source + " | " + msg;
+    if (level == "FATAL") { g_exc_fatal++; cerr << line << endl; }
+    else if (level == "ERROR") { g_exc_error++; cerr << line << endl; }
+    else if (level == "WARN") { g_exc_warn++; cout << line << endl; }
+    else { g_exc_info++; cout << line << endl; }
+    extern ofstream g_session_log;
+    if (g_session_log.is_open()) g_session_log << line << "\n" << flush;
+}
+
 // ================== 全局状态 ==================
 atomic<bool> global_running{true};
+
+// ================== 会话日志 ==================
+ofstream g_session_log;
+string g_session_log_path;
+int g_capture_count = 0;
+int g_undo_count = 0;
 
 // ================== UDP 全局句柄 ==================
 SOCKET g_udp_sock = INVALID_SOCKET;
@@ -884,6 +909,28 @@ int main() {
 
     g_ready_time = chrono::steady_clock::now();
 
+    // Session log
+    {
+        auto t = chrono::system_clock::to_time_t(chrono::system_clock::now());
+        char tb[64]; strftime(tb, sizeof(tb), "%Y%m%d_%H%M%S", localtime(&t));
+        error_code ec;
+        fs::create_directories("log/capture", ec);
+        if (!ec) {
+            g_session_log_path = string("log/capture/calib_session_") + tb + ".md";
+            g_session_log.open(g_session_log_path, ios::out | ios::app);
+        }
+        if (g_session_log.is_open()) {
+            g_session_log << "# Calib Session: " << tb << "\n\n"
+                          << "- **Cameras**: " << camera_ids.size() << "\n"
+                          << "- **Trigger**: SW\n"
+                          << "- **Net Sync**: " << (g_enable_net_sync ? "ON" : "OFF") << "\n"
+                          << "- **Role**: " << (g_is_master ? "MASTER" : "SLAVE") << "\n\n---\n" << flush;
+            cout << "[Log] Session log: " << g_session_log_path << endl;
+        } else if (ec) {
+            cerr << "[WARN] Cannot create log/capture/: " << ec.message() << endl;
+        }
+    }
+
     while (global_running) {
         auto current_time = chrono::steady_clock::now();
         bool need_ui_update = (current_time - last_ui_time) >= ui_interval;
@@ -1074,6 +1121,11 @@ int main() {
     }
     if (listener_thread.joinable()) listener_thread.join();
 
+    if (g_session_log.is_open()) {
+        g_session_log << "\n---\n**Session ended**: " << g_capture_count << " captures, "
+                      << g_undo_count << " undos\n" << flush;
+        g_session_log.close();
+    }
     cv::destroyAllWindows();
     Pylon::PylonTerminate();
     if (g_udp_sock != INVALID_SOCKET) closesocket(g_udp_sock);
