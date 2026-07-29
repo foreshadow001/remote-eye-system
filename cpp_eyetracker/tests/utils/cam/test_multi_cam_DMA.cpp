@@ -1033,7 +1033,8 @@ int main() {
     double margin_frames_ratio = cfg["test_multi_cam"]["margin_frames_ratio"].as<double>();
     int margin_frames = static_cast<int>(std::ceil(core_frames * margin_frames_ratio));
     int total_record_frames = core_frames + 2 * margin_frames;
-    int max_num_buffer = 30;
+    // DMA mode: must hold all frames as GrabResultPtr, need 1 Pylon buffer per frame
+    int max_num_buffer = total_record_frames + 10;
     try { max_num_buffer = cfg["test_multi_cam"]["max_num_buffer"].as<int>(); } catch (...) {}
 
     cout << "\n--- Network Sync Configuration ---" << endl;
