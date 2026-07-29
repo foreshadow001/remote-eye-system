@@ -1133,7 +1133,13 @@ int main() {
 
     g_ready_time = std::chrono::steady_clock::now();
 
+    static int loop_cnt = 0;
     while (global_running) {
+        loop_cnt++;
+        if (loop_cnt <= 5 || loop_cnt % 200 == 0)
+            cout << "[DEBUG-MAIN] iter=" << loop_cnt << " rec=" << is_recording
+                 << " dump=" << is_dumping << " fault=" << g_fault_active.load() << endl;
+
         // E1: check if no camera has started streaming within 30s
         static bool startup_checked = false;
         if (!startup_checked && chrono::duration<double>(chrono::steady_clock::now() - g_ready_time).count() > 30.0) {
