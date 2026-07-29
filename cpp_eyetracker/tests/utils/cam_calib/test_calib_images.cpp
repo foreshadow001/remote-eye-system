@@ -647,6 +647,7 @@ void udpListenerWorker(const string& bind_ip, int port) {
             string cmd(buffer);
 
             if (cmd.rfind("PHOTO:", 0) == 0) {
+                if (cmd.length() <= 6) { logException("WARN", "slave", "PHOTO msg truncated"); continue; }
                 int img_idx = stoi(cmd.substr(6));
                 stringstream ss;
                 ss << setw(2) << setfill('0') << img_idx;
@@ -664,12 +665,15 @@ void udpListenerWorker(const string& bind_ip, int port) {
                         if (ctx->is_mono) out_img = snapshot.clone();
                         else cv::cvtColor(snapshot, out_img, cv::COLOR_BayerRG2RGB);
                         string fn = g_calib_save_dir + "/calib_cam_" + ctx->sn + "_" + ss.str() + ".jpg";
-                        cv::imwrite(fn, out_img);
-                        cout << "  -> Saved " << fn << endl;
+                        if (!cv::imwrite(fn, out_img))
+                            logException("ERROR", "photo", "cv::imwrite failed: " + fn);
+                        else
+                            cout << "  -> Saved " << fn << endl;
                     }
                 }
             }
             else if (cmd.rfind("UNDO:", 0) == 0) {
+                if (cmd.length() <= 5) { logException("WARN", "slave", "UNDO msg truncated"); continue; }
                 int idx = stoi(cmd.substr(5));
                 stringstream ss; ss << setw(2) << setfill('0') << idx;
                 cout << "[Slave] UNDO index " << ss.str() << endl;
@@ -1094,8 +1098,10 @@ int main() {
                         if (ctx->is_mono) out_img = snapshot.clone();
                         else cv::cvtColor(snapshot, out_img, cv::COLOR_BayerRG2RGB);
                         string fn = g_calib_save_dir + "/calib_cam_" + ctx->sn + "_" + ss.str() + ".jpg";
-                        cv::imwrite(fn, out_img);
-                        cout << "  -> Saved " << fn << endl;
+                        if (!cv::imwrite(fn, out_img))
+                            logException("ERROR", "photo", "cv::imwrite failed: " + fn);
+                        else
+                            cout << "  -> Saved " << fn << endl;
                     }
                 }
             }
