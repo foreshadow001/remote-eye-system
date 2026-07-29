@@ -67,7 +67,7 @@ atomic<bool> global_running{true};
 // ================== 会话日志 ==================
 ofstream g_session_log;
 string g_session_log_path;
-int g_capture_count = 0;
+int g_capture_count = -1;  // initialized from directory at startup
 int g_undo_count = 0;
 
 // ================== UDP 全局句柄 ==================
@@ -914,9 +914,9 @@ int main() {
         auto t = chrono::system_clock::to_time_t(chrono::system_clock::now());
         char tb[64]; strftime(tb, sizeof(tb), "%Y%m%d_%H%M%S", localtime(&t));
         error_code ec;
-        fs::create_directories("log/capture", ec);
+        fs::create_directories("log/calib_images", ec);
         if (!ec) {
-            g_session_log_path = string("log/capture/calib_session_") + tb + ".md";
+            g_session_log_path = string("log/calib_images/session_") + tb + ".md";
             g_session_log.open(g_session_log_path, ios::out | ios::app);
         }
         if (g_session_log.is_open()) {
@@ -930,6 +930,10 @@ int main() {
             cerr << "[WARN] Cannot create log/capture/: " << ec.message() << endl;
         }
     }
+
+    // Initialize capture count from existing files
+    g_capture_count = getNextCalibCounter(g_calib_save_dir);
+    cout << "[Init] Existing captures: " << g_capture_count << endl;
 
     while (global_running) {
         auto current_time = chrono::steady_clock::now();
@@ -1012,6 +1016,29 @@ int main() {
                 renderEnlargedView(canvas, sel);
                 cv::line(canvas, cv::Point(g_left_w, 0), cv::Point(g_left_w, g_win_h),
                          cv::Scalar(60, 60, 60), 2);
+
+                // Watermark hints (enlarged area bottom-left)
+                int hx = g_right_x + 10, hy = g_win_h - 45;
+                string hints;
+                if (g_fault_active.load()) hints = "[FAULT] Press ESC to exit";
+                else if (!g_is_master && g_xfer_active) hints = "[XFER] Receiving images...";
+                else if (g_enable_net_sync && !g_is_master) hints = "[SPACE][z][c][t][ESC/q] disabled (Slave)";
+                else hints = "[SPACE] capture  [z] undo  [c] clear  [t] transfer  [ESC/q] quit";
+                cv::putText(canvas, hints, cv::Point(hx, hy),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
+                hy += 18;
+                string status = g_enable_net_sync
+                    ? (g_is_master ? "Role: MASTER  |  Net Sync: ON  |  Captures: " + to_string(g_capture_count)
+                                   : "Role: SLAVE  |  Net Sync: ON  |  Captures: " + to_string(g_capture_count))
+                    : "Role: STANDALONE  |  Net Sync: OFF  |  Captures: " + to_string(g_capture_count);
+                cv::putText(canvas, status, cv::Point(hx, hy),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(110, 110, 110), 1, cv::LINE_AA);
+
+                // Crosshair at center of enlarged area
+                int cx = g_right_x + g_right_w / 2, cy = g_win_h / 2, cl = 20;
+                cv::line(canvas, cv::Point(cx - cl, cy), cv::Point(cx + cl, cy), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
+                cv::line(canvas, cv::Point(cx, cy - cl), cv::Point(cx, cy + cl), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
+
                 cv::imshow("Calib Capture", canvas);
             }
             last_ui_time = current_time;
@@ -1021,21 +1048,26 @@ int main() {
         char key = static_cast<char>(cv::waitKey(1));
 
         if (key == 27 || key == 'q') {
-            if (g_fault_active.load() && g_enable_net_sync) {
-                fastUdpSend(g_peer_fault_addr, "SHUTDOWN");
-                // Brief delay to let the message go out
-                this_thread::sleep_for(chrono::milliseconds(200));
+            if (g_enable_net_sync) {
+                if (g_is_master) {
+                    fastUdpSend(g_peer_fault_addr, "SHUTDOWN");
+                    this_thread::sleep_for(chrono::milliseconds(200));
+                    global_running = false;
+                }
+                // Slave: ignore ESC/q when net sync on (except during fault)
+                if (!g_is_master && g_fault_active.load()) global_running = false;
+            } else {
+                global_running = false;
             }
-            global_running = false;
         }
         else if (g_fault_active.load()) {
             // Block all keys except ESC during fault
         }
         else if (key == ' ') {
-            if (g_xfer_active) {
+            if (g_enable_net_sync && !g_is_master) {
+                // Slave: ignore SPACE when net sync is on
+            } else if (g_xfer_active) {
                 // Block SPACE during transfer on both hosts
-            } else if (g_enable_net_sync && !g_is_master) {
-                cout << "[Slave] Waiting for master SPACE..." << endl;
             } else {
                 int counter = getNextCalibCounter(g_calib_save_dir);
                 stringstream ss;
@@ -1047,7 +1079,10 @@ int main() {
                 }
 
                 g_last_capture_index.store(counter, memory_order_relaxed);
+                g_capture_count++;
                 cout << "\n[Photo] Capturing index " << counter << endl;
+                if (g_session_log.is_open())
+                    g_session_log << "* [CAPTURE] `" << counter << "`\n" << flush;
                 for (auto& ctx : cam_ctxs) {
                     cv::Mat snapshot;
                     {
@@ -1065,11 +1100,17 @@ int main() {
                 }
             }
         }
+        else if ((key == 't' || key == 'T') && g_enable_net_sync && !g_is_master) {
+            // Slave: ignore 't' when net sync is on
+        }
         else if ((key == 't' || key == 'T') && g_is_master && g_enable_net_sync && !g_xfer_active) {
             // 传输缺失的 slave 图片（同步阻塞调用）
             transferMissingImages();
             // 传输期间 UI 被阻塞，返回后刷新 UI
             last_ui_time = chrono::steady_clock::now() - ui_interval;
+        }
+        else if ((key == 'z' || key == 'Z') && g_enable_net_sync && !g_is_master) {
+            // Slave: ignore 'z' when net sync is on
         }
         else if ((key == 'z' || key == 'Z') && !g_xfer_active && !g_fault_active.load()) {
             int last_idx = g_last_capture_index.load(memory_order_relaxed);
@@ -1091,8 +1132,15 @@ int main() {
                 if (g_enable_net_sync && g_is_master)
                     fastUdpSend(g_slave_addr, "UNDO:" + to_string(last_idx));
                 g_last_capture_index.store(last_idx - 1, memory_order_relaxed);
+                g_undo_count++;
+                if (g_capture_count > 0) g_capture_count--;
                 cout << "[Undo] Done.\n" << endl;
+                if (g_session_log.is_open())
+                    g_session_log << "* [UNDO] `" << ss.str() << "`\n" << flush;
             }
+        }
+        else if ((key == 'c' || key == 'C') && g_enable_net_sync && !g_is_master) {
+            // Slave: ignore 'c' when net sync is on
         }
         else if ((key == 'c' || key == 'C') && g_is_master && g_enable_net_sync && !g_xfer_active) {
             cout << "\n[Clear] Removing local calibration photos..." << endl;

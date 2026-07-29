@@ -75,7 +75,7 @@ main()
 
 ### 3.1 会话日志
 
-仿照 `test_multi_cam_multi_host`，程序启动时创建 `log/capture/calib_session_<ts>.md`。
+仿照 `test_multi_cam_multi_host`，程序启动时创建 `log/calib_images/session_<ts>.md`。
 
 **日志内容**：
 - Session 头（相机数、触发模式）
