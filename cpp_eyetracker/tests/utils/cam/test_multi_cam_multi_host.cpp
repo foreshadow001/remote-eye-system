@@ -686,6 +686,7 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
 }
 
 void dumpToDiskWorker(shared_ptr<CameraContext> ctx, int write_delay_ms, atomic<int>& finished_cams) {
+    cout << "[DEBUG] dumpToDiskWorker start cam=" << ctx->index << " sn=" << ctx->id << " frames=" << ctx->recorded_frames.load() << endl;
     ctx->dump_start_time = chrono::steady_clock::now();
     ctx->log_stream.open(ctx->log_file_path);
     int frames_to_dump = ctx->recorded_frames.load();
@@ -710,6 +711,7 @@ void dumpToDiskWorker(shared_ptr<CameraContext> ctx, int write_delay_ms, atomic<
     if (ctx->log_stream.is_open()) ctx->log_stream.close();
     ctx->dump_end_time = chrono::steady_clock::now();
     finished_cams++;
+    cout << "[DEBUG] dumpToDiskWorker done cam=" << ctx->index << " sn=" << ctx->id << " finished=" << finished_cams.load() << endl;
 }
 
 vector<LogEntry> parseLogFile(const string& log_path) {
@@ -1235,14 +1237,21 @@ int main() {
                 vector<thread> dump_threads;
 
                 for (auto& ctx : cam_ctxs) dump_threads.emplace_back(dumpToDiskWorker, ctx, write_delay_ms, std::ref(finished_cams));
+                cout << "[DEBUG] Dump threads started: " << dump_threads.size() << endl;
 
+                int dump_wait_iters = 0;
                 while (finished_cams < cam_ctxs.size()) {
+                    if (dump_wait_iters % 20 == 0)
+                        cout << "[DEBUG] Dumping... " << finished_cams.load() << "/" << cam_ctxs.size() << endl;
+                    dump_wait_iters++;
                     cv::Mat loading = cv::Mat::zeros(400, 600, CV_8UC3);
                     cv::putText(loading, "DUMPING RAM TO DISK... (" + to_string(finished_cams.load()) + "/" + to_string(cam_ctxs.size()) + ")", cv::Point(50, 200), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
                     cv::imshow("Multi-Cam Preview", loading);
                     cv::waitKey(50);
                 }
+                cout << "[DEBUG] All dumps complete, joining threads..." << endl;
                 for (auto& t : dump_threads) if (t.joinable()) t.join();
+                cout << "[DEBUG] All dump threads joined" << endl;
 
                 double dump_duration = std::chrono::duration<double>(std::chrono::steady_clock::now() - dump_start_time).count();
 
