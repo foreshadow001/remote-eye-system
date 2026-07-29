@@ -688,9 +688,10 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
 
             lock_guard<mutex> lock(ctx->copy_mtx);
             if (ctx->recording) {
-                // DMA: unlimited queue — Pylon buffers pre-allocated to total_record_frames+50
-                ctx->copy_queue.push({ptr, meta});
-                ctx->copy_cv.notify_one();
+                if ((int)ctx->copy_queue.size() < ctx->total_record_frames) {
+                    ctx->copy_queue.push({ptr, meta});
+                    ctx->copy_cv.notify_one();
+                }
             } else {
                 if (ctx->copy_queue.size() < 2) {
                     ctx->copy_queue.push({ptr, meta});
@@ -1014,8 +1015,7 @@ int main() {
     double margin_frames_ratio = cfg["test_multi_cam"]["margin_frames_ratio"].as<double>();
     int margin_frames = static_cast<int>(std::ceil(core_frames * margin_frames_ratio));
     int total_record_frames = core_frames + 2 * margin_frames;
-    // DMA mode: need enough Pylon buffers to hold all recorded frames
-    int max_num_buffer = total_record_frames + 50;
+    int max_num_buffer = 30;
     try { max_num_buffer = cfg["test_multi_cam"]["max_num_buffer"].as<int>(); } catch (...) {}
 
     cout << "\n--- Network Sync Configuration ---" << endl;
