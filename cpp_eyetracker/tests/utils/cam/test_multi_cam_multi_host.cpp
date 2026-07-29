@@ -138,12 +138,6 @@ atomic<bool> g_fault_on_master{false};
 chrono::steady_clock::time_point g_ready_time;
 chrono::steady_clock::time_point g_fault_time;
 
-// ================== CPU 占用率采样 ==================
-double g_cpu_ram_avg = 0, g_cpu_ram_peak = 0;
-double g_cpu_disk_avg = 0, g_cpu_disk_peak = 0;
-atomic<bool> g_cpu_sampling{false};
-atomic<int> g_cpu_phase{0};  // 0=idle, 1=RAM, 2=DISK
-
 // ================== 会话日志 ==================
 string g_session_log_path;
 int g_recording_number = 0;
@@ -686,7 +680,6 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
 }
 
 void dumpToDiskWorker(shared_ptr<CameraContext> ctx, int write_delay_ms, atomic<int>& finished_cams) {
-    cout << "[DEBUG] dumpToDiskWorker start cam=" << ctx->index << " sn=" << ctx->id << " frames=" << ctx->recorded_frames.load() << endl;
     ctx->dump_start_time = chrono::steady_clock::now();
     ctx->log_stream.open(ctx->log_file_path);
     int frames_to_dump = ctx->recorded_frames.load();
@@ -711,7 +704,6 @@ void dumpToDiskWorker(shared_ptr<CameraContext> ctx, int write_delay_ms, atomic<
     if (ctx->log_stream.is_open()) ctx->log_stream.close();
     ctx->dump_end_time = chrono::steady_clock::now();
     finished_cams++;
-    cout << "[DEBUG] dumpToDiskWorker done cam=" << ctx->index << " sn=" << ctx->id << " finished=" << finished_cams.load() << endl;
 }
 
 vector<LogEntry> parseLogFile(const string& log_path) {
@@ -751,28 +743,6 @@ void convertRawToJpgWorker(string temp_raw_dir, string out_jpg_dir, vector<LogEn
         global_processed++;
     }
     if (jpg_end) *jpg_end = chrono::steady_clock::now();
-}
-
-// ================== CPU 采样辅助函数 ==================
-static double filetimeToMs(const FILETIME& ft) {
-    ULARGE_INTEGER ul;
-    ul.LowPart = ft.dwLowDateTime;
-    ul.HighPart = ft.dwHighDateTime;
-    return ul.QuadPart / 10000.0;
-}
-
-static double sampleCpuPct(FILETIME& prev_kernel, FILETIME& prev_user, LARGE_INTEGER& prev_wall) {
-    FILETIME ct, et, kt, ut;
-    GetProcessTimes(GetCurrentProcess(), &ct, &et, &kt, &ut);
-    LARGE_INTEGER wall, freq;
-    QueryPerformanceCounter(&wall);
-    QueryPerformanceFrequency(&freq);
-    if (freq.QuadPart == 0) return 0;
-    double cpu_delta = (filetimeToMs(kt) - filetimeToMs(prev_kernel))
-                     + (filetimeToMs(ut) - filetimeToMs(prev_user));
-    double wall_delta = (wall.QuadPart - prev_wall.QuadPart) * 1000.0 / freq.QuadPart;
-    prev_kernel = kt; prev_user = ut; prev_wall = wall;
-    return wall_delta > 0 ? cpu_delta / wall_delta * 100.0 : 0;
 }
 
 // ================== 结构化报告写入 ==================
@@ -935,10 +905,6 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
     g_session_log << "| max_ram2disk | " << fixed << setprecision(3) << max_ram2disk << " s | DISK写入最长 (cam " << max_ram2disk_cam << ": " << (max_ram2disk_cam >= 0 ? cam_ctxs[max_ram2disk_cam]->id : "?") << ") |\n";
     g_session_log << "| max_end_to_end | " << fixed << setprecision(3) << max_total << " s | 端到端最长 (cam " << max_total_cam << ": " << (max_total_cam >= 0 ? cam_ctxs[max_total_cam]->id : "?") << ") |\n";
     g_session_log << "| system_healthy | **" << (healthy ? "PASS" : "FAIL") << "** | sync≤2 && fps≥95% && drop≤1% |\n";
-    g_session_log << "| cpu_ram_avg | " << fixed << setprecision(1) << g_cpu_ram_avg << "% | RAM写入阶段平均 CPU 占用 |\n";
-    g_session_log << "| cpu_ram_peak | " << g_cpu_ram_peak << "% | RAM写入阶段峰值 CPU 占用 |\n";
-    g_session_log << "| cpu_disk_avg | " << g_cpu_disk_avg << "% | DISK写入阶段平均 CPU 占用 |\n";
-    g_session_log << "| cpu_disk_peak | " << g_cpu_disk_peak << "% | DISK写入阶段峰值 CPU 占用 |\n";
     g_session_log << defaultfloat << flush;
 }
 
@@ -1146,10 +1112,9 @@ int main() {
             auto now = std::chrono::steady_clock::now();
             for (size_t i = 0; i < cam_ctxs.size(); ++i) {
                 if (!cam_ctxs[i]->has_streamed.load()) continue;
-                double age = std::chrono::duration<double>(now - cam_ctxs[i]->last_frame_time.load()).count();
-                if (age > 1.0) {
+                if (std::chrono::duration<double>(now - cam_ctxs[i]->last_frame_time.load()).count() > 1.0) {
                     cerr << "\n[FAULT] Camera " << cam_ctxs[i]->id
-                         << " (index " << i << ") stalled! age=" << fixed << setprecision(2) << age << "s" << endl;
+                         << " (index " << i << ") stalled!" << endl;
                     g_fault_time = std::chrono::steady_clock::now();
                     g_fault_active.store(true); g_faulty_cam.store((int)i);
                     g_fault_on_master.store(is_master_pc);
@@ -1216,42 +1181,27 @@ int main() {
 
         // ===== 2. 落盘等待逻辑 =====
         if (is_recording && !is_dumping) {
-            static int rec_check_count = 0; rec_check_count++;
             bool all_done = true;
             for (auto& ctx : cam_ctxs) if (!ctx->dump_ready.load()) { all_done = false; break; }
-            if (rec_check_count % 20 == 0 || all_done) {
-                cout << "[DEBUG] Recording check #" << rec_check_count << " all_done=" << all_done;
-                if (!all_done) { cout << " recorded: "; for (auto& c : cam_ctxs) cout << c->recorded_frames.load() << " "; }
-                cout << endl;
-            }
 
             if (all_done) {
-                rec_check_count = 0;
                 is_recording = false;
                 is_dumping = true;
                 g_recording_number++;
-                g_cpu_phase = 2;  // switch CPU sampling to DISK phase
 
                 auto dump_start_time = std::chrono::steady_clock::now();
                 atomic<int> finished_cams{0};
                 vector<thread> dump_threads;
 
                 for (auto& ctx : cam_ctxs) dump_threads.emplace_back(dumpToDiskWorker, ctx, write_delay_ms, std::ref(finished_cams));
-                cout << "[DEBUG] Dump threads started: " << dump_threads.size() << endl;
 
-                int dump_wait_iters = 0;
                 while (finished_cams < cam_ctxs.size()) {
-                    if (dump_wait_iters % 20 == 0)
-                        cout << "[DEBUG] Dumping... " << finished_cams.load() << "/" << cam_ctxs.size() << endl;
-                    dump_wait_iters++;
                     cv::Mat loading = cv::Mat::zeros(400, 600, CV_8UC3);
                     cv::putText(loading, "DUMPING RAM TO DISK... (" + to_string(finished_cams.load()) + "/" + to_string(cam_ctxs.size()) + ")", cv::Point(50, 200), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
                     cv::imshow("Multi-Cam Preview", loading);
                     cv::waitKey(50);
                 }
-                cout << "[DEBUG] All dumps complete, joining threads..." << endl;
                 for (auto& t : dump_threads) if (t.joinable()) t.join();
-                cout << "[DEBUG] All dump threads joined" << endl;
 
                 double dump_duration = std::chrono::duration<double>(std::chrono::steady_clock::now() - dump_start_time).count();
 
@@ -1338,10 +1288,6 @@ int main() {
                     jpg_duration = chrono::duration<double>(chrono::steady_clock::now() - jpg_start).count();
                 }
 
-                // Stop CPU sampling and wait for final stats
-                g_cpu_sampling = false;
-                this_thread::sleep_for(chrono::milliseconds(100));
-
                 // Write report
                 writeReport(current_record_timestr, g_recording_number, target_fps, total_record_frames,
                             dump_duration, jpg_duration, write_jpg, use_hw_trigger);
@@ -1349,17 +1295,9 @@ int main() {
                 cout << "[Recording #" << g_recording_number << "] Done in " << fixed << setprecision(1)
                      << dump_duration + jpg_duration << "s (appended to session log)" << endl;
 
-                // Reset health timers so post-dump health check doesn't false-trigger
-                auto post_dump_now = chrono::steady_clock::now();
-                for (auto& ctx : cam_ctxs) ctx->last_frame_time.store(post_dump_now);
-                cout << "[DEBUG] Health timers reset, clearing is_dumping flag" << endl;
-
                 is_dumping = false;
                 while (cv::waitKey(1) >= 0);
                 last_ui_time = chrono::steady_clock::now();
-
-                cout << "[DEBUG] Post-dump: entering main loop, is_dumping=" << is_dumping.load()
-                     << " global_running=" << global_running.load() << endl;
             }
         }
 
@@ -1452,42 +1390,6 @@ int main() {
             
             is_recording = true; // 更新主线程 UI 状态
             cout << "[Info] I/O PREPARED FOR: " << current_record_timestr << endl;
-
-            // Start CPU sampling (RAM phase)
-            cout << "[DEBUG] Starting CPU sampling thread..." << endl;
-            g_cpu_phase = 1;
-            g_cpu_sampling = true;
-            g_cpu_ram_avg = 0; g_cpu_ram_peak = 0;
-            g_cpu_disk_avg = 0; g_cpu_disk_peak = 0;
-            thread cpu_thread([]() {
-                cout << "[DEBUG] CPU thread running" << endl;
-                FILETIME pk, pu; LARGE_INTEGER pw;
-                GetProcessTimes(GetCurrentProcess(), nullptr, nullptr, &pk, &pu);
-                QueryPerformanceCounter(&pw);
-                vector<double> ram_samples, disk_samples;
-                int sample_count = 0;
-                while (g_cpu_sampling) {
-                    this_thread::sleep_for(chrono::milliseconds(50));
-                    if (!g_cpu_sampling) break;
-                    double pct = sampleCpuPct(pk, pu, pw);
-                    if (g_cpu_phase == 1) ram_samples.push_back(pct);
-                    else if (g_cpu_phase == 2) disk_samples.push_back(pct);
-                    sample_count++;
-                    if (sample_count % 20 == 0) cout << "[DEBUG] CPU sample #" << sample_count << " pct=" << fixed << setprecision(1) << pct << "%" << endl;
-                }
-                cout << "[DEBUG] CPU thread stopping, ram=" << ram_samples.size() << " disk=" << disk_samples.size() << " samples" << endl;
-                auto compute = [](vector<double>& v, double& avg, double& peak) {
-                    if (v.empty()) return;
-                    double sum = 0; peak = 0;
-                    for (auto x : v) { sum += x; if (x > peak) peak = x; }
-                    avg = sum / v.size();
-                };
-                compute(ram_samples, g_cpu_ram_avg, g_cpu_ram_peak);
-                compute(disk_samples, g_cpu_disk_avg, g_cpu_disk_peak);
-                cout << "[DEBUG] CPU stats: ram_avg=" << g_cpu_ram_avg << "% ram_peak=" << g_cpu_ram_peak << "% disk_avg=" << g_cpu_disk_avg << "% disk_peak=" << g_cpu_disk_peak << "%" << endl;
-            });
-            cpu_thread.detach();
-            cout << "[DEBUG] CPU thread detached" << endl;
         }
     }
 
