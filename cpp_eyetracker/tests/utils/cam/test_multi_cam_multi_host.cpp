@@ -1144,9 +1144,10 @@ int main() {
             auto now = std::chrono::steady_clock::now();
             for (size_t i = 0; i < cam_ctxs.size(); ++i) {
                 if (!cam_ctxs[i]->has_streamed.load()) continue;
-                if (std::chrono::duration<double>(now - cam_ctxs[i]->last_frame_time.load()).count() > 1.0) {
+                double age = std::chrono::duration<double>(now - cam_ctxs[i]->last_frame_time.load()).count();
+                if (age > 1.0) {
                     cerr << "\n[FAULT] Camera " << cam_ctxs[i]->id
-                         << " (index " << i << ") stalled!" << endl;
+                         << " (index " << i << ") stalled! age=" << fixed << setprecision(2) << age << "s" << endl;
                     g_fault_time = std::chrono::steady_clock::now();
                     g_fault_active.store(true); g_faulty_cam.store((int)i);
                     g_fault_on_master.store(is_master_pc);
@@ -1332,9 +1333,17 @@ int main() {
                 cout << "[Recording #" << g_recording_number << "] Done in " << fixed << setprecision(1)
                      << dump_duration + jpg_duration << "s (appended to session log)" << endl;
 
+                // Reset health timers so post-dump health check doesn't false-trigger
+                auto post_dump_now = chrono::steady_clock::now();
+                for (auto& ctx : cam_ctxs) ctx->last_frame_time.store(post_dump_now);
+                cout << "[DEBUG] Health timers reset, clearing is_dumping flag" << endl;
+
                 is_dumping = false;
                 while (cv::waitKey(1) >= 0);
                 last_ui_time = chrono::steady_clock::now();
+
+                cout << "[DEBUG] Post-dump: entering main loop, is_dumping=" << is_dumping.load()
+                     << " global_running=" << global_running.load() << endl;
             }
         }
 
