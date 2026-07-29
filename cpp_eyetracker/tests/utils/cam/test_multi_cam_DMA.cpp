@@ -579,6 +579,11 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
 
         if (ctx->recording) {
             int seq = ctx->recorded_frames.load(std::memory_order_relaxed);
+            if (seq >= ctx->total_record_frames) {
+                static atomic<int> overflow_log{0};
+                if (overflow_log++ < 3)
+                    cout << "[DEBUG-CPW-OVF] cam" << ctx->index << " seq=" << seq << " >= total=" << ctx->total_record_frames << endl;
+            }
             if (seq < ctx->total_record_frames) {
                 // DMA: store GrabResultPtr — keeps Pylon DMA buffer alive, zero CPU copy
                 ctx->dma_frames[seq] = task.first;
@@ -622,6 +627,10 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
             ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
             ctx->has_streamed.store(true, memory_order_relaxed);
         } else {
+            // DEBUG: why is recording false?
+            static atomic<int> notrec_log{0};
+            if (notrec_log++ < 3)
+                cout << "[DEBUG-CPW-NR] cam" << ctx->index << " NOT recording, q=" << ctx->copy_queue.size() << endl;
             // Standby: clone single frame for UI preview
             cv::Mat temp(task.first->GetHeight(), task.first->GetWidth(), CV_8UC1, task.first->GetBuffer());
             {
