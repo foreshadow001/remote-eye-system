@@ -592,7 +592,11 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
                     ctx->latest_meta = task.second;
                 }
 
-                // ---- metrics: first frame ----
+                // DEBUG
+                if (seq <= 3 || seq % 50 == 0)
+                    cout << "[DEBUG-CPW] cam" << ctx->index << " seq=" << seq
+                         << " blk=" << task.second.blockID << " q=" << ctx->copy_queue.size() << endl;
+
                 if (seq == 0) {
                     ctx->first_recorded_block_id = task.second.blockID;
                     ctx->first_frame_time = chrono::steady_clock::now();
@@ -682,9 +686,14 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
         }
 
         if (ctx->offset_initialized) {
-            // 对于硬件触发(offset=0)，blockID自然保持严格一致
-            meta.blockID = meta.blockID - ctx->frame_offset; 
+            meta.blockID = meta.blockID - ctx->frame_offset;
             ctx->captured_frames++;
+
+            // DEBUG
+            static atomic<int> cb_count{0}; int n = ++cb_count;
+            if (n <= 5 || n % 100 == 0)
+                cout << "[DEBUG-CB] cam" << ctx->index << " frame #" << n
+                     << " blk=" << meta.blockID << " q=" << ctx->copy_queue.size() << endl;
 
             lock_guard<mutex> lock(ctx->copy_mtx);
             if (ctx->recording) {
@@ -1176,8 +1185,8 @@ int main() {
             }
         }
 
-        // ===== 1. 相机健康检查 =====
-        if (!g_fault_active.load() && !is_dumping.load()) {
+        // ===== 1. 相机健康检查 (TEMPORARILY DISABLED) =====
+        if (false && !g_fault_active.load() && !is_dumping.load()) {
             auto now = std::chrono::steady_clock::now();
             for (size_t i = 0; i < cam_ctxs.size(); ++i) {
                 if (!cam_ctxs[i]->has_streamed.load()) continue;
