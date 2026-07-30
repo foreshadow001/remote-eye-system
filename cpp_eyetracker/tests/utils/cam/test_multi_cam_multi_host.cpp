@@ -347,6 +347,10 @@ void udpListenerWorker(const string& bind_ip, int port) {
                 cout << "[Slave] Received SHUTDOWN from master." << endl;
                 global_running = false;
             }
+            else if (cmd == "CLEAR") {
+                g_recording_number = 0;
+                cout << "[Slave] Received CLEAR from master. Recording counter reset." << endl;
+            }
         } 
     }
     closesocket(sock);
@@ -1220,7 +1224,7 @@ int main() {
                 if (is_recording) hints = "[REC] Recording in progress...";
                 else if (is_dumping) hints = "[DUMP] Writing to disk...";
                 else if (enable_net_sync && !is_master_pc) hints = "[r][space][q] disabled (Slave)  |  Waiting for Master...";
-                else hints = "[r] record  [space] photo  [ESC/q] quit";
+                else hints = "[r] record  [space] photo  [c] clear  [ESC/q] quit";
                 cv::putText(canvas, hints, cv::Point(hx, hy),
                             cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
                 hy += 18;
@@ -1429,6 +1433,17 @@ int main() {
                         cv::imwrite(fn, out_snapshot);
                         cout << "  -> Saved " << fn << endl;
                     }
+                }
+            }
+        } else if ((key == 'c' || key == 'C') && !is_recording && !is_dumping) {
+            if (enable_net_sync && !is_master_pc) {
+                // Slave: ignore 'c' when net sync is on
+            } else {
+                g_recording_number = 0;
+                cout << "\n[Clear] Recording counter reset to 0" << endl;
+                if (enable_net_sync && is_master_pc) {
+                    fastUdpSend("CLEAR");
+                    cout << "[Master] Sent CLEAR to slave" << endl;
                 }
             }
         }
