@@ -737,6 +737,8 @@ void udpListenerWorker(const string& bind_ip, int port) {
                             fs::remove(e.path());
                     }
                 }
+                g_capture_count = 0;
+                g_last_capture_index = -1;
                 fastUdpSend(client_addr, "CLEAR_DONE");
                 cout << "[Slave] Cleared." << endl;
             }
