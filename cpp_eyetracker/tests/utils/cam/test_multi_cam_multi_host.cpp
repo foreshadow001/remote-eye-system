@@ -317,6 +317,9 @@ void udpListenerWorker(const string& bind_ip, int port) {
             buffer[bytes] = '\0';
             string cmd(buffer);
             // [修改] 识别带时间戳的指令，瞬间开火
+            static int udp_msg_count = 0;
+            if (++udp_msg_count <= 20 || udp_msg_count % 50 == 0)
+                cout << "[Slave UDP] rcvd(" << bytes << "): '" << cmd << "'" << endl;
             if (cmd.rfind("CMD_START:", 0) == 0) {
                 if (cmd.length() <= 10) { logException("WARN", "slave", "CMD_START truncated"); continue; }
                 instantTrigger();
@@ -347,9 +350,9 @@ void udpListenerWorker(const string& bind_ip, int port) {
                 cout << "[Slave] Received SHUTDOWN from master." << endl;
                 global_running = false;
             }
-            else if (cmd == "CLEAR") {
+            else if (cmd.rfind("CLEAR", 0) == 0) {
                 g_recording_number = 0;
-                cout << "[Slave] Received CLEAR from master. Recording counter reset." << endl;
+                cout << "[Slave] Received CLEAR from master. Counter reset." << endl;
             }
         } 
     }
@@ -1442,8 +1445,8 @@ int main() {
                 g_recording_number = 0;
                 cout << "\n[Clear] Recording counter reset to 0" << endl;
                 if (enable_net_sync && is_master_pc) {
+                    cout << "[Master] Sending CLEAR to slave..." << endl;
                     fastUdpSend("CLEAR");
-                    cout << "[Master] Sent CLEAR to slave" << endl;
                 }
             }
         }
