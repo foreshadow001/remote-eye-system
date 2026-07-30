@@ -686,6 +686,7 @@ void udpListenerWorker(const string& bind_ip, int port) {
                     }
                 }
                 g_last_capture_index.store(idx - 1, memory_order_relaxed);
+                if (g_capture_count > 0) g_capture_count--;
             }
             else if (cmd == "LIST") {
                 cout << "[Slave] LIST request" << endl;
