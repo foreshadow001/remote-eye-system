@@ -84,6 +84,7 @@ atomic<bool> g_fault_active{false};
 atomic<int> g_faulty_cam{-1};
 atomic<bool> g_fault_on_master{false};
 atomic<int> g_last_capture_index{-1};
+atomic<bool> g_capturing{false};  // block keys during capture
 chrono::steady_clock::time_point g_ready_time;
 chrono::steady_clock::time_point g_fault_time;
 int g_win_w = 1224;
@@ -654,6 +655,7 @@ void udpListenerWorker(const string& bind_ip, int port) {
                 cout << "[Slave] PHOTO " << img_idx << endl;
                 g_last_capture_index.store(img_idx, memory_order_relaxed);
                 g_capture_count++;
+                g_capturing = true;
 
                 for (auto& ctx : cam_ctxs) {
                     cv::Mat snapshot;
@@ -672,6 +674,7 @@ void udpListenerWorker(const string& bind_ip, int port) {
                             cout << "  -> Saved " << fn << endl;
                     }
                 }
+                g_capturing = false;
             }
             else if (cmd.rfind("UNDO:", 0) == 0) {
                 if (cmd.length() <= 5) { logException("WARN", "slave", "UNDO msg truncated"); continue; }
@@ -1062,7 +1065,10 @@ int main() {
         // ===== 3. 键盘事件 =====
         char key = static_cast<char>(cv::waitKey(1));
 
-        if (key == 27 || key == 'q') {
+        if (g_capturing.load()) {
+            // Block all keys during capture (all cameras must finish)
+        }
+        else if (key == 27 || key == 'q') {
             if (g_enable_net_sync) {
                 if (g_is_master) {
                     fastUdpSend(g_peer_fault_addr, "SHUTDOWN");
@@ -1095,6 +1101,7 @@ int main() {
 
                 g_last_capture_index.store(counter, memory_order_relaxed);
                 g_capture_count++;
+                g_capturing = true;
                 cout << "\n[Photo] Capturing index " << counter << endl;
                 if (g_session_log.is_open())
                     g_session_log << "* [CAPTURE] `" << counter << "`\n" << flush;
@@ -1115,6 +1122,7 @@ int main() {
                             cout << "  -> Saved " << fn << endl;
                     }
                 }
+                g_capturing = false;
             }
         }
         else if ((key == 't' || key == 'T') && g_enable_net_sync && !g_is_master) {
