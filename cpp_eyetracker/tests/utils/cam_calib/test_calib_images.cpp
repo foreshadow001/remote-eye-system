@@ -674,6 +674,7 @@ void udpListenerWorker(const string& bind_ip, int port) {
                             cout << "  -> Saved " << fn << endl;
                     }
                 }
+                while (cv::waitKey(1) >= 0);  // flush buffered keys
                 g_capturing = false;
             }
             else if (cmd.rfind("UNDO:", 0) == 0) {
@@ -1122,6 +1123,7 @@ int main() {
                             cout << "  -> Saved " << fn << endl;
                     }
                 }
+                while (cv::waitKey(1) >= 0);  // flush buffered keys
                 g_capturing = false;
             }
         }
