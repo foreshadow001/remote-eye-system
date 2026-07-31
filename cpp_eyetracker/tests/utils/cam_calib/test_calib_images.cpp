@@ -674,8 +674,7 @@ void udpListenerWorker(const string& bind_ip, int port) {
                             cout << "  -> Saved " << fn << endl;
                     }
                 }
-                while (cv::waitKey(1) >= 0);  // flush buffered keys
-                g_capturing = false;
+                // g_capturing stays true until next UI render
             }
             else if (cmd.rfind("UNDO:", 0) == 0) {
                 if (cmd.length() <= 5) { logException("WARN", "slave", "UNDO msg truncated"); continue; }
@@ -1066,8 +1065,9 @@ int main() {
         // ===== 3. 键盘事件 =====
         char key = static_cast<char>(cv::waitKey(1));
 
-        if (g_capturing.load()) {
-            // Block all keys during capture (all cameras must finish)
+        if (g_capturing.exchange(false)) {
+            // Drain buffered keys and block — capture just finished
+            while (cv::waitKey(1) >= 0);
         }
         else if (key == 27 || key == 'q') {
             if (g_enable_net_sync) {
@@ -1123,8 +1123,7 @@ int main() {
                             cout << "  -> Saved " << fn << endl;
                     }
                 }
-                while (cv::waitKey(1) >= 0);  // flush buffered keys
-                g_capturing = false;
+                // g_capturing stays true until next UI render
             }
         }
         else if ((key == 't' || key == 'T') && g_enable_net_sync && !g_is_master) {
