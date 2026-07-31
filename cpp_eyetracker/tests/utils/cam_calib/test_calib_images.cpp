@@ -1071,6 +1071,7 @@ int main() {
         }
 
         // ===== 3. 键盘事件 =====
+        if (g_capturing.load()) g_capturing = false;  // overlay shown for one frame, now clear
         char key = static_cast<char>(cv::waitKey(1));
 
         if (key == 27 || key == 'q') {
@@ -1127,7 +1128,7 @@ int main() {
                             cout << "  -> Saved " << fn << endl;
                     }
                 }
-                g_capturing = false;
+                // g_capturing cleared after next render
             }
         }
         else if ((key == 't' || key == 'T') && g_enable_net_sync && !g_is_master) {
