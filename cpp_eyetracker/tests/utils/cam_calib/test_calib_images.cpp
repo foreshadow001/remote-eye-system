@@ -674,7 +674,7 @@ void udpListenerWorker(const string& bind_ip, int port) {
                             cout << "  -> Saved " << fn << endl;
                     }
                 }
-                // g_capturing stays true until next UI render
+                g_capturing = false;
             }
             else if (cmd.rfind("UNDO:", 0) == 0) {
                 if (cmd.length() <= 5) { logException("WARN", "slave", "UNDO msg truncated"); continue; }
@@ -1057,6 +1057,14 @@ int main() {
                 cv::line(canvas, cv::Point(cx - cl, cy), cv::Point(cx + cl, cy), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
                 cv::line(canvas, cv::Point(cx, cy - cl), cv::Point(cx, cy + cl), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
 
+                // CAPTURING overlay
+                if (g_capturing.load()) {
+                    int bl; cv::Size sz = cv::getTextSize("CAPTURING...", cv::FONT_HERSHEY_SIMPLEX, 1.5, 3, &bl);
+                    cv::putText(canvas, "CAPTURING...",
+                                cv::Point(cx - sz.width / 2, cy + sz.height / 2),
+                                cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0, 0, 255), 3, cv::LINE_AA);
+                }
+
                 cv::imshow("Calib Capture", canvas);
             }
             last_ui_time = current_time;
@@ -1065,11 +1073,7 @@ int main() {
         // ===== 3. 键盘事件 =====
         char key = static_cast<char>(cv::waitKey(1));
 
-        if (g_capturing.exchange(false)) {
-            // Drain buffered keys and block — capture just finished
-            while (cv::waitKey(1) >= 0);
-        }
-        else if (key == 27 || key == 'q') {
+        if (key == 27 || key == 'q') {
             if (g_enable_net_sync) {
                 if (g_is_master) {
                     fastUdpSend(g_peer_fault_addr, "SHUTDOWN");
@@ -1123,7 +1127,7 @@ int main() {
                             cout << "  -> Saved " << fn << endl;
                     }
                 }
-                // g_capturing stays true until next UI render
+                g_capturing = false;
             }
         }
         else if ((key == 't' || key == 'T') && g_enable_net_sync && !g_is_master) {
