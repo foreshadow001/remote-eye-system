@@ -84,7 +84,6 @@ atomic<bool> g_fault_active{false};
 atomic<int> g_faulty_cam{-1};
 atomic<bool> g_fault_on_master{false};
 atomic<int> g_last_capture_index{-1};
-atomic<bool> g_capturing{false};  // block keys during capture
 chrono::steady_clock::time_point g_ready_time;
 chrono::steady_clock::time_point g_fault_time;
 int g_win_w = 1224;
@@ -655,7 +654,6 @@ void udpListenerWorker(const string& bind_ip, int port) {
                 cout << "[Slave] PHOTO " << img_idx << endl;
                 g_last_capture_index.store(img_idx, memory_order_relaxed);
                 g_capture_count++;
-                g_capturing = true;
 
                 for (auto& ctx : cam_ctxs) {
                     cv::Mat snapshot;
@@ -674,7 +672,6 @@ void udpListenerWorker(const string& bind_ip, int port) {
                             cout << "  -> Saved " << fn << endl;
                     }
                 }
-                g_capturing = false;
             }
             else if (cmd.rfind("UNDO:", 0) == 0) {
                 if (cmd.length() <= 5) { logException("WARN", "slave", "UNDO msg truncated"); continue; }
@@ -1057,21 +1054,12 @@ int main() {
                 cv::line(canvas, cv::Point(cx - cl, cy), cv::Point(cx + cl, cy), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
                 cv::line(canvas, cv::Point(cx, cy - cl), cv::Point(cx, cy + cl), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
 
-                // CAPTURING overlay
-                if (g_capturing.load()) {
-                    int bl; cv::Size sz = cv::getTextSize("CAPTURING...", cv::FONT_HERSHEY_SIMPLEX, 1.5, 3, &bl);
-                    cv::putText(canvas, "CAPTURING...",
-                                cv::Point(cx - sz.width / 2, cy + sz.height / 2),
-                                cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0, 0, 255), 3, cv::LINE_AA);
-                }
-
                 cv::imshow("Calib Capture", canvas);
             }
             last_ui_time = current_time;
         }
 
         // ===== 3. 键盘事件 =====
-        if (g_capturing.load()) g_capturing = false;  // overlay shown for one frame, now clear
         char key = static_cast<char>(cv::waitKey(1));
 
         if (key == 27 || key == 'q') {
@@ -1107,7 +1095,6 @@ int main() {
 
                 g_last_capture_index.store(counter, memory_order_relaxed);
                 g_capture_count++;
-                g_capturing = true;
                 cout << "\n[Photo] Capturing index " << counter << endl;
                 if (g_session_log.is_open())
                     g_session_log << "* [CAPTURE] `" << counter << "`\n" << flush;
@@ -1128,7 +1115,6 @@ int main() {
                             cout << "  -> Saved " << fn << endl;
                     }
                 }
-                // g_capturing cleared after next render
             }
         }
         else if ((key == 't' || key == 'T') && g_enable_net_sync && !g_is_master) {
