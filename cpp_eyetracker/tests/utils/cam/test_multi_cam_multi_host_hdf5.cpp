@@ -749,16 +749,16 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
         int cam_h = ctx->ram_buffer[0].rows;
         int cam_w = ctx->ram_buffer[0].cols;
 
-        // Open or create HDF5 file
         stringstream ss; ss << ctx->hdf5_dir << "/" << setw(4) << setfill('0') << g_chunk_idx << ".h5";
         string path = ss.str();
-        H5::H5File f(path, fs::exists(path) ? H5F_ACC_RDWR : H5F_ACC_TRUNC);
+        bool exists = fs::exists(path);
+        H5::H5File f(path, exists ? H5F_ACC_RDWR : H5F_ACC_TRUNC);
         H5::DataSet raw_ds, gaze_ds, valid_ds;
-        try {
+        if (exists) {
             raw_ds = f.openDataSet("raw_image");
             gaze_ds = f.openDataSet("gaze_target");
             valid_ds = f.openDataSet("valid");
-        } catch (const H5::Exception&) {
+        } else {
             hsize_t rd[3] = {(hsize_t)g_hdf5_chunk_capacity, (hsize_t)cam_h, (hsize_t)cam_w};
             raw_ds = f.createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd));
             hsize_t gd[2] = {(hsize_t)g_hdf5_chunk_capacity, 2};
