@@ -726,39 +726,52 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
                        atomic<int>& finished_cams) {
     ctx->dump_start_time = chrono::steady_clock::now();
     int N = core_frames;
-    int cam_h = ctx->ram_buffer[0].rows;
-    int cam_w = ctx->ram_buffer[0].cols;
 
-    vector<uint8_t> raw_buf(N * cam_h * cam_w);
-    for (int i = 0; i < N; ++i) {
-        int src_idx = margin_frames + i;
-        if (src_idx < (int)ctx->ram_buffer.size())
-            memcpy(raw_buf.data() + i * cam_h * cam_w,
-                   ctx->ram_buffer[src_idx].data, cam_h * cam_w);
+    if (ctx->ram_buffer.empty() || N <= 0) {
+        logException("ERROR", "hdf5:cam" + to_string(ctx->index), "ram_buffer empty, skipping HDF5 write");
+        ctx->dump_end_time = chrono::steady_clock::now();
+        finished_cams++;
+        return;
     }
 
-    hsize_t start[3] = {(hsize_t)g_frame_offset, 0, 0};
-    hsize_t count[3] = {(hsize_t)N, (hsize_t)cam_h, (hsize_t)cam_w};
-    H5::DataSpace mem_sp(3, count);
-    H5::DataSpace file_sp = ctx->hdf5_raw_ds.getSpace();
-    file_sp.selectHyperslab(H5S_SELECT_SET, count, start);
-    ctx->hdf5_raw_ds.write(raw_buf.data(), H5::PredType::NATIVE_UINT8, mem_sp, file_sp);
+    try {
+        int cam_h = ctx->ram_buffer[0].rows;
+        int cam_w = ctx->ram_buffer[0].cols;
 
-    hsize_t gz_start[2] = {(hsize_t)g_frame_offset, 0};
-    hsize_t gz_count[2] = {(hsize_t)N, 2};
-    H5::DataSpace gz_mem(2, gz_count);
-    H5::DataSpace gz_file = ctx->hdf5_gaze_ds.getSpace();
-    gz_file.selectHyperslab(H5S_SELECT_SET, gz_count, gz_start);
-    vector<double> gz_buf(N * 2, 0.0);
-    ctx->hdf5_gaze_ds.write(gz_buf.data(), H5::PredType::NATIVE_DOUBLE, gz_mem, gz_file);
+        vector<uint8_t> raw_buf(N * cam_h * cam_w);
+        for (int i = 0; i < N; ++i) {
+            int src_idx = margin_frames + i;
+            if (src_idx < (int)ctx->ram_buffer.size())
+                memcpy(raw_buf.data() + i * cam_h * cam_w,
+                       ctx->ram_buffer[src_idx].data, cam_h * cam_w);
+        }
 
-    hsize_t v_start[1] = {(hsize_t)g_frame_offset};
-    hsize_t v_count[1] = {(hsize_t)N};
-    H5::DataSpace v_mem(1, v_count);
-    H5::DataSpace v_file = ctx->hdf5_valid_ds.getSpace();
-    v_file.selectHyperslab(H5S_SELECT_SET, v_count, v_start);
-    vector<uint8_t> v_buf(N, 1);
-    ctx->hdf5_valid_ds.write(v_buf.data(), H5::PredType::NATIVE_UINT8, v_mem, v_file);
+        hsize_t start[3] = {(hsize_t)g_frame_offset, 0, 0};
+        hsize_t count[3] = {(hsize_t)N, (hsize_t)cam_h, (hsize_t)cam_w};
+        H5::DataSpace mem_sp(3, count);
+        H5::DataSpace file_sp = ctx->hdf5_raw_ds.getSpace();
+        file_sp.selectHyperslab(H5S_SELECT_SET, count, start);
+        ctx->hdf5_raw_ds.write(raw_buf.data(), H5::PredType::NATIVE_UINT8, mem_sp, file_sp);
+
+        hsize_t gz_start[2] = {(hsize_t)g_frame_offset, 0};
+        hsize_t gz_count[2] = {(hsize_t)N, 2};
+        H5::DataSpace gz_mem(2, gz_count);
+        H5::DataSpace gz_file = ctx->hdf5_gaze_ds.getSpace();
+        gz_file.selectHyperslab(H5S_SELECT_SET, gz_count, gz_start);
+        vector<double> gz_buf(N * 2, 0.0);
+        ctx->hdf5_gaze_ds.write(gz_buf.data(), H5::PredType::NATIVE_DOUBLE, gz_mem, gz_file);
+
+        hsize_t v_start[1] = {(hsize_t)g_frame_offset};
+        hsize_t v_count[1] = {(hsize_t)N};
+        H5::DataSpace v_mem(1, v_count);
+        H5::DataSpace v_file = ctx->hdf5_valid_ds.getSpace();
+        v_file.selectHyperslab(H5S_SELECT_SET, v_count, v_start);
+        vector<uint8_t> v_buf(N, 1);
+        ctx->hdf5_valid_ds.write(v_buf.data(), H5::PredType::NATIVE_UINT8, v_mem, v_file);
+    } catch (const H5::Exception& e) {
+        logException("ERROR", "hdf5:cam" + to_string(ctx->index),
+                     string("HDF5 write failed: ") + e.getCDetailMsg());
+    }
 
     ctx->dump_end_time = chrono::steady_clock::now();
     finished_cams++;
