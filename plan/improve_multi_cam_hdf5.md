@@ -281,6 +281,278 @@ void updateSentry(const string& participant_root) {
 
 耗时 < 1ms。两次录制之间发送 SHUTDOWN 崩溃也不会丢失位点，因为更新在每次录制完成后立即执行。
 
+### 5.3 `chunk_idx` 和 `frame_offset` 的递增规则
+
+#### 递增时机
+
+| 时间点 | 代码位置 | 操作 |
+|--------|----------|------|
+| **录制完成后** | `main()` dump 完成后 | `g_frame_offset += core_frames`；若 `>= capacity`：`g_chunk_idx++`，`g_frame_offset -= capacity`；写 `updateSentry()` |
+
+唯一递增点，没有预检。`g_frame_offset` 始终 ≤ capacity，因为每次溢出都立即回卷。
+
+#### 初始化规则
+
+| 条件 | 代码位置 | 操作 |
+|------|----------|------|
+| **程序启动** | `main()` 中 `initSentry(g_sentry_root)` | 读 `sentry.txt`。若文件存在：加载 `chunk_idx` 和 `frame_offset`。若文件不存在（首次运行）：初始化为 `(0, 0)` 并创建文件 |
+| **每轮录制开始** | `instantTrigger()` | **不重置** sentry。sentry 是跨录制持久化的全局位点，类似"文件写入指针" |
+| **程序退出** | 无操作 | sentry 已在每次录制完成后写入磁盘，退出时无需额外保存 |
+
+**Master 和 Slave 各自独立初始化**：双方都调用 `initSentry()` 读取自己本地的 `sentry.txt`。若文件不存在则从 `(0,0)` 开始。双方不交换初始化值——各自对自己的本地相机负责。
+
+**重启动后恢复**：sentry.txt 是纯文本文件，持久化在磁盘上。程序崩溃或正常退出后重启，自动从上次的位点继续写入，不会覆盖已有数据。
+
+#### 什么情况下递增
+
+**每台相机的 `dump_ready` 机制**：
+
+每台相机在 `copyWorker` 中独立计数。当该相机的 `recorded_frames` 达到 `total_record_frames`（如 220）时，该相机设置 `ctx->dump_ready = true`。注意 `total_record_frames` 包含 margin 帧（220 = 200 core + 20 margin），但最终写入 HDF5 的只有 `core_frames`（200 帧，取中间部分）。
+
+主循环的 `all_done` 检查遍历所有相机，**所有相机**的 `dump_ready` 都为 true 时才进入 dump 阶段：
+
+```cpp
+bool all_done = true;
+for (auto& ctx : cam_ctxs)
+    if (!ctx->dump_ready.load()) { all_done = false; break; }
+if (all_done) {
+    // → dump → g_frame_offset += core_frames
+}
+```
+
+因此递增条件是：
+
+所有相机都成功写满 `ram_buffer`（`all_done == true`）→ 进入 dump 阶段。dump 阶段的完整流程：
+
+```
+all_done == true               ← 10 台相机全部 dump_ready
+  │
+  ├─ is_recording = false
+  ├─ is_dumping = true          ← 健康检查在此阶段被跳过
+  ├─ g_recording_number++
+  │
+  ├─ for (每个 ctx : cam_ctxs):              ← 串行，一台接一台
+  │     dumpToHdf5Worker(ctx, core_frames, margin_frames)
+  │        │
+  │        ├─ ctx->dump_start_time = now()
+  │        ├─ 打开/创建 <hdf5_dir>/<g_chunk_idx>.h5
+  │        ├─ 逐帧写入 raw_image[g_frame_offset : g_frame_offset+core_frames]
+  │        ├─ 写入 gaze_target（全 0）
+  │        ├─ 写入 valid（全 1）
+  │        ├─ H5File 析构关闭
+  │        └─ ctx->dump_end_time = now()
+  │
+  ├─ dump_duration = now() - dump_start_time
+  │
+  ├─ g_frame_offset += core_frames   ← 核心：sentry 位点前移
+  │     │
+  │     └─ 若 g_frame_offset >= capacity:
+  │           g_chunk_idx++
+  │           g_frame_offset -= capacity
+  │
+  ├─ updateSentry(g_sentry_root)     ← 将新位点写入 sentry.txt
+  │
+  ├─ 若 is_master: fastUdpSend("SENTRY:<chunk_idx>:<frame_offset>")
+  │
+  ├─ writeReport(...)                ← 写 session log
+  ├─ cout << "Done in X.Xs"
+  │
+  ├─ 重置 last_frame_time（防健康检查误判）
+  └─ is_dumping = false             ← 恢复健康检查
+```
+
+**关键点**：`g_frame_offset += core_frames` 在**所有相机 dump 全部成功完成之后**才执行。若某台相机的 HDF5 写入中途失败（被 try-catch 捕获），该相机的 ram_buffer 数据丢失，但 dump 循环继续，`g_frame_offset` 仍然递增。该相机在 HDF5 文件中对应位置为零（数据集创建时的默认填充值），`valid` 亦为零。
+
+**注意**：`g_frame_offset` 递增的是 `core_frames`（200），不是 `total_record_frames`（220）。margin 帧仅用于跨相机 BlockID 对齐，不写入 HDF5，不计入 sentry。
+
+#### 什么情况下不递增
+
+| 场景 | `g_frame_offset` | `g_chunk_idx` | 说明 |
+|------|-----------------|---------------|------|
+| 相机故障（FAULT） | 不递增 | 不递增 | 录制被中断，`all_done` 永远不会为 true，dump 代码块不执行 |
+| 程序崩溃/强杀 | 不递增 | 不递增 | `updateSentry()` 未执行，sentry.txt 保持上一次的值 |
+| 网络丢包导致 Slave 未收到 `CMD_START` | 不递增 | 不递增 | Slave 未触发录制 |
+
+#### Master 和 Slave sentry 不一致的两种场景
+
+Master 和 Slave 各自独立维护 sentry，各自对自己的相机负责。不一致可能发生在两个时间点：
+
+**场景一：刚打开程序时（启动时）**
+
+```
+上一次运行：
+  Master: 录制 #1(offset 0→200) → 录制 #2(offset 200→400) → updateSentry → 正常退出
+  Slave:  录制 #1(offset 0→200) → 录制 #2 中途崩溃 → sentry 停在 200
+  
+本次启动：
+  Master: initSentry() → 读 sentry.txt → (0, 400)
+  Slave:  initSentry() → 读 sentry.txt → (0, 200)   ← 不一致！
+```
+
+原因：上一次运行时 Slave 在某次录制中崩溃，`updateSentry()` 未执行，sentry 落后于 Master。
+
+**场景二：一次录制完成后（运行时）**
+
+```
+本次录制：
+  Master: 10 台相机全部正常，dump 完成 → g_frame_offset += 200 → updateSentry → (0, 400)
+  Slave:  某台相机 HDF5 写入失败（磁盘满/权限问题）→ 异常被 catch → dump 循环继续
+          → g_frame_offset += 200 → updateSentry → (0, 400)
+          
+  表面上看数值相同。但如果 Slave 相机在录制期间有 BlockID 跳变（丢帧但未触发 FAULT），
+  Slave 实际有效帧数可能少于 Master。两者的 frame_offset 相同但"实际数据质量"不同。
+  
+  更严重的情况：Slave 磁盘满导致 HDF5 创建失败（H5Fcreate failed），
+  异常被 catch 后 ram_buffer 数据丢失，但 sentry 仍然前移。
+  该相机的 HDF5 文件中对应位置全是零。
+```
+
+#### 统一处理方法
+
+**比较时要综合考虑 `chunk_idx` 和 `frame_offset`**，不能只看 `frame_offset`。将两者转换为全局帧号：
+
+```
+master_total = master_ci × capacity + master_fo
+slave_total  = slave_ci  × capacity + slave_fo
+```
+
+**采用较小值**（回退到落后的一方），用落后方的数据覆盖领先方的对应位置。这样可以覆盖可能无效的数据、节约存储空间：
+
+```
+若 master_total > slave_total:
+    → Master 领先，回退到 Slave 位点
+    → 双方都采用 (slave_ci, slave_fo)
+    → 下一轮录制从该位点重新写入，覆盖 Master 之前可能无效的数据
+
+若 slave_total > master_total:
+    → Slave 领先，回退到 Master 位点
+    → 双方都采用 (master_ci, master_fo)
+```
+
+**连续 3 次不一致 → ERROR + 退出**：
+
+维护全局计数器 `g_sentry_mismatch_count`。每次 sentry 不一致时 `++`，相同时清零。达到 3 次时：
+
+```
+logException("FATAL", "sentry",
+    "Sentry mismatch 3 consecutive times. Possible hardware fault. Exiting.")
+global_running = false
+```
+
+防止硬件故障（如某台相机持续丢帧）导致无限循环回退。
+
+```
+Slave dump 完成后:
+  ├─ g_frame_offset += core_frames
+  ├─ updateSentry(local)
+  └─ 等待 SENTRY 消息到达
+       │
+       ├─ 收到 master_ci, master_fo
+       ├─ master_total = master_ci × capacity + master_fo
+       ├─ slave_total  = slave_ci  × capacity + slave_fo
+       │
+       ├─ 若 master_total == slave_total → 正常，g_sentry_mismatch_count = 0
+       │
+       └─ 若不同:
+             ├─ g_sentry_mismatch_count++
+             ├─ 采用 min(master_total, slave_total) → 回退到落后方
+             ├─ 双方都设置为较小值对应的 (chunk_idx, frame_offset)
+             ├─ logException("WARN", "sentry", "mismatch #" + to_string(count)
+             │     + ": Master(" + ... + ") Slave(" + ... + "), using min")
+             ├─ updateSentry(local)  // 重写本地 sentry.txt
+             │
+             └─ 若 g_sentry_mismatch_count >= 3:
+                   logException("FATAL", "sentry", "3 consecutive mismatches, exiting")
+                   global_running = false
+```
+
+**为什么采用较小值**：领先方的最后一段数据可能无效（例如 Slave 某相机 HDF5 写入失败导致全零帧）。回退后重新录制，用新的有效数据覆盖。代价是浪费一段存储空间（最多 `core_frames` 帧），但保证数据质量。
+
+#### 当前代码中 `g_frame_offset` 是 `atomic<int>`
+
+这是早期并发 dump 线程的遗留。现在已改为串行 for 循环，`atomic` 不再必要，但保留也不影响正确性。注意 `g_frame_offset += core_frames` 在主线程中执行，`g_frame_offset` 仅在 dump 线程中**读取**（串行 for 循环中每次调 `dumpToHdf5Worker` 时读取），无竞争。
+
+### 5.4 Master/Slave 同步时序分析
+
+#### 当前实现
+
+**Master**（以一次录制为例，`core_frames=200`）：
+
+| 时间点 | 操作 | g_chunk_idx | g_frame_offset |
+|--------|------|-------------|----------------|
+| T0 启动 | `initSentry()` 读 `sentry.txt` | 0 | 1600 |
+| T1 录制前 | chunk 空间检查：`1600+200=1800 ≤ 2000`，无需换 chunk | 0 | 1600 |
+| T2 录制 | `instantTrigger()` → copyWorker 写入 ram_buffer | 0 | 1600 |
+| T3 dump 后 | `g_frame_offset += 200` → `1800`；`1800 ≤ 2000`，无需换 chunk；`updateSentry()` 写 `0\n1800\n` | 0 | 1800 |
+| T4 同步 | `fastUdpSend("SENTRY:0:1800")` | 0 | 1800 |
+
+**Slave**：
+
+| 时间点 | 操作 | g_chunk_idx | g_frame_offset |
+|--------|------|-------------|----------------|
+| T0 启动 | `initSentry()` 读 `sentry.txt` | 0 | 1600 |
+| T1 | 收到 `CMD_START` → `instantTrigger()` | 0 | 1600 |
+| T2 dump 后 | `g_frame_offset += 200` → `1800`；`updateSentry()` 写 `0\n1800\n` | 0 | 1800 |
+| T3 | 收到 `SENTRY:0:1800` → 覆盖 `g_chunk_idx=0, g_frame_offset=1800`，写 `sentry.txt` | 0 | 1800 |
+
+正常情况下 T2 和 T3 的值相同。SENTRY 消息起到"对账"作用——若 slave 因丢帧导致偏移落后，SENTRY 可修正；若 slave 的 UDP 消息丢失，自身 T2 也能正确更新。
+
+#### 当前问题
+
+1. **SENTRY 延迟到达**：Master 的 SENTRY 通过 UDP 发送，可能在下一次录制中途才到达 slave。这不影响正确性——slave 自身已在 T2 更新了 sentry，SENTRY 只是二次确认。但控制台日志会显示 SENTRY 出现在下一段录制的 I/O PREPARED 之后。
+
+2. **slave 多录一次**：上一轮测试中 slave 出现了 11 次录制而 master 只有 10 次。根因是 `net_cmd_record` 被旧 SENTRY 或其他 UDP 消息意外触发。`SENTRY` 消息不应触发录制——需在 `udpListenerWorker` 中确认 `SENTRY` 不会被误当作 `CMD_START`。
+
+#### 修改后方案：各自维护 + 握手校验
+
+Master 和 Slave **完全独立**地按相同逻辑维护自身 `(chunk_idx, frame_offset)`，录制完成后双方均更新本地 sentry。更新完毕后，Master 发送自己的值给 Slave，Slave 与自身值比对。
+
+> **核心原则**：Master 和 Slave 各自对自己本地的相机负责。若 Slave 相机丢帧，Slave 的 `frame_offset` 应反映真实写入量，不能被 Master 的值无声覆盖。
+
+**修改后时序**：
+
+| 时间点 | Master | Slave |
+|--------|--------|-------|
+| T0 启动 | `initSentry()` 读本地 `sentry.txt` | `initSentry()` 读本地 `sentry.txt` |
+| T1 | 按 'r' → `fastUdpSend("CMD_START:...")` | 收到 `CMD_START` → `instantTrigger()` |
+| T2 | 录制 + dump → `g_frame_offset += core_frames` | 录制 + dump → `g_frame_offset += core_frames` |
+| T3 | 若溢出 → `g_chunk_idx++, g_frame_offset -= capacity` | 同上 |
+| T4 | `updateSentry()` 写本地 | `updateSentry()` 写本地 |
+| T5 | `fastUdpSend("SENTRY:<chunk_idx>:<frame_offset>")` | — |
+| T6 | — | 收到 `SENTRY`，**比对**本地的 `(chunk_idx, frame_offset)` |
+
+**T6 比对逻辑（Slave 端）**：
+
+```
+收到 SENTRY:<master_ci>:<master_fo>
+    本地 slave_ci, slave_fo
+
+若 master_ci == slave_ci && master_fo == slave_fo:
+    → 正常，无需操作
+
+若 master_ci != slave_ci || master_fo != slave_fo:
+    → [WARN] 打印差异，采用 Master 值（Master 为权威），
+       但保留 Slave 值记录到 session log（用于事后排查 Slave 相机故障）
+       g_chunk_idx = master_ci; g_frame_offset = master_fo;
+       重写本地 sentry.txt
+```
+
+**为什么差异意味着 Slave 相机故障**：
+- Master 的 `frame_offset` 反映 Master 相机组的真实写入帧数
+- Slave 的 `frame_offset` 反映 Slave 相机组的真实写入帧数
+- 两者应始终相等。若不等，说明某一端有相机丢帧或写入失败
+- 采用 Master 值保证 sentry 位点一致（下次录制从同一位置开始），但**记录差异到 session log** 用于事后审计
+
+---
+
+**修改后对比**：
+
+| | 旧方案 | 新方案 |
+|---|--------|--------|
+| Slave sentry 维护 | 自身更新 + 被 Master 覆盖 | 自身独立更新 + Master 发来的值做比对校验 |
+| 差异处理 | 静默覆盖 | 打印 WARN + 记录到 session log + 采用 Master 值 |
+| 故障发现 | 无 | Slave 相机丢帧时可从 session log 发现 `frame_offset` 不一致 |
+
 ---
 
 ## 六、跨 chunk 写入的处理

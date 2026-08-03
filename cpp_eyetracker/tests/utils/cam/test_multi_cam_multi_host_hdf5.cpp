@@ -150,6 +150,8 @@ atomic<int> g_frame_offset{0};
 vector<string> g_participant_roots;
 string g_sentry_root;  // = g_participant_roots[0]
 int g_hdf5_chunk_capacity = 2000;
+int g_sentry_mismatch_count = 0;  // consecutive SENTRY mismatches
+int g_consecutive_faults = 0;     // consecutive recording failures (all_done never true)
 
 // ================== 会话日志 ==================
 string g_session_log_path;
@@ -362,13 +364,39 @@ void udpListenerWorker(const string& bind_ip, int port) {
             else if (cmd.rfind("SENTRY:", 0) == 0) {
                 auto p1 = cmd.find(':', 7);
                 if (p1 != string::npos) {
-                    g_chunk_idx = stoi(cmd.substr(7, p1 - 7));
-                    g_frame_offset = stoi(cmd.substr(p1 + 1));
-                    // Plain-text sentry — no HDF5, no thread-safety issues
-                    string sp = g_sentry_root + "/sentry.txt";
-                    ofstream out(sp);
-                    out << g_chunk_idx << "\n" << g_frame_offset << "\n";
-                    cout << "[Slave] SENTRY synced: chunk=" << g_chunk_idx << " offset=" << g_frame_offset << endl;
+                    int m_ci = stoi(cmd.substr(7, p1 - 7));
+                    int m_fo = stoi(cmd.substr(p1 + 1));
+                    int64_t master_total = (int64_t)m_ci * g_hdf5_chunk_capacity + m_fo;
+                    int64_t slave_total  = (int64_t)g_chunk_idx * g_hdf5_chunk_capacity + g_frame_offset;
+
+                    if (master_total == slave_total) {
+                        g_sentry_mismatch_count = 0;
+                    } else {
+                        g_sentry_mismatch_count++;
+                        // Use the smaller total — overwrite potentially invalid trailing data
+                        if (master_total < slave_total) {
+                            g_chunk_idx = m_ci;
+                            g_frame_offset = m_fo;
+                        }
+                        // else: slave is already at the smaller position, keep current values
+
+                        string sp = g_sentry_root + "/sentry.txt";
+                        ofstream out(sp);
+                        out << g_chunk_idx << "\n" << g_frame_offset << "\n";
+
+                        logException("WARN", "sentry",
+                            "Mismatch #" + to_string(g_sentry_mismatch_count)
+                            + ": Master(" + to_string(m_ci) + "," + to_string(m_fo) + ")"
+                            + " Slave(" + to_string(g_chunk_idx) + "," + to_string(g_frame_offset.load()) + ")"
+                            + " total " + to_string(master_total) + " vs " + to_string(slave_total)
+                            + " — using min");
+
+                        if (g_sentry_mismatch_count >= 3) {
+                            logException("FATAL", "sentry",
+                                "3 consecutive SENTRY mismatches — possible hardware fault, exiting.");
+                            global_running = false;
+                        }
+                    }
                 }
             }
         } 
@@ -1289,6 +1317,13 @@ int main() {
                     g_fault_time = std::chrono::steady_clock::now();
                     g_fault_active.store(true); g_faulty_cam.store((int)i);
                     g_fault_on_master.store(is_master_pc);
+                    g_consecutive_faults++;
+                    if (g_consecutive_faults >= 3) {
+                        logException("FATAL", "health",
+                            "3 consecutive recording failures (all_done never true). Exiting.");
+                        global_running = false;
+                        break;
+                    }
                     if (enable_net_sync && g_fault_sock != INVALID_SOCKET) {
                         string fm = "FAULT:" + string(is_master_pc ? "M" : "S") + to_string(i);
                         sendto(g_fault_sock, fm.c_str(), (int)fm.length(), 0,
@@ -1356,6 +1391,7 @@ int main() {
             for (auto& ctx : cam_ctxs) if (!ctx->dump_ready.load()) { all_done = false; break; }
 
             if (all_done) {
+                g_consecutive_faults = 0;  // recording success — reset fault counter
                 is_recording = false;
                 is_dumping = true;
                 g_recording_number++;
@@ -1477,14 +1513,6 @@ int main() {
             cout << "[Info] RAM CAPTURE STARTED. PREPARING I/O ASYNC..." << endl;
 
             // HDF5: no temp_raw directories needed — data goes directly to HDF5
-
-            // HDF5: check chunk space before recording
-            if (g_frame_offset + core_frames > g_hdf5_chunk_capacity) {
-                g_chunk_idx++;
-                g_frame_offset = 0;
-                updateSentry(g_sentry_root);
-                cout << "[HDF5] New chunk: " << g_chunk_idx << endl;
-            }
 
             is_recording = true; // 更新主线程 UI 状态
             cout << "[Info] I/O PREPARED FOR: " << current_record_timestr << endl;
