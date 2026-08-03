@@ -1048,7 +1048,7 @@ int main() {
     }
 #endif
 
-    Cfg cfg("capture.yaml");
+    Cfg cfg("cfg/capture.yaml");
     auto& cap = cfg["capture"];
     Pylon::PylonInitialize();
 
@@ -1083,10 +1083,8 @@ int main() {
     double exp_time = cap["exposure_time"].as<double>();
     g_win_w = cap["window_width"].as<int>();
     g_win_h = cap["window_height"].as<int>();
-    bool write_jpg = cap["write_jpg"].as<bool>(); 
-    
-    double record_time = cap["record_time"].as<double>(); 
-    int write_delay_ms = cap["write_delay_ms"].as<int>();
+
+    double record_time = cap["record_time"].as<double>();
     int cam_w = cap["cam_width"].as<int>();
     int cam_h = cap["cam_height"].as<int>();
 
@@ -1182,7 +1180,7 @@ int main() {
                           << "- **Cameras**: " << camera_ids.size() << "\n"
                           << "- **Trigger**: " << (use_hw_trigger ? "HW" : "SW") << "\n"
                           << "- **Target FPS**: " << target_fps << "\n"
-                          << "- **write_jpg**: " << (write_jpg ? "true" : "false") << "\n"
+                          << "- **Storage**: HDF5\n"
                           << "\n---\n" << flush;
         cout << "[Log] Session log: " << g_session_log_path << endl;
     }
