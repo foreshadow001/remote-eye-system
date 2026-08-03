@@ -150,6 +150,7 @@ chrono::steady_clock::time_point g_fault_time;
 // ================== HDF5 全局 ==================
 int g_chunk_idx = 0;
 atomic<int> g_frame_offset{0};
+mutex g_hdf5_mtx;  // HDF5 library is NOT thread-safe — serialize all HDF5 API calls
 vector<string> g_participant_roots;   // per-camera, same length as cam_ctxs
 string g_sentry_root;                // = g_participant_roots[0]
 int g_hdf5_chunk_capacity = 2000;
@@ -746,32 +747,33 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
         f_start[1] = 0; f_start[2] = 0;
         f_count[0] = 1; f_count[1] = (hsize_t)cam_h; f_count[2] = (hsize_t)cam_w;
         H5::DataSpace f_mem(3, f_count);
-        for (int i = 0; i < N; ++i) {
-            int src_idx = margin_frames + i;
-            f_start[0] = (hsize_t)(g_frame_offset + i);
-            H5::DataSpace f_file = ctx->hdf5_raw_ds.getSpace();  // fresh per frame
-            f_file.selectHyperslab(H5S_SELECT_SET, f_count, f_start);
-            ctx->hdf5_raw_ds.write(ctx->ram_buffer[src_idx].data, H5::PredType::NATIVE_UINT8, f_mem, f_file);
+        {
+            lock_guard<mutex> lk(g_hdf5_mtx);
+            for (int i = 0; i < N; ++i) {
+                int src_idx = margin_frames + i;
+                f_start[0] = (hsize_t)(g_frame_offset + i);
+                H5::DataSpace f_file = ctx->hdf5_raw_ds.getSpace();
+                f_file.selectHyperslab(H5S_SELECT_SET, f_count, f_start);
+                ctx->hdf5_raw_ds.write(ctx->ram_buffer[src_idx].data, H5::PredType::NATIVE_UINT8, f_mem, f_file);
+            }
+
+            // gaze_target and valid
+            hsize_t gz_start[2] = {(hsize_t)g_frame_offset, 0};
+            hsize_t gz_count[2] = {(hsize_t)N, 2};
+            H5::DataSpace gz_mem(2, gz_count);
+            H5::DataSpace gz_file = ctx->hdf5_gaze_ds.getSpace();
+            gz_file.selectHyperslab(H5S_SELECT_SET, gz_count, gz_start);
+            vector<double> gz_buf(N * 2, 0.0);
+            ctx->hdf5_gaze_ds.write(gz_buf.data(), H5::PredType::NATIVE_DOUBLE, gz_mem, gz_file);
+
+            hsize_t v_start[1] = {(hsize_t)g_frame_offset};
+            hsize_t v_count[1] = {(hsize_t)N};
+            H5::DataSpace v_mem(1, v_count);
+            H5::DataSpace v_file = ctx->hdf5_valid_ds.getSpace();
+            v_file.selectHyperslab(H5S_SELECT_SET, v_count, v_start);
+            vector<uint8_t> v_buf(N, 1);
+            ctx->hdf5_valid_ds.write(v_buf.data(), H5::PredType::NATIVE_UINT8, v_mem, v_file);
         }
-        auto t2 = chrono::steady_clock::now();
-        cout << "[DEBUG-HDF5] cam" << ctx->index << " raw_image (" << N << " frames) done in " << chrono::duration<double>(t2-t1).count() << "s" << endl;
-
-        // Write gaze_target and valid as single hyperslabs (small data, negligible memory)
-        hsize_t gz_start[2] = {(hsize_t)g_frame_offset, 0};
-        hsize_t gz_count[2] = {(hsize_t)N, 2};
-        H5::DataSpace gz_mem(2, gz_count);
-        H5::DataSpace gz_file = ctx->hdf5_gaze_ds.getSpace();
-        gz_file.selectHyperslab(H5S_SELECT_SET, gz_count, gz_start);
-        vector<double> gz_buf(N * 2, 0.0);
-        ctx->hdf5_gaze_ds.write(gz_buf.data(), H5::PredType::NATIVE_DOUBLE, gz_mem, gz_file);
-
-        hsize_t v_start[1] = {(hsize_t)g_frame_offset};
-        hsize_t v_count[1] = {(hsize_t)N};
-        H5::DataSpace v_mem(1, v_count);
-        H5::DataSpace v_file = ctx->hdf5_valid_ds.getSpace();
-        v_file.selectHyperslab(H5S_SELECT_SET, v_count, v_start);
-        vector<uint8_t> v_buf(N, 1);
-        ctx->hdf5_valid_ds.write(v_buf.data(), H5::PredType::NATIVE_UINT8, v_mem, v_file);
 
         auto t3 = chrono::steady_clock::now();
         cout << "[DEBUG-HDF5] cam" << ctx->index << " ALL done in " << chrono::duration<double>(t3-t1).count() << "s" << endl;
@@ -839,6 +841,7 @@ static int h5ReadInt(H5::H5File& f, const string& name) {
 }
 
 static void openOrCreateChunk(shared_ptr<CameraContext> ctx, int cam_h, int cam_w, int cap) {
+    lock_guard<mutex> lk(g_hdf5_mtx);
     stringstream ss; ss << ctx->hdf5_dir << "/" << setw(4) << setfill('0') << g_chunk_idx << ".h5";
     string path = ss.str();
     bool exists = fs::exists(path);
@@ -870,6 +873,7 @@ static void openOrCreateChunk(shared_ptr<CameraContext> ctx, int cam_h, int cam_
 }
 
 static void closeChunk(shared_ptr<CameraContext> ctx) {
+    lock_guard<mutex> lk(g_hdf5_mtx);
     if (!ctx->hdf5_file) return;
     ctx->hdf5_raw_ds.close();
     ctx->hdf5_gaze_ds.close();
@@ -880,6 +884,7 @@ static void closeChunk(shared_ptr<CameraContext> ctx) {
 }
 
 static void initSentry(const string& root) {
+    lock_guard<mutex> lk(g_hdf5_mtx);
     fs::create_directories(root);
     string sp = root + "/sentry.h5";
     if (fs::exists(sp)) {
@@ -894,6 +899,7 @@ static void initSentry(const string& root) {
 }
 
 static void updateSentry(const string& root) {
+    lock_guard<mutex> lk(g_hdf5_mtx);
     string sp = root + "/sentry.h5";
     H5::H5File f(sp, H5F_ACC_RDWR);
     f.unlink("chunk_idx");
