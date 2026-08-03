@@ -149,7 +149,7 @@ chrono::steady_clock::time_point g_fault_time;
 
 // ================== HDF5 全局 ==================
 int g_chunk_idx = 0;
-int g_frame_offset = 0;
+atomic<int> g_frame_offset{0};  // read by parallel dump threads
 vector<string> g_participant_roots;   // per-camera, same length as cam_ctxs
 string g_sentry_root;                // = g_participant_roots[0]
 int g_hdf5_chunk_capacity = 2000;
@@ -833,18 +833,30 @@ static void openOrCreateChunk(shared_ptr<CameraContext> ctx, int cam_h, int cam_
     stringstream ss; ss << ctx->hdf5_dir << "/" << setw(4) << setfill('0') << g_chunk_idx << ".h5";
     string path = ss.str();
     bool exists = fs::exists(path);
-    ctx->hdf5_file = new H5::H5File(path, exists ? H5F_ACC_RDWR : H5F_ACC_TRUNC);
-    if (!exists) {
+
+    auto create = [&]() {
+        ctx->hdf5_file = new H5::H5File(path, H5F_ACC_TRUNC);
         hsize_t rd[3] = {(hsize_t)cap, (hsize_t)cam_h, (hsize_t)cam_w};
         ctx->hdf5_raw_ds = ctx->hdf5_file->createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd));
         hsize_t gd[2] = {(hsize_t)cap, 2};
         ctx->hdf5_gaze_ds = ctx->hdf5_file->createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd));
         hsize_t vd[1] = {(hsize_t)cap};
         ctx->hdf5_valid_ds = ctx->hdf5_file->createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd));
+    };
+
+    if (exists) {
+        try {
+            ctx->hdf5_file = new H5::H5File(path, H5F_ACC_RDWR);
+            ctx->hdf5_raw_ds = ctx->hdf5_file->openDataSet("raw_image");
+            ctx->hdf5_gaze_ds = ctx->hdf5_file->openDataSet("gaze_target");
+            ctx->hdf5_valid_ds = ctx->hdf5_file->openDataSet("valid");
+        } catch (const H5::Exception&) {
+            delete ctx->hdf5_file;
+            fs::remove(path);
+            create();
+        }
     } else {
-        ctx->hdf5_raw_ds = ctx->hdf5_file->openDataSet("raw_image");
-        ctx->hdf5_gaze_ds = ctx->hdf5_file->openDataSet("gaze_target");
-        ctx->hdf5_valid_ds = ctx->hdf5_file->openDataSet("valid");
+        create();
     }
 }
 
