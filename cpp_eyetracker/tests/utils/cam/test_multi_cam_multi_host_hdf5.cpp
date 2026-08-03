@@ -147,6 +147,10 @@ atomic<bool> g_fault_on_master{false};
 chrono::steady_clock::time_point g_ready_time;
 chrono::steady_clock::time_point g_fault_time;
 
+// HDF5 helpers (forward decl)
+static void h5WriteInt(H5::H5File& f, const string& name, int v);
+static int h5ReadInt(H5::H5File& f, const string& name);
+
 // ================== HDF5 全局 ==================
 int g_chunk_idx = 0;
 atomic<int> g_frame_offset{0};
@@ -362,6 +366,19 @@ void udpListenerWorker(const string& bind_ip, int port) {
             else if (cmd == "SHUTDOWN") {
                 cout << "[Slave] Received SHUTDOWN from master." << endl;
                 global_running = false;
+            }
+            else if (cmd.rfind("SENTRY:", 0) == 0) {
+                auto p1 = cmd.find(':', 7);
+                if (p1 != string::npos) {
+                    g_chunk_idx = stoi(cmd.substr(7, p1 - 7));
+                    g_frame_offset = stoi(cmd.substr(p1 + 1));
+                    string sp = g_sentry_root + "/sentry.h5";
+                    H5::H5File f(sp, H5F_ACC_RDWR);
+                    f.unlink("chunk_idx"); f.unlink("frame_offset");
+                    h5WriteInt(f, "chunk_idx", g_chunk_idx);
+                    h5WriteInt(f, "frame_offset", g_frame_offset);
+                    cout << "[Slave] SENTRY synced: chunk=" << g_chunk_idx << " offset=" << g_frame_offset << endl;
+                }
             }
         } 
     }
@@ -1414,6 +1431,8 @@ int main() {
                     for (auto& ctx : cam_ctxs) openOrCreateChunk(ctx, cam_h, cam_w, g_hdf5_chunk_capacity);
                 }
                 updateSentry(g_sentry_root);
+                if (is_master_pc && enable_net_sync)
+                    fastUdpSend("SENTRY:" + to_string(g_chunk_idx) + ":" + to_string(g_frame_offset));
 
                 double jpg_duration = 0.0;
                 writeReport(current_record_timestr, g_recording_number, target_fps, total_record_frames,
