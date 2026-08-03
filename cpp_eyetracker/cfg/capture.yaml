@@ -1,0 +1,69 @@
+# capture.yaml — test_multi_cam_multi_host_hdf5.cpp 配置文件
+
+capture:
+  participant_root:
+    - "D:/capture/P001"
+    - "D:/capture/P001"
+    - "D:/capture/P001"
+    - "D:/capture/P001"
+    - "D:/capture/P001"
+    - "E:/capture/P001"
+    - "E:/capture/P001"
+    - "E:/capture/P001"
+    - "E:/capture/P001"
+    - "E:/capture/P001"
+
+  cam_indices:
+    - "40768742"
+    - "40774056"
+    - "40768741"
+    - "40774063"
+    - "40774057"
+    - "40774064"
+    - "40768744"
+    - "40768743"
+    - "40773101"
+    - "40772283"
+
+  hardware_trigger: true
+  fps: 200
+  gain: 0.0
+  gamma: 1.0
+  exposure_time: 4000.0
+  cam_width: 2448
+  cam_height: 2048
+  record_time: 1.0
+  margin_frames_ratio: 0.05
+  max_num_buffer: 30
+  ui_fps: 20.0
+  window_width: 1600
+  window_height: 800
+  enable_offset: false
+  enable_intersection: false
+
+  # 网络同步
+  enable_net_sync: true
+  is_master: false
+  master_ip: "192.168.10.1"
+  slave_ip: "192.168.10.2"
+  port: 49200
+
+  # HDF5
+  hdf5_chunk_frame_capacity: 2000
+
+# 加载/验证节点
+loader:
+  participant_root: "D:/capture/P001"
+  cam_indices:
+    - "40768742"
+    - "40774056"
+    - "40768741"
+    - "40774063"
+    - "40774057"
+    - "40774064"
+    - "40768744"
+    - "40768743"
+    - "40773101"
+    - "40772283"
+  cam_width: 2448
+  cam_height: 2048
