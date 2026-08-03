@@ -149,7 +149,7 @@ chrono::steady_clock::time_point g_fault_time;
 
 // ================== HDF5 全局 ==================
 int g_chunk_idx = 0;
-atomic<int> g_frame_offset{0};  // read by parallel dump threads
+atomic<int> g_frame_offset{0};
 vector<string> g_participant_roots;   // per-camera, same length as cam_ctxs
 string g_sentry_root;                // = g_participant_roots[0]
 int g_hdf5_chunk_capacity = 2000;
@@ -747,7 +747,8 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
                 memcpy(raw_buf.data() + i * cam_h * cam_w,
                        ctx->ram_buffer[src_idx].data, cam_h * cam_w);
         }
-        cout << "[DEBUG-HDF5] cam" << ctx->index << " raw buf ready, writing raw_image..." << endl;
+        cout << "[DEBUG-HDF5] cam" << ctx->index << " raw buf ready (" << (N*cam_h*cam_w/1024/1024) << " MB), writing raw_image..." << endl;
+        auto t1 = chrono::steady_clock::now();
 
         hsize_t start[3] = {(hsize_t)g_frame_offset, 0, 0};
         hsize_t count[3] = {(hsize_t)N, (hsize_t)cam_h, (hsize_t)cam_w};
@@ -755,7 +756,8 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
         H5::DataSpace file_sp = ctx->hdf5_raw_ds.getSpace();
         file_sp.selectHyperslab(H5S_SELECT_SET, count, start);
         ctx->hdf5_raw_ds.write(raw_buf.data(), H5::PredType::NATIVE_UINT8, mem_sp, file_sp);
-        cout << "[DEBUG-HDF5] cam" << ctx->index << " raw_image done, writing gaze..." << endl;
+        auto t2 = chrono::steady_clock::now();
+        cout << "[DEBUG-HDF5] cam" << ctx->index << " raw_image done in " << chrono::duration<double>(t2-t1).count() << "s" << endl;
 
         hsize_t gz_start[2] = {(hsize_t)g_frame_offset, 0};
         hsize_t gz_count[2] = {(hsize_t)N, 2};
@@ -764,7 +766,6 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
         gz_file.selectHyperslab(H5S_SELECT_SET, gz_count, gz_start);
         vector<double> gz_buf(N * 2, 0.0);
         ctx->hdf5_gaze_ds.write(gz_buf.data(), H5::PredType::NATIVE_DOUBLE, gz_mem, gz_file);
-        cout << "[DEBUG-HDF5] cam" << ctx->index << " gaze done, writing valid..." << endl;
 
         hsize_t v_start[1] = {(hsize_t)g_frame_offset};
         hsize_t v_count[1] = {(hsize_t)N};
@@ -773,7 +774,9 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
         v_file.selectHyperslab(H5S_SELECT_SET, v_count, v_start);
         vector<uint8_t> v_buf(N, 1);
         ctx->hdf5_valid_ds.write(v_buf.data(), H5::PredType::NATIVE_UINT8, v_mem, v_file);
-        cout << "[DEBUG-HDF5] cam" << ctx->index << " all done, finished_cams=" << (finished_cams.load()+1) << "/" << cam_ctxs.size() << endl;
+
+        auto t3 = chrono::steady_clock::now();
+        cout << "[DEBUG-HDF5] cam" << ctx->index << " ALL done in " << chrono::duration<double>(t3-t1).count() << "s (raw=" << chrono::duration<double>(t2-t1).count() << "s)" << endl;
     } catch (const H5::Exception& e) {
         cout << "[DEBUG-HDF5] cam" << ctx->index << " EXCEPTION: " << e.getCDetailMsg() << endl;
         logException("ERROR", "hdf5:cam" + to_string(ctx->index),
