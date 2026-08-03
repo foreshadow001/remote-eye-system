@@ -152,6 +152,8 @@ string g_sentry_root;  // = g_participant_roots[0]
 int g_hdf5_chunk_capacity = 2000;
 int g_sentry_mismatch_count = 0;  // consecutive SENTRY mismatches
 int g_consecutive_faults = 0;     // consecutive recording failures (all_done never true)
+int g_pending_master_ci = -1;     // deferred SENTRY compare: master's chunk_idx (-1 = none)
+int g_pending_master_fo = 0;      // deferred SENTRY compare: master's frame_offset
 
 // ================== 会话日志 ==================
 string g_session_log_path;
@@ -362,41 +364,11 @@ void udpListenerWorker(const string& bind_ip, int port) {
                 global_running = false;
             }
             else if (cmd.rfind("SENTRY:", 0) == 0) {
+                // Buffer SENTRY — compare after slave's own dump/sentry update
                 auto p1 = cmd.find(':', 7);
                 if (p1 != string::npos) {
-                    int m_ci = stoi(cmd.substr(7, p1 - 7));
-                    int m_fo = stoi(cmd.substr(p1 + 1));
-                    int64_t master_total = (int64_t)m_ci * g_hdf5_chunk_capacity + m_fo;
-                    int64_t slave_total  = (int64_t)g_chunk_idx * g_hdf5_chunk_capacity + g_frame_offset;
-
-                    if (master_total == slave_total) {
-                        g_sentry_mismatch_count = 0;
-                    } else {
-                        g_sentry_mismatch_count++;
-                        // Use the smaller total — overwrite potentially invalid trailing data
-                        if (master_total < slave_total) {
-                            g_chunk_idx = m_ci;
-                            g_frame_offset = m_fo;
-                        }
-                        // else: slave is already at the smaller position, keep current values
-
-                        string sp = g_sentry_root + "/sentry.txt";
-                        ofstream out(sp);
-                        out << g_chunk_idx << "\n" << g_frame_offset << "\n";
-
-                        logException("WARN", "sentry",
-                            "Mismatch #" + to_string(g_sentry_mismatch_count)
-                            + ": Master(" + to_string(m_ci) + "," + to_string(m_fo) + ")"
-                            + " Slave(" + to_string(g_chunk_idx) + "," + to_string(g_frame_offset.load()) + ")"
-                            + " total " + to_string(master_total) + " vs " + to_string(slave_total)
-                            + " — using min");
-
-                        if (g_sentry_mismatch_count >= 3) {
-                            logException("FATAL", "sentry",
-                                "3 consecutive SENTRY mismatches — possible hardware fault, exiting.");
-                            global_running = false;
-                        }
-                    }
+                    g_pending_master_ci = stoi(cmd.substr(7, p1 - 7));
+                    g_pending_master_fo = stoi(cmd.substr(p1 + 1));
                 }
             }
         } 
@@ -1417,6 +1389,34 @@ int main() {
                     g_frame_offset -= g_hdf5_chunk_capacity;
                 }
                 updateSentry(g_sentry_root);
+
+                // Compare with buffered SENTRY from master (if received)
+                if (!is_master_pc && g_pending_master_ci >= 0) {
+                    int64_t master_total = (int64_t)g_pending_master_ci * g_hdf5_chunk_capacity + g_pending_master_fo;
+                    int64_t slave_total  = (int64_t)g_chunk_idx * g_hdf5_chunk_capacity + g_frame_offset;
+                    if (master_total == slave_total) {
+                        g_sentry_mismatch_count = 0;
+                    } else {
+                        g_sentry_mismatch_count++;
+                        if (master_total < slave_total) {
+                            g_chunk_idx = g_pending_master_ci;
+                            g_frame_offset = g_pending_master_fo;
+                            updateSentry(g_sentry_root);
+                        }
+                        logException("WARN", "sentry",
+                            "Mismatch #" + to_string(g_sentry_mismatch_count)
+                            + ": Master(" + to_string(g_pending_master_ci) + "," + to_string(g_pending_master_fo) + ")"
+                            + " Slave(" + to_string(g_chunk_idx) + "," + to_string(g_frame_offset.load()) + ")"
+                            + " — using min");
+                        if (g_sentry_mismatch_count >= 3) {
+                            logException("FATAL", "sentry",
+                                "3 consecutive SENTRY mismatches — possible hardware fault, exiting.");
+                            global_running = false;
+                        }
+                    }
+                    g_pending_master_ci = -1;  // consumed
+                }
+
                 if (is_master_pc && enable_net_sync)
                     fastUdpSend("SENTRY:" + to_string(g_chunk_idx) + ":" + to_string(g_frame_offset));
 
