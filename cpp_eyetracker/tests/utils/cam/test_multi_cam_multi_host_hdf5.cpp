@@ -1390,28 +1390,43 @@ int main() {
                 }
                 updateSentry(g_sentry_root);
 
-                // Compare with buffered SENTRY from master (if received)
-                if (!is_master_pc && g_pending_master_ci >= 0) {
-                    int64_t master_total = (int64_t)g_pending_master_ci * g_hdf5_chunk_capacity + g_pending_master_fo;
-                    int64_t slave_total  = (int64_t)g_chunk_idx * g_hdf5_chunk_capacity + g_frame_offset;
-                    if (master_total == slave_total) {
-                        g_sentry_mismatch_count = 0;
+                // Slave: block-wait for SENTRY from master (udpListenerWorker buffers it)
+                if (!is_master_pc && enable_net_sync) {
+                    cout << "[Sentry] Waiting for master SENTRY..." << endl;
+                    g_pending_master_ci = -1;
+                    auto deadline = chrono::steady_clock::now() + chrono::seconds(10);
+                    while (chrono::steady_clock::now() < deadline && g_pending_master_ci < 0 && global_running) {
+                        this_thread::sleep_for(chrono::milliseconds(50));
+                        cv::waitKey(1);  // keep UI alive
+                    }
+                    if (g_pending_master_ci < 0) {
+                        logException("WARN", "sentry", "SENTRY timeout after 10s — master may have crashed, using local sentry");
                     } else {
-                        g_sentry_mismatch_count++;
-                        if (master_total < slave_total) {
-                            g_chunk_idx = g_pending_master_ci;
-                            g_frame_offset = g_pending_master_fo;
-                            updateSentry(g_sentry_root);
-                        }
-                        logException("WARN", "sentry",
-                            "Mismatch #" + to_string(g_sentry_mismatch_count)
-                            + ": Master(" + to_string(g_pending_master_ci) + "," + to_string(g_pending_master_fo) + ")"
-                            + " Slave(" + to_string(g_chunk_idx) + "," + to_string(g_frame_offset.load()) + ")"
-                            + " — using min");
-                        if (g_sentry_mismatch_count >= 3) {
-                            logException("FATAL", "sentry",
-                                "3 consecutive SENTRY mismatches — possible hardware fault, exiting.");
-                            global_running = false;
+                        int64_t master_total = (int64_t)g_pending_master_ci * g_hdf5_chunk_capacity + g_pending_master_fo;
+                        int64_t slave_total  = (int64_t)g_chunk_idx * g_hdf5_chunk_capacity + g_frame_offset;
+                        cout << "[DEBUG-SENTRY] Compare: Master(" << g_pending_master_ci << "," << g_pending_master_fo
+                             << ")=" << master_total << " Slave(" << g_chunk_idx << "," << g_frame_offset
+                             << ")=" << slave_total << " rec#" << g_recording_number << endl;
+                        if (master_total == slave_total) {
+                            g_sentry_mismatch_count = 0;
+                        } else {
+                            g_sentry_mismatch_count++;
+                            int64_t slave_before = slave_total;
+                            if (master_total < slave_total) {
+                                g_chunk_idx = g_pending_master_ci;
+                                g_frame_offset = g_pending_master_fo;
+                                updateSentry(g_sentry_root);
+                            }
+                            logException("WARN", "sentry",
+                                "Mismatch #" + to_string(g_sentry_mismatch_count)
+                                + ": Master(" + to_string(g_pending_master_ci) + "," + to_string(g_pending_master_fo) + ")"
+                                + " Slave_before(" + to_string(slave_before / g_hdf5_chunk_capacity) + "," + to_string(slave_before % g_hdf5_chunk_capacity) + ")"
+                                + " — using min, diff=" + to_string(abs(master_total - slave_before)));
+                            if (g_sentry_mismatch_count >= 3) {
+                                logException("FATAL", "sentry",
+                                    "3 consecutive SENTRY mismatches — possible hardware fault, exiting.");
+                                global_running = false;
+                            }
                         }
                     }
                     g_pending_master_ci = -1;  // consumed
