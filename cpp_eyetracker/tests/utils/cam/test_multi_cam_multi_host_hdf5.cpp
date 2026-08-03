@@ -724,11 +724,12 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
 
 void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin_frames,
                        atomic<int>& finished_cams) {
+    cout << "[DEBUG-HDF5] cam" << ctx->index << " dumpToHdf5Worker START" << endl;
     ctx->dump_start_time = chrono::steady_clock::now();
     int N = core_frames;
 
     if (ctx->ram_buffer.empty() || N <= 0) {
-        logException("ERROR", "hdf5:cam" + to_string(ctx->index), "ram_buffer empty, skipping HDF5 write");
+        cout << "[DEBUG-HDF5] cam" << ctx->index << " ram_buffer EMPTY, skipping" << endl;
         ctx->dump_end_time = chrono::steady_clock::now();
         finished_cams++;
         return;
@@ -737,6 +738,7 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
     try {
         int cam_h = ctx->ram_buffer[0].rows;
         int cam_w = ctx->ram_buffer[0].cols;
+        cout << "[DEBUG-HDF5] cam" << ctx->index << " writing " << N << " frames offset=" << g_frame_offset << endl;
 
         vector<uint8_t> raw_buf(N * cam_h * cam_w);
         for (int i = 0; i < N; ++i) {
@@ -745,6 +747,7 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
                 memcpy(raw_buf.data() + i * cam_h * cam_w,
                        ctx->ram_buffer[src_idx].data, cam_h * cam_w);
         }
+        cout << "[DEBUG-HDF5] cam" << ctx->index << " raw buf ready, writing raw_image..." << endl;
 
         hsize_t start[3] = {(hsize_t)g_frame_offset, 0, 0};
         hsize_t count[3] = {(hsize_t)N, (hsize_t)cam_h, (hsize_t)cam_w};
@@ -752,6 +755,7 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
         H5::DataSpace file_sp = ctx->hdf5_raw_ds.getSpace();
         file_sp.selectHyperslab(H5S_SELECT_SET, count, start);
         ctx->hdf5_raw_ds.write(raw_buf.data(), H5::PredType::NATIVE_UINT8, mem_sp, file_sp);
+        cout << "[DEBUG-HDF5] cam" << ctx->index << " raw_image done, writing gaze..." << endl;
 
         hsize_t gz_start[2] = {(hsize_t)g_frame_offset, 0};
         hsize_t gz_count[2] = {(hsize_t)N, 2};
@@ -760,6 +764,7 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
         gz_file.selectHyperslab(H5S_SELECT_SET, gz_count, gz_start);
         vector<double> gz_buf(N * 2, 0.0);
         ctx->hdf5_gaze_ds.write(gz_buf.data(), H5::PredType::NATIVE_DOUBLE, gz_mem, gz_file);
+        cout << "[DEBUG-HDF5] cam" << ctx->index << " gaze done, writing valid..." << endl;
 
         hsize_t v_start[1] = {(hsize_t)g_frame_offset};
         hsize_t v_count[1] = {(hsize_t)N};
@@ -768,7 +773,9 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
         v_file.selectHyperslab(H5S_SELECT_SET, v_count, v_start);
         vector<uint8_t> v_buf(N, 1);
         ctx->hdf5_valid_ds.write(v_buf.data(), H5::PredType::NATIVE_UINT8, v_mem, v_file);
+        cout << "[DEBUG-HDF5] cam" << ctx->index << " all done, finished_cams=" << (finished_cams.load()+1) << "/" << cam_ctxs.size() << endl;
     } catch (const H5::Exception& e) {
+        cout << "[DEBUG-HDF5] cam" << ctx->index << " EXCEPTION: " << e.getCDetailMsg() << endl;
         logException("ERROR", "hdf5:cam" + to_string(ctx->index),
                      string("HDF5 write failed: ") + e.getCDetailMsg());
     }
@@ -1073,6 +1080,7 @@ int main() {
     }
 #endif
 
+    H5::Exception::dontPrint();
     Cfg cfg("cfg/capture.yaml");
     auto& cap = cfg["capture"];
     Pylon::PylonInitialize();
@@ -1374,16 +1382,22 @@ int main() {
 
                 for (auto& ctx : cam_ctxs) dump_threads.emplace_back(dumpToHdf5Worker, ctx, core_frames, margin_frames, std::ref(finished_cams));
 
+                cout << "[DEBUG-HDF5] Dump wait loop START, waiting for " << cam_ctxs.size() << " cameras" << endl;
                 while (finished_cams < cam_ctxs.size()) {
+                    if (finished_cams.load() % 2 == 0)
+                        cout << "[DEBUG-HDF5] Dump progress: " << finished_cams.load() << "/" << cam_ctxs.size() << endl;
                     cv::Mat loading = cv::Mat::zeros(400, 600, CV_8UC3);
-                    cv::putText(loading, "DUMPING RAM TO DISK... (" + to_string(finished_cams.load()) + "/" + to_string(cam_ctxs.size()) + ")", cv::Point(50, 200), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
+                    cv::putText(loading, "DUMPING RAM TO HDF5... (" + to_string(finished_cams.load()) + "/" + to_string(cam_ctxs.size()) + ")", cv::Point(50, 200), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
                     cv::imshow("Multi-Cam Preview", loading);
                     cv::waitKey(50);
                 }
+                cout << "[DEBUG-HDF5] All dumps done, joining threads..." << endl;
                 for (auto& t : dump_threads) if (t.joinable()) t.join();
+                cout << "[DEBUG-HDF5] All threads joined" << endl;
 
                 double dump_duration = chrono::duration<double>(chrono::steady_clock::now() - dump_start_time).count();
 
+                cout << "[DEBUG-HDF5] Updating sentry, frame_offset " << g_frame_offset << " -> " << (g_frame_offset + core_frames) << endl;
                 // Update HDF5 sentry
                 g_frame_offset += core_frames;
                 if (g_frame_offset >= g_hdf5_chunk_capacity) {
@@ -1486,16 +1500,8 @@ int main() {
 
             cout << "[Info] RAM CAPTURE STARTED. PREPARING I/O ASYNC..." << endl;
 
-            // 慢慢建文件夹，完全不影响底层的图像拷贝
-            for (auto& ctx : cam_ctxs) {
-                string batch_raw = ctx->save_base_dir + "/temp_raw_" + current_record_timestr + "/" + ctx->id;
-                error_code ec;
-                fs::create_directories(batch_raw, ec);
-                if (ec) logException("ERROR", "io:cam" + to_string(ctx->index), "Cannot create " + batch_raw + ": " + ec.message());
-                ctx->temp_dir = batch_raw;
-                ctx->log_file_path = ctx->save_base_dir + "/record_" + current_record_timestr + "_" + ctx->id + ".txt";
-            }
-            
+            // HDF5: no temp_raw directories needed — data goes directly to HDF5
+
             // HDF5: check chunk space before recording
             if (g_frame_offset + core_frames > g_hdf5_chunk_capacity) {
                 for (auto& ctx : cam_ctxs) closeChunk(ctx);
