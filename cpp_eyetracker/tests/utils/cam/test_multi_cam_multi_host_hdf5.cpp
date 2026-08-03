@@ -333,6 +333,9 @@ void udpListenerWorker(const string& bind_ip, int port) {
             buffer[bytes] = '\0';
             string cmd(buffer);
             // [修改] 识别带时间戳的指令，瞬间开火
+            static int udp_dbg = 0;
+            if (++udp_dbg <= 20 || udp_dbg % 20 == 0)
+                cout << "[Slave UDP] rcvd(" << bytes << "): '" << cmd << "'" << endl;
             if (cmd.rfind("CMD_START:", 0) == 0) {
                 if (cmd.length() <= 10) { logException("WARN", "slave", "CMD_START truncated"); continue; }
                 instantTrigger();
@@ -369,6 +372,7 @@ void udpListenerWorker(const string& bind_ip, int port) {
                 if (p1 != string::npos) {
                     g_pending_master_ci = stoi(cmd.substr(7, p1 - 7));
                     g_pending_master_fo = stoi(cmd.substr(p1 + 1));
+                    cout << "[Slave UDP] Buffered SENTRY: ci=" << g_pending_master_ci << " fo=" << g_pending_master_fo << endl;
                 }
             }
         } 
@@ -1432,8 +1436,11 @@ int main() {
                     g_pending_master_ci = -1;  // consumed
                 }
 
-                if (is_master_pc && enable_net_sync)
-                    fastUdpSend("SENTRY:" + to_string(g_chunk_idx) + ":" + to_string(g_frame_offset));
+                if (is_master_pc && enable_net_sync) {
+                    string sm = "SENTRY:" + to_string(g_chunk_idx) + ":" + to_string(g_frame_offset);
+                    cout << "[Master] Sending " << sm << " to slave..." << endl;
+                    fastUdpSend(sm);
+                }
 
                 double jpg_duration = 0.0;
                 writeReport(current_record_timestr, g_recording_number, target_fps, total_record_frames,
