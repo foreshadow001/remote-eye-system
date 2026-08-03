@@ -126,11 +126,7 @@ struct CameraContext {
     chrono::steady_clock::time_point jpg_end_time;
 
     // ---- HDF5 ----
-    string hdf5_dir;
-    H5::H5File* hdf5_file = nullptr;
-    H5::DataSet hdf5_raw_ds;
-    H5::DataSet hdf5_gaze_ds;
-    H5::DataSet hdf5_valid_ds;
+    string hdf5_dir;  // <participant_root>/<SN>/
 
     CameraContext(int idx, string cam_id, string save_dir) : index(idx), id(cam_id), save_base_dir(save_dir), cam(cam_id) {}
 };
@@ -740,14 +736,12 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
     ctx->cam.close();
 }
 
-void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin_frames,
-                       atomic<int>& finished_cams) {
+void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin_frames) {
     ctx->dump_start_time = chrono::steady_clock::now();
     int N = core_frames;
 
     if (ctx->ram_buffer.empty() || N <= 0) {
         ctx->dump_end_time = chrono::steady_clock::now();
-        finished_cams++;
         return;
     }
 
@@ -755,12 +749,23 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
         int cam_h = ctx->ram_buffer[0].rows;
         int cam_w = ctx->ram_buffer[0].cols;
 
-        // Open HDF5 file in THIS thread (no cross-thread handle sharing)
+        // Open or create HDF5 file
         stringstream ss; ss << ctx->hdf5_dir << "/" << setw(4) << setfill('0') << g_chunk_idx << ".h5";
-        H5::H5File f(ss.str(), H5F_ACC_RDWR);
-        H5::DataSet raw_ds = f.openDataSet("raw_image");
-        H5::DataSet gaze_ds = f.openDataSet("gaze_target");
-        H5::DataSet valid_ds = f.openDataSet("valid");
+        string path = ss.str();
+        H5::H5File f(path, fs::exists(path) ? H5F_ACC_RDWR : H5F_ACC_TRUNC);
+        H5::DataSet raw_ds, gaze_ds, valid_ds;
+        try {
+            raw_ds = f.openDataSet("raw_image");
+            gaze_ds = f.openDataSet("gaze_target");
+            valid_ds = f.openDataSet("valid");
+        } catch (const H5::Exception&) {
+            hsize_t rd[3] = {(hsize_t)g_hdf5_chunk_capacity, (hsize_t)cam_h, (hsize_t)cam_w};
+            raw_ds = f.createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd));
+            hsize_t gd[2] = {(hsize_t)g_hdf5_chunk_capacity, 2};
+            gaze_ds = f.createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd));
+            hsize_t vd[1] = {(hsize_t)g_hdf5_chunk_capacity};
+            valid_ds = f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd));
+        }
 
         hsize_t f_start[3], f_count[3];
         f_start[1] = 0; f_start[2] = 0;
@@ -796,7 +801,6 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
     }
 
     ctx->dump_end_time = chrono::steady_clock::now();
-    finished_cams++;
 }
 
 vector<LogEntry> parseLogFile(const string& log_path) {
@@ -849,49 +853,6 @@ static int h5ReadInt(H5::H5File& f, const string& name) {
     auto d = f.openDataSet(name);
     int v; d.read(&v, H5::PredType::NATIVE_INT);
     return v;
-}
-
-static void openOrCreateChunk(shared_ptr<CameraContext> ctx, int cam_h, int cam_w, int cap) {
-    lock_guard<mutex> lk(g_hdf5_mtx);
-    stringstream ss; ss << ctx->hdf5_dir << "/" << setw(4) << setfill('0') << g_chunk_idx << ".h5";
-    string path = ss.str();
-    bool exists = fs::exists(path);
-
-    auto create = [&]() {
-        ctx->hdf5_file = new H5::H5File(path, H5F_ACC_TRUNC);
-        hsize_t rd[3] = {(hsize_t)cap, (hsize_t)cam_h, (hsize_t)cam_w};
-        ctx->hdf5_raw_ds = ctx->hdf5_file->createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd));
-        hsize_t gd[2] = {(hsize_t)cap, 2};
-        ctx->hdf5_gaze_ds = ctx->hdf5_file->createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd));
-        hsize_t vd[1] = {(hsize_t)cap};
-        ctx->hdf5_valid_ds = ctx->hdf5_file->createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd));
-    };
-
-    if (exists) {
-        try {
-            ctx->hdf5_file = new H5::H5File(path, H5F_ACC_RDWR);
-            ctx->hdf5_raw_ds = ctx->hdf5_file->openDataSet("raw_image");
-            ctx->hdf5_gaze_ds = ctx->hdf5_file->openDataSet("gaze_target");
-            ctx->hdf5_valid_ds = ctx->hdf5_file->openDataSet("valid");
-        } catch (const H5::Exception&) {
-            delete ctx->hdf5_file;
-            fs::remove(path);
-            create();
-        }
-    } else {
-        create();
-    }
-}
-
-static void closeChunk(shared_ptr<CameraContext> ctx) {
-    lock_guard<mutex> lk(g_hdf5_mtx);
-    if (!ctx->hdf5_file) return;
-    ctx->hdf5_raw_ds.close();
-    ctx->hdf5_gaze_ds.close();
-    ctx->hdf5_valid_ds.close();
-    ctx->hdf5_file->close();
-    delete ctx->hdf5_file;
-    ctx->hdf5_file = nullptr;
 }
 
 static void initSentry(const string& root) {
@@ -1236,15 +1197,14 @@ int main() {
         cout << "[Log] Session log: " << g_session_log_path << endl;
     }
 
-    // HDF5: init sentry + open all camera chunks
+    // HDF5: init sentry
     initSentry(g_sentry_root);
     cout << "[HDF5] Sentry: chunk=" << g_chunk_idx << " offset=" << g_frame_offset << endl;
     for (auto& ctx : cam_ctxs) {
         ctx->hdf5_dir = g_participant_roots[ctx->index] + "/" + ctx->id;
         fs::create_directories(ctx->hdf5_dir);
-        openOrCreateChunk(ctx, cam_h, cam_w, g_hdf5_chunk_capacity);
     }
-    cout << "[HDF5] All camera chunks opened." << endl;
+    cout << "[HDF5] Ready." << endl;
 
     if (is_master_pc) cout << "Press 'r' to START REC across ALL nodes, 'space' to photo, 'q' to quit.\n";
     else cout << "Waiting for Master trigger... Press 'space' to photo, 'q' to quit.\n";
@@ -1395,23 +1355,15 @@ int main() {
                 g_recording_number++;
 
                 auto dump_start_time = std::chrono::steady_clock::now();
-                atomic<int> finished_cams{0};
-                vector<thread> dump_threads;
 
-                for (auto& ctx : cam_ctxs) dump_threads.emplace_back(dumpToHdf5Worker, ctx, core_frames, margin_frames, std::ref(finished_cams));
-
-                cout << "[DEBUG-HDF5] Dump wait loop START, waiting for " << cam_ctxs.size() << " cameras" << endl;
-                while (finished_cams < cam_ctxs.size()) {
-                    if (finished_cams.load() % 2 == 0)
-                        cout << "[DEBUG-HDF5] Dump progress: " << finished_cams.load() << "/" << cam_ctxs.size() << endl;
+                // Serial HDF5 write — one camera at a time
+                for (size_t i = 0; i < cam_ctxs.size(); ++i) {
                     cv::Mat loading = cv::Mat::zeros(400, 600, CV_8UC3);
-                    cv::putText(loading, "DUMPING RAM TO HDF5... (" + to_string(finished_cams.load()) + "/" + to_string(cam_ctxs.size()) + ")", cv::Point(50, 200), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
+                    cv::putText(loading, "DUMPING RAM TO HDF5... (" + to_string(i) + "/" + to_string(cam_ctxs.size()) + ")", cv::Point(50, 200), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
                     cv::imshow("Multi-Cam Preview", loading);
-                    cv::waitKey(50);
+                    cv::waitKey(1);
+                    dumpToHdf5Worker(cam_ctxs[i], core_frames, margin_frames);
                 }
-                cout << "[DEBUG-HDF5] All dumps done, joining threads..." << endl;
-                for (auto& t : dump_threads) if (t.joinable()) t.join();
-                cout << "[DEBUG-HDF5] All threads joined" << endl;
 
                 double dump_duration = chrono::duration<double>(chrono::steady_clock::now() - dump_start_time).count();
 
@@ -1419,10 +1371,8 @@ int main() {
                 // Update HDF5 sentry
                 g_frame_offset += core_frames;
                 if (g_frame_offset >= g_hdf5_chunk_capacity) {
-                    for (auto& ctx : cam_ctxs) closeChunk(ctx);
                     g_chunk_idx++;
                     g_frame_offset -= g_hdf5_chunk_capacity;
-                    for (auto& ctx : cam_ctxs) openOrCreateChunk(ctx, cam_h, cam_w, g_hdf5_chunk_capacity);
                 }
                 updateSentry(g_sentry_root);
                 if (is_master_pc && enable_net_sync)
@@ -1524,10 +1474,8 @@ int main() {
 
             // HDF5: check chunk space before recording
             if (g_frame_offset + core_frames > g_hdf5_chunk_capacity) {
-                for (auto& ctx : cam_ctxs) closeChunk(ctx);
                 g_chunk_idx++;
                 g_frame_offset = 0;
-                for (auto& ctx : cam_ctxs) openOrCreateChunk(ctx, cam_h, cam_w, g_hdf5_chunk_capacity);
                 updateSentry(g_sentry_root);
                 cout << "[HDF5] New chunk: " << g_chunk_idx << endl;
             }
@@ -1550,7 +1498,6 @@ int main() {
     }
 
     if (g_session_log.is_open()) g_session_log.close();
-    for (auto& ctx : cam_ctxs) closeChunk(ctx);
     cv::destroyAllWindows();
     Pylon::PylonTerminate();
     if (master_udp_sock != INVALID_SOCKET) closesocket(master_udp_sock);
