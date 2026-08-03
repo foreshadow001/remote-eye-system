@@ -374,6 +374,7 @@ void udpListenerWorker(const string& bind_ip, int port) {
                     h5WriteInt(f, "chunk_idx", g_chunk_idx);
                     h5WriteInt(f, "frame_offset", g_frame_offset);
                     cout << "[Slave] SENTRY synced: chunk=" << g_chunk_idx << " offset=" << g_frame_offset << endl;
+                    H5garbage_collect();
                 }
             }
         } 
@@ -801,6 +802,7 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
     }
 
     ctx->dump_end_time = chrono::steady_clock::now();
+    H5garbage_collect();  // force HDF5 to release all resources
 }
 
 vector<LogEntry> parseLogFile(const string& log_path) {
