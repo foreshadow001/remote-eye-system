@@ -744,6 +744,7 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
     int cam_w = ctx->ram_buffer[0].cols;
     try {
 
+        fs::create_directories(ctx->hdf5_dir);  // ensure directory exists
         stringstream ss; ss << ctx->hdf5_dir << "/" << setw(4) << setfill('0') << g_chunk_idx << ".h5";
         string path = ss.str();
         bool exists = fs::exists(path);
