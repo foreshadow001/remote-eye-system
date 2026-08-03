@@ -1052,8 +1052,9 @@ void writeReport(const string& timestr, int rec_num, double target_fps, int tota
 }
 
 int main() {
+    _putenv("HDF5_USE_FILE_LOCKING=FALSE");  // disable HDF5 file locking (buggy in 2.1.1 on Windows)
     cout << "=== [TEST] Multi-Basler Camera Tool (Sync Network Node) ===" << endl;
-    
+
 #ifdef _WIN32
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
