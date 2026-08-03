@@ -741,15 +741,15 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
         cout << "[DEBUG-HDF5] cam" << ctx->index << " writing " << N << " frames offset=" << g_frame_offset << " (per-frame, zero-copy)" << endl;
         auto t1 = chrono::steady_clock::now();
 
-        // Write raw_image frame-by-frame directly from ram_buffer — no extra buffer
+        // Write raw_image frame-by-frame directly from ram_buffer
         hsize_t f_start[3], f_count[3];
         f_start[1] = 0; f_start[2] = 0;
         f_count[0] = 1; f_count[1] = (hsize_t)cam_h; f_count[2] = (hsize_t)cam_w;
         H5::DataSpace f_mem(3, f_count);
-        H5::DataSpace f_file = ctx->hdf5_raw_ds.getSpace();
         for (int i = 0; i < N; ++i) {
             int src_idx = margin_frames + i;
             f_start[0] = (hsize_t)(g_frame_offset + i);
+            H5::DataSpace f_file = ctx->hdf5_raw_ds.getSpace();  // fresh per frame
             f_file.selectHyperslab(H5S_SELECT_SET, f_count, f_start);
             ctx->hdf5_raw_ds.write(ctx->ram_buffer[src_idx].data, H5::PredType::NATIVE_UINT8, f_mem, f_file);
         }
@@ -776,7 +776,8 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
         auto t3 = chrono::steady_clock::now();
         cout << "[DEBUG-HDF5] cam" << ctx->index << " ALL done in " << chrono::duration<double>(t3-t1).count() << "s" << endl;
     } catch (const H5::Exception& e) {
-        cout << "[DEBUG-HDF5] cam" << ctx->index << " EXCEPTION: " << e.getCDetailMsg() << endl;
+        cout << "[DEBUG-HDF5] cam" << ctx->index << " HDF5 FATAL: " << e.getCDetailMsg() << endl;
+        e.printErrorStack();
         logException("ERROR", "hdf5:cam" + to_string(ctx->index),
                      string("HDF5 write failed: ") + e.getCDetailMsg());
     }
@@ -1081,7 +1082,6 @@ int main() {
     }
 #endif
 
-    H5::Exception::dontPrint();
     Cfg cfg("cfg/capture.yaml");
     auto& cap = cfg["capture"];
     Pylon::PylonInitialize();
