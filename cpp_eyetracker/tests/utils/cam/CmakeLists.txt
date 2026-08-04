@@ -49,3 +49,39 @@ target_include_directories(test_load_hdf5_frame
 )
 
 message(STATUS "test_load_hdf5_frame will be built")
+
+# ---- Multi-process HDF5 dump ----
+
+add_executable(hdf5_multi_process
+    hdf5_multi_process.cpp
+)
+
+target_link_libraries(hdf5_multi_process
+    PRIVATE
+        eyetracker::cfg
+        eyetracker::cam
+        ${HDF5_CXX_LIBRARIES}
+)
+
+target_include_directories(hdf5_multi_process
+    PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+)
+
+message(STATUS "hdf5_multi_process will be built")
+
+add_executable(hdf5_multi_process_child
+    hdf5_multi_process_child.cpp
+)
+
+target_link_libraries(hdf5_multi_process_child
+    PRIVATE
+        ${HDF5_CXX_LIBRARIES}
+)
+
+target_include_directories(hdf5_multi_process_child
+    PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+)
+
+message(STATUS "hdf5_multi_process_child will be built")
