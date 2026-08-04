@@ -152,8 +152,7 @@ string g_sentry_root;  // = g_participant_roots[0]
 int g_hdf5_chunk_capacity = 2000;
 int g_sentry_mismatch_count = 0;  // consecutive SENTRY mismatches
 int g_consecutive_faults = 0;     // consecutive recording failures (all_done never true)
-int g_pending_master_ci = -1;     // deferred SENTRY compare: master's chunk_idx (-1 = none)
-int g_pending_master_fo = 0;      // deferred SENTRY compare: master's frame_offset
+atomic<bool> g_syncing{false};    // TCP sentry handshake in progress — block keys
 
 // ================== 会话日志 ==================
 string g_session_log_path;
@@ -333,9 +332,6 @@ void udpListenerWorker(const string& bind_ip, int port) {
             buffer[bytes] = '\0';
             string cmd(buffer);
             // [修改] 识别带时间戳的指令，瞬间开火
-            static int udp_dbg = 0;
-            if (++udp_dbg <= 20 || udp_dbg % 20 == 0)
-                cout << "[Slave UDP] rcvd(" << bytes << "): '" << cmd << "'" << endl;
             if (cmd.rfind("CMD_START:", 0) == 0) {
                 if (cmd.length() <= 10) { logException("WARN", "slave", "CMD_START truncated"); continue; }
                 instantTrigger();
@@ -366,16 +362,7 @@ void udpListenerWorker(const string& bind_ip, int port) {
                 cout << "[Slave] Received SHUTDOWN from master." << endl;
                 global_running = false;
             }
-            else if (cmd.rfind("SENTRY:", 0) == 0) {
-                // Buffer SENTRY — compare after slave's own dump/sentry update
-                auto p1 = cmd.find(':', 7);
-                if (p1 != string::npos) {
-                    g_pending_master_ci = stoi(cmd.substr(7, p1 - 7));
-                    g_pending_master_fo = stoi(cmd.substr(p1 + 1));
-                    cout << "[Slave UDP] Buffered SENTRY: ci=" << g_pending_master_ci << " fo=" << g_pending_master_fo << endl;
-                }
-            }
-        } 
+        }
     }
     closesocket(sock);
 }
@@ -1339,6 +1326,7 @@ int main() {
                 if (is_recording) hints = "[REC] Recording in progress...";
                 else if (is_dumping) hints = "[DUMP] Writing to disk...";
                 else if (enable_net_sync && !is_master_pc) hints = "[r][space][q] disabled (Slave)  |  Waiting for Master...";
+                else if (g_syncing.load()) hints = "Syncing sentry — please wait...";
                 else hints = "[r] record  [space] photo  [ESC/q] quit";
                 cv::putText(canvas, hints, cv::Point(hx, hy),
                             cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
@@ -1394,52 +1382,67 @@ int main() {
                 }
                 updateSentry(g_sentry_root);
 
-                // Slave: block-wait for SENTRY from master (udpListenerWorker buffers it)
-                if (!is_master_pc && enable_net_sync) {
-                    cout << "[Sentry] Waiting for master SENTRY..." << endl;
-                    g_pending_master_ci = -1;
-                    auto deadline = chrono::steady_clock::now() + chrono::seconds(10);
-                    while (chrono::steady_clock::now() < deadline && g_pending_master_ci < 0 && global_running) {
-                        this_thread::sleep_for(chrono::milliseconds(50));
-                        cv::waitKey(1);  // keep UI alive
-                    }
-                    if (g_pending_master_ci < 0) {
-                        logException("WARN", "sentry", "SENTRY timeout after 10s — master may have crashed, using local sentry");
+                // TCP handshake: exchange sentry values reliably, both sides block
+                if (enable_net_sync) {
+                    g_syncing = true;
+                    int handshake_port = net_port + 300;
+                    auto local_ci = g_chunk_idx;
+                    auto local_fo = g_frame_offset.load();
+                    int64_t local_total = (int64_t)local_ci * g_hdf5_chunk_capacity + local_fo;
+
+                    if (is_master_pc) {
+                        // Master: listen, accept
+                        SOCKET hs = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                        sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(handshake_port);
+                        sa.sin_addr.s_addr = INADDR_ANY;
+                        ::bind(hs, (sockaddr*)&sa, sizeof(sa));
+                        listen(hs, 1);
+                        cout << "[Sentry] Master waiting for Slave TCP handshake on port " << handshake_port << "..." << endl;
+                        sockaddr_in ca; socklen_t cl = sizeof(ca);
+                        SOCKET cs = accept(hs, (sockaddr*)&ca, &cl);
+                        if (cs != INVALID_SOCKET) {
+                            int64_t peer_buf[2]; recv(cs, (char*)peer_buf, sizeof(peer_buf), 0);
+                            int64_t peer_total = peer_buf[0]; int peer_ci = (int)(peer_total / g_hdf5_chunk_capacity); int peer_fo = (int)(peer_total % g_hdf5_chunk_capacity);
+                            int64_t send_buf[2] = {local_total, local_total};
+                            send(cs, (const char*)send_buf, sizeof(send_buf), 0);
+                            closesocket(cs);
+                            int64_t peer_val = peer_total, local_val = local_total;
+                            cout << "[Sentry] Master TCP done. Local=" << local_val << " Peer(Slave)=" << peer_val << endl;
+                            if (peer_val != local_val) {
+                                g_sentry_mismatch_count++;
+                                if (peer_val < local_val) { g_chunk_idx = peer_ci; g_frame_offset = peer_fo; updateSentry(g_sentry_root); }
+                                logException("WARN", "sentry", "Mismatch #" + to_string(g_sentry_mismatch_count) + ": Master(" + to_string(local_ci) + "," + to_string(local_fo) + ") Slave(" + to_string(peer_ci) + "," + to_string(peer_fo) + ") diff=" + to_string(abs(local_val - peer_val)) + " — using min");
+                                if (g_sentry_mismatch_count >= 3) { logException("FATAL", "sentry", "3 consecutive mismatches — exiting."); global_running = false; }
+                            } else { g_sentry_mismatch_count = 0; }
+                        }
+                        closesocket(hs);
                     } else {
-                        int64_t master_total = (int64_t)g_pending_master_ci * g_hdf5_chunk_capacity + g_pending_master_fo;
-                        int64_t slave_total  = (int64_t)g_chunk_idx * g_hdf5_chunk_capacity + g_frame_offset;
-                        cout << "[DEBUG-SENTRY] Compare: Master(" << g_pending_master_ci << "," << g_pending_master_fo
-                             << ")=" << master_total << " Slave(" << g_chunk_idx << "," << g_frame_offset
-                             << ")=" << slave_total << " rec#" << g_recording_number << endl;
-                        if (master_total == slave_total) {
-                            g_sentry_mismatch_count = 0;
-                        } else {
-                            g_sentry_mismatch_count++;
-                            int64_t slave_before = slave_total;
-                            if (master_total < slave_total) {
-                                g_chunk_idx = g_pending_master_ci;
-                                g_frame_offset = g_pending_master_fo;
-                                updateSentry(g_sentry_root);
-                            }
-                            logException("WARN", "sentry",
-                                "Mismatch #" + to_string(g_sentry_mismatch_count)
-                                + ": Master(" + to_string(g_pending_master_ci) + "," + to_string(g_pending_master_fo) + ")"
-                                + " Slave_before(" + to_string(slave_before / g_hdf5_chunk_capacity) + "," + to_string(slave_before % g_hdf5_chunk_capacity) + ")"
-                                + " — using min, diff=" + to_string(abs(master_total - slave_before)));
-                            if (g_sentry_mismatch_count >= 3) {
-                                logException("FATAL", "sentry",
-                                    "3 consecutive SENTRY mismatches — possible hardware fault, exiting.");
-                                global_running = false;
-                            }
+                        // Slave: connect, send, receive
+                        cout << "[Sentry] Slave connecting to Master TCP handshake on port " << handshake_port << "..." << endl;
+                        SOCKET hs = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                        sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(handshake_port);
+                        inet_pton(AF_INET, master_ip.c_str(), &sa.sin_addr);
+                        while (connect(hs, (sockaddr*)&sa, sizeof(sa)) == -1 && global_running) {
+                            this_thread::sleep_for(chrono::milliseconds(100));
+                            cv::waitKey(1);
+                        }
+                        if (hs != INVALID_SOCKET) {
+                            int64_t send_buf[2] = {local_total, local_total};
+                            send(hs, (const char*)send_buf, sizeof(send_buf), 0);
+                            int64_t peer_buf[2]; recv(hs, (char*)peer_buf, sizeof(peer_buf), 0);
+                            int64_t peer_total = peer_buf[0]; int peer_ci = (int)(peer_total / g_hdf5_chunk_capacity); int peer_fo = (int)(peer_total % g_hdf5_chunk_capacity);
+                            closesocket(hs);
+                            int64_t peer_val = peer_total, local_val = local_total;
+                            cout << "[Sentry] Slave TCP done. Local=" << local_val << " Peer(Master)=" << peer_val << endl;
+                            if (peer_val != local_val) {
+                                g_sentry_mismatch_count++;
+                                if (peer_val < local_val) { g_chunk_idx = peer_ci; g_frame_offset = peer_fo; updateSentry(g_sentry_root); }
+                                logException("WARN", "sentry", "Mismatch #" + to_string(g_sentry_mismatch_count) + ": Master(" + to_string(peer_ci) + "," + to_string(peer_fo) + ") Slave(" + to_string(local_ci) + "," + to_string(local_fo) + ") diff=" + to_string(abs(local_val - peer_val)) + " — using min");
+                                if (g_sentry_mismatch_count >= 3) { logException("FATAL", "sentry", "3 consecutive mismatches — exiting."); global_running = false; }
+                            } else { g_sentry_mismatch_count = 0; }
                         }
                     }
-                    g_pending_master_ci = -1;  // consumed
-                }
-
-                if (is_master_pc && enable_net_sync) {
-                    string sm = "SENTRY:" + to_string(g_chunk_idx) + ":" + to_string(g_frame_offset);
-                    cout << "[Master] Sending " << sm << " to slave..." << endl;
-                    fastUdpSend(sm);
+                    g_syncing = false;
                 }
 
                 double jpg_duration = 0.0;
@@ -1459,7 +1462,10 @@ int main() {
         char key = (char)cv::waitKey(1);
         bool trigger_start = false;
 
-        if (key == 'q' || key == 27) {
+        if (g_syncing.load()) {
+            // Block all keys during sentry sync
+        }
+        else if (key == 'q' || key == 27) {
             if (enable_net_sync) {
                 if (is_master_pc) {
                     if (g_fault_sock != INVALID_SOCKET) {
