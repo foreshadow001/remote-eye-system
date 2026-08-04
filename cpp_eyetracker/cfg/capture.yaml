@@ -53,7 +53,17 @@ capture:
 
 # 加载/验证节点
 loader:
-  participant_root: "D:/capture/P001"
+  participant_root:
+    - "D:/capture/P001"
+    - "D:/capture/P001"
+    - "D:/capture/P001"
+    - "D:/capture/P001"
+    - "D:/capture/P001"
+    - "E:/capture/P001"
+    - "E:/capture/P001"
+    - "E:/capture/P001"
+    - "E:/capture/P001"
+    - "E:/capture/P001"
   cam_indices:
     - "40768742"
     - "40774056"

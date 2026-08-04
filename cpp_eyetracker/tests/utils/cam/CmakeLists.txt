@@ -10,6 +10,7 @@ target_link_libraries(test_multi_cam_multi_host
 
 message(STATUS "test_multi_cam_multi_host will be built and linked with eyetracker::cam")
 
+find_package(OpenCV REQUIRED)
 find_package(HDF5 REQUIRED COMPONENTS CXX)
 
 add_executable(test_multi_cam_multi_host_hdf5
@@ -29,3 +30,22 @@ target_include_directories(test_multi_cam_multi_host_hdf5
 )
 
 message(STATUS "test_multi_cam_multi_host_hdf5 will be built")
+
+add_executable(test_load_hdf5_frame
+    test_load_hdf5_frame.cpp
+)
+
+target_link_libraries(test_load_hdf5_frame
+    PRIVATE
+        eyetracker::cfg
+        ${OpenCV_LIBS}
+        ${HDF5_CXX_LIBRARIES}
+)
+
+target_include_directories(test_load_hdf5_frame
+    PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+        ${OpenCV_INCLUDE_DIRS}
+)
+
+message(STATUS "test_load_hdf5_frame will be built")
