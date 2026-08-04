@@ -314,7 +314,19 @@ for (auto& p : procs) {
 
 CloseHandle(hJob);  // All children have exited — safe to release Job Object now
 
-// Step 4: Update sentry (no HDF5 file access needed — children did everything)
+// Step 4: TCP handshake — sync sentry BEFORE counting.
+// Both sides agree on the current (pre-increment) position first,
+// THEN both increment by core_frames.  This prevents one side from
+// counting ahead if it had stale sentry data from a previous session.
+if (enable_net_sync) {
+    g_syncing = true;
+    // ... Master accept / Slave connect on net_port + 300 ...
+    // Exchange local_total = g_chunk_idx * capacity + g_frame_offset
+    // If mismatch: both sides adopt min(local, peer)
+    g_syncing = false;
+}
+
+// Step 5: Increment sentry — only AFTER both sides agree on the base.
 if (all_ok) {
     g_frame_offset += core_frames;
     if (g_frame_offset >= g_hdf5_chunk_capacity) { g_chunk_idx++; g_frame_offset -= g_hdf5_chunk_capacity; }

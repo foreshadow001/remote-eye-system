@@ -1494,21 +1494,12 @@ int main() {
                 for (auto& ctx : cam_ctxs)
                     ctx->dump_end_time = chrono::steady_clock::now();
 
-                cout << "[DEBUG-HDF5] Updating sentry, frame_offset " << g_frame_offset << " -> " << (g_frame_offset + core_frames) << endl;
-
-                // Step 4: Update sentry (no HDF5 file access — children did everything)
-                if (all_ok) {
-                    g_frame_offset += core_frames;
-                    if (g_frame_offset >= g_hdf5_chunk_capacity) {
-                        g_chunk_idx++;
-                        g_frame_offset -= g_hdf5_chunk_capacity;
-                    }
-                    updateSentry(g_sentry_root);
-                } else {
-                    logException("WARN", "hdf5", "Some child processes failed — sentry NOT updated");
-                }
-
-                // TCP handshake: exchange sentry values reliably, both sides block
+                // ====== Step 4: Sync sentry BEFORE counting ======
+                // TCP handshake first — agree on the current (pre-increment) position.
+                // Only AFTER both sides confirm the same base do we increment.
+                // This prevents one side from counting ahead if it had stale sentry data.
+                // The handshake always runs (even if some children failed) to prevent
+                // deadlock: one side waiting in accept() while the other skipped.
                 if (enable_net_sync) {
                     g_syncing = true;
                     int handshake_port = net_port + 300;
@@ -1517,7 +1508,6 @@ int main() {
                     int64_t local_total = (int64_t)local_ci * g_hdf5_chunk_capacity + local_fo;
 
                     if (is_master_pc) {
-                        // Master: listen, accept
                         SOCKET hs = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                         sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(handshake_port);
                         sa.sin_addr.s_addr = INADDR_ANY;
@@ -1528,7 +1518,7 @@ int main() {
                         SOCKET cs = accept(hs, (sockaddr*)&ca, &cl);
                         if (cs != INVALID_SOCKET) {
                             int64_t peer_buf[2]; recv(cs, (char*)peer_buf, sizeof(peer_buf), 0);
-                            int64_t peer_total = peer_buf[0]; int peer_ci = (int)(peer_total / g_hdf5_chunk_capacity); int peer_fo = (int)(peer_total % g_hdf5_chunk_capacity);
+                            int64_t peer_total = peer_buf[0];
                             int64_t send_buf[2] = {local_total, local_total};
                             send(cs, (const char*)send_buf, sizeof(send_buf), 0);
                             closesocket(cs);
@@ -1536,14 +1526,27 @@ int main() {
                             cout << "[Sentry] Master TCP done. Local=" << local_val << " Peer(Slave)=" << peer_val << endl;
                             if (peer_val != local_val) {
                                 g_sentry_mismatch_count++;
-                                if (peer_val < local_val) { g_chunk_idx = peer_ci; g_frame_offset = peer_fo; updateSentry(g_sentry_root); }
-                                logException("WARN", "sentry", "Mismatch #" + to_string(g_sentry_mismatch_count) + ": Master(" + to_string(local_ci) + "," + to_string(local_fo) + ") Slave(" + to_string(peer_ci) + "," + to_string(peer_fo) + ") diff=" + to_string(abs(local_val - peer_val)) + " — using min");
-                                if (g_sentry_mismatch_count >= 3) { logException("FATAL", "sentry", "3 consecutive mismatches — exiting."); global_running = false; }
+                                int peer_ci = (int)(peer_val / g_hdf5_chunk_capacity);
+                                int peer_fo = (int)(peer_val % g_hdf5_chunk_capacity);
+                                // Use the minimum — then BOTH sides will add core_frames below
+                                if (peer_val < local_val) {
+                                    g_chunk_idx = peer_ci;
+                                    g_frame_offset = peer_fo;
+                                }
+                                // else: master is behind — slave will fix itself when it receives master's value
+                                logException("WARN", "sentry",
+                                    "Mismatch #" + to_string(g_sentry_mismatch_count)
+                                    + ": Master(" + to_string(local_ci) + "," + to_string(local_fo)
+                                    + ") Slave(" + to_string(peer_ci) + "," + to_string(peer_fo)
+                                    + ") diff=" + to_string(llabs(local_val - peer_val)) + " — using min");
+                                if (g_sentry_mismatch_count >= 3) {
+                                    logException("FATAL", "sentry", "3 consecutive mismatches — exiting.");
+                                    global_running = false;
+                                }
                             } else { g_sentry_mismatch_count = 0; }
                         }
                         closesocket(hs);
                     } else {
-                        // Slave: connect, send, receive
                         cout << "[Sentry] Slave connecting to Master TCP handshake on port " << handshake_port << "..." << endl;
                         SOCKET hs = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                         sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(handshake_port);
@@ -1556,19 +1559,46 @@ int main() {
                             int64_t send_buf[2] = {local_total, local_total};
                             send(hs, (const char*)send_buf, sizeof(send_buf), 0);
                             int64_t peer_buf[2]; recv(hs, (char*)peer_buf, sizeof(peer_buf), 0);
-                            int64_t peer_total = peer_buf[0]; int peer_ci = (int)(peer_total / g_hdf5_chunk_capacity); int peer_fo = (int)(peer_total % g_hdf5_chunk_capacity);
+                            int64_t peer_total = peer_buf[0];
                             closesocket(hs);
                             int64_t peer_val = peer_total, local_val = local_total;
                             cout << "[Sentry] Slave TCP done. Local=" << local_val << " Peer(Master)=" << peer_val << endl;
                             if (peer_val != local_val) {
                                 g_sentry_mismatch_count++;
-                                if (peer_val < local_val) { g_chunk_idx = peer_ci; g_frame_offset = peer_fo; updateSentry(g_sentry_root); }
-                                logException("WARN", "sentry", "Mismatch #" + to_string(g_sentry_mismatch_count) + ": Master(" + to_string(peer_ci) + "," + to_string(peer_fo) + ") Slave(" + to_string(local_ci) + "," + to_string(local_fo) + ") diff=" + to_string(abs(local_val - peer_val)) + " — using min");
-                                if (g_sentry_mismatch_count >= 3) { logException("FATAL", "sentry", "3 consecutive mismatches — exiting."); global_running = false; }
+                                int peer_ci = (int)(peer_val / g_hdf5_chunk_capacity);
+                                int peer_fo = (int)(peer_val % g_hdf5_chunk_capacity);
+                                if (peer_val < local_val) {
+                                    g_chunk_idx = peer_ci;
+                                    g_frame_offset = peer_fo;
+                                }
+                                logException("WARN", "sentry",
+                                    "Mismatch #" + to_string(g_sentry_mismatch_count)
+                                    + ": Master(" + to_string(peer_ci) + "," + to_string(peer_fo)
+                                    + ") Slave(" + to_string(local_ci) + "," + to_string(local_fo)
+                                    + ") diff=" + to_string(llabs(local_val - peer_val)) + " — using min");
+                                if (g_sentry_mismatch_count >= 3) {
+                                    logException("FATAL", "sentry", "3 consecutive mismatches — exiting.");
+                                    global_running = false;
+                                }
                             } else { g_sentry_mismatch_count = 0; }
                         }
                     }
                     g_syncing = false;
+                }
+
+                // Step 5: Increment sentry — only AFTER both sides have agreed on the base.
+                // Both master and slave add core_frames to the agreed-upon position.
+                cout << "[DEBUG-HDF5] Updating sentry, chunk=" << g_chunk_idx
+                     << " frame_offset " << g_frame_offset << " -> " << (g_frame_offset + core_frames) << endl;
+                if (all_ok) {
+                    g_frame_offset += core_frames;
+                    if (g_frame_offset >= g_hdf5_chunk_capacity) {
+                        g_chunk_idx++;
+                        g_frame_offset -= g_hdf5_chunk_capacity;
+                    }
+                    updateSentry(g_sentry_root);
+                } else {
+                    logException("WARN", "hdf5", "Some child processes failed — sentry NOT updated");
                 }
 
                 double jpg_duration = 0.0;
