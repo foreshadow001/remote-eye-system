@@ -1224,11 +1224,90 @@ int main() {
 
     // HDF5: init sentry
     initSentry(g_sentry_root);
-    cout << "[HDF5] Sentry: chunk=" << g_chunk_idx << " offset=" << g_frame_offset << endl;
+    cout << "[HDF5] Sentry (local): chunk=" << g_chunk_idx << " offset=" << g_frame_offset << endl;
     for (auto& ctx : cam_ctxs) {
         ctx->hdf5_dir = g_participant_roots[ctx->index] + "/" + ctx->id;
         fs::create_directories(ctx->hdf5_dir);
     }
+
+    // ====== Startup sentry handshake ======
+    // Sync sentry with peer BEFORE the first recording.  If one side has stale
+    // data from a previous session, this catches the mismatch before any HDF5
+    // writes happen at wrong offsets.
+    if (enable_net_sync) {
+        int handshake_port = net_port + 300;
+        auto local_ci = g_chunk_idx;
+        auto local_fo = g_frame_offset.load();
+        int64_t local_total = (int64_t)local_ci * g_hdf5_chunk_capacity + local_fo;
+
+        cout << "[Sentry] Startup handshake: local=" << local_total
+             << " (chunk=" << local_ci << " offset=" << local_fo << ")" << endl;
+
+        if (is_master_pc) {
+            SOCKET hs = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(handshake_port);
+            sa.sin_addr.s_addr = INADDR_ANY;
+            ::bind(hs, (sockaddr*)&sa, sizeof(sa));
+            listen(hs, 1);
+            cout << "[Sentry] Master waiting for Slave startup handshake on port " << handshake_port << "..." << endl;
+            sockaddr_in ca; socklen_t cl = sizeof(ca);
+            SOCKET cs = accept(hs, (sockaddr*)&ca, &cl);
+            if (cs != INVALID_SOCKET) {
+                int64_t peer_buf[2]; recv(cs, (char*)peer_buf, sizeof(peer_buf), 0);
+                int64_t peer_total = peer_buf[0];
+                int64_t send_buf[2] = {local_total, local_total};
+                send(cs, (const char*)send_buf, sizeof(send_buf), 0);
+                closesocket(cs);
+                if (peer_total != local_total) {
+                    int peer_ci = (int)(peer_total / g_hdf5_chunk_capacity);
+                    int peer_fo = (int)(peer_total % g_hdf5_chunk_capacity);
+                    logException("WARN", "sentry",
+                        "Startup mismatch: Master(" + to_string(local_ci) + "," + to_string(local_fo)
+                        + ") Slave(" + to_string(peer_ci) + "," + to_string(peer_fo)
+                        + ") diff=" + to_string(llabs(local_total - peer_total)) + " — using min");
+                    if (peer_total < local_total) {
+                        g_chunk_idx = peer_ci;
+                        g_frame_offset = peer_fo;
+                        updateSentry(g_sentry_root);
+                    }
+                }
+                cout << "[Sentry] Startup handshake done. Synced to: chunk=" << g_chunk_idx
+                     << " offset=" << g_frame_offset << endl;
+            }
+            closesocket(hs);
+        } else {
+            cout << "[Sentry] Slave connecting to Master for startup handshake on port " << handshake_port << "..." << endl;
+            SOCKET hs = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(handshake_port);
+            inet_pton(AF_INET, master_ip.c_str(), &sa.sin_addr);
+            while (connect(hs, (sockaddr*)&sa, sizeof(sa)) == -1 && global_running) {
+                this_thread::sleep_for(chrono::milliseconds(100));
+            }
+            if (hs != INVALID_SOCKET) {
+                int64_t send_buf[2] = {local_total, local_total};
+                send(hs, (const char*)send_buf, sizeof(send_buf), 0);
+                int64_t peer_buf[2]; recv(hs, (char*)peer_buf, sizeof(peer_buf), 0);
+                int64_t peer_total = peer_buf[0];
+                closesocket(hs);
+                if (peer_total != local_total) {
+                    int peer_ci = (int)(peer_total / g_hdf5_chunk_capacity);
+                    int peer_fo = (int)(peer_total % g_hdf5_chunk_capacity);
+                    logException("WARN", "sentry",
+                        "Startup mismatch: Master(" + to_string(peer_ci) + "," + to_string(peer_fo)
+                        + ") Slave(" + to_string(local_ci) + "," + to_string(local_fo)
+                        + ") diff=" + to_string(llabs(local_total - peer_total)) + " — using min");
+                    if (peer_total < local_total) {
+                        g_chunk_idx = peer_ci;
+                        g_frame_offset = peer_fo;
+                        updateSentry(g_sentry_root);
+                    }
+                }
+                cout << "[Sentry] Startup handshake done. Synced to: chunk=" << g_chunk_idx
+                     << " offset=" << g_frame_offset << endl;
+            }
+        }
+    }
+
     cout << "[HDF5] Ready." << endl;
 
     if (is_master_pc) cout << "Press 'r' to START REC across ALL nodes, 'space' to photo, 'q' to quit.\n";
