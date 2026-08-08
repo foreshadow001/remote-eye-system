@@ -209,23 +209,27 @@ network:
 main():
   1. WSAStartup
   2. 加载 cfg/piper.yaml → ubuntu_ip, ctrl_port
-  3. 加载 cfg/gaze_target/P001/piper_upper.txt → targets_upper
-  4. 加载 cfg/gaze_target/P001/piper_lower.txt → targets_lower
-  5. socket() + connect() 到 ubuntu_ip:ctrl_port
-  6. Upper 回零: MOVE_JOINTS:upper:0,0,0,0,0,0 → 等待 MOVED
-  7. Lower 回零: MOVE_JOINTS:lower:0,0,0,0,0,0 → 等待 MOVED
-  8. 进入 drawUI 循环 (单线程):
-     - 当前臂: "upper" (初始)，当前索引: 0
-     - 渲染状态：当前臂名称、目标序号/N、指令 (x,y,z)、实际 (x,y,z)、
-       Z-X-Z' 欧拉角、距目标距离
-     - [空格] → 发送 MOVE_TO:<arm>:x,y,z → 接收 MOVED → 索引++
-       → 若当前臂全部完成 → 提示 "UPPER DONE" 或 "LOWER DONE"
-     - [t]   → 切换当前臂 (upper↔lower)，索引归零
-     - [R]   → 重新发送当前臂回零指令
-     - 两个臂都执行完毕 → 显示 "ALL DONE"，等待退出
-     - [ESC]/[q] → 发送 SHUTDOWN，退出
-  9. closesocket, WSACleanup
+  3. 加载 cfg/capture.yaml → participant_id
+  4. 加载 cfg/gaze_target/<pid>/piper_upper.txt → targets_upper
+  5. 加载 cfg/gaze_target/<pid>/piper_lower.txt → targets_lower
+  6. 读取 cfg/gaze_target/<pid>/sentry.txt → 恢复进度 (upper_idx, lower_idx)
+  7. socket() + connect() 到 ubuntu_ip:ctrl_port
+  8. Upper 回零: MOVE_JOINTS:upper → 等待 MOVED → 记录进度
+  9. Lower 回零: MOVE_JOINTS:lower → 等待 MOVED → 记录进度
+  10. 进入 drawUI 循环 (单线程):
+      - 当前臂: "upper" (初始)，arm_idx = sentry 恢复的值
+      - 渲染状态：臂名称、进度 N/M、指令/实际位姿、距离
+      - [空格] → 发送 MOVE_TO → 接收响应：
+          MOVED → arm_idx++ → updateSentry()
+          ERROR:no_solution → arm_idx++ (跳过) → updateSentry()
+          → 若当前臂全部完成 → 提示 "UPPER/LOWER DONE"
+      - [t]   → 切换臂 → 目标臂回零 → 恢复该臂进度 → updateSentry()
+      - [R]   → 当前臂重新回零
+      - 两个臂都完成 → "ALL DONE"
+      - [ESC]/[q] → 双回零 → SHUTDOWN → 退出
+  11. closesocket, WSACleanup
 ```
+
 ### 6.3 TCP 辅助函数（复用自 get_piper_pose.cpp）
 
 ```cpp
@@ -313,6 +317,80 @@ auto loadTargets = [](const string& path) -> vector<array<double,3>> {
 auto targets_upper = loadTargets("cfg/gaze_target/P001/piper_upper.txt");
 auto targets_lower = loadTargets("cfg/gaze_target/P001/piper_lower.txt");
 ```
+
+### 6.8 进度维护与异常恢复
+
+#### sentry.txt
+
+每次执行完一个点位后，将两个臂的进度写入 `cfg/gaze_target/<participant_id>/sentry.txt`。格式：
+
+```
+upper:<已完成帧数>
+lower:<已完成帧数>
+```
+
+其中数字表示该臂**已成功执行的帧数**（即下一帧的索引）。例如 `upper:3` 表示 upper 已完成前 3 个点位，下次从第 4 个（index=3）开始。
+
+#### 启动时恢复
+
+程序启动时读取 sentry.txt：
+- 文件不存在 → 两个臂都从 0 开始
+- 文件存在 → 加载进度，从上次中断处继续
+
+```cpp
+int upper_idx = 0, lower_idx = 0;
+ifstream sf(gaze_dir + "/sentry.txt");
+if (sf) {
+    string line;
+    while (getline(sf, line)) {
+        if (line.rfind("upper:", 0) == 0) upper_idx = stoi(line.substr(6));
+        if (line.rfind("lower:", 0) == 0) lower_idx = stoi(line.substr(6));
+    }
+}
+arm_idx = (arm == "upper") ? upper_idx : lower_idx;
+```
+
+#### 每次写入后更新
+
+```cpp
+auto updateSentry = [&]() {
+    ofstream sf(gaze_dir + "/sentry.txt");
+    sf << "upper:" << upper_idx << "\nlower:" << lower_idx << "\n";
+};
+```
+
+在每次 MOVE_TO 成功后、MOVE_JOINTS 成功后调用 `updateSentry()`。
+
+#### 切换臂时回零
+
+按下 `t` 切换到另一臂后：
+1. 若目标臂未完成 → 先对该臂执行 `MOVE_JOINTS` 回零
+2. 回零成功 → 从 sentry 记录的索引恢复该臂的进度
+3. 回零失败 → 保持当前臂，提示用户
+
+```
+[t] 按下
+  → 若目标臂已完成 → 跳过
+  → zeroArm(target_arm) → 等待完成
+  → 切换到目标臂，arm_idx = saved_idx
+  → updateSentry()
+```
+
+#### 无解情况处理
+
+当 Ubuntu 返回 `ERROR:<arm>:no_solution` 时，跳过当前点位，自动递增索引，更新 sentry：
+
+```
+recvLine 返回 "ERROR:upper:no_solution"
+  → 打印警告
+  → arm_idx++  (跳过此点)
+  → updateSentry()
+  → 状态：SKIPPED — upper #N
+```
+
+不阻塞等待用户确认，自动继续下一个点位。
+
+---
 
 ## 七、CMake 改造
 

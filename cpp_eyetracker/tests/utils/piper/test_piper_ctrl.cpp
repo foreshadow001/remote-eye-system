@@ -154,6 +154,26 @@ int main() {
     cout << "Loaded: upper=" << targets_upper.size()
          << " pts, lower=" << targets_lower.size() << " pts" << endl;
 
+    // --- Restore progress from sentry ---
+    int upper_idx = 0, lower_idx = 0;
+    string sentry_path = gaze_dir + "/sentry.txt";
+    {
+        ifstream sf(sentry_path);
+        if (sf) {
+            string line;
+            while (getline(sf, line)) {
+                if (line.rfind("upper:", 0) == 0) upper_idx = stoi(line.substr(6));
+                if (line.rfind("lower:", 0) == 0) lower_idx = stoi(line.substr(6));
+            }
+            cout << "Restored progress: upper=" << upper_idx
+                 << " lower=" << lower_idx << endl;
+        }
+    }
+    auto updateSentry = [&]() {
+        ofstream sf(sentry_path);
+        sf << "upper:" << upper_idx << "\nlower:" << lower_idx << "\n";
+    };
+
     // --- Connect TCP ---
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == INVALID_SOCKET) {
@@ -176,14 +196,19 @@ int main() {
     // --- State ---
     string status        = "Connected";
     string arm           = "upper";
-    int    arm_idx       = 0;    // current target index within this arm
     ArmPose last_pose;
     string last_response;
-    bool   upper_done    = false;
-    bool   lower_done    = false;
-    bool   all_done      = false;
+    bool   upper_done    = (upper_idx >= (int)targets_upper.size());
+    bool   lower_done    = (lower_idx >= (int)targets_lower.size());
+    bool   all_done      = upper_done && lower_done;
 
-    // Helper: send MOVE_JOINTS for an arm, wait for response
+    // Helper: current arm index (write-through to sentry)
+    auto armIdx = [&]() -> int& { return (arm=="upper") ? upper_idx : lower_idx; };
+    auto armDone = [&]() -> bool& { return (arm=="upper") ? upper_done : lower_done; };
+    auto armTotal = [&]() -> int { return (arm=="upper") ? (int)targets_upper.size()
+                                                         : (int)targets_lower.size(); };
+
+    // Helper: send MOVE_JOINTS for an arm, wait for response, update sentry
     auto zeroArm = [&](const string& arm_name) -> bool {
         cout << "Zeroing " << arm_name << "..." << endl;
         status = "Zeroing " + arm_name + "...";
@@ -199,6 +224,7 @@ int main() {
             if (parsePoseResponse(resp, resp_arm, pose)) {
                 last_pose = pose;
                 cout << arm_name << " zeroed: (" << pose.x << ", " << pose.y << ", " << pose.z << ")" << endl;
+                updateSentry();
                 return true;
             } else {
                 cerr << arm_name << " zero FAIL: " << resp << endl;
@@ -216,8 +242,9 @@ int main() {
 
     // Helper: get current target
     auto getCurrentTarget = [&]() -> const array<double,3>* {
+        int idx = armIdx();
         auto& tgt = (arm == "upper") ? targets_upper : targets_lower;
-        if (arm_idx >= 0 && arm_idx < (int)tgt.size()) return &tgt[arm_idx];
+        if (idx >= 0 && idx < (int)tgt.size()) return &tgt[idx];
         return nullptr;
     };
 
@@ -259,7 +286,7 @@ int main() {
         auto* tgt = getCurrentTarget();
         if (tgt) {
             snprintf(b,sizeof(b),"Target #%d/%d: (%.3f, %.3f, %.3f) m",
-                     arm_idx+1, tgt_count, (*tgt)[0], (*tgt)[1], (*tgt)[2]);
+                     armIdx()+1, tgt_count, (*tgt)[0], (*tgt)[1], (*tgt)[2]);
             put(b, {255,200,0});
         } else if ((arm=="upper"&&upper_done)||(arm=="lower"&&lower_done)) {
             put("Target: ALL DONE for " + arm, {0,255,0});
@@ -322,31 +349,38 @@ int main() {
             running = false;
         }
         else if (key == 't' || key == 'T') {
-            // Switch arm
+            // Switch arm — zero target arm first, then restore its saved index
             if (all_done) continue;
             string new_arm = (arm == "upper") ? "lower" : "upper";
-            bool new_done = (new_arm == "upper") ? upper_done : lower_done;
-            if (new_done) {
+            bool& nd = (new_arm == "upper") ? upper_done : lower_done;
+            if (nd) {
                 status = new_arm + " already done — skipped";
                 cout << status << endl;
                 continue;
             }
-            arm = new_arm;
-            arm_idx = 0;
-            status = "Switched to " + arm;
-            cout << "Switched to " << arm << endl;
+            cout << "Switching to " << new_arm << " — zeroing first..." << endl;
+            status = "Zeroing " + new_arm + "...";
+            if (zeroArm(new_arm)) {
+                arm = new_arm;
+                status = "Switched to " + arm;
+                cout << "Switched to " << arm << " (index=" << armIdx() << ")" << endl;
+            } else {
+                status = "Zero FAIL — stayed on " + arm;
+            }
         }
         else if (key == ' ' && !all_done) {
             // Check if current arm is already done
-            if ((arm=="upper" && upper_done) || (arm=="lower" && lower_done)) {
+            if (armDone()) {
                 status = arm + " already done — press T to switch";
                 continue;
             }
             auto* ct = getCurrentTarget();
             if (!ct) {
                 // Mark this arm as done
+                armDone() = true;
                 if (arm == "upper") upper_done = true;
                 else                lower_done = true;
+                updateSentry();
                 status = arm + " DONE!";
                 cout << "\n=== " << arm << " COMPLETED ===" << endl;
                 if (upper_done && lower_done) {
@@ -360,8 +394,10 @@ int main() {
             char cmd[128];
             snprintf(cmd,sizeof(cmd),"MOVE_TO:%s:%.6f,%.6f,%.6f",
                      arm.c_str(), (*ct)[0], (*ct)[1], (*ct)[2]);
-            cout << "Sending: " << cmd << endl;
-            status = "Moving " + arm + "...";
+            int cur_idx = armIdx();
+            cout << "Sending [" << arm << " #" << (cur_idx+1) << "/" << armTotal()
+                 << "]: " << cmd << endl;
+            status = "Moving " + arm + " #" + to_string(cur_idx+1) + "...";
             if (!sendLine(sock, cmd)) {
                 status = "Send FAIL";
             } else {
@@ -371,10 +407,19 @@ int main() {
                     ArmPose mp;
                     if (parsePoseResponse(mr, mr_arm, mp)) {
                         last_pose = mp;
-                        status = "OK — " + arm + " #" + to_string(arm_idx+1);
-                        arm_idx++;
-                        cout << arm << " #" << arm_idx << " MOVED: ("
-                             << mp.x << ", " << mp.y << ", " << mp.z << ")" << endl;
+                        status = "OK — " + arm + " #" + to_string(cur_idx+1);
+                        armIdx()++;
+                        updateSentry();
+                        cout << arm << " #" << cur_idx+1 << " MOVED: ("
+                             << mp.x << ", " << mp.y << ", " << mp.z << ")"
+                             << "  progress saved" << endl;
+                    } else if (mr.rfind("ERROR:", 0) == 0) {
+                        // No solution — skip this target, save progress
+                        armIdx()++;
+                        updateSentry();
+                        status = "SKIPPED — " + arm + " #" + to_string(cur_idx+1)
+                               + " (no solution)";
+                        cout << "  SKIPPED (no solution). Progress saved." << endl;
                     } else {
                         status = "Bad resp: " + mr.substr(0,40);
                     }
@@ -384,12 +429,12 @@ int main() {
             }
         }
         else if (key == 'r' || key == 'R') {
-            // Re-zero current arm
+            // Re-zero current arm — reset its progress
             zeroArm(arm);
-            arm_idx = 0;
-            if (arm == "upper") upper_done = false;
-            else                 lower_done = false;
+            armIdx() = 0;
+            armDone() = false;
             all_done = false;
+            updateSentry();
             status = "Re-zeroed " + arm;
         }
     }
