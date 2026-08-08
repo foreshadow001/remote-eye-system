@@ -1066,6 +1066,10 @@ int main() {
     Pylon::PylonInitialize();
 
     g_participant_roots = cap["participant_root"].as<vector<string>>();
+    // Append participant_id to each root: "D:/capture" → "D:/capture/P001"
+    string participant_id;
+    try { participant_id = cap["participant_id"].as<string>(); } catch (...) { participant_id = "P001"; }
+    for (auto& root : g_participant_roots) root += "/" + participant_id;
     g_sentry_root = g_participant_roots[0];
     try { g_hdf5_chunk_capacity = cap["hdf5_chunk_frame_capacity"].as<int>(); } catch (...) {}
 

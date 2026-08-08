@@ -174,8 +174,12 @@ int main(int argc, char* argv[]) {
     vector<string> sns;
     try {
         Cfg cfg("cfg/capture.yaml");
+        // Append participant_id to each root
+        string participant_id;
+        try { participant_id = cfg["capture"]["participant_id"].as<string>(); } catch (...) { participant_id = "P001"; }
         auto& loader = cfg["loader"];
         roots = loader["participant_root"].as<vector<string>>();
+        for (auto& r : roots) r += "/" + participant_id;
         sns = loader["cam_indices"].as<vector<string>>();
         g_cam_w = loader["cam_width"].as<int>();
         g_cam_h = loader["cam_height"].as<int>();

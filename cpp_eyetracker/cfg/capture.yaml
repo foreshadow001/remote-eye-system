@@ -1,17 +1,18 @@
 # capture.yaml — test_multi_cam_multi_host_hdf5.cpp 配置文件
 
 capture:
-  participant_root:
-    - "D:/capture/P001"
-    - "D:/capture/P001"
-    - "D:/capture/P001"
-    - "D:/capture/P001"
-    - "D:/capture/P001"
-    - "E:/capture/P001"
-    - "E:/capture/P001"
-    - "E:/capture/P001"
-    - "E:/capture/P001"
-    - "E:/capture/P001"
+  participant_id: "P001"          # 参与者编号，用于定位 gaze_target 目录
+  participant_root:                # 仅存储盘符/根目录，participant_id 在代码中拼接
+    - "D:/capture"
+    - "D:/capture"
+    - "D:/capture"
+    - "D:/capture"
+    - "D:/capture"
+    - "E:/capture"
+    - "E:/capture"
+    - "E:/capture"
+    - "E:/capture"
+    - "E:/capture"
 
   cam_indices:
     - "40768742"
@@ -53,17 +54,17 @@ capture:
 
 # 加载/验证节点
 loader:
-  participant_root:
-    - "D:/capture/P001"
-    - "D:/capture/P001"
-    - "D:/capture/P001"
-    - "D:/capture/P001"
-    - "D:/capture/P001"
-    - "E:/capture/P001"
-    - "E:/capture/P001"
-    - "E:/capture/P001"
-    - "E:/capture/P001"
-    - "E:/capture/P001"
+  participant_root:                # 仅存储盘符/根目录，participant_id 在代码中拼接
+    - "D:/capture"
+    - "D:/capture"
+    - "D:/capture"
+    - "D:/capture"
+    - "D:/capture"
+    - "E:/capture"
+    - "E:/capture"
+    - "E:/capture"
+    - "E:/capture"
+    - "E:/capture"
   cam_indices:
     - "40768742"
     - "40774056"

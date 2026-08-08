@@ -106,14 +106,20 @@ int main() {
 #endif
 
     // --- Load config ---
-    auto yp = (fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()
-               / "cfg" / "piper.yaml").string();
-    Cfg cfg(yp);
-    string ubuntu_ip = cfg["network"]["ubuntu_ip"].as<string>();
-    int    ctrl_port = cfg["network"]["ctrl_port"].as<int>();
+    auto cfg_dir = (fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()
+                    / "cfg").string();
+    Cfg cfg_piper(cfg_dir + "/piper.yaml");
+    string ubuntu_ip = cfg_piper["network"]["ubuntu_ip"].as<string>();
+    int    ctrl_port = cfg_piper["network"]["ctrl_port"].as<int>();
+
+    // Read participant ID from capture.yaml to locate gaze_target directory
+    Cfg cfg_capture(cfg_dir + "/capture.yaml");
+    string participant_id = cfg_capture["capture"]["participant_id"].as<string>();
+    string gaze_dir = "cfg/gaze_target/" + participant_id;
 
     cout << "=== Piper Arm Control ===" << endl;
     cout << "Server: " << ubuntu_ip << ":" << ctrl_port << endl;
+    cout << "Participant: " << participant_id << endl;
 
     // --- Helper: load all targets from a file ---
     auto loadTargets = [](const string& path) -> vector<array<double,3>> {
@@ -139,8 +145,8 @@ int main() {
     };
 
     // --- Load targets for both arms ---
-    auto targets_upper = loadTargets("cfg/gaze_target/P001/piper_upper.txt");
-    auto targets_lower = loadTargets("cfg/gaze_target/P001/piper_lower.txt");
+    auto targets_upper = loadTargets(gaze_dir + "/piper_upper.txt");
+    auto targets_lower = loadTargets(gaze_dir + "/piper_lower.txt");
     if (targets_upper.empty() && targets_lower.empty()) {
         cerr << "ERROR: No target points loaded." << endl;
         return 1;
