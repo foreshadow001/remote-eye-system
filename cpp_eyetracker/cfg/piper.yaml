@@ -78,7 +78,8 @@ arms:
 # Network config (must match Ubuntu net.yaml)
 network:
   ubuntu_ip: "192.168.10.4"
-  port: 49300
+  port: 49300                # windows_end_monitor.py
+  ctrl_port: 49301           # piper_windows_ctrl_server.py
 
 test_record_arm_data:
   cam_indices:

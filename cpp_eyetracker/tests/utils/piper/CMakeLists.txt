@@ -38,6 +38,18 @@ target_link_libraries(test_piper_to_cam
 )
 
 message(STATUS "get_piper_pose will be built")
+
+add_executable(test_piper_ctrl
+    test_piper_ctrl.cpp
+)
+
+target_link_libraries(test_piper_ctrl
+    PRIVATE
+        eyetracker::cfg
+        ${OpenCV_LIBS}
+)
+
+message(STATUS "test_piper_ctrl will be built")
 message(STATUS "test_record_arm_data will be built")
 message(STATUS "test_piper_to_cam will be built")
 

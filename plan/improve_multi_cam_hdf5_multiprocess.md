@@ -336,6 +336,108 @@ if (all_ok) {
 
 ---
 
+### 3.6 sentry 维护机制
+
+sentry 由两个全局变量组成：`g_chunk_idx`（当前 chunk 编号，从 0 递增）和 `g_frame_offset`（当前 chunk 内已写入帧数，0 ~ `g_hdf5_chunk_capacity - 1`，默认 capacity=2000）。两者共同构成一个**全局写入位点**——子进程写入 HDF5 的 hyperslab 起始位置由 `g_frame_offset` 决定，文件路径中的 chunk 编号由 `g_chunk_idx` 决定。
+
+#### 3.6.1 存储格式
+
+sentry 以纯文本文件 `sentry.txt` 存储在 `g_sentry_root`（即 `g_participant_roots[0]`）目录下。格式为两行整数：
+
+```
+<chunk_idx>
+<frame_offset>
+```
+
+选择纯文本而非 HDF5 的原因：避免 HDF5 库的线程安全问题——sentry 的读写极其频繁且轻量（每次录制后写一次），不需要 HDF5 的复杂性。
+
+#### 3.6.2 两个握手点
+
+多进程架构中，Master 和 Slave **各自独立运行**同一个 `hdf5_multi_process.exe`，各自独立维护自己的本地 sentry。为保持两者一致，程序在两个时间点通过 TCP（端口 `net_port + 300`）进行握手：
+
+| 握手点 | 时机 | 代码位置 | 目的 |
+|--------|------|----------|------|
+| **启动握手** | `initSentry()` 之后、进入主循环之前 | `main()` 初始化阶段 | 首次录制前对齐两台机器的 sentry，消除上次运行残留的不一致 |
+| **事后握手** | 每次录制 dump 完成后、sentry 递增之前 | `main()` dump 阶段 Step 4 | 确保本次录制的基数双方一致，再各自递增 |
+
+#### 3.6.3 握手协议
+
+两个握手点使用**完全相同的协议**：
+
+```
+1. Master 在 port+300 监听 (listen/accept)
+2. Slave 连接 Master 的 port+300
+3. Slave 发送: [local_total, local_total]  (int64_t[2])
+4. Master 接收后发送: [local_total, local_total]
+5. 双方各自比对:
+
+   若 peer_total == local_total:
+       → 一致，g_sentry_mismatch_count = 0
+
+   若 peer_total != local_total:
+       → g_sentry_mismatch_count++
+       → 取 min(peer_total, local_total)，回退到较小值
+       → 转换回 (chunk_idx, frame_offset):
+           chunk_idx    = min_total / capacity
+           frame_offset = min_total % capacity
+       → updateSentry() 写回本地 sentry.txt
+       → 若 g_sentry_mismatch_count >= 3 → FATAL 退出
+```
+
+**比较时使用全局帧号**而非分别比较 `chunk_idx` 和 `frame_offset`：
+
+```
+local_total = local_chunk_idx × capacity + local_frame_offset
+peer_total  = peer_chunk_idx  × capacity + peer_frame_offset
+```
+
+**采用较小值**的原因：领先方的最后一段数据可能无效（如某端相机丢帧或 HDF5 写入失败）。回退后用新录制的有效数据覆盖，代价是浪费最多 `core_frames` 帧的存储空间，但保证数据质量。
+
+#### 3.6.4 握手在前的核心原则
+
+**握手永远在 sentry 递增之前执行**。这是修复版与原版之间最关键的区别：
+
+```
+修复后（正确）:
+  dump 完成 → 握手（对齐基数）→ g_frame_offset += core_frames → updateSentry()
+
+修复前（错误）:
+  dump 完成 → g_frame_offset += core_frames → updateSentry() → 握手（比对已递增的值）
+```
+
+修复前的顺序导致：若 Master 启动时 sentry 因历史残留已领先 Slave（如 Master 在 (1,600)、Slave 在 (0,0)），双方各自独立递增 200 后，Master 报告 2800、Slave 报告 200——差值 2600 帧。此时 Master 的子进程已将数据写到了错误的 HDF5 offset，事后握手虽然能发现并修正 sentry，但 HDF5 文件中的数据已经错位，无法挽回。
+
+修复后的顺序保证：无论启动时双方 sentry 差距多大，握手先将基数对齐到同一个值，然后双方从同一个基数递增。HDF5 写入位置始终正确。
+
+#### 3.6.5 递增规则
+
+| 条件 | 操作 |
+|------|------|
+| `all_ok == true`（所有子进程退出码为 0） | `g_frame_offset += core_frames`；若 `>= capacity`：`g_chunk_idx++`，`g_frame_offset -= capacity`；`updateSentry()` |
+| `all_ok == false`（任一子进程失败） | **不递增**。sentry 停在上一轮的值，下次录制从同一位置重新写入 |
+| 相机故障（FAULT） | `all_done` 永不为 true，dump 代码块不执行，sentry 不变 |
+| 程序崩溃 / 强杀 | `updateSentry()` 未执行，sentry.txt 保持上一次的值 |
+
+递增的值是 `core_frames`（本次录制的有效帧数，如 200），不是 `total_record_frames`（含 margin 的总帧数，如 220）。margin 帧仅用于跨相机 BlockID 对齐，不写入 HDF5，不计入 sentry。
+
+#### 3.6.6 时序保证
+
+握手和递增在**同一个主线程迭代**中完成，中间没有 `cv::waitKey` 可中断点。整个流程是原子化的：
+
+```
+all_done == true
+  → is_dumping = true               ← 阻塞后续录制
+  → 启动子进程 → WaitForMultipleObjects → 检查退出码
+  → 握手（阻塞，直到对端就绪）
+  → g_frame_offset += core_frames
+  → updateSentry()
+  → is_dumping = false              ← 释放，允许下次录制
+```
+
+`is_dumping = true` 期间，UI 事件循环中的 `'r'` 按键被 `!is_dumping` 条件阻断，不可能触发新录制。
+
+---
+
 ## 四、开发注意事项
 
 ### 4.1 内存用量
