@@ -5,26 +5,34 @@
 
 ## 概括
 
-在 Windows 端新建 `test_piper_ctrl.cpp`，读取 `gaze_target/piper_upper.txt` 中的目标点位，**当前阶段仅执行第一行**——通过 TCP 发送至 Ubuntu 端，完成单点的"回零→移动→接收实际位姿"全流程验证。Ubuntu 端新建 `piper_windows_ctrl_server.py`，接收指令后调用 `PiperArmController` 驱动机械臂运动，运动完成后从 ROS `/end_pose` 主题获取实际到达位姿，回传 Windows 端显示。
+在 Windows 端新建 `test_piper_ctrl.cpp`，读取 `cfg/gaze_target/P001/piper_upper.txt` 和 `piper_lower.txt` 中的目标点位，通过 TCP 逐点发送至 Ubuntu 端。**启动时 upper 和 lower 均回零**，用户按空格依次执行当前臂的所有点位，按 `t` 切换机械臂。全部执行完毕后提示完成，按 ESC/q 退出。Ubuntu 端新建 `piper_windows_ctrl_server.py`，接收指令后调用 `PiperArmController` 驱动机械臂运动，运动完成后从 ROS `/end_pose` 主题获取实际到达位姿，回传 Windows 端显示。
 
 ```
 Windows (test_piper_ctrl.cpp)              Ubuntu (piper_windows_ctrl_server.py)
   │                                              │
-  │─ 读取 gaze_target/piper_upper.txt 第一行        │
+  │─ 读取 cfg/gaze_target/P001/piper_upper.txt     │
+  │─ 读取 cfg/gaze_target/P001/piper_lower.txt     │
   │─ TCP connect ───────────────────────────────→│─ 监听 :49301
-  │─ MOVE_JOINTS (回零) ────────────────────────→│─ ctrl.move_to_joints([0,0,0,0,0,0])
-  │←────────────────────── MOVED:upper:x,y,z,...─│─ 查询 /piper_upper/end_pose
+  │─ MOVE_JOINTS:upper 回零 ────────────────────→│─ ctrl.move_to_joints(...)
+  │←────────────────────── MOVED:upper:... ──────│
+  │─ MOVE_JOINTS:lower 回零 ────────────────────→│─ ctrl.move_to_joints(...)
+  │←────────────────────── MOVED:lower:... ──────│
   │                                              │
-  │─ [空格] MOVE_TO:upper:x,y,z (第一行) ────────→│─ ctrl.move_to(x,y,z)
-  │←────────────────────── MOVED:upper:x,y,z,...─│─ 查询 /piper_upper/end_pose
+  │─ [空格] MOVE_TO:<arm>:x,y,z ────────────────→│─ ctrl.move_to(x,y,z)
+  │←────────────────────── MOVED:<arm>:... ──────│─ 查询 /end_pose
   │  (OpenCV 显示指令位姿 vs 实际位姿)              │
+  │  ... 循环直至当前 arm 所有点位执行完毕 ...        │
   │                                              │
-  │─ [ESC] SHUTDOWN ─────────────────────────────────→│─ rospy.signal_shutdown()
+  │─ [t] 切换到 lower arm ───────────────────────→│─ (同上流程)
+  │  ... lower 全部点位执行完毕 → 提示完成           │
+  │                                              │
+  │─ [ESC] SHUTDOWN ────────────────────────────→│─ rospy.signal_shutdown()
 ```
 
 - **Windows 端**：纯单线程阻塞模式（send → recv → 显示 → 等按键），无需摄像头或 HDF5
 - **Ubuntu 端**：独立脚本，不修改现有的 `windows_end_monitor.py`；使用独立端口 `49301` 避免冲突
 - **协议**：换行分隔纯文本，格式为 `MOVED:arm:x,y,z,qx,qy,qz,qw,α,β,γ`
+- **双机械臂**：启动时 upper 和 lower 都回零，按 `t` 切换，各自独立执行本臂的全部点位
 
 ---
 
@@ -193,7 +201,7 @@ network:
 | 通信模式 | 轮询 `GET_POSE`（每 200ms） | 顺序发送指令，等待响应 |
 | 线程模型 | `tcpWorker` 独立线程 | 单线程：send → recv → 显示 → 等按键 |
 | 指令集 | `GET_POSE` 只读 | `MOVE_JOINTS` / `MOVE_TO` / `SHUTDOWN` |
-| 数据来源 | 无（被动查询） | `gaze_target/piper_upper.txt` |
+| 数据来源 | 无（被动查询） | `cfg/gaze_target/P001/piper_upper.txt` |
 
 ### 6.2 结构
 
@@ -201,19 +209,23 @@ network:
 main():
   1. WSAStartup
   2. 加载 cfg/piper.yaml → ubuntu_ip, ctrl_port
-  3. 加载 gaze_target/piper_upper.txt → vector<array<double,3>>
-  4. socket() + connect() 到 ubuntu_ip:ctrl_port
-  5. 发送 "MOVE_JOINTS:upper:0.0,0.0,0.0,0.0,0.0,0.0"
-     接收 "MOVED:" 响应 → 验证回零完成
-  6. 进入 drawUI 循环 (单线程):
-     - 渲染状态：目标序号/N、指令 (x,y,z)、实际 (x,y,z)、
+  3. 加载 cfg/gaze_target/P001/piper_upper.txt → targets_upper
+  4. 加载 cfg/gaze_target/P001/piper_lower.txt → targets_lower
+  5. socket() + connect() 到 ubuntu_ip:ctrl_port
+  6. Upper 回零: MOVE_JOINTS:upper:0,0,0,0,0,0 → 等待 MOVED
+  7. Lower 回零: MOVE_JOINTS:lower:0,0,0,0,0,0 → 等待 MOVED
+  8. 进入 drawUI 循环 (单线程):
+     - 当前臂: "upper" (初始)，当前索引: 0
+     - 渲染状态：当前臂名称、目标序号/N、指令 (x,y,z)、实际 (x,y,z)、
        Z-X-Z' 欧拉角、距目标距离
-     - [空格] → 发送下一个 MOVE_TO，接收 MOVED，解析，更新显示
-     - [R]    → 重新发送回零指令
+     - [空格] → 发送 MOVE_TO:<arm>:x,y,z → 接收 MOVED → 索引++
+       → 若当前臂全部完成 → 提示 "UPPER DONE" 或 "LOWER DONE"
+     - [t]   → 切换当前臂 (upper↔lower)，索引归零
+     - [R]   → 重新发送当前臂回零指令
+     - 两个臂都执行完毕 → 显示 "ALL DONE"，等待退出
      - [ESC]/[q] → 发送 SHUTDOWN，退出
-  7. closesocket, WSACleanup
+  9. closesocket, WSACleanup
 ```
-
 ### 6.3 TCP 辅助函数（复用自 get_piper_pose.cpp）
 
 ```cpp
@@ -269,31 +281,38 @@ int    ctrl_port = cfg["network"]["ctrl_port"].as<int>();
 
 ### 6.7 目标点位文件加载
 
-当前阶段**只读取第一行**。文件格式为每行一个点位 `"x, y, z"`：
+文件位于 `cfg/gaze_target/P001/`，每个臂一个 txt 文件，每行一个 `"x, y, z"` 点位。启动时加载全部行，依次执行。
 
 ```
-gaze_target/piper_upper.txt:
+cfg/gaze_target/P001/piper_upper.txt:
   0.3, 0.1, 0.2
   0.3, -0.1, 0.2
-  ...（后续行保留，后续阶段扩展为遍历）
+  ...（8 个点）
+
+cfg/gaze_target/P001/piper_lower.txt:
+  0.3, 0.1, 0.2
+  ...（8 个点）
 ```
 
 ```cpp
-ifstream in("gaze_target/piper_upper.txt");
-string line;
-double cmd_x = 0, cmd_y = 0, cmd_z = 0;
-if (getline(in, line)) {
-    stringstream ss(line); string token;
-    array<double,3> pt;
-    for (int i = 0; i < 3; ++i) {
-        getline(ss, token, ',');
-        pt[i] = stod(token);
+auto loadTargets = [](const string& path) -> vector<array<double,3>> {
+    vector<array<double,3>> out;
+    ifstream in(path);
+    string line;
+    while (getline(in, line)) {
+        stringstream ss(line); string token;
+        array<double,3> pt{};
+        for (int i = 0; i < 3; ++i) {
+            if (!getline(ss, token, ',')) break;
+            try { pt[i] = stod(token); } catch (...) { break; }
+        }
+        out.push_back(pt);
     }
-    cmd_x = pt[0]; cmd_y = pt[1]; cmd_z = pt[2];
-}
+    return out;
+};
+auto targets_upper = loadTargets("cfg/gaze_target/P001/piper_upper.txt");
+auto targets_lower = loadTargets("cfg/gaze_target/P001/piper_lower.txt");
 ```
-
----
 
 ## 七、CMake 改造
 

@@ -115,33 +115,38 @@ int main() {
     cout << "=== Piper Arm Control ===" << endl;
     cout << "Server: " << ubuntu_ip << ":" << ctrl_port << endl;
 
-    // --- Load first target from gaze_target/piper_upper.txt ---
-    double cmd_x = 0, cmd_y = 0, cmd_z = 0;
-    bool has_target = false;
-    {
-        ifstream in("gaze_target/piper_upper.txt");
+    // --- Helper: load all targets from a file ---
+    auto loadTargets = [](const string& path) -> vector<array<double,3>> {
+        vector<array<double,3>> out;
+        ifstream in(path);
         if (!in) {
-            cerr << "ERROR: Cannot open gaze_target/piper_upper.txt" << endl;
-            return 1;
+            cerr << "ERROR: Cannot open " << path << endl;
+            return out;
         }
         string line;
-        if (getline(in, line)) {
+        while (getline(in, line)) {
+            if (line.empty()) continue;
             stringstream ss(line);
             string token;
-            array<double, 3> pt;
+            array<double,3> pt{};
             for (int i = 0; i < 3; ++i) {
                 if (!getline(ss, token, ',')) break;
                 try { pt[i] = stod(token); } catch (...) { break; }
             }
-            cmd_x = pt[0]; cmd_y = pt[1]; cmd_z = pt[2];
-            has_target = true;
-            cout << "Target: (" << cmd_x << ", " << cmd_y << ", " << cmd_z << ")" << endl;
+            out.push_back(pt);
         }
-        if (!has_target) {
-            cerr << "ERROR: No target points in piper_upper.txt" << endl;
-            return 1;
-        }
+        return out;
+    };
+
+    // --- Load targets for both arms ---
+    auto targets_upper = loadTargets("cfg/gaze_target/P001/piper_upper.txt");
+    auto targets_lower = loadTargets("cfg/gaze_target/P001/piper_lower.txt");
+    if (targets_upper.empty() && targets_lower.empty()) {
+        cerr << "ERROR: No target points loaded." << endl;
+        return 1;
     }
+    cout << "Loaded: upper=" << targets_upper.size()
+         << " pts, lower=" << targets_lower.size() << " pts" << endl;
 
     // --- Connect TCP ---
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -163,48 +168,62 @@ int main() {
     cout << "Connected." << endl;
 
     // --- State ---
-    string status     = "Connected";
-    string arm        = "upper";
+    string status        = "Connected";
+    string arm           = "upper";
+    int    arm_idx       = 0;    // current target index within this arm
     ArmPose last_pose;
-    bool   zeroed     = false;
-    bool   move_sent  = false;
     string last_response;
+    bool   upper_done    = false;
+    bool   lower_done    = false;
+    bool   all_done      = false;
 
-    // --- Send MOVE_JOINTS (zero-return) ---
-    cout << "Sending zero-return..." << endl;
-    status = "Zeroing...";
-    if (!sendLine(sock, "MOVE_JOINTS:upper:0.0,0.0,0.0,0.0,0.0,0.0")) {
-        cerr << "ERROR: send MOVE_JOINTS failed" << endl;
-        closesocket(sock);
-        return 1;
-    }
-
-    string resp;
-    string resp_arm;
-    if (recvLine(sock, resp, 30000)) {
-        last_response = resp;
-        if (parsePoseResponse(resp, resp_arm, last_pose)) {
-            zeroed = true;
-            status = "Zeroed";
-            cout << "Zero-return OK: (" << last_pose.x << ", " << last_pose.y << ", " << last_pose.z << ")" << endl;
-        } else {
-            status = "Zero FAIL: " + resp;
-            cerr << status << endl;
+    // Helper: send MOVE_JOINTS for an arm, wait for response
+    auto zeroArm = [&](const string& arm_name) -> bool {
+        cout << "Zeroing " << arm_name << "..." << endl;
+        status = "Zeroing " + arm_name + "...";
+        string cmd = "MOVE_JOINTS:" + arm_name + ":0.0,0.0,0.0,0.0,0.0,0.0";
+        if (!sendLine(sock, cmd)) {
+            cerr << "ERROR: send MOVE_JOINTS failed for " << arm_name << endl;
+            return false;
         }
-    } else {
-        status = "Zero timeout";
-        cerr << status << endl;
-    }
+        string resp, resp_arm;
+        ArmPose pose;
+        if (recvLine(sock, resp, 30000)) {
+            last_response = resp;
+            if (parsePoseResponse(resp, resp_arm, pose)) {
+                last_pose = pose;
+                cout << arm_name << " zeroed: (" << pose.x << ", " << pose.y << ", " << pose.z << ")" << endl;
+                return true;
+            } else {
+                cerr << arm_name << " zero FAIL: " << resp << endl;
+            }
+        } else {
+            cerr << arm_name << " zero timeout" << endl;
+        }
+        return false;
+    };
+
+    // --- Zero both arms ---
+    if (!zeroArm("upper")) { closesocket(sock); return 1; }
+    if (!zeroArm("lower")) { closesocket(sock); return 1; }
+    status = "Zeroed — upper";
+
+    // Helper: get current target
+    auto getCurrentTarget = [&]() -> const array<double,3>* {
+        auto& tgt = (arm == "upper") ? targets_upper : targets_lower;
+        if (arm_idx >= 0 && arm_idx < (int)tgt.size()) return &tgt[arm_idx];
+        return nullptr;
+    };
 
     // ==================================================================
     // OpenCV UI loop
     // ==================================================================
     cv::namedWindow("Piper Arm Control", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Piper Arm Control", 640, 420);
+    cv::resizeWindow("Piper Arm Control", 640, 460);
 
     bool running = true;
     while (running) {
-        cv::Mat canvas = cv::Mat::zeros(420, 640, CV_8UC3);
+        cv::Mat canvas = cv::Mat::zeros(460, 640, CV_8UC3);
         int y = 25;
         auto put = [&](const string& s, cv::Scalar c = {255,255,255}) {
             cv::putText(canvas, s, {20, y}, cv::FONT_HERSHEY_SIMPLEX, 0.5, c, 1, cv::LINE_AA);
@@ -212,117 +231,160 @@ int main() {
         };
 
         // Title
-        cv::putText(canvas, "Piper Upper Arm Control", {160, y},
+        string title = "Piper Arm Control — " + arm + (arm=="upper"?" (UPPER)":" (LOWER)");
+        cv::putText(canvas, title, {140, y},
                     cv::FONT_HERSHEY_SIMPLEX, 0.7, {0, 255, 255}, 2, cv::LINE_AA);
-        y += 35;
+        y += 32;
 
         // Status
-        cv::Scalar sc = (status == "Zeroed" || status.rfind("MOVED", 0) == 0)
-                            ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 200, 255);
+        cv::Scalar sc = all_done ? cv::Scalar(0,255,0) :
+                        ((arm=="upper"&&upper_done)||(arm=="lower"&&lower_done))
+                            ? cv::Scalar(0,255,200) : cv::Scalar(0,200,255);
         put("Status: " + status, sc);
 
-        // Target
+        // Current arm + index
+        int tgt_count = (arm=="upper") ? (int)targets_upper.size() : (int)targets_lower.size();
         char b[128];
-        snprintf(b, sizeof(b), "Command (x,y,z): [%.3f, %.3f, %.3f] m", cmd_x, cmd_y, cmd_z);
-        put(b, {255, 200, 0});
-        y += 8;
+        snprintf(b,sizeof(b),"Arm: %s  |  Upper done: %s  |  Lower done: %s",
+                 arm.c_str(), upper_done?"YES":"no", lower_done?"YES":"no");
+        put(b, {200,200,200});
+
+        // Current target
+        auto* tgt = getCurrentTarget();
+        if (tgt) {
+            snprintf(b,sizeof(b),"Target #%d/%d: (%.3f, %.3f, %.3f) m",
+                     arm_idx+1, tgt_count, (*tgt)[0], (*tgt)[1], (*tgt)[2]);
+            put(b, {255,200,0});
+        } else if ((arm=="upper"&&upper_done)||(arm=="lower"&&lower_done)) {
+            put("Target: ALL DONE for " + arm, {0,255,0});
+        }
+        y += 6;
 
         // Actual pose
         if (last_pose.valid) {
-            snprintf(b, sizeof(b), "Actual  (x,y,z): [%.4f, %.4f, %.4f] m",
-                     last_pose.x, last_pose.y, last_pose.z);
-            put(b);
-            snprintf(b, sizeof(b), "Quat (x,y,z,w): [%.4f, %.4f, %.4f, %.4f]",
-                     last_pose.qx, last_pose.qy, last_pose.qz, last_pose.qw);
-            put(b);
-            snprintf(b, sizeof(b), "Euler Z-X-Z'' : a=%.2f  b=%.2f  g=%.2f deg",
-                     last_pose.alpha, last_pose.beta, last_pose.gamma);
-            put(b, {0, 255, 0});
+            snprintf(b,sizeof(b),"Actual (x,y,z): [%.4f, %.4f, %.4f] m",
+                     last_pose.x, last_pose.y, last_pose.z); put(b);
+            snprintf(b,sizeof(b),"Quat (x,y,z,w): [%.4f, %.4f, %.4f, %.4f]",
+                     last_pose.qx,last_pose.qy,last_pose.qz,last_pose.qw); put(b);
+            snprintf(b,sizeof(b),"Euler Z-X-Z'': a=%.2f  b=%.2f  g=%.2f deg",
+                     last_pose.alpha,last_pose.beta,last_pose.gamma);
+            put(b,{0,255,0});
 
-            // Distance from command
-            double dx = last_pose.x - cmd_x;
-            double dy = last_pose.y - cmd_y;
-            double dz = last_pose.z - cmd_z;
-            double dist = sqrt(dx*dx + dy*dy + dz*dz);
-            snprintf(b, sizeof(b), "Dist to target: %.4f m  %s",
-                     dist, dist < 0.02 ? "OK" : "OFF");
-            put(b, dist < 0.02 ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 165, 255));
+            if (tgt) {
+                double dx=last_pose.x-(*tgt)[0], dy=last_pose.y-(*tgt)[1], dz=last_pose.z-(*tgt)[2];
+                double dist=sqrt(dx*dx+dy*dy+dz*dz);
+                snprintf(b,sizeof(b),"Dist: %.4f m  %s",dist,dist<0.02?"OK":"OFF");
+                put(b,dist<0.02?cv::Scalar(0,255,0):cv::Scalar(0,165,255));
+            }
         } else {
             put("No pose data yet");
         }
-        y += 5;
+        y += 4;
 
-        // Last raw response
-        if (!last_response.empty()) {
-            put("Last resp: " + last_response.substr(0, min((size_t)70, last_response.size())),
-                {150, 150, 150});
+        // All done banner
+        if (all_done) {
+            cv::putText(canvas, "*** ALL DONE — Press ESC/q to exit ***",
+                        {60, y+10}, cv::FONT_HERSHEY_SIMPLEX, 0.7, {0,255,0}, 2);
+            y += 40;
         }
 
+        // Last raw response (truncated)
+        if (!last_response.empty())
+            put("Last: "+last_response.substr(0,min((size_t)65,last_response.size())),{150,150,150});
+
         // Key hints
-        y = 395;
-        cv::putText(canvas, "[SPACE] Send MOVE_TO   [R] Re-zero   [ESC]/[q] Quit",
-                    {20, y}, cv::FONT_HERSHEY_SIMPLEX, 0.45, {140, 140, 140}, 1);
+        y = 442;
+        string hints = all_done ? "[ESC/q] Quit"
+                      : "[SPACE] Next  [T] Switch arm  [R] Re-zero  [ESC/q] Quit";
+        cv::putText(canvas, hints, {20,y}, cv::FONT_HERSHEY_SIMPLEX, 0.45, {140,140,140}, 1);
 
         cv::imshow("Piper Arm Control", canvas);
         char key = (char)cv::waitKey(30);
 
-        if (key == 'q' || key == 27) {  // q or ESC
+        if (key == 'q' || key == 27) {
+            // Zero both arms before exit
+            if (!all_done) {
+                status = "Zeroing both arms before exit...";
+                cout << "\nZeroing both arms before exit..." << endl;
+                zeroArm("upper");
+                zeroArm("lower");
+            }
             cout << "Sending SHUTDOWN..." << endl;
             sendLine(sock, "SHUTDOWN");
-            // read SHUTDOWN_ACK
-            string ack;
-            recvLine(sock, ack, 2000);
-            cout << "Server response: " << ack << endl;
+            string ack; recvLine(sock, ack, 2000);
+            cout << "Server: " << ack << endl;
             running = false;
         }
-        else if (key == ' ' && zeroed && !move_sent) {  // SPACE: send MOVE_TO
+        else if (key == 't' || key == 'T') {
+            // Switch arm
+            if (all_done) continue;
+            string new_arm = (arm == "upper") ? "lower" : "upper";
+            bool new_done = (new_arm == "upper") ? upper_done : lower_done;
+            if (new_done) {
+                status = new_arm + " already done — skipped";
+                cout << status << endl;
+                continue;
+            }
+            arm = new_arm;
+            arm_idx = 0;
+            status = "Switched to " + arm;
+            cout << "Switched to " << arm << endl;
+        }
+        else if (key == ' ' && !all_done) {
+            // Check if current arm is already done
+            if ((arm=="upper" && upper_done) || (arm=="lower" && lower_done)) {
+                status = arm + " already done — press T to switch";
+                continue;
+            }
+            auto* ct = getCurrentTarget();
+            if (!ct) {
+                // Mark this arm as done
+                if (arm == "upper") upper_done = true;
+                else                lower_done = true;
+                status = arm + " DONE!";
+                cout << "\n=== " << arm << " COMPLETED ===" << endl;
+                if (upper_done && lower_done) {
+                    all_done = true;
+                    status = "ALL DONE!";
+                    cout << "=== ALL TARGETS COMPLETED ===" << endl;
+                }
+                continue;
+            }
+            // Send MOVE_TO
             char cmd[128];
-            snprintf(cmd, sizeof(cmd), "MOVE_TO:upper:%.6f,%.6f,%.6f", cmd_x, cmd_y, cmd_z);
+            snprintf(cmd,sizeof(cmd),"MOVE_TO:%s:%.6f,%.6f,%.6f",
+                     arm.c_str(), (*ct)[0], (*ct)[1], (*ct)[2]);
             cout << "Sending: " << cmd << endl;
-            status = "Moving...";
+            status = "Moving " + arm + "...";
             if (!sendLine(sock, cmd)) {
                 status = "Send FAIL";
-                cerr << status << endl;
             } else {
-                string mr;
-                string mr_arm;
-                if (recvLine(sock, mr, 60000)) {   // movement may take up to 60s
+                string mr, mr_arm;
+                if (recvLine(sock, mr, 60000)) {
                     last_response = mr;
                     ArmPose mp;
                     if (parsePoseResponse(mr, mr_arm, mp)) {
                         last_pose = mp;
-                        status = "OK — MOVED";
-                        move_sent = true;
-                        cout << "MOVED: (" << mp.x << ", " << mp.y << ", " << mp.z << ")" << endl;
+                        status = "OK — " + arm + " #" + to_string(arm_idx+1);
+                        arm_idx++;
+                        cout << arm << " #" << arm_idx << " MOVED: ("
+                             << mp.x << ", " << mp.y << ", " << mp.z << ")" << endl;
                     } else {
-                        status = "Bad response: " + mr;
-                        cerr << status << endl;
+                        status = "Bad resp: " + mr.substr(0,40);
                     }
                 } else {
                     status = "Timeout";
-                    cerr << status << endl;
                 }
             }
         }
-        else if (key == 'r' || key == 'R') {  // Re-zero
-            cout << "Re-sending zero-return..." << endl;
-            status = "Zeroing...";
-            sendLine(sock, "MOVE_JOINTS:upper:0.0,0.0,0.0,0.0,0.0,0.0");
-            string zr;
-            string zr_arm;
-            if (recvLine(sock, zr, 30000)) {
-                last_response = zr;
-                if (parsePoseResponse(zr, zr_arm, last_pose)) {
-                    zeroed = true;
-                    move_sent = false;
-                    status = "Zeroed";
-                    cout << "Re-zero OK" << endl;
-                } else {
-                    status = "Re-zero FAIL: " + zr;
-                }
-            } else {
-                status = "Re-zero timeout";
-            }
+        else if (key == 'r' || key == 'R') {
+            // Re-zero current arm
+            zeroArm(arm);
+            arm_idx = 0;
+            if (arm == "upper") upper_done = false;
+            else                 lower_done = false;
+            all_done = false;
+            status = "Re-zeroed " + arm;
         }
     }
 
