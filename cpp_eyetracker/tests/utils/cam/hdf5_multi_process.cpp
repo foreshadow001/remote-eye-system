@@ -1512,7 +1512,7 @@ int main() {
                             H5::H5File f(pss.str(), H5F_ACC_TRUNC);
                             hsize_t rd[3] = {(hsize_t)g_hdf5_chunk_capacity, (hsize_t)cam_h, (hsize_t)cam_w};
                             f.createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd));
-                            hsize_t gd[2] = {(hsize_t)g_hdf5_chunk_capacity, 2};
+                            hsize_t gd[2] = {(hsize_t)g_hdf5_chunk_capacity, 3};
                             f.createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd));
                             hsize_t vd[1] = {(hsize_t)g_hdf5_chunk_capacity};
                             f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd));
