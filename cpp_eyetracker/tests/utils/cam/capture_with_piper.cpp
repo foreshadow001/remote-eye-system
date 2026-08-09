@@ -65,6 +65,7 @@ string g_arm = "upper";
 int g_upper_idx = 0, g_lower_idx = 0;
 bool g_upper_done = false, g_lower_done = false;
 bool g_recording_enabled = false;
+atomic<bool> g_init_ok{false};     // Master→Slave: all connections ready
 atomic<bool> g_piper_busy{false};
 struct ArmTransform { Pt3 tool_t, tool_r, ccs_t, ccs_r; };
 ArmTransform g_xf_upper, g_xf_lower;
@@ -244,7 +245,7 @@ void gazeServerWorker(int gaze_port) {
                 char buf[128];
                 snprintf(buf,sizeof(buf),"GAZE:%.6f,%.6f,%.6f\n", g_gaze_x.load(), g_gaze_y.load(), g_gaze_z.load());
                 lock_guard<mutex> lk(g_gaze_send_mtx);
-                if (send(g_gaze_sock, buf, (int)strlen(buf), 0) <= 0) break;
+                if (send(g_gaze_sock, buf, (int)strlen(buf), 0) <= 0) {cerr<<"[Gaze] Send failed - exiting."<<endl;global_running=false;break;}
                 string ack; recvLine(g_gaze_sock, ack, 5000);
                 cout << "[Gaze] Sent ("<<g_gaze_x<<","<<g_gaze_y<<","<<g_gaze_z<<") ack="<<ack<<endl;
             }
@@ -267,7 +268,7 @@ void gazeClientWorker(const string& master_ip, int gaze_port) {
         cout << "[Gaze] Slave connected to Master." << endl;
         while (global_running) {
             string line;
-            if (!recvLine(sock, line, 300000)) { cerr<<"[Gaze] Connection lost"<<endl; break; }
+            if (!recvLine(sock, line, 300000)) { cerr<<"[Gaze] Connection lost - exiting."<<endl;global_running=false;break; }
             if (line.rfind("GAZE:",0) == 0) {
                 double gx,gy,gz; sscanf_s(line.c_str()+5, "%lf,%lf,%lf", &gx, &gy, &gz);
                 g_gaze_x=gx; g_gaze_y=gy; g_gaze_z=gz;
@@ -465,8 +466,9 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
             cout<<"[Cmd] Handshake OK."<<endl;
             while(global_running){
                 string line;
-                if(!recvLine(g_cmd_sock,line,300000)) break;
-                if(line=="TRIGGER"){instantTrigger();net_cmd_record=true;}
+                if(!recvLine(g_cmd_sock,line,300000)){cerr<<"[Cmd] Connection lost - exiting."<<endl;global_running=false;break;}
+                if(line=="INIT_OK"){g_init_ok=true;cout<<"[Cmd] Received INIT_OK from Master."<<endl;}
+                else if(line=="TRIGGER"){instantTrigger();net_cmd_record=true;}
                 else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){
                     if(line.length()<=7) continue;
                     char hf=line[6]; int fi=stoi(line.substr(7));
@@ -631,7 +633,18 @@ int main() {
         cout<<"[Piper] Arm initialization complete."<<endl;
     }
 
-    // ====== Camera init (only after ALL TCP handshakes done) ======
+    // ====== Master signals Slave: all connections ready ======
+    if (enable_net_sync && is_master_pc) {
+        cout<<"[Init] All connections established. Signaling Slave to proceed..."<<endl;
+        sendLineRaw(g_cmd_sock, "INIT_OK");
+    }
+    if (enable_net_sync && !is_master_pc) {
+        cout<<"[Init] Waiting for Master INIT_OK signal..."<<endl;
+        while (global_running && !g_init_ok.load())
+            this_thread::sleep_for(chrono::milliseconds(100));
+        if (!global_running) { cerr<<"[Init] Connection lost before INIT_OK."<<endl; return 1; }
+    }
+    cout<<"[Init] All 3 hosts ready. Starting camera initialization..."<<endl;
 
     // ---- Camera init ----
     for (int i=0;i<(int)camera_ids.size();++i)
