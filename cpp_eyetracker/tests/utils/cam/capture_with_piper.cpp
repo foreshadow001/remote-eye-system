@@ -887,6 +887,14 @@ int main() {
                         hsize_t vd[1]={(hsize_t)g_hdf5_chunk_capacity};
                         f.createDataSet("valid",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,vd));}
                         catch(const H5::Exception& e){logException("ERROR","hdf5:precreate",e.getCDetailMsg());}}}
+                // Show dump status
+                { cv::Mat loading=cv::Mat::zeros(400,600,CV_8UC3);
+                  cv::putText(loading,"DUMPING RAM TO HDF5... ("+to_string(cam_ctxs.size())+" processes)",
+                              cv::Point(50,200),cv::FONT_HERSHEY_SIMPLEX,0.8,cv::Scalar(0,255,255),2);
+                  char gb[128];snprintf(gb,sizeof(gb),"Gaze: [%.4f, %.4f, %.4f]",g_gaze_x.load(),g_gaze_y.load(),g_gaze_z.load());
+                  cv::putText(loading,gb,cv::Point(50,240),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,0),1);
+                  cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
+
                 // Step 1: Launch child processes
                 char exe_path[MAX_PATH];GetModuleFileNameA(NULL,exe_path,MAX_PATH);
                 string parent_dir=fs::path(exe_path).parent_path().string();
