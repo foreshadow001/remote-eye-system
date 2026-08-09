@@ -235,10 +235,20 @@ int main() {
         return false;
     };
 
-    // --- Zero both arms ---
-    if (!zeroArm("upper")) { closesocket(sock); return 1; }
-    if (!zeroArm("lower")) { closesocket(sock); return 1; }
-    status = "Zeroed — upper";
+    // --- Zero both arms (non-fatal — UI opens regardless) ---
+    if (!zeroArm("upper")) {
+        status = "Upper zero FAIL — press R to retry";
+        cerr << status << endl;
+    }
+    if (!zeroArm("lower")) {
+        status = "Lower zero FAIL — press R to retry";
+        cerr << status << endl;
+    }
+    if (status.find("Zeroed") == string::npos && status.find("FAIL") != string::npos) {
+        // neither arm zeroed successfully, keep the last failure status
+    } else {
+        status = "Zeroed — upper";
+    }
 
     // Helper: get current target
     auto getCurrentTarget = [&]() -> const array<double,3>* {
