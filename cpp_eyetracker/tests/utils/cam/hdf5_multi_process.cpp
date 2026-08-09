@@ -312,8 +312,8 @@ bool syncGlobalBlockIDTCP(bool is_master, const string& master_ip, int port, int
 }
 
 // ================== TCP 命令通道 (替代 UDP listener + fault socket) ==================
-// Master: listens on cmd_port, accepts Slave, receives FAULT from Slave
-// Slave:  connects to Master cmd_port, receives TRIGGER/FAULT/EXIT from Master
+// Master: listens on cmd_port, accepts Slave, handshakes, receives FAULT from Slave
+// Slave:  connects to Master cmd_port, handshakes, receives TRIGGER/FAULT/EXIT from Master
 void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
 #ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
@@ -334,12 +334,22 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
         sockaddr_in ca; socklen_t cl = sizeof(ca);
         g_cmd_sock = accept(g_cmd_listen_sock, (sockaddr*)&ca, &cl);
         if (g_cmd_sock == INVALID_SOCKET) return;
-        cout << "[Cmd] Slave connected." << endl;
+        cout << "[Cmd] Slave connected. Handshaking..." << endl;
 
-        // Master receives FAULT from Slave (async)
+        // Startup handshake: receive READY, send ACK
+        string hline;
+        if (recvLine(g_cmd_sock, hline, 10000) && hline == "READY") {
+            sendLine(g_cmd_sock, "ACK");
+            cout << "[Cmd] Handshake OK. Command channel established." << endl;
+        } else {
+            cerr << "[Cmd] Handshake FAILED." << endl;
+            return;
+        }
+
+        // Master receives FAULT from Slave (async, long timeout for idle periods)
         while (global_running) {
             string line;
-            if (!recvLine(g_cmd_sock, line, 500)) continue;  // 500ms timeout for polling
+            if (!recvLine(g_cmd_sock, line, 500)) continue;  // 500ms polling
             if (line.rfind("FAULT:", 0) == 0 && !g_fault_active.load()) {
                 if (line.length() <= 7) continue;
                 char hf = line[6]; int fi = stoi(line.substr(7));
@@ -374,13 +384,26 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
                 this_thread::sleep_for(chrono::seconds(2));
                 continue;
             }
-            cout << "[Cmd] Slave connected to Master." << endl;
+            cout << "[Cmd] Slave connected. Handshaking..." << endl;
 
-            // Slave receives TRIGGER / FAULT / EXIT from Master
+            // Startup handshake: send READY, wait for ACK
+            sendLine(g_cmd_sock, "READY");
+            string hline;
+            if (!recvLine(g_cmd_sock, hline, 10000) || hline != "ACK") {
+                cerr << "[Cmd] Handshake FAILED." << endl;
+                closesocket(g_cmd_sock); g_cmd_sock = INVALID_SOCKET;
+                this_thread::sleep_for(chrono::seconds(2));
+                continue;
+            }
+            cout << "[Cmd] Handshake OK. Command channel established." << endl;
+
+            // Slave receives TRIGGER / FAULT / EXIT from Master.
+            // Use long timeout (5 min) — commands are spaced far apart.
             while (global_running) {
                 string line;
-                if (!recvLine(g_cmd_sock, line, 1000)) {
-                    // Connection lost — reconnect
+                if (!recvLine(g_cmd_sock, line, 300000)) {
+                    // Timeout or connection lost — reconnect
+                    cerr << "[Cmd] Connection lost, reconnecting..." << endl;
                     break;
                 }
                 if (line == "TRIGGER") {
@@ -413,7 +436,8 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
                 }
             }
             closesocket(g_cmd_sock); g_cmd_sock = INVALID_SOCKET;
-            if (global_running) this_thread::sleep_for(chrono::seconds(1));
+            if (!global_running) break;
+            this_thread::sleep_for(chrono::seconds(1));
         }
     }
     // cleanup
