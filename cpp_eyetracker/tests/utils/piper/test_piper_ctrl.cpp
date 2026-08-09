@@ -274,10 +274,14 @@ int main() {
         };
 
         // Title
-        string title = "Piper Arm Control - " + arm + (arm=="upper"?" (UPPER)":" (LOWER)");
-        cv::putText(canvas, title, {140, y},
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, {0, 255, 255}, 2, cv::LINE_AA);
-        y += 32;
+        cv::putText(canvas, "Piper Arm Control", {160, y},
+                    cv::FONT_HERSHEY_DUPLEX, 0.7, {0, 255, 255}, 2, cv::LINE_AA);
+        y += 30;
+        // Arm label (separate line — avoids font rendering quirks)
+        cv::putText(canvas, "Arm: " + arm + " [" + (arm=="upper"?"UPPER":"LOWER") + "]",
+                    {20, y}, cv::FONT_HERSHEY_DUPLEX, 0.6,
+                    (arm=="upper"?cv::Scalar(0,215,255):cv::Scalar(200,80,255)), 1, cv::LINE_AA);
+        y += 28;
 
         // Status
         cv::Scalar sc = all_done ? cv::Scalar(0,255,0) :
@@ -338,7 +342,7 @@ int main() {
         // Key hints
         y = 442;
         string hints = all_done ? "[ESC/q] Quit"
-                      : "[SPACE] Next  [T] Switch arm  [R] Re-zero  [ESC/q] Quit";
+                      : "[SPACE] Next  [T] Switch  [R] Re-zero  [C] Clear  [ESC/q] Quit";
         cv::putText(canvas, hints, {20,y}, cv::FONT_HERSHEY_SIMPLEX, 0.45, {140,140,140}, 1);
 
         cv::imshow("Piper Arm Control", canvas);
@@ -448,6 +452,15 @@ int main() {
             all_done = false;
             updateSentry();
             status = "Re-zeroed " + arm;
+        }
+        else if (key == 'c' || key == 'C') {
+            // Clear sentry - reset all progress to zero
+            upper_idx = 0; lower_idx = 0;
+            upper_done = false; lower_done = false;
+            all_done = false;
+            updateSentry();
+            status = "Sentry cleared - progress reset";
+            cout << "\n=== SENTRY CLEARED - all progress reset ===" << endl;
         }
     }
 
