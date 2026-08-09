@@ -80,6 +80,8 @@ network:
   ubuntu_ip: "192.168.10.4"
   port: 49300                # windows_end_monitor.py
   ctrl_port: 49301           # piper_windows_ctrl_server.py
+  gaze_port: 49302           # gaze forwarding Master->Slave
+  cmd_port: 49303            # TRIGGER/EXIT Master->Slave
 
 test_record_arm_data:
   cam_indices:

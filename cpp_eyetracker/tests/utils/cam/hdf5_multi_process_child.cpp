@@ -29,11 +29,13 @@ int main(int argc, char* argv[]) {
     // argv[3]  = chunk_idx       argv[4]  = frame_offset
     // argv[5]  = core_frames     argv[6]  = cam_h
     // argv[7]  = cam_w           argv[8]  = margin_frames
-    // argv[9]  = shm_name
-    if (argc < 10) {
+    // argv[9]  = shm_name        argv[10] = gaze_x
+    // argv[11] = gaze_y          argv[12] = gaze_z
+    if (argc < 13) {
         cerr << "Usage: " << argv[0]
              << " <camera_index> <hdf5_dir> <chunk_idx> <frame_offset>"
              << " <core_frames> <cam_h> <cam_w> <margin_frames> <shm_name>"
+             << " <gaze_x> <gaze_y> <gaze_z>"
              << endl;
         return 2;
     }
@@ -47,6 +49,9 @@ int main(int argc, char* argv[]) {
     int    cam_w         = atoi(argv[7]);
     int    margin_frames = atoi(argv[8]);
     string shm_name      = argv[9];
+    double gaze_x        = atof(argv[10]);
+    double gaze_y        = atof(argv[11]);
+    double gaze_z        = atof(argv[12]);
 
     // ---- Open shared memory ----
     // Must map margin_frames + N frames to reach the core data region.
@@ -95,14 +100,19 @@ int main(int argc, char* argv[]) {
                          H5::PredType::NATIVE_UINT8, f_mem, f_file);
         }
 
-        // ---- gaze_target: all zeros (tiny, ~0.001s) ----
+        // ---- gaze_target: write actual gaze (x,y,z) for all N frames ----
         {
             hsize_t gz_start[2] = {(hsize_t)frame_offset, 0};
             hsize_t gz_count[2] = {(hsize_t)N, 3};
             H5::DataSpace gz_mem(2, gz_count);
             H5::DataSpace gz_file = gaze_ds.getSpace();
             gz_file.selectHyperslab(H5S_SELECT_SET, gz_count, gz_start);
-            vector<double> gz_buf((size_t)N * 3, 0.0);
+            vector<double> gz_buf((size_t)N * 3);
+            for (int i = 0; i < N; ++i) {
+                gz_buf[i * 3]     = gaze_x;
+                gz_buf[i * 3 + 1] = gaze_y;
+                gz_buf[i * 3 + 2] = gaze_z;
+            }
             gaze_ds.write(gz_buf.data(), H5::PredType::NATIVE_DOUBLE, gz_mem, gz_file);
         }
 

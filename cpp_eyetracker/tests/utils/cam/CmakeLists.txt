@@ -85,3 +85,23 @@ target_include_directories(hdf5_multi_process_child
 )
 
 message(STATUS "hdf5_multi_process_child will be built")
+
+# ---- capture_with_piper (Master+Slave cameras + Piper arm control) ----
+add_executable(capture_with_piper
+    capture_with_piper.cpp
+)
+
+target_link_libraries(capture_with_piper
+    PRIVATE
+        eyetracker::piper
+        eyetracker::cfg
+        eyetracker::cam
+        ${HDF5_CXX_LIBRARIES}
+)
+
+target_include_directories(capture_with_piper
+    PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+)
+
+message(STATUS "capture_with_piper will be built")
