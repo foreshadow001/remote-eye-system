@@ -198,6 +198,7 @@ int main() {
     string arm           = "upper";
     ArmPose last_pose;
     string last_response;
+    bool   busy          = false;  // true = command in flight, block all keys
     bool   upper_done    = (upper_idx >= (int)targets_upper.size());
     bool   lower_done    = (lower_idx >= (int)targets_lower.size());
     bool   all_done      = upper_done && lower_done;
@@ -210,12 +211,13 @@ int main() {
 
     // Helper: send MOVE_JOINTS for an arm, wait for response, update sentry
     auto zeroArm = [&](const string& arm_name) -> bool {
+        busy = true;
         cout << "Zeroing " << arm_name << "..." << endl;
-        status = "Zeroing " + arm_name + "...";
+        status = "BUSY: Zeroing " + arm_name + "...";
         string cmd = "MOVE_JOINTS:" + arm_name + ":0.0,0.0,0.0,0.0,0.0,0.0";
         if (!sendLine(sock, cmd)) {
             cerr << "ERROR: send MOVE_JOINTS failed for " << arm_name << endl;
-            return false;
+            busy = false; return false;
         }
         string resp, resp_arm;
         ArmPose pose;
@@ -225,14 +227,14 @@ int main() {
                 last_pose = pose;
                 cout << arm_name << " zeroed: (" << pose.x << ", " << pose.y << ", " << pose.z << ")" << endl;
                 updateSentry();
-                return true;
+                busy = false; return true;
             } else {
                 cerr << arm_name << " zero FAIL: " << resp << endl;
             }
         } else {
             cerr << arm_name << " zero timeout" << endl;
         }
-        return false;
+        busy = false; return false;
     };
 
     // --- Zero both arms (non-fatal - UI opens regardless) ---
@@ -348,6 +350,10 @@ int main() {
         cv::imshow("Piper Arm Control", canvas);
         char key = (char)cv::waitKey(30);
 
+        // Block all keys while a command is in flight
+        if (busy) continue;
+        if (key == -1) continue;
+
         if (key == 'q' || key == 27) {
             // Park both arms before exit (always, regardless of all_done)
             cout << "\nExiting - zeroing both arms..." << endl;
@@ -406,14 +412,15 @@ int main() {
                 }
                 continue;
             }
-            // Send MOVE_TO
+            // Send MOVE_TO — block keys during command flight
+            busy = true;
             char cmd[128];
             snprintf(cmd,sizeof(cmd),"MOVE_TO:%s:%.6f,%.6f,%.6f",
                      arm.c_str(), (*ct)[0], (*ct)[1], (*ct)[2]);
             int cur_idx = armIdx();
             cout << "Sending [" << arm << " #" << (cur_idx+1) << "/" << armTotal()
                  << "]: " << cmd << endl;
-            status = "Moving " + arm + " #" + to_string(cur_idx+1) + "...";
+            status = "BUSY: Moving " + arm + " #" + to_string(cur_idx+1) + "...";
             if (!sendLine(sock, cmd)) {
                 status = "Send FAIL";
             } else {
@@ -443,6 +450,7 @@ int main() {
                     status = "Timeout";
                 }
             }
+            busy = false;
         }
         else if (key == 'r' || key == 'R') {
             // Re-zero current arm only — does NOT reset progress
@@ -450,13 +458,18 @@ int main() {
             status = "Re-zeroed " + arm;
         }
         else if (key == 'c' || key == 'C') {
-            // Clear sentry - reset all progress to zero
+            // Zero both arms, then clear sentry
+            cout << "\n=== Clearing sentry — zeroing both arms first ===" << endl;
+            status = "Clear: zeroing upper...";
+            zeroArm("upper");
+            status = "Clear: zeroing lower...";
+            zeroArm("lower");
             upper_idx = 0; lower_idx = 0;
             upper_done = false; lower_done = false;
             all_done = false;
             updateSentry();
             status = "Sentry cleared - progress reset";
-            cout << "\n=== SENTRY CLEARED - all progress reset ===" << endl;
+            cout << "=== SENTRY CLEARED - all progress reset ===" << endl;
         }
     }
 
