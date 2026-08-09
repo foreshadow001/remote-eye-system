@@ -49,10 +49,10 @@ atomic<bool> net_cmd_record{false};
 // [新增] 极速触发相关的全局变量
 string shared_record_timestr = "";
 std::chrono::steady_clock::time_point global_record_start_time;
-SOCKET master_udp_sock = INVALID_SOCKET;
-sockaddr_in slave_udp_addr{};
-SOCKET g_fault_sock = INVALID_SOCKET;
-sockaddr_in g_peer_fault_addr{};
+// TCP command channel (replaces UDP CMD_START + fault socket)
+SOCKET g_cmd_listen_sock = INVALID_SOCKET;  // Master: listening socket
+SOCKET g_cmd_sock = INVALID_SOCKET;         // Master+Slave: connected socket
+mutex g_cmd_send_mtx;                       // protects send() on g_cmd_sock
 bool g_use_hw_trigger = false;
 
 // ------------------------------------------------------------------
@@ -217,12 +217,35 @@ void instantTrigger() {
     }
 }
 
-// ================== 网络发送模块 (Master) ==================
-// [修改] 替换为内联的长连接发送函数，消除 socket 创建开销
-inline void fastUdpSend(const string& msg) {
-    if (master_udp_sock != INVALID_SOCKET) {
-        sendto(master_udp_sock, msg.c_str(), msg.length(), 0, (sockaddr*)&slave_udp_addr, sizeof(slave_udp_addr));
+// ================== TCP 辅助函数 (替代 UDP) ==================
+
+// 从 TCP 流中读取完整一行 (以 \n 结尾)
+bool recvLine(SOCKET sock, string& line, int timeout_ms = 3000) {
+    DWORD to = timeout_ms;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+    char buf[256];
+    string acc;
+    auto deadline = chrono::steady_clock::now() + chrono::milliseconds(timeout_ms);
+    while (chrono::steady_clock::now() < deadline) {
+        int n = recv(sock, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) return false;
+        buf[n] = '\0';
+        acc += buf;
+        size_t nl = acc.find('\n');
+        if (nl != string::npos) {
+            line = acc.substr(0, nl);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            return true;
+        }
     }
+    return false;
+}
+
+// 发送一行 (自动追加 \n)，线程安全
+bool sendLine(SOCKET sock, const string& msg) {
+    string data = msg + "\n";
+    lock_guard<mutex> lk(g_cmd_send_mtx);
+    return send(sock, data.c_str(), (int)data.length(), 0) > 0;
 }
 
 // ================== 网络同步与协商模块 (TCP 可靠传输) ==================
@@ -288,70 +311,45 @@ bool syncGlobalBlockIDTCP(bool is_master, const string& master_ip, int port, int
     return true;
 }
 
-// ================== 网络监听模块 (Slave - 提权至最高优先级) ==================
-void udpListenerWorker(const string& bind_ip, int port) {
+// ================== TCP 命令通道 (替代 UDP listener + fault socket) ==================
+// Master: listens on cmd_port, accepts Slave, receives FAULT from Slave
+// Slave:  connects to Master cmd_port, receives TRIGGER/FAULT/EXIT from Master
+void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
 #ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-#else
-    pthread_t this_thread = pthread_self();
-    struct sched_param params;
-    params.sched_priority = sched_get_priority_max(SCHED_FIFO);
-    pthread_setschedparam(this_thread, SCHED_FIFO, &params);
 #endif
 
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == INVALID_SOCKET) return;
+    if (is_master) {
+        // === Master: TCP server ===
+        g_cmd_listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (g_cmd_listen_sock == INVALID_SOCKET) return;
+        int optval = 1;
+        setsockopt(g_cmd_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&optval, sizeof(optval));
+        sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(cmd_port);
+        sa.sin_addr.s_addr = INADDR_ANY;
+        ::bind(g_cmd_listen_sock, (sockaddr*)&sa, sizeof(sa));
+        listen(g_cmd_listen_sock, 1);
+        cout << "[Cmd] Master listening on TCP ::" << cmd_port << endl;
 
-    int optval = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&optval, sizeof(optval));
+        sockaddr_in ca; socklen_t cl = sizeof(ca);
+        g_cmd_sock = accept(g_cmd_listen_sock, (sockaddr*)&ca, &cl);
+        if (g_cmd_sock == INVALID_SOCKET) return;
+        cout << "[Cmd] Slave connected." << endl;
 
-    sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
-    inet_pton(AF_INET, bind_ip.c_str(), &server_addr.sin_addr);
-
-    if (::bind(sock, (sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
-        cerr << "[Slave ERROR] Bind failed on " << bind_ip << ":" << port << endl;
-        closesocket(sock);
-        return;
-    }
-
-#ifdef _WIN32
-    DWORD timeout = 100; // 100ms
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-#else
-    struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 100000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-#endif
-
-    char buffer[256];
-    cout << "[Net Sync] Priority UDP Listener Bound to " << bind_ip << ":" << port << endl;
-
-    while (global_running) {
-        sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int bytes = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, (sockaddr*)&client_addr, &client_len);
-        
-        if (bytes > 0) {
-            buffer[bytes] = '\0';
-            string cmd(buffer);
-            // [修改] 识别带时间戳的指令，瞬间开火
-            if (cmd.rfind("CMD_START:", 0) == 0) {
-                if (cmd.length() <= 10) { logException("WARN", "slave", "CMD_START truncated"); continue; }
-                instantTrigger();
-                shared_record_timestr = cmd.substr(10);
-                net_cmd_record = true;
-            }
-            else if (cmd.rfind("FAULT:", 0) == 0 && !g_fault_active.load()) {
-                if (cmd.length() <= 7) continue;
-                char hf = cmd[6]; int fi = stoi(cmd.substr(7));
+        // Master receives FAULT from Slave (async)
+        while (global_running) {
+            string line;
+            if (!recvLine(g_cmd_sock, line, 500)) continue;  // 500ms timeout for polling
+            if (line.rfind("FAULT:", 0) == 0 && !g_fault_active.load()) {
+                if (line.length() <= 7) continue;
+                char hf = line[6]; int fi = stoi(line.substr(7));
                 if (fi < 0 || fi >= (int)cam_ctxs.size()) {
-                    logException("WARN", "slave", "FAULT cam idx out of bounds: " + to_string(fi));
+                    logException("WARN", "master", "FAULT cam idx out of bounds: " + to_string(fi));
                     continue;
                 }
-                cout << "[Slave] Fault from MASTER: cam " << fi << endl;
+                cout << "[Fault] Received from SLAVE: cam " << fi << endl;
                 g_fault_time = chrono::steady_clock::now();
-                g_fault_active.store(true); g_faulty_cam.store(fi); g_fault_on_master.store(true);
+                g_fault_active.store(true); g_faulty_cam.store(fi); g_fault_on_master.store(false);
                 for (auto& ctx : cam_ctxs) {
                     ctx->running = false;
                     ctx->copy_cv.notify_all();
@@ -362,13 +360,65 @@ void udpListenerWorker(const string& bind_ip, int port) {
                 }
                 cout << "[Fault] All cameras stopped. Press ESC to exit." << endl;
             }
-            else if (cmd == "SHUTDOWN") {
-                cout << "[Slave] Received SHUTDOWN from master." << endl;
-                global_running = false;
+        }
+    } else {
+        // === Slave: TCP client ===
+        while (global_running) {
+            g_cmd_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (g_cmd_sock == INVALID_SOCKET) { this_thread::sleep_for(chrono::seconds(2)); continue; }
+            sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(cmd_port);
+            inet_pton(AF_INET, master_ip.c_str(), &sa.sin_addr);
+            cout << "[Cmd] Slave connecting to Master TCP ::" << cmd_port << "..." << endl;
+            if (connect(g_cmd_sock, (sockaddr*)&sa, sizeof(sa)) != 0) {
+                closesocket(g_cmd_sock); g_cmd_sock = INVALID_SOCKET;
+                this_thread::sleep_for(chrono::seconds(2));
+                continue;
             }
+            cout << "[Cmd] Slave connected to Master." << endl;
+
+            // Slave receives TRIGGER / FAULT / EXIT from Master
+            while (global_running) {
+                string line;
+                if (!recvLine(g_cmd_sock, line, 1000)) {
+                    // Connection lost — reconnect
+                    break;
+                }
+                if (line == "TRIGGER") {
+                    instantTrigger();
+                    net_cmd_record = true;
+                }
+                else if (line.rfind("FAULT:", 0) == 0 && !g_fault_active.load()) {
+                    if (line.length() <= 7) continue;
+                    char hf = line[6]; int fi = stoi(line.substr(7));
+                    if (fi < 0 || fi >= (int)cam_ctxs.size()) {
+                        logException("WARN", "slave", "FAULT cam idx out of bounds: " + to_string(fi));
+                        continue;
+                    }
+                    cout << "[Slave] Fault from MASTER: cam " << fi << endl;
+                    g_fault_time = chrono::steady_clock::now();
+                    g_fault_active.store(true); g_faulty_cam.store(fi); g_fault_on_master.store(true);
+                    for (auto& ctx : cam_ctxs) {
+                        ctx->running = false;
+                        ctx->copy_cv.notify_all();
+                    }
+                    for (auto& ctx : cam_ctxs) {
+                        if (ctx->capture_thread.joinable()) ctx->capture_thread.join();
+                        if (ctx->copy_thread.joinable()) ctx->copy_thread.join();
+                    }
+                    cout << "[Fault] All cameras stopped. Press ESC to exit." << endl;
+                }
+                else if (line == "EXIT") {
+                    cout << "[Slave] Received EXIT from Master." << endl;
+                    global_running = false;
+                }
+            }
+            closesocket(g_cmd_sock); g_cmd_sock = INVALID_SOCKET;
+            if (global_running) this_thread::sleep_for(chrono::seconds(1));
         }
     }
-    closesocket(sock);
+    // cleanup
+    if (g_cmd_listen_sock != INVALID_SOCKET) { closesocket(g_cmd_listen_sock); g_cmd_listen_sock = INVALID_SOCKET; }
+    if (g_cmd_sock != INVALID_SOCKET) { closesocket(g_cmd_sock); g_cmd_sock = INVALID_SOCKET; }
 }
 
 // ================== 相机通用功能 ==================
@@ -1123,28 +1173,11 @@ int main() {
 
     g_use_hw_trigger = use_hw_trigger;
 
-    // [新增] Master 预先建立 UDP Socket (常驻内存)
-    if (is_master_pc && enable_net_sync) {
-        master_udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        slave_udp_addr.sin_family = AF_INET;
-        slave_udp_addr.sin_port = htons(net_port);
-        inet_pton(AF_INET, slave_ip.c_str(), &slave_udp_addr.sin_addr);
-    }
-
-    // 故障通信 socket (port + 200)
+    // --- 启动 TCP 命令通道 (替代 UDP listener + fault socket) ---
+    thread cmd_thread;
     if (enable_net_sync) {
-        g_fault_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        sockaddr_in fb{}; fb.sin_family = AF_INET; fb.sin_port = htons(net_port + 200);
-        inet_pton(AF_INET, (is_master_pc ? master_ip : slave_ip).c_str(), &fb.sin_addr);
-        ::bind(g_fault_sock, (sockaddr*)&fb, sizeof(fb));
-        g_peer_fault_addr.sin_family = AF_INET; g_peer_fault_addr.sin_port = htons(net_port + 200);
-        inet_pton(AF_INET, (is_master_pc ? slave_ip : master_ip).c_str(), &g_peer_fault_addr.sin_addr);
-    }
-
-    // --- 启动网络监听器 (仅Slave) ---
-    thread listener_thread;
-    if (enable_net_sync && !is_master_pc) { // [修改] 加入 enable_net_sync 判断
-        listener_thread = thread(udpListenerWorker, slave_ip, net_port);
+        int cmd_port = net_port + 400;  // TODO: make configurable in yaml
+        cmd_thread = thread(cmdWorker, is_master_pc, master_ip, cmd_port);
     }
 
     for (int i = 0; i < camera_ids.size(); ++i) {
@@ -1340,47 +1373,7 @@ int main() {
         auto current_time = std::chrono::steady_clock::now();
         bool need_ui_update = (current_time - last_ui_time) >= ui_interval;
 
-        // ===== 0. 非阻塞故障/SHUTDOWN 消息轮询 =====
-        if (enable_net_sync && g_fault_sock != INVALID_SOCKET) {
-            fd_set readfds; FD_ZERO(&readfds); FD_SET(g_fault_sock, &readfds);
-            timeval tv = {0, 0};
-            if (select(0, &readfds, NULL, NULL, &tv) > 0) {
-                char poll_buf[64];
-                sockaddr_in sender; socklen_t slen = sizeof(sender);
-                int nb = recvfrom(g_fault_sock, poll_buf, sizeof(poll_buf) - 1, 0, (sockaddr*)&sender, &slen);
-                if (nb > 0) {
-                    poll_buf[nb] = '\0'; string pm(poll_buf);
-                    if (pm.rfind("FAULT:", 0) == 0 && !g_fault_active.load()) {
-                        if (pm.length() <= 7) continue;
-                        char hf = pm[6]; int fi = stoi(pm.substr(7));
-                        if (fi < 0 || fi >= (int)cam_ctxs.size()) {
-                            logException("WARN", "main", "FAULT cam idx out of bounds: " + to_string(fi));
-                            continue;
-                        }
-                        cout << "[Fault] Received from " << (hf == 'M' ? "MASTER" : "SLAVE")
-                             << ": cam " << fi << endl;
-                        g_fault_time = std::chrono::steady_clock::now();
-                        g_fault_active.store(true); g_faulty_cam.store(fi); g_fault_on_master.store(hf == 'M');
-                        for (auto& ctx : cam_ctxs) {
-                            ctx->running = false;
-                            ctx->copy_cv.notify_all();
-                        }
-                        for (auto& ctx : cam_ctxs) {
-                            if (ctx->capture_thread.joinable()) ctx->capture_thread.join();
-                            if (ctx->copy_thread.joinable()) ctx->copy_thread.join();
-                        }
-                        is_recording = false;
-                        cout << "[Fault] All cameras stopped. Press ESC to exit." << endl;
-                    }
-                    else if (pm == "SHUTDOWN") {
-                        cout << "[System] Received SHUTDOWN from peer. Exiting." << endl;
-                        global_running = false;
-                    }
-                }
-            }
-        }
-
-        // ===== 1. 相机健康检查 =====
+        // ===== 0. 相机健康检查 =====
         if (!g_fault_active.load() && !is_dumping.load()) {
             auto now = std::chrono::steady_clock::now();
             for (size_t i = 0; i < cam_ctxs.size(); ++i) {
@@ -1398,10 +1391,9 @@ int main() {
                         global_running = false;
                         break;
                     }
-                    if (enable_net_sync && g_fault_sock != INVALID_SOCKET) {
+                    if (enable_net_sync && g_cmd_sock != INVALID_SOCKET) {
                         string fm = "FAULT:" + string(is_master_pc ? "M" : "S") + to_string(i);
-                        sendto(g_fault_sock, fm.c_str(), (int)fm.length(), 0,
-                               (sockaddr*)&g_peer_fault_addr, sizeof(g_peer_fault_addr));
+                        sendLine(g_cmd_sock, fm);
                     }
                     // Close all cameras
                     for (auto& ctx : cam_ctxs) {
@@ -1707,10 +1699,8 @@ int main() {
         else if (key == 'q' || key == 27) {
             if (enable_net_sync) {
                 if (is_master_pc) {
-                    if (g_fault_sock != INVALID_SOCKET) {
-                        string sm = "SHUTDOWN";
-                        sendto(g_fault_sock, sm.c_str(), (int)sm.length(), 0,
-                               (sockaddr*)&g_peer_fault_addr, sizeof(g_peer_fault_addr));
+                    if (g_cmd_sock != INVALID_SOCKET) {
+                        sendLine(g_cmd_sock, "EXIT");
                         std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     }
                     global_running = false;
@@ -1729,8 +1719,8 @@ int main() {
 
             if (enable_net_sync) {
                 if (is_master_pc) {
-                    cout << "\n[Master UI] 'r' pressed. Broadcast START to Slave..." << endl;
-                    fastUdpSend("CMD_START:" + shared_record_timestr); // 极速发送
+                    cout << "\n[Master UI] 'r' pressed. Sending TRIGGER to Slave..." << endl;
+                    sendLine(g_cmd_sock, "TRIGGER");  // TCP reliable trigger
                     instantTrigger(); // Master 本地瞬间开火
                     trigger_start = true;
                 } else {
@@ -1794,15 +1784,15 @@ int main() {
         if (ctx->copy_thread.joinable()) ctx->copy_thread.join();
     }
     
-    if (listener_thread.joinable()) {
-        listener_thread.join();
+    if (cmd_thread.joinable()) {
+        global_running = false;  // signal cmdWorker to stop
+        closesocket(g_cmd_sock); // unblock recv
+        cmd_thread.join();
     }
 
     if (g_session_log.is_open()) g_session_log.close();
     cv::destroyAllWindows();
     Pylon::PylonTerminate();
-    if (master_udp_sock != INVALID_SOCKET) closesocket(master_udp_sock);
-    if (g_fault_sock != INVALID_SOCKET) closesocket(g_fault_sock);
 
 #ifdef _WIN32
     WSACleanup();
