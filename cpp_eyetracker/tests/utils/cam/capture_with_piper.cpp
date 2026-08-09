@@ -875,16 +875,15 @@ int main() {
                   cv::putText(loading,gb,cv::Point(50,240),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,0),1);
                   cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
 
-                // === Master: move arm to next target (overlaps with dump prep) ===
+                // === Master: move arm to next target (in parallel thread) ===
                 auto t_arm0=chrono::steady_clock::now();
+                thread arm_thread;
                 if (is_master_pc) {
                     int& idx=(g_arm=="upper")?g_upper_idx:g_lower_idx;
                     idx++; updatePiperSentry();
                     cout<<"[Piper] Moving to next target (#"<<(idx+1)<<")..."<<endl;
-                    moveArmToTarget();
-                    this_thread::sleep_for(chrono::milliseconds(200));
+                    arm_thread=thread([&](){ moveArmToTarget(); });
                 }
-                auto t_arm1=chrono::steady_clock::now();
 
                 // Step 0: Pre-create HDF5 files
                 auto t_pre0=chrono::steady_clock::now();
@@ -899,6 +898,11 @@ int main() {
                         f.createDataSet("valid",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,vd));}
                         catch(const H5::Exception& e){logException("ERROR","hdf5:precreate",e.getCDetailMsg());}}}
                 auto t_pre1=chrono::steady_clock::now();
+
+                // Wait for arm thread to finish (gaze values needed for child args)
+                if(arm_thread.joinable()) arm_thread.join();
+                auto t_arm1=chrono::steady_clock::now();
+                if(is_master_pc) this_thread::sleep_for(chrono::milliseconds(200)); // gaze server flush
 
                 // Step 1: Launch child processes
                 char exe_path[MAX_PATH];GetModuleFileNameA(NULL,exe_path,MAX_PATH);
