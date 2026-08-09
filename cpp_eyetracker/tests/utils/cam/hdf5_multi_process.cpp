@@ -331,20 +331,27 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
         listen(g_cmd_listen_sock, 1);
         cout << "[Cmd] Master listening on TCP ::" << cmd_port << endl;
 
-        sockaddr_in ca; socklen_t cl = sizeof(ca);
-        g_cmd_sock = accept(g_cmd_listen_sock, (sockaddr*)&ca, &cl);
-        if (g_cmd_sock == INVALID_SOCKET) return;
-        cout << "[Cmd] Slave connected. Handshaking..." << endl;
+        // Accept loop — retry on handshake failure
+        while (global_running) {
+            sockaddr_in ca; socklen_t cl = sizeof(ca);
+            g_cmd_sock = accept(g_cmd_listen_sock, (sockaddr*)&ca, &cl);
+            if (g_cmd_sock == INVALID_SOCKET) break;
+            cout << "[Cmd] Slave connected. Handshaking..." << endl;
 
-        // Startup handshake: receive READY, send ACK
-        string hline;
-        if (recvLine(g_cmd_sock, hline, 10000) && hline == "READY") {
-            sendLine(g_cmd_sock, "ACK");
-            cout << "[Cmd] Handshake OK. Command channel established." << endl;
-        } else {
-            cerr << "[Cmd] Handshake FAILED." << endl;
-            return;
+            // Startup handshake: receive READY, send ACK
+            string hline;
+            if (recvLine(g_cmd_sock, hline, 10000) && hline == "READY") {
+                sendLine(g_cmd_sock, "ACK");
+                cout << "[Cmd] Handshake OK. Command channel established." << endl;
+                break;  // success — proceed to command loop
+            } else {
+                cerr << "[Cmd] Handshake FAILED (received: '" << hline
+                     << "'). Closing and waiting for reconnect..." << endl;
+                closesocket(g_cmd_sock); g_cmd_sock = INVALID_SOCKET;
+                // continue accept loop
+            }
         }
+        if (g_cmd_sock == INVALID_SOCKET) return;
 
         // Master receives FAULT from Slave (async, long timeout for idle periods)
         while (global_running) {
@@ -387,10 +394,15 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
             cout << "[Cmd] Slave connected. Handshaking..." << endl;
 
             // Startup handshake: send READY, wait for ACK
-            sendLine(g_cmd_sock, "READY");
+            if (!sendLine(g_cmd_sock, "READY")) {
+                cerr << "[Cmd] Handshake FAILED (send READY error: " << WSAGetLastError() << ")" << endl;
+                closesocket(g_cmd_sock); g_cmd_sock = INVALID_SOCKET;
+                this_thread::sleep_for(chrono::seconds(2));
+                continue;
+            }
             string hline;
             if (!recvLine(g_cmd_sock, hline, 10000) || hline != "ACK") {
-                cerr << "[Cmd] Handshake FAILED." << endl;
+                cerr << "[Cmd] Handshake FAILED (recv: '" << hline << "' err=" << WSAGetLastError() << ")" << endl;
                 closesocket(g_cmd_sock); g_cmd_sock = INVALID_SOCKET;
                 this_thread::sleep_for(chrono::seconds(2));
                 continue;
