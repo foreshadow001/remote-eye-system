@@ -584,7 +584,8 @@ int main() {
             if (g_cmd_sock != INVALID_SOCKET) cmd_ready = true;
             else this_thread::sleep_for(chrono::milliseconds(100));
         }
-        if (!cmd_ready) { cerr<<"[Cmd] FAILED to establish command channel."<<endl; return 1; }
+        if (!cmd_ready) { cerr<<"[Cmd] FATAL: Command channel failed."<<endl;
+            if(is_master_pc){global_running=false;if(cmd_thread.joinable())cmd_thread.join();}return 1; }
         cout<<"[Cmd] Command channel established."<<endl;
 
         // 2. Gaze channel
@@ -595,17 +596,34 @@ int main() {
             if (g_gaze_connected.load()) gaze_ready = true;
             if (!gaze_ready) this_thread::sleep_for(chrono::milliseconds(100));
         }
-        if (!gaze_ready) { cerr<<"[Gaze] FAILED to establish gaze channel."<<endl; return 1; }
+        if (!gaze_ready) { cerr<<"[Gaze] FATAL: Gaze channel failed."<<endl;
+            if(is_master_pc&&g_cmd_sock!=INVALID_SOCKET)sendLineRaw(g_cmd_sock,"EXIT");
+            global_running=false;if(cmd_thread.joinable())cmd_thread.join();return 1; }
         cout<<"[Gaze] Gaze channel established."<<endl;
     }
 
-    // 3. Piper connection (Master only)
+    // 3. Piper connection (Master only, with retry)
     if (is_master_pc) {
         cout<<"[Piper] Connecting to Ubuntu "<<ubuntu_ip<<":"<<ctrl_port<<"..."<<endl;
-        g_piper_sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); if(g_piper_sock==INVALID_SOCKET){cerr<<"[Piper] socket fail"<<endl;return 1;}
-        sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(ctrl_port);
-        inet_pton(AF_INET,ubuntu_ip.c_str(),&sa.sin_addr);
-        if(connect(g_piper_sock,(sockaddr*)&sa,sizeof(sa))!=0){cerr<<"[Piper] connect fail"<<endl;return 1;}
+        bool piper_ok = false;
+        for (int retry = 0; retry < 30 && global_running; ++retry) {
+            g_piper_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (g_piper_sock == INVALID_SOCKET) { this_thread::sleep_for(chrono::seconds(2)); continue; }
+            sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(ctrl_port);
+            inet_pton(AF_INET, ubuntu_ip.c_str(), &sa.sin_addr);
+            if (connect(g_piper_sock, (sockaddr*)&sa, sizeof(sa)) == 0) {
+                piper_ok = true; break;
+            }
+            cerr << "[Piper] Connect attempt " << (retry+1) << "/30 failed, retrying..." << endl;
+            closesocket(g_piper_sock); g_piper_sock = INVALID_SOCKET;
+            this_thread::sleep_for(chrono::seconds(2));
+        }
+        if (!piper_ok) {
+            cerr << "[Piper] FATAL: Cannot connect to Ubuntu after 30 attempts." << endl;
+            if (enable_net_sync && g_cmd_sock != INVALID_SOCKET)
+                sendLineRaw(g_cmd_sock, "EXIT");  // tell Slave to exit
+            return 1;
+        }
         cout<<"[Piper] Connected to Ubuntu."<<endl;
         cout<<"[Piper] Zeroing both arms..."<<endl;
         if(!zeroArm("upper")) cerr<<"[Piper] WARN: upper zero FAIL"<<endl;
