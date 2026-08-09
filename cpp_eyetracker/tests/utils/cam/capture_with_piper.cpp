@@ -401,7 +401,20 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
     ctx->cam.close();
 }
 
-// ================== UI ==================
+// ================== UI (from hdf5_multi_process.cpp) ==================
+int getNextCalibCounter(const std::string& save_dir) {
+    int max_counter = -1;
+    if (!fs::exists(save_dir)) return 0;
+    for (auto& e : fs::directory_iterator(save_dir)) {
+        if (e.path().extension() == ".jpg") {
+            try { string stem = e.path().stem().string();
+                size_t last_underscore = stem.find_last_of('_');
+                if (last_underscore != string::npos) max_counter = max(max_counter, stoi(stem.substr(last_underscore + 1)));
+            } catch (...) {}
+        }
+    }
+    return max_counter + 1;
+}
 void updateLayout() {
     g_left_w=g_win_h*2/5; g_right_x=g_left_w; g_right_w=g_win_w-g_left_w;
     g_thumb_w=g_left_w/2; g_thumb_h=g_win_h/5;
@@ -411,6 +424,53 @@ void onMouse(int event, int x, int y, int, void*) {
     int col=x/g_thumb_w, row=y/g_thumb_h, idx=row*2+col;
     int n=(int)cam_ctxs.size();
     if(idx>=0&&idx<n){int prev=g_enlarged_cam.load();g_enlarged_cam.store((prev==idx)?-1:idx);}
+}
+void renderThumbnailGrid(cv::Mat& canvas, int selected_idx, bool is_recording,
+                         const chrono::steady_clock::time_point& record_start_time, int total_record_frames) {
+    int n=(int)cam_ctxs.size();
+    for(int i=0;i<10;++i){int row=i/2,col=i%2;int x=col*g_thumb_w,y=row*g_thumb_h;cv::Rect roi(x,y,g_thumb_w,g_thumb_h);
+        if(i<n){cv::Mat local_raw;{lock_guard<mutex> lock(cam_ctxs[i]->frame_mtx);local_raw=cam_ctxs[i]->latest_frame;}
+            cv::Mat cell;if(!local_raw.empty()){if(cam_ctxs[i]->is_mono)cv::cvtColor(local_raw,cell,cv::COLOR_GRAY2RGB);else cv::cvtColor(local_raw,cell,cv::COLOR_BayerRG2RGB);
+                double scale=min((double)g_thumb_w/cell.cols,(double)g_thumb_h/cell.rows);int dw=(int)(cell.cols*scale),dh=(int)(cell.rows*scale);
+                cv::Mat resized;cv::resize(cell,resized,cv::Size(dw,dh));cell=cv::Mat::zeros(g_thumb_h,g_thumb_w,CV_8UC3);
+                int ox=(g_thumb_w-dw)/2,oy=(g_thumb_h-dh)/2;resized.copyTo(cell(cv::Rect(ox,oy,dw,dh)));}
+            else{cell=cv::Mat::zeros(g_thumb_h,g_thumb_w,CV_8UC3);int bl=0;cv::Size ts=cv::getTextSize(cam_ctxs[i]->status_msg,cv::FONT_HERSHEY_SIMPLEX,0.5,1,&bl);
+                cv::putText(cell,cam_ctxs[i]->status_msg,cv::Point((g_thumb_w-ts.width)/2,(g_thumb_h+ts.height)/2),cv::FONT_HERSHEY_SIMPLEX,0.5,cv::Scalar(0,255,255),1);}
+            if(is_recording){int r=6;cv::circle(cell,cv::Point(g_thumb_w-r*2,r*2),r,cv::Scalar(0,0,255),-1,cv::LINE_AA);
+                int cf=cam_ctxs[i]->recorded_frames.load(memory_order_relaxed);cv::putText(cell,to_string(cf)+"/"+to_string(total_record_frames),cv::Point(4,14),cv::FONT_HERSHEY_SIMPLEX,0.35,cv::Scalar(0,0,0),2);
+                cv::putText(cell,to_string(cf)+"/"+to_string(total_record_frames),cv::Point(4,14),cv::FONT_HERSHEY_SIMPLEX,0.35,cv::Scalar(0,255,0),1);}
+            string label=cam_ctxs[i]->id;int bl=0;cv::Size ts=cv::getTextSize(label,cv::FONT_HERSHEY_SIMPLEX,0.4,1,&bl);
+            cv::putText(cell,label,cv::Point((g_thumb_w-ts.width)/2,g_thumb_h-5),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(0,0,0),3);
+            cv::putText(cell,label,cv::Point((g_thumb_w-ts.width)/2,g_thumb_h-5),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(255,255,255),1);
+            cell.copyTo(canvas(roi));if(i==selected_idx)cv::rectangle(canvas,roi,cv::Scalar(0,255,0),2);}
+        else{canvas(roi)=cv::Scalar(0,0,0);}
+    }
+}
+void renderEnlargedView(cv::Mat& canvas, int cam_idx, bool is_recording,
+                        const chrono::steady_clock::time_point& record_start_time, int total_record_frames) {
+    cv::Rect right_roi(g_right_x,0,g_right_w,g_win_h);if(cam_idx<0||cam_idx>=(int)cam_ctxs.size()){canvas(right_roi)=cv::Scalar(0,0,0);return;}
+    cv::Mat local_raw;{lock_guard<mutex> lock(cam_ctxs[cam_idx]->frame_mtx);local_raw=cam_ctxs[cam_idx]->latest_frame;}
+    if(local_raw.empty()){canvas(right_roi)=cv::Scalar(0,0,0);return;}
+    cv::Mat img;if(cam_ctxs[cam_idx]->is_mono)cv::cvtColor(local_raw,img,cv::COLOR_GRAY2RGB);else cv::cvtColor(local_raw,img,cv::COLOR_BayerRG2RGB);
+    double scale=min((double)g_right_w/img.cols,(double)g_win_h/img.rows);int dw=(int)(img.cols*scale),dh=(int)(img.rows*scale);
+    cv::Mat resized;cv::resize(img,resized,cv::Size(dw,dh));int off_x=g_right_x+(g_right_w-dw)/2,off_y=(g_win_h-dh)/2;
+    if(is_recording){int r=14;cv::circle(resized,cv::Point(dw-r*2,r*2),r,cv::Scalar(0,0,255),-1,cv::LINE_AA);
+        cv::putText(resized,"REC",cv::Point(dw-r*10,r*3),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,0,255),2);
+        int cf=cam_ctxs[cam_idx]->recorded_frames.load(memory_order_relaxed);double es=chrono::duration<double>(chrono::steady_clock::now()-record_start_time).count();char b[64];
+        snprintf(b,sizeof(b),"%.1fs",es);cv::putText(resized,"Frame: "+to_string(cf)+"/"+to_string(total_record_frames),cv::Point(10,30),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,0,0),3);
+        cv::putText(resized,"Frame: "+to_string(cf)+"/"+to_string(total_record_frames),cv::Point(10,30),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,255,0),2);
+        cv::putText(resized,string(b),cv::Point(10,60),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,0,0),3);cv::putText(resized,string(b),cv::Point(10,60),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,255,0),2);
+        if(cf>10&&es>0.01){double fps=cf/es;char fb[32];snprintf(fb,sizeof(fb),"%.1f fps",fps);cv::putText(resized,string(fb),cv::Point(10,90),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,0,0),3);cv::putText(resized,string(fb),cv::Point(10,90),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,255,0),2);}}
+    canvas(right_roi)=cv::Scalar(0,0,0);resized.copyTo(canvas(cv::Rect(off_x,off_y,dw,dh)));
+}
+void showFaultOverlay(int faulty_cam, bool is_hw) {
+    cv::Mat canvas=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);int cx=g_win_w/2,y=g_win_h/2-80;
+    auto put=[&](int y,const string& t,double s,cv::Scalar c){int bl;cv::Size sz=cv::getTextSize(t,cv::FONT_HERSHEY_SIMPLEX,s,2,&bl);cv::putText(canvas,t,cv::Point(cx-sz.width/2,y),cv::FONT_HERSHEY_SIMPLEX,s,c,2);};
+    put(y,"CAMERA FAULT DETECTED",1.0,cv::Scalar(0,0,255));y+=40;
+    string ci="Camera: "+(faulty_cam>=0&&faulty_cam<(int)cam_ctxs.size()?cam_ctxs[faulty_cam]->id:"?")+" (index "+to_string(faulty_cam)+")";put(y,ci,0.7,cv::Scalar(255,255,255));y+=30;
+    put(y,string("Host: ")+(g_fault_on_master.load()?"MASTER":"SLAVE"),0.7,cv::Scalar(255,255,255));y+=30;
+    auto uptime_s=chrono::duration<double>(g_fault_time-g_ready_time).count();int h=(int)uptime_s/3600,m=((int)uptime_s%3600)/60;char ub[64];snprintf(ub,sizeof(ub),"Uptime: %dh %dm",h,m);put(y,string(ub),0.7,cv::Scalar(255,255,255));y+=40;
+    put(y,"All cameras stopped. Press ESC to exit both hosts.",0.6,cv::Scalar(0,255,255));cv::imshow("Multi-Cam Preview",canvas);cv::waitKey(1);
 }
 
 // ================== HDF5 Sentry ==================
@@ -669,8 +729,8 @@ int main() {
         ctx->capture_thread=thread(captureWorker,ctx,target_fps,gain,gammav,exp_time,use_hw_trigger,enable_offset);}
 
     // ---- UI init ----
-    cv::namedWindow("Capture+Piper",cv::WINDOW_NORMAL);cv::resizeWindow("Capture+Piper",g_win_w,g_win_h);
-    updateLayout();cv::setMouseCallback("Capture+Piper",onMouse);
+    cv::namedWindow("Multi-Cam Preview",cv::WINDOW_NORMAL);cv::resizeWindow("Multi-Cam Preview",g_win_w,g_win_h);
+    updateLayout();cv::setMouseCallback("Multi-Cam Preview",onMouse);
     {auto t=chrono::system_clock::to_time_t(chrono::system_clock::now());char tb[64];strftime(tb,sizeof(tb),"%Y%m%d_%H%M%S",localtime(&t));
         error_code ec;fs::create_directories("log/capture",ec);
         g_session_log_path=string("log/capture/session_")+tb+".md";g_session_log.open(g_session_log_path,ios::out|ios::app);
@@ -747,31 +807,56 @@ int main() {
                     is_recording=false;break;
         }}}
 
-        // ---- UI render ----
-        if (need_ui_update&&!is_dumping) {
-            cv::Mat canvas=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
-            int y=25; auto put=[&](const string& s,cv::Scalar c={255,255,255}){cv::putText(canvas,s,{20,y},cv::FONT_HERSHEY_SIMPLEX,0.5,c,1,cv::LINE_AA);y+=22;};
-            stringstream ss; ss<<"Capture+Piper ["<<(is_master_pc?"MASTER":"SLAVE")<<"]";
-            cv::putText(canvas,ss.str(),{160,y},cv::FONT_HERSHEY_DUPLEX,0.7,{0,255,255},2,cv::LINE_AA);y+=35;
-            if(is_recording) put("RECORDING...",{0,0,255});
-            else if(is_dumping) put("DUMPING...",{0,255,255});
-            else if(g_piper_busy) put("BUSY: arm moving...",{0,200,255});
-            else if(!g_recording_enabled&&is_master_pc) put("Press [s] to start session",{0,255,200});
-            else put("Ready - press [SPACE] to record",{0,255,0});
-            if(is_master_pc){
-                char buf[128]; snprintf(buf,sizeof(buf),"Arm: %s [%s] | Upper: %d/%d %s | Lower: %d/%d %s",
-                    g_arm.c_str(),g_arm=="upper"?"UPPER":"LOWER",
-                    g_upper_idx,(int)g_targets_upper.size(),g_upper_done?"DONE":"",
-                    g_lower_idx,(int)g_targets_lower.size(),g_lower_done?"DONE":"");
-                put(buf,{200,200,200});
-                if(g_tool_ccs_valid){snprintf(buf,sizeof(buf),"Tool in CCS: [%.4f, %.4f, %.4f] m",g_tool_ccs_pos.x,g_tool_ccs_pos.y,g_tool_ccs_pos.z);put(buf,{0,255,200});}
-                if(g_gaze_ready){snprintf(buf,sizeof(buf),"Gaze: [%.4f, %.4f, %.4f]",g_gaze_x.load(),g_gaze_y.load(),g_gaze_z.load());put(buf,{255,200,0});}
+        // ===== UI render (from hdf5_multi_process.cpp) =====
+        if (need_ui_update && !is_dumping) {
+            if (g_fault_active.load()) {
+                showFaultOverlay(g_faulty_cam.load(), g_use_hw_trigger);
+            } else {
+                cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
+                int sel = g_enlarged_cam.load();
+                renderThumbnailGrid(canvas, sel, is_recording, record_start_time, total_record_frames);
+                renderEnlargedView(canvas, sel, is_recording, record_start_time, total_record_frames);
+                cv::line(canvas, cv::Point(g_left_w, 0), cv::Point(g_left_w, g_win_h), cv::Scalar(60, 60, 60), 2);
+
+                // Watermark hints (bottom-left of right panel)
+                int hx = g_right_x + 10, hy = g_win_h - 60;
+                string hints;
+                if (is_recording) hints = "[REC] Recording in progress...";
+                else if (is_dumping) hints = "[DUMP] Writing to disk...";
+                else if (g_syncing.load()) hints = "Syncing sentry - please wait...";
+                else if (enable_net_sync && !is_master_pc) hints = "[s][space] disabled (Slave) | Waiting for Master...";
+                else if (is_master_pc) {
+                    if (!g_recording_enabled) hints = "[s] Start session  [SPACE/b/c/t]  [ESC/q] quit";
+                    else hints = "[SPACE] Record  [t] Switch arm  [b] Zero  [c] Clear  [ESC/q] quit";
+                }
+                cv::putText(canvas, hints, cv::Point(hx, hy), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
+                hy += 18;
+                string role = enable_net_sync ? (is_master_pc ? "Role: MASTER | Net Sync: ON" : "Role: SLAVE | Net Sync: ON") : "Role: STANDALONE | Net Sync: OFF";
+                cv::putText(canvas, role, cv::Point(hx, hy), cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(110, 110, 110), 1, cv::LINE_AA);
+                // Piper status line (Master only)
+                if (is_master_pc) {
+                    hy += 16; char pb[128];
+                    snprintf(pb, sizeof(pb), "Arm: %s | U:%d/%d%s | L:%d/%d%s | %s",
+                        g_arm.c_str(), g_upper_idx, (int)g_targets_upper.size(), g_upper_done?" DONE":"",
+                        g_lower_idx, (int)g_targets_lower.size(), g_lower_done?" DONE":"",
+                        g_piper_busy?"BUSY":(g_recording_enabled?"Ready":""));
+                    cv::putText(canvas, pb, cv::Point(hx, hy), cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(0, 200, 255), 1, cv::LINE_AA);
+                    if (g_tool_ccs_valid) {
+                        hy += 16; snprintf(pb, sizeof(pb), "Tool CCS: [%.4f %.4f %.4f]  Gaze: [%.4f %.4f %.4f]",
+                            g_tool_ccs_pos.x, g_tool_ccs_pos.y, g_tool_ccs_pos.z,
+                            g_gaze_x.load(), g_gaze_y.load(), g_gaze_z.load());
+                        cv::putText(canvas, pb, cv::Point(hx, hy), cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(0, 255, 200), 1, cv::LINE_AA);
+                    }
+                }
+
+                // Crosshair at center of enlarged area
+                int cx = g_right_x + g_right_w / 2, cy = g_win_h / 2, cl = 20;
+                cv::line(canvas, cv::Point(cx - cl, cy), cv::Point(cx + cl, cy), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
+                cv::line(canvas, cv::Point(cx, cy - cl), cv::Point(cx, cy + cl), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
+
+                cv::imshow("Multi-Cam Preview", canvas);
             }
-            y=g_win_h-25;
-            string hints=is_master_pc?"[s]Start [SPACE]Rec [b]Zero [c]Clear [t]Switch [ESC/q]Quit":"[ESC/q] Quit";
-            cv::putText(canvas,hints,{20,y},cv::FONT_HERSHEY_SIMPLEX,0.45,{140,140,140},1);
-            cv::imshow("Capture+Piper",canvas);
-            last_ui_time=current_time;
+            last_ui_time = current_time;
         }
 
         // ---- Dump wait logic ----
