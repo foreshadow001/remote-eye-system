@@ -45,6 +45,7 @@ add_executable(test_piper_ctrl
 
 target_link_libraries(test_piper_ctrl
     PRIVATE
+        eyetracker::piper
         eyetracker::cfg
         ${OpenCV_LIBS}
 )

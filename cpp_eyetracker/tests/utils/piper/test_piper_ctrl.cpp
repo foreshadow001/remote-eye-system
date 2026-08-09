@@ -35,6 +35,7 @@
 #include <cmath>
 
 #include "cfg/config.hpp"
+#include "piper/piper.hpp"
 
 namespace fs = std::filesystem;
 using namespace std;
@@ -120,6 +121,37 @@ int main() {
     cout << "=== Piper Arm Control ===" << endl;
     cout << "Server: " << ubuntu_ip << ":" << ctrl_port << endl;
     cout << "Participant: " << participant_id << endl;
+
+    // --- Load arm transforms from piper.yaml (tool + arm_in_ccs) ---
+    struct ArmTransform { Pt3 tool_t, tool_r, ccs_t, ccs_r; };
+    ArmTransform xf_upper, xf_lower;
+    auto readPt3 = [](const CfgNode& n) -> Pt3 {
+        return {n[0].as<double>(), n[1].as<double>(), n[2].as<double>()};
+    };
+    auto loadArmXf = [&](const string& arm_name) -> ArmTransform {
+        ArmTransform xf{};
+        try {
+            auto& a  = cfg_piper["arms"][arm_name];
+            auto& tl = a["tool"];
+            auto& cc = a["arm_in_ccs"];
+            xf.tool_t = readPt3(tl["translation"]);
+            xf.tool_r = readPt3(tl["rotation_zxz"]);
+            xf.ccs_t  = readPt3(cc["translation"]);
+            xf.ccs_r  = readPt3(cc["rotation_zxz"]);
+            cout << "  " << arm_name << " arm_in_ccs: t=("
+                 << xf.ccs_t.x << "," << xf.ccs_t.y << "," << xf.ccs_t.z
+                 << ") r=(" << xf.ccs_r.x << "," << xf.ccs_r.y << "," << xf.ccs_r.z << ")" << endl;
+        } catch (const exception& e) {
+            cerr << "WARN: Cannot load transform for " << arm_name << ": " << e.what() << endl;
+        }
+        return xf;
+    };
+    xf_upper = loadArmXf("upper");
+    xf_lower = loadArmXf("lower");
+
+    // Data for computed tool-in-CCS position (updated after each MOVED)
+    Pt3 tool_ccs_pos{};
+    bool tool_ccs_valid = false;
 
     // --- Helper: load all targets from a file ---
     auto loadTargets = [](const string& path) -> vector<array<double,3>> {
@@ -209,6 +241,16 @@ int main() {
     auto armTotal = [&]() -> int { return (arm=="upper") ? (int)targets_upper.size()
                                                          : (int)targets_lower.size(); };
 
+    // Helper: compute tool tip position in CCS from last flange pose
+    auto computeToolCcs = [&](const string& arm_name) {
+        auto& xf = (arm_name == "upper") ? xf_upper : xf_lower;
+        Pose flange{{last_pose.x, last_pose.y, last_pose.z},
+                    {last_pose.qx, last_pose.qy, last_pose.qz, last_pose.qw}};
+        Pose tccs = armToolToCamPose(flange, xf.tool_t, xf.tool_r, xf.ccs_t, xf.ccs_r);
+        tool_ccs_pos = tccs.pos;
+        tool_ccs_valid = true;
+    };
+
     // Helper: send MOVE_JOINTS for an arm, wait for response, update sentry
     auto zeroArm = [&](const string& arm_name) -> bool {
         busy = true;
@@ -225,6 +267,7 @@ int main() {
             last_response = resp;
             if (parsePoseResponse(resp, resp_arm, pose)) {
                 last_pose = pose;
+                computeToolCcs(arm_name);
                 cout << arm_name << " zeroed: (" << pose.x << ", " << pose.y << ", " << pose.z << ")" << endl;
                 updateSentry();
                 busy = false; return true;
@@ -318,6 +361,13 @@ int main() {
             snprintf(b,sizeof(b),"Euler Z-X-Z'': a=%.2f  b=%.2f  g=%.2f deg",
                      last_pose.alpha,last_pose.beta,last_pose.gamma);
             put(b,{0,255,0});
+
+            // Tool tip in CCS
+            if (tool_ccs_valid) {
+                snprintf(b,sizeof(b),"Tool in CCS (m): [%.4f, %.4f, %.4f]",
+                         tool_ccs_pos.x, tool_ccs_pos.y, tool_ccs_pos.z);
+                put(b,{0,255,200});
+            }
 
             if (tgt) {
                 double dx=last_pose.x-(*tgt)[0], dy=last_pose.y-(*tgt)[1], dz=last_pose.z-(*tgt)[2];
@@ -430,6 +480,7 @@ int main() {
                     ArmPose mp;
                     if (parsePoseResponse(mr, mr_arm, mp)) {
                         last_pose = mp;
+                        computeToolCcs(arm);
                         status = "OK - " + arm + " #" + to_string(cur_idx+1);
                         armIdx()++;
                         updateSentry();

@@ -457,6 +457,106 @@ if (sf) {
 
 ---
 
+### 6.9 末端工具在 CCS 中的位置显示
+
+#### 坐标系链
+
+从 TCP 收到的 flange 位姿到末端工具在相机坐标系 (CCS) 中的位姿，经过两层变换：
+
+```
+Flange (来自 /end_pose)
+  │
+  ├─ T_tool_in_flange: tool.translation + tool.rotation_zxz
+  │     R_offset = zxzToQuat(tool_rot_zxz)
+  │     p_tool_arm = p_flange + R_flange * R_offset * tool_trans
+  │     R_tool_arm = R_flange * R_offset
+  │
+  └─ 末端工具在 Arm Base 坐标系中 (tool_in_arm)
+       │
+       ├─ T_arm_in_ccs: arm_in_ccs.translation + arm_in_ccs.rotation_zxz
+       │     R_arm_ccs = zxzToQuat(arm_rot_zxz)
+       │     p_tool_ccs = arm_trans + R_arm_ccs * p_tool_arm
+       │     R_tool_ccs = R_arm_ccs * R_tool_arm
+       │
+       └─ 末端工具在 CCS 中 (返回值)
+```
+
+即 `T_tool_ccs = T_arm_in_ccs * T_flange * T_tool_in_flange`。
+
+#### 数学实现
+
+复用 `eyetracker::piper` 库中已有的 `armToolToCamPose()`（`utils/piper/src/piper.cpp:102-109`）：
+
+```cpp
+Pose armToolToCamPose(const Pose& flange,
+                      const Pt3& tool_trans, const Pt3& tool_rot_zxz_deg,
+                      const Pt3& arm_trans,   const Pt3& arm_rot_zxz_deg);
+```
+
+**注意**：`piper` 库中 `Quat` 的字段顺序是 `{x, y, z, w}`（w 在最后），而 ROS `/end_pose` 和 TCP 响应中的四元数顺序是 `(qx, qy, qz, qw)`。传入 `armToolToCamPose` 前无需重排——两者的 x/y/z/w 字段顺序恰好一致。
+
+#### 配置读取
+
+从 `piper.yaml` 读取两个臂的变换参数（启动时加载，切换臂时自动切换）：
+
+```yaml
+arms:
+  upper:
+    tool:
+      translation: [0.0, 0.0, 0.02]                  # 米, 法兰盘坐标系
+      rotation_zxz: [0.0, 0.0, 0.0]                 # 度, 内旋 Z-X-Z''
+    arm_in_ccs:
+      translation: [-0.0091, 0.0224, -0.1684]        # 米
+      rotation_zxz: [0.0948, 89.4077, 86.6415]      # 度, 内旋 Z-X-Z''
+  lower:
+    tool: ...
+    arm_in_ccs: ...
+```
+
+```cpp
+struct ArmTransform { Pt3 tool_t, tool_r, ccs_t, ccs_r; };
+ArmTransform xf_upper, xf_lower;
+
+// 加载 (以 upper 为例):
+xf_upper.tool_t = readPt3(cfg["arms"]["upper"]["tool"]["translation"]);
+xf_upper.tool_r = readPt3(cfg["arms"]["upper"]["tool"]["rotation_zxz"]);
+xf_upper.ccs_t  = readPt3(cfg["arms"]["upper"]["arm_in_ccs"]["translation"]);
+xf_upper.ccs_r  = readPt3(cfg["arms"]["upper"]["arm_in_ccs"]["rotation_zxz"]);
+```
+
+#### 计算与显示
+
+每次收到 `MOVED` 响应后立即计算：
+
+```cpp
+// flange pose 来自 MOVED 响应解析
+Pose flange{{mp.x, mp.y, mp.z}, {mp.qx, mp.qy, mp.qz, mp.qw}};
+auto& xf = (arm == "upper") ? xf_upper : xf_lower;
+Pose tool_ccs = armToolToCamPose(flange, xf.tool_t, xf.tool_r, xf.ccs_t, xf.ccs_r);
+// 显示: tool_ccs.pos.x, tool_ccs.pos.y, tool_ccs.pos.z
+```
+
+UI 在现有 flange 位姿行之后新增一行：
+
+```
+Tool in CCS (m): [ 0.1234,  0.0567,  0.8901]
+```
+
+#### CMake 依赖
+
+`test_piper_ctrl` 当前只链接 `eyetracker::cfg` + `OpenCV`。需新增 `eyetracker::piper`：
+
+```cmake
+target_link_libraries(test_piper_ctrl
+    PRIVATE
+        eyetracker::piper
+        eyetracker::cfg
+        ${OpenCV_LIBS}
+)
+```
+
+---
+
 ## 七、CMake 改造
 
 ### 7.1 `tests/utils/CMakeLists.txt`
