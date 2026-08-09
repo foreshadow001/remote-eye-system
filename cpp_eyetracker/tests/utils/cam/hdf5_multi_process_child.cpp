@@ -98,11 +98,11 @@ int main(int argc, char* argv[]) {
         // ---- gaze_target: all zeros (tiny, ~0.001s) ----
         {
             hsize_t gz_start[2] = {(hsize_t)frame_offset, 0};
-            hsize_t gz_count[2] = {(hsize_t)N, 2};
+            hsize_t gz_count[2] = {(hsize_t)N, 3};
             H5::DataSpace gz_mem(2, gz_count);
             H5::DataSpace gz_file = gaze_ds.getSpace();
             gz_file.selectHyperslab(H5S_SELECT_SET, gz_count, gz_start);
-            vector<double> gz_buf((size_t)N * 2, 0.0);
+            vector<double> gz_buf((size_t)N * 3, 0.0);
             gaze_ds.write(gz_buf.data(), H5::PredType::NATIVE_DOUBLE, gz_mem, gz_file);
         }
 

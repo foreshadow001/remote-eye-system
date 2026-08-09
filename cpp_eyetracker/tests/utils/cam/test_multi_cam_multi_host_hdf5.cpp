@@ -748,7 +748,7 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
         } else {
             hsize_t rd[3] = {(hsize_t)g_hdf5_chunk_capacity, (hsize_t)cam_h, (hsize_t)cam_w};
             raw_ds = f.createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd));
-            hsize_t gd[2] = {(hsize_t)g_hdf5_chunk_capacity, 2};
+            hsize_t gd[2] = {(hsize_t)g_hdf5_chunk_capacity, 3};
             gaze_ds = f.createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd));
             hsize_t vd[1] = {(hsize_t)g_hdf5_chunk_capacity};
             valid_ds = f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd));
@@ -768,11 +768,11 @@ void dumpToHdf5Worker(shared_ptr<CameraContext> ctx, int core_frames, int margin
         }
 
         hsize_t gz_start[2] = {(hsize_t)g_frame_offset, 0};
-        hsize_t gz_count[2] = {(hsize_t)N, 2};
+        hsize_t gz_count[2] = {(hsize_t)N, 3};
         H5::DataSpace gz_mem(2, gz_count);
         H5::DataSpace gz_file = gaze_ds.getSpace();
         gz_file.selectHyperslab(H5S_SELECT_SET, gz_count, gz_start);
-        vector<double> gz_buf(N * 2, 0.0);
+        vector<double> gz_buf(N * 3, 0.0);
         gaze_ds.write(gz_buf.data(), H5::PredType::NATIVE_DOUBLE, gz_mem, gz_file);
 
         hsize_t v_start[1] = {(hsize_t)g_frame_offset};
