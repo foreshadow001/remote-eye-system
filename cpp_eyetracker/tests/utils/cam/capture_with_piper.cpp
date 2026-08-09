@@ -56,7 +56,8 @@ SOCKET g_gaze_sock = INVALID_SOCKET;
 mutex g_gaze_send_mtx;
 atomic<double> g_gaze_x{0}, g_gaze_y{0}, g_gaze_z{0};
 atomic<bool> g_gaze_ready{false};
-atomic<bool> g_gaze_need_send{false};  // set by main thread when gaze is ready to send
+atomic<bool> g_gaze_need_send{false};
+atomic<bool> g_gaze_connected{false};  // set when gaze TCP connection established
 
 // ================== Piper arm state (Master only) ==================
 SOCKET g_piper_sock = INVALID_SOCKET;
@@ -234,7 +235,7 @@ void gazeServerWorker(int gaze_port) {
         sockaddr_in ca; socklen_t cl=sizeof(ca);
         SOCKET cs = accept(g_gaze_listen_sock, (sockaddr*)&ca, &cl);
         if (cs == INVALID_SOCKET) break;
-        g_gaze_sock = cs;
+        g_gaze_sock = cs; g_gaze_connected = true;
         cout << "[Gaze] Slave connected." << endl;
         // Loop: wait for main thread to signal new gaze data, then send
         while (global_running) {
@@ -248,7 +249,7 @@ void gazeServerWorker(int gaze_port) {
                 cout << "[Gaze] Sent ("<<g_gaze_x<<","<<g_gaze_y<<","<<g_gaze_z<<") ack="<<ack<<endl;
             }
         }
-        closesocket(g_gaze_sock); g_gaze_sock = INVALID_SOCKET;
+        g_gaze_connected = false; closesocket(g_gaze_sock); g_gaze_sock = INVALID_SOCKET;
     }
 }
 
@@ -262,6 +263,7 @@ void gazeClientWorker(const string& master_ip, int gaze_port) {
         if (connect(sock, (sockaddr*)&sa, sizeof(sa)) != 0) {
             closesocket(sock); this_thread::sleep_for(chrono::seconds(2)); continue;
         }
+        g_gaze_connected = true;
         cout << "[Gaze] Slave connected to Master." << endl;
         while (global_running) {
             string line;
@@ -273,7 +275,7 @@ void gazeClientWorker(const string& master_ip, int gaze_port) {
                 sendLineRaw(sock, "GAZE_ACK");
             }
         }
-        closesocket(sock);
+        g_gaze_connected = false; closesocket(sock);
         if (!global_running) break;
         this_thread::sleep_for(chrono::seconds(1));
     }
@@ -490,7 +492,7 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
 // ================== main ==================
 int main() {
     _putenv("HDF5_USE_FILE_LOCKING=FALSE");
-    cout<<"=== capture_with_piper ==="<<endl;
+    cout<<"=== [TEST] Multi-Basler Camera Tool (Sync Network Node + Piper) ==="<<endl;
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2,2),&wsa);
 #endif
@@ -523,6 +525,18 @@ int main() {
     int margin_frames=(int)ceil(core_frames*margin_ratio);
     int total_record_frames=core_frames+2*margin_frames;
     bool is_master_pc=g_is_master;
+    g_use_hw_trigger=use_hw_trigger;
+
+    cout<<"\n--- Network Sync Configuration ---"<<endl;
+    cout<<"Role             : "<<(is_master_pc?"MASTER (Sender)":"SLAVE (Receiver)")<<endl;
+    cout<<"Master IP        : "<<g_master_ip<<endl;
+    cout<<"Slave IP         : "<<slave_ip<<endl;
+    cout<<"Port             : "<<net_port<<endl;
+    cout<<"HW Trigger       : "<<(use_hw_trigger?"ON":"OFF")<<endl;
+    cout<<"SW Offset Init   : "<<(enable_offset?"ON":"OFF")<<endl;
+    cout<<"Intersection Crop: "<<(enable_intersection?"ON":"OFF")<<endl;
+    cout<<"Net Sync         : "<<(enable_net_sync?"ON":"OFF (Local Mode)")<<endl;
+    cout<<"----------------------------------\n"<<endl;
 
     // ---- Piper config (Master only) ----
     string ubuntu_ip; int ctrl_port=49301, gaze_port=49302;
@@ -557,31 +571,49 @@ int main() {
             <<(g_lower_done?" DONE":"")<<endl;
     }
 
-    cout<<"\n--- Config ---"<<endl;
-    cout<<"Role: "<<(is_master_pc?"MASTER":"SLAVE")<<" | HW Trigger: "<<(use_hw_trigger?"ON":"OFF")
-        <<" | Net Sync: "<<(enable_net_sync?"ON":"OFF")<<endl;
-    cout<<"Frames: core="<<core_frames<<" margin="<<margin_frames<<" total="<<total_record_frames<<endl;
-    g_use_hw_trigger=use_hw_trigger;
-
-    // ---- TCP init ----
+    // ====== TCP handshakes (sequential, one port at a time, before camera init) ======
     thread cmd_thread, gaze_thread;
+    atomic<bool> cmd_ready{false}, gaze_ready{false};
+
     if (enable_net_sync) {
         int cmd_port=net_port+400;
+        // 1. Cmd channel
+        cout<<"[Cmd] Starting TCP command channel on port "<<cmd_port<<"..."<<endl;
         cmd_thread=thread(cmdWorker, is_master_pc, g_master_ip, cmd_port);
+        while (!cmd_ready.load() && global_running) {
+            if (g_cmd_sock != INVALID_SOCKET) cmd_ready = true;
+            else this_thread::sleep_for(chrono::milliseconds(100));
+        }
+        if (!cmd_ready) { cerr<<"[Cmd] FAILED to establish command channel."<<endl; return 1; }
+        cout<<"[Cmd] Command channel established."<<endl;
+
+        // 2. Gaze channel
+        cout<<"[Gaze] Starting gaze channel on port "<<gaze_port<<"..."<<endl;
         if (is_master_pc) gaze_thread=thread(gazeServerWorker, gaze_port);
         else gaze_thread=thread(gazeClientWorker, g_master_ip, gaze_port);
+        while (!gaze_ready.load() && global_running) {
+            if (g_gaze_connected.load()) gaze_ready = true;
+            if (!gaze_ready) this_thread::sleep_for(chrono::milliseconds(100));
+        }
+        if (!gaze_ready) { cerr<<"[Gaze] FAILED to establish gaze channel."<<endl; return 1; }
+        cout<<"[Gaze] Gaze channel established."<<endl;
     }
 
-    // ---- Piper: connect to Ubuntu (Master only) ----
+    // 3. Piper connection (Master only)
     if (is_master_pc) {
-        g_piper_sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); if(g_piper_sock==INVALID_SOCKET){cerr<<"socket fail"<<endl;return 1;}
+        cout<<"[Piper] Connecting to Ubuntu "<<ubuntu_ip<<":"<<ctrl_port<<"..."<<endl;
+        g_piper_sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); if(g_piper_sock==INVALID_SOCKET){cerr<<"[Piper] socket fail"<<endl;return 1;}
         sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(ctrl_port);
         inet_pton(AF_INET,ubuntu_ip.c_str(),&sa.sin_addr);
-        if(connect(g_piper_sock,(sockaddr*)&sa,sizeof(sa))!=0){cerr<<"connect fail"<<endl;return 1;}
+        if(connect(g_piper_sock,(sockaddr*)&sa,sizeof(sa))!=0){cerr<<"[Piper] connect fail"<<endl;return 1;}
         cout<<"[Piper] Connected to Ubuntu."<<endl;
+        cout<<"[Piper] Zeroing both arms..."<<endl;
         if(!zeroArm("upper")) cerr<<"[Piper] WARN: upper zero FAIL"<<endl;
         if(!zeroArm("lower")) cerr<<"[Piper] WARN: lower zero FAIL"<<endl;
+        cout<<"[Piper] Arm initialization complete."<<endl;
     }
+
+    // ====== Camera init (only after ALL TCP handshakes done) ======
 
     // ---- Camera init ----
     for (int i=0;i<(int)camera_ids.size();++i)
