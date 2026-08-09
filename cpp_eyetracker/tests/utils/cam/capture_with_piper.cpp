@@ -865,18 +865,29 @@ int main() {
             for(auto& ctx:cam_ctxs) if(!ctx->dump_ready.load()){all_done=false;break;}
             if (all_done) {
                 g_consecutive_faults=0; is_recording=false; is_dumping=true; g_recording_number++;
-                auto dump_start=chrono::steady_clock::now();
-                // === Master: move arm to next target ===
+                auto t0=chrono::steady_clock::now();
+
+                // Show dump loading screen IMMEDIATELY
+                { cv::Mat loading=cv::Mat::zeros(400,600,CV_8UC3);
+                  cv::putText(loading,"DUMPING RAM TO HDF5... ("+to_string(cam_ctxs.size())+" processes)",
+                              cv::Point(50,200),cv::FONT_HERSHEY_SIMPLEX,0.8,cv::Scalar(0,255,255),2);
+                  char gb[128];snprintf(gb,sizeof(gb),"Gaze: [%.4f, %.4f, %.4f]",g_gaze_x.load(),g_gaze_y.load(),g_gaze_z.load());
+                  cv::putText(loading,gb,cv::Point(50,240),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,0),1);
+                  cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
+
+                // === Master: move arm to next target (overlaps with dump prep) ===
+                auto t_arm0=chrono::steady_clock::now();
                 if (is_master_pc) {
                     int& idx=(g_arm=="upper")?g_upper_idx:g_lower_idx;
                     idx++; updatePiperSentry();
                     cout<<"[Piper] Moving to next target (#"<<(idx+1)<<")..."<<endl;
                     moveArmToTarget();
-                    // Wait for gaze server to send (brief delay)
                     this_thread::sleep_for(chrono::milliseconds(200));
                 }
-                // === Multi-process HDF5 dump ===
+                auto t_arm1=chrono::steady_clock::now();
+
                 // Step 0: Pre-create HDF5 files
+                auto t_pre0=chrono::steady_clock::now();
                 for (auto& ctx:cam_ctxs){ctx->dump_start_time=chrono::steady_clock::now();
                     stringstream pss;pss<<ctx->hdf5_dir<<"/"<<setw(4)<<setfill('0')<<g_chunk_idx<<".h5";
                     if(!fs::exists(pss.str())){try{H5::H5File f(pss.str(),H5F_ACC_TRUNC);
@@ -887,13 +898,7 @@ int main() {
                         hsize_t vd[1]={(hsize_t)g_hdf5_chunk_capacity};
                         f.createDataSet("valid",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,vd));}
                         catch(const H5::Exception& e){logException("ERROR","hdf5:precreate",e.getCDetailMsg());}}}
-                // Show dump status
-                { cv::Mat loading=cv::Mat::zeros(400,600,CV_8UC3);
-                  cv::putText(loading,"DUMPING RAM TO HDF5... ("+to_string(cam_ctxs.size())+" processes)",
-                              cv::Point(50,200),cv::FONT_HERSHEY_SIMPLEX,0.8,cv::Scalar(0,255,255),2);
-                  char gb[128];snprintf(gb,sizeof(gb),"Gaze: [%.4f, %.4f, %.4f]",g_gaze_x.load(),g_gaze_y.load(),g_gaze_z.load());
-                  cv::putText(loading,gb,cv::Point(50,240),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,0),1);
-                  cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
+                auto t_pre1=chrono::steady_clock::now();
 
                 // Step 1: Launch child processes
                 char exe_path[MAX_PATH];GetModuleFileNameA(NULL,exe_path,MAX_PATH);
@@ -911,14 +916,19 @@ int main() {
                     if(CreateProcessA(child_exe.c_str(),&cmd_line[0],NULL,NULL,FALSE,0,NULL,NULL,&si,&pi)){
                         CloseHandle(pi.hThread);if(hJob)AssignProcessToJobObject(hJob,pi.hProcess);procs[i]=pi;}
                     else{logException("ERROR","hdf5:proc","CreateProcess failed cam "+to_string(i));procs[i].hProcess=NULL;}}
+                auto t_launch=chrono::steady_clock::now();
+
                 // Step 2-3: Wait + check
                 vector<HANDLE> handles;for(auto&p:procs)if(p.hProcess)handles.push_back(p.hProcess);
                 if(!handles.empty())WaitForMultipleObjects((DWORD)handles.size(),handles.data(),TRUE,INFINITE);
+                auto t_wait=chrono::steady_clock::now();
                 bool all_ok=true;
                 for(auto&p:procs){if(!p.hProcess){all_ok=false;continue;}DWORD ec;if(GetExitCodeProcess(p.hProcess,&ec)&&ec!=0){all_ok=false;logException("ERROR","hdf5:cam","child exit "+to_string(ec));}CloseHandle(p.hProcess);}
                 if(hJob)CloseHandle(hJob);
                 for(auto& ctx:cam_ctxs)ctx->dump_end_time=chrono::steady_clock::now();
-                // Step 4: Post-dump sentry handshake (sync BEFORE counting)
+
+                // Step 4: Post-dump sentry handshake
+                auto t_sentry0=chrono::steady_clock::now();
                 if (enable_net_sync) {
                     g_syncing=true;
                     int handshake_port=net_port+300;
@@ -953,12 +963,25 @@ int main() {
                     }
                     g_syncing=false;
                 }
+                auto t_sentry1=chrono::steady_clock::now();
+
                 // Step 5: Increment sentry AFTER handshake
                 cout<<"[DEBUG-HDF5] frame_offset "<<g_frame_offset<<" -> "<<(g_frame_offset+core_frames)<<endl;
                 if(all_ok){g_frame_offset+=core_frames;if(g_frame_offset>=g_hdf5_chunk_capacity){g_chunk_idx++;g_frame_offset-=g_hdf5_chunk_capacity;}updateSentry(g_sentry_root);}
                 else{logException("WARN","hdf5","Child failures - sentry NOT updated");}
-                double dump_dur=chrono::duration<double>(chrono::steady_clock::now()-dump_start).count();
-                cout<<"[Recording #"<<g_recording_number<<"] Done in "<<fixed<<setprecision(1)<<dump_dur<<"s\n";
+
+                // ---- Per-phase timing ----
+                auto d_arm=chrono::duration<double>(t_arm1-t_arm0).count();
+                auto d_pre=chrono::duration<double>(t_pre1-t_pre0).count();
+                auto d_launch=chrono::duration<double>(t_launch-t_pre1).count();
+                auto d_wait=chrono::duration<double>(t_wait-t_launch).count();
+                auto d_sentry=chrono::duration<double>(t_sentry1-t_sentry0).count();
+                auto d_total=chrono::duration<double>(t_sentry1-t0).count();
+                cout<<"[Timing] arm="<<fixed<<setprecision(2)<<d_arm
+                    <<"s precreate="<<d_pre<<"s launch="<<d_launch
+                    <<"s wait="<<d_wait<<"s sentry="<<d_sentry
+                    <<"s TOTAL="<<d_total<<"s"<<endl;
+                cout<<"[Recording #"<<g_recording_number<<"] Done in "<<fixed<<setprecision(1)<<d_total<<"s\n";
                 is_dumping=false;while(cv::waitKey(1)>=0);last_ui_time=chrono::steady_clock::now();
         }}
 
