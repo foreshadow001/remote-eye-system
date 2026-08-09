@@ -976,10 +976,15 @@ int main() {
             cout<<"[s] Starting session - moving "<<g_arm<<" to sentry target..."<<endl;
             if(moveArmToTarget()){this_thread::sleep_for(chrono::milliseconds(200));g_recording_enabled=true;cout<<"[s] Session started. SPACE to record."<<endl;}
         }
-        else if(is_master_pc&&key==' '&&!is_recording&&!is_dumping&&!g_piper_busy&&g_recording_enabled){
-            instantTrigger(); trigger_start=true;
-            if(enable_net_sync&&g_cmd_sock!=INVALID_SOCKET) sendLineRaw(g_cmd_sock,"TRIGGER");
-            cout<<"[Recording] Started."<<endl;
+        else if(is_master_pc&&key==' '&&!is_recording&&!is_dumping&&!g_piper_busy){
+            if(g_recording_enabled){
+                instantTrigger(); trigger_start=true;
+                if(enable_net_sync&&g_cmd_sock!=INVALID_SOCKET) sendLineRaw(g_cmd_sock,"TRIGGER");
+                cout<<"[Recording] Started."<<endl;
+            } else {
+                cout<<"[SPACE] Recording not enabled. Press [s] first."<<endl;
+                if(g_upper_done&&g_lower_done) cout<<"[SPACE] Both arms DONE. Press [c] to clear sentry."<<endl;
+            }
         }
         else if(is_master_pc&&(key=='b'||key=='B')&&!g_piper_busy){zeroArm(g_arm);}
         else if(is_master_pc&&(key=='c'||key=='C')&&!g_piper_busy){
