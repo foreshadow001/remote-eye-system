@@ -73,7 +73,7 @@ bool sendLine(SOCKET sock, const string& msg) {
 }
 
 // Parse "MOVED:arm:x,y,z,qx,qy,qz,qw,alpha,beta,gamma" or "POSE:arm:..."
-// (shared format — POSE and MOVED both carry 10 comma-separated values)
+// (shared format - POSE and MOVED both carry 10 comma-separated values)
 struct ArmPose { double x,y,z, qx,qy,qz,qw, alpha,beta,gamma; bool valid=false; };
 
 bool parsePoseResponse(const string& resp, string& arm, ArmPose& pose) {
@@ -235,19 +235,19 @@ int main() {
         return false;
     };
 
-    // --- Zero both arms (non-fatal — UI opens regardless) ---
+    // --- Zero both arms (non-fatal - UI opens regardless) ---
     if (!zeroArm("upper")) {
-        status = "Upper zero FAIL — press R to retry";
+        status = "Upper zero FAIL - press R to retry";
         cerr << status << endl;
     }
     if (!zeroArm("lower")) {
-        status = "Lower zero FAIL — press R to retry";
+        status = "Lower zero FAIL - press R to retry";
         cerr << status << endl;
     }
     if (status.find("Zeroed") == string::npos && status.find("FAIL") != string::npos) {
         // neither arm zeroed successfully, keep the last failure status
     } else {
-        status = "Zeroed — upper";
+        status = "Zeroed - upper";
     }
 
     // Helper: get current target
@@ -274,7 +274,7 @@ int main() {
         };
 
         // Title
-        string title = "Piper Arm Control — " + arm + (arm=="upper"?" (UPPER)":" (LOWER)");
+        string title = "Piper Arm Control - " + arm + (arm=="upper"?" (UPPER)":" (LOWER)");
         cv::putText(canvas, title, {140, y},
                     cv::FONT_HERSHEY_SIMPLEX, 0.7, {0, 255, 255}, 2, cv::LINE_AA);
         y += 32;
@@ -316,7 +316,7 @@ int main() {
             if (tgt) {
                 double dx=last_pose.x-(*tgt)[0], dy=last_pose.y-(*tgt)[1], dz=last_pose.z-(*tgt)[2];
                 double dist=sqrt(dx*dx+dy*dy+dz*dz);
-                snprintf(b,sizeof(b),"Dist: %.4f m  %s",dist,dist<0.02?"OK":"OFF");
+                snprintf(b,sizeof(b),"Dist to target: %.4f m  %s",dist,dist<0.02?"OK":"OFF");
                 put(b,dist<0.02?cv::Scalar(0,255,0):cv::Scalar(0,165,255));
             }
         } else {
@@ -326,14 +326,14 @@ int main() {
 
         // All done banner
         if (all_done) {
-            cv::putText(canvas, "*** ALL DONE — Press ESC/q to exit ***",
+            cv::putText(canvas, "*** ALL DONE - Press ESC/q to exit ***",
                         {60, y+10}, cv::FONT_HERSHEY_SIMPLEX, 0.7, {0,255,0}, 2);
             y += 40;
         }
 
         // Last raw response (truncated)
         if (!last_response.empty())
-            put("Last: "+last_response.substr(0,min((size_t)65,last_response.size())),{150,150,150});
+            put("Last TCP resp: "+last_response.substr(0,min((size_t)60,last_response.size())),{150,150,150});
 
         // Key hints
         y = 442;
@@ -345,43 +345,45 @@ int main() {
         char key = (char)cv::waitKey(30);
 
         if (key == 'q' || key == 27) {
-            // Zero both arms before exit
-            if (!all_done) {
-                status = "Zeroing both arms before exit...";
-                cout << "\nZeroing both arms before exit..." << endl;
-                zeroArm("upper");
-                zeroArm("lower");
-            }
+            // Park both arms before exit (always, regardless of all_done)
+            cout << "\nExiting - zeroing both arms..." << endl;
+            status = "Exit: zeroing upper...";
+            bool u_ok = zeroArm("upper");
+            cout << "  upper zero: " << (u_ok ? "OK" : "FAIL") << endl;
+            status = "Exit: zeroing lower...";
+            bool l_ok = zeroArm("lower");
+            cout << "  lower zero: " << (l_ok ? "OK" : "FAIL") << endl;
+            // Send SHUTDOWN
             cout << "Sending SHUTDOWN..." << endl;
+            status = "Exiting...";
             sendLine(sock, "SHUTDOWN");
             string ack; recvLine(sock, ack, 2000);
             cout << "Server: " << ack << endl;
             running = false;
         }
         else if (key == 't' || key == 'T') {
-            // Switch arm — zero target arm first, then restore its saved index
+            // Switch arm - zero current arm first (park it), then switch
             if (all_done) continue;
             string new_arm = (arm == "upper") ? "lower" : "upper";
             bool& nd = (new_arm == "upper") ? upper_done : lower_done;
             if (nd) {
-                status = new_arm + " already done — skipped";
+                status = new_arm + " already done - skipped";
                 cout << status << endl;
                 continue;
             }
-            cout << "Switching to " << new_arm << " — zeroing first..." << endl;
-            status = "Zeroing " + new_arm + "...";
-            if (zeroArm(new_arm)) {
-                arm = new_arm;
-                status = "Switched to " + arm;
-                cout << "Switched to " << arm << " (index=" << armIdx() << ")" << endl;
-            } else {
-                status = "Zero FAIL — stayed on " + arm;
-            }
+            // Park current arm (the one being left) before switching
+            cout << "Parking " << arm << " before switching to " << new_arm << "..." << endl;
+            status = "Parking " + arm + "...";
+            zeroArm(arm);
+            // Switch (allow forced switch even if zero times out)
+            arm = new_arm;
+            status = "Switched to " + arm;
+            cout << "Switched to " << arm << " (index=" << armIdx() << ")" << endl;
         }
         else if (key == ' ' && !all_done) {
             // Check if current arm is already done
             if (armDone()) {
-                status = arm + " already done — press T to switch";
+                status = arm + " already done - press T to switch";
                 continue;
             }
             auto* ct = getCurrentTarget();
@@ -417,17 +419,17 @@ int main() {
                     ArmPose mp;
                     if (parsePoseResponse(mr, mr_arm, mp)) {
                         last_pose = mp;
-                        status = "OK — " + arm + " #" + to_string(cur_idx+1);
+                        status = "OK - " + arm + " #" + to_string(cur_idx+1);
                         armIdx()++;
                         updateSentry();
                         cout << arm << " #" << cur_idx+1 << " MOVED: ("
                              << mp.x << ", " << mp.y << ", " << mp.z << ")"
                              << "  progress saved" << endl;
                     } else if (mr.rfind("ERROR:", 0) == 0) {
-                        // No solution — skip this target, save progress
+                        // No solution - skip this target, save progress
                         armIdx()++;
                         updateSentry();
-                        status = "SKIPPED — " + arm + " #" + to_string(cur_idx+1)
+                        status = "SKIPPED - " + arm + " #" + to_string(cur_idx+1)
                                + " (no solution)";
                         cout << "  SKIPPED (no solution). Progress saved." << endl;
                     } else {
@@ -439,7 +441,7 @@ int main() {
             }
         }
         else if (key == 'r' || key == 'R') {
-            // Re-zero current arm — reset its progress
+            // Re-zero current arm - reset its progress
             zeroArm(arm);
             armIdx() = 0;
             armDone() = false;
