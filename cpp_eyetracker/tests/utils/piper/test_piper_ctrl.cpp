@@ -445,12 +445,8 @@ int main() {
             }
         }
         else if (key == 'r' || key == 'R') {
-            // Re-zero current arm - reset its progress
+            // Re-zero current arm only — does NOT reset progress
             zeroArm(arm);
-            armIdx() = 0;
-            armDone() = false;
-            all_done = false;
-            updateSentry();
             status = "Re-zeroed " + arm;
         }
         else if (key == 'c' || key == 'C') {

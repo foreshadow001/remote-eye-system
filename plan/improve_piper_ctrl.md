@@ -318,28 +318,31 @@ auto targets_upper = loadTargets("cfg/gaze_target/P001/piper_upper.txt");
 auto targets_lower = loadTargets("cfg/gaze_target/P001/piper_lower.txt");
 ```
 
-### 6.8 进度维护与异常恢复
+### 6.8 sentry 维护机制
 
-#### sentry.txt
+sentry 由两个独立变量组成：`upper_idx` 和 `lower_idx`，分别记录 **upper 臂**和 **lower 臂**各自已成功执行的目标点位数量（即下一帧的索引）。例如 `upper_idx=3` 表示 upper 臂已完成前 3 个点位，下一次按空格将从第 4 个（index=3）开始执行。
 
-每次执行完一个点位后，将两个臂的进度写入 `cfg/gaze_target/<participant_id>/sentry.txt`。格式：
+两个臂的进度完全独立——切换臂时各自保留自己的索引，互不影响。
+
+#### 6.8.1 存储格式
+
+sentry 以纯文本文件 `sentry.txt` 存储在 `cfg/gaze_target/<participant_id>/` 目录下。格式为两行 `key:value`：
 
 ```
 upper:<已完成帧数>
 lower:<已完成帧数>
 ```
 
-其中数字表示该臂**已成功执行的帧数**（即下一帧的索引）。例如 `upper:3` 表示 upper 已完成前 3 个点位，下次从第 4 个（index=3）开始。
+选择纯文本的原因：读写极其轻量（每次点位完成后写一次，约 20 字节），无需 HDF5 的复杂性。
 
-#### 启动时恢复
+#### 6.8.2 启动时初始化
 
-程序启动时读取 sentry.txt：
-- 文件不存在 → 两个臂都从 0 开始
-- 文件存在 → 加载进度，从上次中断处继续
+程序启动后，读取 `sentry.txt`。若文件不存在（首次运行），两个臂都从索引 0 开始：
 
 ```cpp
+string sentry_path = gaze_dir + "/sentry.txt";
 int upper_idx = 0, lower_idx = 0;
-ifstream sf(gaze_dir + "/sentry.txt");
+ifstream sf(sentry_path);
 if (sf) {
     string line;
     while (getline(sf, line)) {
@@ -347,48 +350,110 @@ if (sf) {
         if (line.rfind("lower:", 0) == 0) lower_idx = stoi(line.substr(6));
     }
 }
-arm_idx = (arm == "upper") ? upper_idx : lower_idx;
 ```
 
-#### 每次写入后更新
+若 `upper_idx >= targets_upper.size()`，则该臂标记为已完成（`upper_done = true`）。同理处理 lower。
 
-```cpp
-auto updateSentry = [&]() {
-    ofstream sf(gaze_dir + "/sentry.txt");
-    sf << "upper:" << upper_idx << "\nlower:" << lower_idx << "\n";
-};
-```
+#### 6.8.3 更新时机
 
-在每次 MOVE_TO 成功后、MOVE_JOINTS 成功后调用 `updateSentry()`。
+`updateSentry()` 在以下**每一个事件后立即调用**，确保异常退出不丢进度：
 
-#### 切换臂时回零
+| 事件 | 对 sentry 的操作 | 代码路径 |
+|------|-----------------|----------|
+| **MOVE_TO 成功** | `armIdx()++` 然后 `updateSentry()` | SPACE 键 → 收到 `MOVED:` 响应 |
+| **MOVE_TO 无解** | `armIdx()++`（跳过此点）然后 `updateSentry()` | SPACE 键 → 收到 `ERROR:no_solution` |
+| **MOVE_JOINTS 成功** | 不改变索引，但 `updateSentry()` 确保持久化 | `zeroArm()` 内部、`t` 切换臂、`R` 回零、`ESC` 退出前 |
+| **按 C 清除** | `upper_idx=0, lower_idx=0` 然后 `updateSentry()` | `c` 键 |
+| **按 R 回零** | 仅 `zeroArm()`，**不改变索引**，不写 sentry | `r` 键 |
+| **全部完成** | 标记 `armDone()=true` 然后 `updateSentry()` | SPACE 键 → 当前臂无下一目标 |
 
-按下 `t` 切换到另一臂后：
-1. 若目标臂未完成 → 先对该臂执行 `MOVE_JOINTS` 回零
-2. 回零成功 → 从 sentry 记录的索引恢复该臂的进度
-3. 回零失败 → 保持当前臂，提示用户
+**注意**：`updateSentry()` 始终写入 `upper_idx` 和 `lower_idx` 的当前值，不论当前激活的是哪个臂。例如当前在 upper 臂执行，`lower_idx` 保持上次的值不变，一并写入 sentry。
+
+#### 6.8.4 upper 臂的 `upper_idx` 维护
+
+| 条件 | 操作 |
+|------|------|
+| **程序启动** | 从 `sentry.txt` 读取 `upper:N`；若文件不存在则 `upper_idx=0` |
+| **按下空格（upper 激活）** | `MOVE_TO:upper:x,y,z` → 成功后 `upper_idx++` → `updateSentry()`；若无解 `upper_idx++`（跳过）→ `updateSentry()` |
+| **按下 R（upper 激活）** | `zeroArm("upper")` → 仅物理回零，`upper_idx` 和 sentry **不变** |
+| **按下 T 切换到 lower** | `zeroArm("upper")`（park 当前臂）→ 切换到 lower，`upper_idx` **保持不变** |
+| **按下 T 从 lower 切回 upper** | 从 sentry 恢复 `upper_idx`（已有值），继续执行 |
+| **按下 C** | `upper_idx=0` → `updateSentry()` |
+| **upper 全部完成** | `upper_done=true`，`upper_idx` 不再递增 |
+| **程序崩溃/强杀** | `updateSentry()` 已在上次事件后执行，进度保留到最近一次成功写入 |
+
+#### 6.8.5 lower 臂的 `lower_idx` 维护
+
+与 upper 完全对称的逻辑：
+
+| 条件 | 操作 |
+|------|------|
+| **程序启动** | 从 `sentry.txt` 读取 `lower:N`；若文件不存在则 `lower_idx=0` |
+| **按下空格（lower 激活）** | `MOVE_TO:lower:x,y,z` → 成功后 `lower_idx++` → `updateSentry()`；若无解 `lower_idx++`（跳过）→ `updateSentry()` |
+| **按下 R（lower 激活）** | `zeroArm("lower")` → 仅物理回零，`lower_idx` 和 sentry **不变** |
+| **按下 T 切换到 upper** | `zeroArm("lower")`（park 当前臂）→ 切换到 upper，`lower_idx` **保持不变** |
+| **按下 T 从 upper 切回 lower** | 从 sentry 恢复 `lower_idx`（已有值），继续执行 |
+| **按下 C** | `lower_idx=0` → `updateSentry()` |
+| **lower 全部完成** | `lower_done=true`，`lower_idx` 不再递增 |
+| **程序崩溃/强杀** | `updateSentry()` 已在上次事件后执行，进度保留到最近一次成功写入 |
+
+#### 6.8.6 切换臂时的回零策略
+
+按下 `t` 时，**先对当前臂执行 MOVE_JOINTS 回零（park），再切换到目标臂**。无论回零是否成功都强制切换（超时也不阻塞）：
 
 ```
 [t] 按下
   → 若目标臂已完成 → 跳过
-  → zeroArm(target_arm) → 等待完成
-  → 切换到目标臂，arm_idx = saved_idx
-  → updateSentry()
+  → zeroArm(当前臂)   ← park 当前臂，放回安全位置
+  → arm = 目标臂
+  → 目标臂的 armIdx 保持 sentry 中记录的值（不受切换影响）
 ```
 
-#### 无解情况处理
+设计理由：离开一个臂时将其归零，防止机械臂停留在上次运动的目标位置（可能不安全）。
 
-当 Ubuntu 返回 `ERROR:<arm>:no_solution` 时，跳过当前点位，自动递增索引，更新 sentry：
+#### 6.8.7 退出时的回零策略
+
+按下 `ESC/q` 时，**无论是否全部完成，两个臂都执行回零**，然后再发送 SHUTDOWN：
 
 ```
-recvLine 返回 "ERROR:upper:no_solution"
-  → 打印警告
-  → arm_idx++  (跳过此点)
-  → updateSentry()
-  → 状态：SKIPPED — upper #N
+[ESC] 按下
+  → zeroArm("upper") → 打印 OK/FAIL
+  → zeroArm("lower") → 打印 OK/FAIL
+  → sendLine("SHUTDOWN")
+  → 接收 SHUTDOWN_ACK
+  → 退出
 ```
 
-不阻塞等待用户确认，自动继续下一个点位。
+回零在 SHUTDOWN 之前执行，确保两臂都回到安全零位后再关闭 Ubuntu 端服务。
+
+#### 6.8.8 异常恢复
+
+| 场景 | `upper_idx` | `lower_idx` | 说明 |
+|------|------------|------------|------|
+| 程序正常退出 | 保持 | 保持 | `updateSentry()` 已在最后事件时写入 |
+| 程序崩溃/强杀 | 保持 | 保持 | sentry 在上次事件时已写入，最多丢失**最后一次**操作 |
+| 网络断开 | 保持 | 保持 | Windows 端退出不会回滚 sentry |
+| Ubuntu 端崩溃 | 保持 | 保持 | TCP 超时 → `zeroArm` 失败 → Windows 端状态不变 |
+| 按 C 清除 | 归零 | 归零 | 手动重置，相当于首次运行 |
+
+
+#### 6.8.7 退出时的回零策略
+
+按下  时，**无论是否全部完成，两个臂都执行回零**，然后再发送 SHUTDOWN：
+
+
+
+回零在 SHUTDOWN 之前执行，确保两臂都回到安全零位后再关闭 Ubuntu 端服务。
+
+#### 6.8.8 异常恢复
+
+| 场景 |  |  | 说明 |
+|------|------------|------------|------|
+| 程序正常退出 | 保持 | 保持 |  已在最后事件时写入 |
+| 程序崩溃/强杀 | 保持 | 保持 | sentry 在上次事件时已写入，最多丢失**最后一次**操作 |
+| 网络断开 | 保持 | 保持 | Windows 端退出不会回滚 sentry |
+| Ubuntu 端崩溃 | 保持 | 保持 | TCP 超时 →  失败 → Windows 端状态不变 |
+| 按 C 清除 | 归零 | 归零 | 手动重置，相当于首次运行 |
 
 ---
 
