@@ -236,8 +236,8 @@ void updatePiperSentry() {
 void syncPiperToSlave(bool send_init_ok=false) {
     if(g_cmd_sock==INVALID_SOCKET) return;
     char buf[64];
-    // Send one message at a time with small delay — prevents TCP buffering
-    // from merging multiple lines into one recv() and confusing recvLine.
+    snprintf(buf,sizeof(buf),"PIPER:active:%s",g_arm.c_str());
+    sendLineRaw(g_cmd_sock,buf); this_thread::sleep_for(chrono::milliseconds(50));
     snprintf(buf,sizeof(buf),"PIPER:upper:%d:%s",g_upper_idx,g_upper_done?"done":"ok");
     sendLineRaw(g_cmd_sock,buf); this_thread::sleep_for(chrono::milliseconds(50));
     snprintf(buf,sizeof(buf),"PIPER:lower:%d:%s",g_lower_idx,g_lower_done?"done":"ok");
@@ -559,7 +559,19 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
                 string line;
                 if(!recvLine(g_cmd_sock,line,300000)){cerr<<"[Cmd] Connection lost - exiting."<<endl;global_running=false;break;}
                 if(line=="INIT_OK"){g_init_ok=true;cout<<"[Cmd] Received INIT_OK from Master."<<endl;}
-                else if(line.rfind("PIPER:",0)==0){/* PIPER:upper:8:done */ size_t c2=line.find(':',6);if(c2!=string::npos){string an=line.substr(6,c2-6);int n=stoi(line.substr(c2+1,line.find(':',c2+1)-c2-1));string st=line.substr(line.find_last_of(':')+1);bool d=(st=="done");if(an=="upper"){g_upper_idx=n;g_upper_done=d;}else{g_lower_idx=n;g_lower_done=d;}g_show_exhausted=d;cout<<"[Cmd] PIPER: "<<an<<" idx="<<n<<" "<<(d?"done":"ok")<<endl;}}
+                else if(line.rfind("PIPER:",0)==0){
+                    size_t c2=line.find(':',6); if(c2==string::npos) continue;
+                    string an=line.substr(6,c2-6);
+                    if(an=="active"){ g_arm=line.substr(c2+1); cout<<"[Cmd] PIPER active="<<g_arm<<endl; }
+                    else {
+                        int n=stoi(line.substr(c2+1,line.find(':',c2+1)-c2-1));
+                        string st=line.substr(line.find_last_of(':')+1); bool d=(st=="done");
+                        if(an=="upper"){g_upper_idx=n;g_upper_done=d;} else {g_lower_idx=n;g_lower_done=d;}
+                        cout<<"[Cmd] PIPER: "<<an<<" idx="<<n<<" "<<(d?"done":"ok")<<endl;
+                    }
+                    // Recompute exhausted based on current active arm
+                    bool& cd=(g_arm=="upper")?g_upper_done:g_lower_done; g_show_exhausted=cd;
+                }
                 else if(line=="GAZE_DONE"){g_gaze_done=true;cout<<"[Cmd] Received GAZE_DONE from Master."<<endl;}
                 else if(line=="TRIGGER"){instantTrigger();net_cmd_record=true;}
                 else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){
@@ -1237,18 +1249,21 @@ int main() {
         }
         else if(is_master_pc&&(key=='b'||key=='B')&&!g_piper_busy){zeroArm(g_arm);}
         else if(is_master_pc&&(key=='c'||key=='C')&&!g_piper_busy){
-            g_upper_idx=0; g_lower_idx=0; g_upper_done=false; g_lower_done=false; g_show_exhausted=false;
-            g_recording_enabled=false; updatePiperSentry();
+            // Clear only current arm's piper sentry
+            if(g_arm=="upper"){g_upper_idx=0;g_upper_done=false;}
+            else{g_lower_idx=0;g_lower_done=false;}
+            g_show_exhausted=false; g_recording_enabled=false; updatePiperSentry();
             syncPiperToSlave();
-            cout<<"[Piper] Sentry cleared."<<endl;
+            cout<<"[Piper] "<<g_arm<<" sentry cleared."<<endl;
         }
         else if(is_master_pc&&(key=='t'||key=='T')&&!g_piper_busy){
             string new_arm=(g_arm=="upper")?"lower":"upper";
             bool nd=(new_arm=="upper")?g_upper_done:g_lower_done;
             if(nd){cout<<"[t] "<<new_arm<<" already done."<<endl;goto next_iter;}
-            zeroArm(g_arm); g_arm=new_arm; g_recording_enabled=false;
+            zeroArm(g_arm);
+            g_arm=new_arm; g_recording_enabled=false; g_show_exhausted=false;
             syncPiperToSlave();
-            cout<<"[t] Switched to "<<g_arm<<endl;
+            cout<<"[t] Switched to "<<g_arm<<" (press 's' to start session)"<<endl;
         }
 
         if((trigger_start||net_cmd_record.exchange(false))&&!is_recording&&!is_dumping){
