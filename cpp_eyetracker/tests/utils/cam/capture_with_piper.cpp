@@ -126,6 +126,13 @@ int g_hdf5_chunk_capacity = 2000;
 int g_sentry_mismatch_count = 0, g_consecutive_faults = 0;
 atomic<bool> g_syncing{false};
 string g_session_log_path; int g_recording_number = 0; ofstream g_session_log;
+// Timing metrics (per-recording, updated after each dump)
+double g_arm_stage_s = 0;       // ARM stage wall time
+double g_master_hdf5_s = 0;    // Master HDF5 write (hdf5 phase in par)
+double g_slave_hdf5_s = 0;     // Slave HDF5 write (hdf5 phase in par)
+double g_gaze_sync_s = 0;      // Gaze forward + HDF5_DONE handshake
+double g_sentry_sync_s = 0;    // Sentry handshake
+double g_recording_end_to_end_s = 0; // Total from SPACE to SPACE-ready
 atomic<int> g_exc_fatal{0}, g_exc_error{0}, g_exc_warn{0}, g_exc_info{0};
 int64_t g_peer_first_block_id = -1;
 atomic<int> g_enlarged_cam{-1};
@@ -554,6 +561,61 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
     }
     if(g_cmd_listen_sock!=INVALID_SOCKET){closesocket(g_cmd_listen_sock);g_cmd_listen_sock=INVALID_SOCKET;}
     if(g_cmd_sock!=INVALID_SOCKET){closesocket(g_cmd_sock);g_cmd_sock=INVALID_SOCKET;}
+}
+
+// ================== Session report ==================
+void writeReport(const string& timestr, int rec_num, int total_frames, bool hw_trigger) {
+    if (!g_session_log.is_open()) return;
+    g_session_log << "\n---\n\n"
+                  << "## Recording #" << rec_num << ": " << timestr << "\n\n"
+                  << "- **Cameras**: " << cam_ctxs.size() << "\n"
+                  << "- **Trigger**: " << (hw_trigger ? "HW" : "SW") << "\n"
+                  << "- **Total frames**: " << total_frames << "\n\n";
+
+    // Per-Camera Metrics
+    g_session_log << "### Per-Camera Metrics\n\n";
+    g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | Rec2RAM(s) |"
+                  << " ArmStage(s) | M-HDF5(s) | S-HDF5(s) |\n";
+    g_session_log << "|---|-----|------|-------|------|-----|-------|---------|------------|"
+                  << "------------|-----------|-----------|\n";
+
+    double theoretical_s = total_frames / 200.0;
+    for (auto& ctx : cam_ctxs) {
+        int saved = ctx->recorded_frames.load();
+        int dropped = ctx->dropped_frames.load();
+        double fps = 0.0;
+        if (saved > 1) {
+            double dur_s = (ctx->meta_buffer[saved-1].timestamp - ctx->meta_buffer[0].timestamp) / 10000000.0;
+            if (dur_s > 0) fps = (saved - 1) / dur_s;
+        }
+        double actual_ram_s = chrono::duration<double>(ctx->recording_end_time - ctx->first_frame_time).count();
+        ctx->recover2ram_s = actual_ram_s - theoretical_s;
+        double lat_ms = ctx->first_frame_time.time_since_epoch().count() > 0
+            ? chrono::duration<double,milli>(ctx->first_frame_time - global_record_start_time).count() : 0.0;
+
+        g_session_log << "| " << ctx->index << " | " << ctx->id << " | "
+                      << (ctx->is_mono?"mono":"color") << " | "
+                      << saved << " | " << dropped << " | "
+                      << fixed << setprecision(1) << fps << " | "
+                      << ctx->max_queue_size.load() << "/" << total_frames << " | "
+                      << fixed << setprecision(1) << lat_ms << " | "
+                      << fixed << setprecision(3) << ctx->recover2ram_s << " | "
+                      << g_arm_stage_s << " | " << g_master_hdf5_s << " | " << g_slave_hdf5_s << " |\n";
+    }
+
+    // Summary
+    g_session_log << "\n### Summary\n\n";
+    g_session_log << "| Metric | Value | Note |\n";
+    g_session_log << "|--------|-------|------|\n";
+    g_session_log << "| ARM stage | " << fixed << setprecision(2) << g_arm_stage_s << " s | Par. wall clock (arm || HDF5) |\n";
+    g_session_log << "| Master HDF5 write | " << g_master_hdf5_s << " s | WaitForMultipleObjects |\n";
+    g_session_log << "| Slave HDF5 write | " << g_slave_hdf5_s << " s | WaitForMultipleObjects |\n";
+    double max_hdf5 = max(g_master_hdf5_s, g_slave_hdf5_s);
+    g_session_log << "| Max HDF5 write | " << max_hdf5 << " s | max(Master, Slave) |\n";
+    g_session_log << "| Gaze sync | " << g_gaze_sync_s << " s | HDF5_DONE + GAZE + GAZE_DONE |\n";
+    g_session_log << "| Sentry sync | " << g_sentry_sync_s << " s | TCP handshake port+300 |\n";
+    g_session_log << "| End-to-end | " << g_recording_end_to_end_s << " s | SPACE→SPACE-ready |\n";
+    g_session_log << defaultfloat << flush;
 }
 
 // ================== main ==================
@@ -1018,19 +1080,26 @@ int main() {
                 else{logException("WARN","hdf5","Child failures - sentry NOT updated");}
 
                 // ---- Per-phase timing ----
-                auto d_par=chrono::duration<double>(t_arm_done-t_par0).count();  // parallel phase wall time
+                auto d_par=chrono::duration<double>(t_arm_done-t_par0).count();
                 auto d_pre=chrono::duration<double>(t_pre-t_par0).count();
                 auto d_launch=chrono::duration<double>(t_launch-t_pre).count();
                 auto d_wait=chrono::duration<double>(t_hdf5_done-t_launch).count();
-                auto d_arm_wait=chrono::duration<double>(t_arm_done-t_hdf5_done).count(); // extra arm wait after HDF5
+                auto d_arm_wait=chrono::duration<double>(t_arm_done-t_hdf5_done).count();
                 auto d_sync=chrono::duration<double>(t_sync_done-t_arm_done).count();
                 auto d_sentry=chrono::duration<double>(t_sentry1-t_sentry0).count();
                 auto d_total=chrono::duration<double>(t_sentry1-t0).count();
+                // Store for report
+                g_arm_stage_s = d_par;   // ARM wall time (Master=arm||hdf5, Slave=hdf5 only)
+                if(is_master_pc) g_master_hdf5_s = d_wait; else g_slave_hdf5_s = d_wait;
+                g_gaze_sync_s = d_sync;
+                g_sentry_sync_s = d_sentry;
+                g_recording_end_to_end_s = d_total;
                 cout<<"[Timing] par="<<fixed<<setprecision(2)<<d_par
                     <<"s (pre="<<d_pre<<" launch="<<d_launch
                     <<" hdf5="<<d_wait<<" armExtra="<<d_arm_wait
                     <<") sync="<<d_sync<<" sentry="<<d_sentry
                     <<"s TOTAL="<<d_total<<"s"<<endl;
+                writeReport(current_record_timestr.empty()?"-":current_record_timestr, g_recording_number, total_record_frames, use_hw_trigger);
                 cout<<"[Recording #"<<g_recording_number<<"] Done in "<<fixed<<setprecision(1)<<d_total<<"s\n";
                 is_dumping=false;while(cv::waitKey(1)>=0);last_ui_time=chrono::steady_clock::now();
         }}
