@@ -57,7 +57,9 @@ mutex g_gaze_send_mtx;
 atomic<double> g_gaze_x{0}, g_gaze_y{0}, g_gaze_z{0};
 atomic<bool> g_gaze_ready{false};
 atomic<bool> g_gaze_need_send{false};
-atomic<bool> g_gaze_connected{false};  // set when gaze TCP connection established
+atomic<bool> g_gaze_connected{false};
+atomic<bool> g_slave_hdf5_done{false};  // Slave→Master: HDF5 write complete
+atomic<bool> g_gaze_done{false};       // Master→Slave: GAZE forwarded, proceed to sentry
 
 // ================== Piper arm state (Master only) ==================
 SOCKET g_piper_sock = INVALID_SOCKET;
@@ -504,7 +506,8 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
         while(global_running){
             string line;
             if(!recvLine(g_cmd_sock,line,500)) continue;
-            if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){
+            if(line=="HDF5_DONE"){g_slave_hdf5_done=true;cout<<"[Cmd] Slave HDF5 done."<<endl;}
+            else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){
                 if(line.length()<=7) continue;
                 char hf=line[6]; int fi=stoi(line.substr(7));
                 if(fi<0||fi>=(int)cam_ctxs.size()) continue;
@@ -529,6 +532,7 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
                 string line;
                 if(!recvLine(g_cmd_sock,line,300000)){cerr<<"[Cmd] Connection lost - exiting."<<endl;global_running=false;break;}
                 if(line=="INIT_OK"){g_init_ok=true;cout<<"[Cmd] Received INIT_OK from Master."<<endl;}
+                else if(line=="GAZE_DONE"){g_gaze_done=true;cout<<"[Cmd] Received GAZE_DONE from Master."<<endl;}
                 else if(line=="TRIGGER"){instantTrigger();net_cmd_record=true;}
                 else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){
                     if(line.length()<=7) continue;
@@ -873,51 +877,26 @@ int main() {
                 double rec_gaze_y = g_gaze_y.load();
                 double rec_gaze_z = g_gaze_z.load();
 
-                // ====== ARM STAGE (serial, Master+Slave sync via TCP) ======
-                auto t_arm0=chrono::steady_clock::now();
+                // ====== PARALLEL: ARM (thread) + HDF5 (main thread) ======
                 { cv::Mat loading=cv::Mat::zeros(400,600,CV_8UC3);
-                  cv::putText(loading,"ARM STAGE - Moving arm... ("+to_string(cam_ctxs.size())+" cameras)",
+                  cv::putText(loading,"ARM + HDF5 STAGE ("+to_string(cam_ctxs.size())+" cameras)",
                               cv::Point(50,200),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,200,255),2);
-                  char gb[128];snprintf(gb,sizeof(gb),"Gaze (rec #%d): [%.4f, %.4f, %.4f]",g_recording_number+1,rec_gaze_x,rec_gaze_y,rec_gaze_z);
+                  char gb[128];snprintf(gb,sizeof(gb),"Gaze (rec #%d): [%.4f, %.4f, %.4f]",g_recording_number,rec_gaze_x,rec_gaze_y,rec_gaze_z);
                   cv::putText(loading,gb,cv::Point(50,240),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,0),1);
                   cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
 
+                auto t_par0=chrono::steady_clock::now();
+
+                // Master: start arm thread (parallel with HDF5)
+                thread arm_thread;
                 if (is_master_pc) {
-                    // Master ARM stage
                     int& idx=(g_arm=="upper")?g_upper_idx:g_lower_idx;
                     idx++; updatePiperSentry();
                     cout<<"[Piper] Moving to next target (#"<<(idx+1)<<")..."<<endl;
-                    moveArmToTarget(); // blocks ~3.5s
-
-                    // Forward new gaze to Slave (blocking, wait for ACK)
-                    cout<<"[Gaze] Forwarding to Slave... ("<<g_gaze_x<<","<<g_gaze_y<<","<<g_gaze_z<<")"<<endl;
-                    char gbuf[128]; snprintf(gbuf,sizeof(gbuf),"GAZE:%.6f,%.6f,%.6f",g_gaze_x.load(),g_gaze_y.load(),g_gaze_z.load());
-                    { lock_guard<mutex> lk(g_gaze_send_mtx);
-                      send(g_gaze_sock, (string(gbuf)+"\n").c_str(), (int)strlen(gbuf)+1, 0); }
-                    string ack; recvLine(g_gaze_sock, ack, 5000);
-                    cout<<"[Gaze] Slave ACK: "<<ack<<endl;
-                } else {
-                    // Slave ARM stage: clear stale flag, then wait for fresh GAZE
-                    g_gaze_need_send = false;  // discard any stale signal from previous cycle
-                    cout<<"[Gaze] Waiting for Master to send new gaze..."<<endl;
-                    while (global_running && !g_gaze_need_send.load())
-                        this_thread::sleep_for(chrono::milliseconds(50));
-                    g_gaze_need_send = false;
-                    cout<<"[Gaze] Received new gaze from Master: ("
-                        <<g_gaze_x<<","<<g_gaze_y<<","<<g_gaze_z<<")"<<endl;
+                    arm_thread=thread([&](){ moveArmToTarget(); });
                 }
-                auto t_arm1=chrono::steady_clock::now();
-
-                // ====== HDF5 STAGE ======
-                { cv::Mat loading=cv::Mat::zeros(400,600,CV_8UC3);
-                  cv::putText(loading,"DUMPING RAM TO HDF5... ("+to_string(cam_ctxs.size())+" processes)",
-                              cv::Point(50,200),cv::FONT_HERSHEY_SIMPLEX,0.8,cv::Scalar(0,255,255),2);
-                  char gb[128];snprintf(gb,sizeof(gb),"Gaze (rec #%d): [%.4f, %.4f, %.4f]",g_recording_number+1,rec_gaze_x,rec_gaze_y,rec_gaze_z);
-                  cv::putText(loading,gb,cv::Point(50,240),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,0),1);
-                  cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
 
                 // Step 0: Pre-create HDF5 files
-                auto t_pre0=chrono::steady_clock::now();
                 for (auto& ctx:cam_ctxs){ctx->dump_start_time=chrono::steady_clock::now();
                     stringstream pss;pss<<ctx->hdf5_dir<<"/"<<setw(4)<<setfill('0')<<g_chunk_idx<<".h5";
                     if(!fs::exists(pss.str())){try{H5::H5File f(pss.str(),H5F_ACC_TRUNC);
@@ -928,7 +907,7 @@ int main() {
                         hsize_t vd[1]={(hsize_t)g_hdf5_chunk_capacity};
                         f.createDataSet("valid",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,vd));}
                         catch(const H5::Exception& e){logException("ERROR","hdf5:precreate",e.getCDetailMsg());}}}
-                auto t_pre1=chrono::steady_clock::now();
+                auto t_pre=chrono::steady_clock::now();
 
                 // Step 1: Launch child processes
                 char exe_path[MAX_PATH];GetModuleFileNameA(NULL,exe_path,MAX_PATH);
@@ -948,14 +927,51 @@ int main() {
                     else{logException("ERROR","hdf5:proc","CreateProcess failed cam "+to_string(i));procs[i].hProcess=NULL;}}
                 auto t_launch=chrono::steady_clock::now();
 
-                // Step 2-3: Wait + check
+                // Step 2-3: Wait for children + cleanup
                 vector<HANDLE> handles;for(auto&p:procs)if(p.hProcess)handles.push_back(p.hProcess);
                 if(!handles.empty())WaitForMultipleObjects((DWORD)handles.size(),handles.data(),TRUE,INFINITE);
-                auto t_wait=chrono::steady_clock::now();
+                auto t_hdf5_done=chrono::steady_clock::now();
                 bool all_ok=true;
                 for(auto&p:procs){if(!p.hProcess){all_ok=false;continue;}DWORD ec;if(GetExitCodeProcess(p.hProcess,&ec)&&ec!=0){all_ok=false;logException("ERROR","hdf5:cam","child exit "+to_string(ec));}CloseHandle(p.hProcess);}
                 if(hJob)CloseHandle(hJob);
                 for(auto& ctx:cam_ctxs)ctx->dump_end_time=chrono::steady_clock::now();
+
+                // Join arm thread (if Master)
+                if(arm_thread.joinable()) arm_thread.join();
+                auto t_arm_done=chrono::steady_clock::now();
+
+                // ====== SYNC: Gaze forward + HDF5_DONE handshake ======
+                if (is_master_pc) {
+                    // Wait for Slave HDF5_DONE
+                    cout<<"[Sync] Waiting for Slave HDF5_DONE..."<<endl;
+                    while(global_running && !g_slave_hdf5_done.load())
+                        this_thread::sleep_for(chrono::milliseconds(50));
+                    g_slave_hdf5_done = false;
+                    // Forward gaze to Slave
+                    cout<<"[Gaze] Forwarding to Slave: ("<<g_gaze_x<<","<<g_gaze_y<<","<<g_gaze_z<<")"<<endl;
+                    char gbuf[128]; snprintf(gbuf,sizeof(gbuf),"GAZE:%.6f,%.6f,%.6f",g_gaze_x.load(),g_gaze_y.load(),g_gaze_z.load());
+                    { lock_guard<mutex> lk(g_gaze_send_mtx);
+                      send(g_gaze_sock, (string(gbuf)+"\n").c_str(), (int)strlen(gbuf)+1, 0); }
+                    string ack; recvLine(g_gaze_sock, ack, 5000);
+                    cout<<"[Gaze] Slave ACK: "<<ack<<endl;
+                    // Signal Slave to proceed to sentry
+                    sendLineRaw(g_cmd_sock, "GAZE_DONE");
+                } else {
+                    // Signal Master: HDF5 done
+                    sendLineRaw(g_cmd_sock, "HDF5_DONE");
+                    // Wait for gaze from Master
+                    g_gaze_need_send = false;
+                    cout<<"[Sync] Waiting for Master GAZE..."<<endl;
+                    while(global_running && !g_gaze_need_send.load())
+                        this_thread::sleep_for(chrono::milliseconds(50));
+                    g_gaze_need_send = false;
+                    // Wait for GAZE_DONE from Master (cmdWorker sets g_gaze_done)
+                    cout<<"[Sync] Waiting for Master GAZE_DONE..."<<endl;
+                    while(global_running && !g_gaze_done.load())
+                        this_thread::sleep_for(chrono::milliseconds(50));
+                    g_gaze_done = false;
+                }
+                auto t_sync_done=chrono::steady_clock::now();
 
                 // Step 4: Post-dump sentry handshake
                 auto t_sentry0=chrono::steady_clock::now();
@@ -1002,17 +1018,19 @@ int main() {
                 else{logException("WARN","hdf5","Child failures - sentry NOT updated");}
 
                 // ---- Per-phase timing ----
-                auto d_arm=chrono::duration<double>(t_arm1-t_arm0).count();   // ARM stage total
-                auto d_pre=chrono::duration<double>(t_pre1-t_pre0).count();    // HDF5: precreate
-                auto d_launch=chrono::duration<double>(t_launch-t_pre1).count(); // HDF5: CreateProcess
-                auto d_wait=chrono::duration<double>(t_wait-t_launch).count();  // HDF5: wait children
-                auto d_sentry=chrono::duration<double>(t_sentry1-t_sentry0).count(); // HDF5: sentry handshake
-                auto d_hdf5=d_pre+d_launch+d_wait+d_sentry;                    // HDF5 stage total
+                auto d_par=chrono::duration<double>(t_arm_done-t_par0).count();  // parallel phase wall time
+                auto d_pre=chrono::duration<double>(t_pre-t_par0).count();
+                auto d_launch=chrono::duration<double>(t_launch-t_pre).count();
+                auto d_wait=chrono::duration<double>(t_hdf5_done-t_launch).count();
+                auto d_arm_wait=chrono::duration<double>(t_arm_done-t_hdf5_done).count(); // extra arm wait after HDF5
+                auto d_sync=chrono::duration<double>(t_sync_done-t_arm_done).count();
+                auto d_sentry=chrono::duration<double>(t_sentry1-t_sentry0).count();
                 auto d_total=chrono::duration<double>(t_sentry1-t0).count();
-                cout<<"[Timing] ARM="<<fixed<<setprecision(2)<<d_arm
-                    <<"s HDF5(pre="<<d_pre<<" launch="<<d_launch
-                    <<" wait="<<d_wait<<" sentry="<<d_sentry
-                    <<")="<<d_hdf5<<"s TOTAL="<<d_total<<"s"<<endl;
+                cout<<"[Timing] par="<<fixed<<setprecision(2)<<d_par
+                    <<"s (pre="<<d_pre<<" launch="<<d_launch
+                    <<" hdf5="<<d_wait<<" armExtra="<<d_arm_wait
+                    <<") sync="<<d_sync<<" sentry="<<d_sentry
+                    <<"s TOTAL="<<d_total<<"s"<<endl;
                 cout<<"[Recording #"<<g_recording_number<<"] Done in "<<fixed<<setprecision(1)<<d_total<<"s\n";
                 is_dumping=false;while(cv::waitKey(1)>=0);last_ui_time=chrono::steady_clock::now();
         }}
