@@ -58,8 +58,9 @@ atomic<double> g_gaze_x{0}, g_gaze_y{0}, g_gaze_z{0};
 atomic<bool> g_gaze_ready{false};
 atomic<bool> g_gaze_need_send{false};
 atomic<bool> g_gaze_connected{false};
-atomic<bool> g_slave_hdf5_done{false};  // Slave→Master: HDF5 write complete
-atomic<bool> g_gaze_done{false};       // Master→Slave: GAZE forwarded, proceed to sentry
+atomic<bool> g_slave_hdf5_done{false};
+atomic<bool> g_gaze_done{false};
+bool g_show_exhausted = false;           // true = render EXHAUSTED UI after dump
 
 // ================== Piper arm state (Master only) ==================
 SOCKET g_piper_sock = INVALID_SOCKET;
@@ -231,6 +232,13 @@ void updatePiperSentry() {
     ofstream sf(g_gaze_dir + "/sentry.txt");
     sf << "upper:" << g_upper_idx << "\nlower:" << g_lower_idx << "\n";
 }
+// ================== Piper: sync state to Slave via cmd_port ==================
+void syncPiperToSlave() {
+    if(g_cmd_sock==INVALID_SOCKET) return;
+    char buf[64];
+    snprintf(buf,sizeof(buf),"PIPER:upper:%d:%s",g_upper_idx,g_upper_done?"done":"ok"); sendLineRaw(g_cmd_sock,buf);
+    snprintf(buf,sizeof(buf),"PIPER:lower:%d:%s",g_lower_idx,g_lower_done?"done":"ok"); sendLineRaw(g_cmd_sock,buf);
+}
 
 // ================== Gaze server (Master) ==================
 void gazeServerWorker(int gaze_port) {
@@ -293,8 +301,11 @@ void gazeClientWorker(const string& master_ip, int gaze_port) {
     }
 }
 
+// ================== Piper: arm result enum ==================
+enum class ArmResult { ARM_OK, ARM_EXHAUSTED, ARM_ERROR };
+
 // ================== Piper: move arm to target (auto-skip on failure) ==================
-bool moveArmToTarget() {
+ArmResult moveArmToTarget() {
     auto& tgt = (g_arm=="upper") ? g_targets_upper : g_targets_lower;
     int& idx = (g_arm=="upper") ? g_upper_idx : g_lower_idx;
     int total = (int)tgt.size();
@@ -303,16 +314,16 @@ bool moveArmToTarget() {
         char cmd[128]; snprintf(cmd,sizeof(cmd),"MOVE_TO:%s:%.6f,%.6f,%.6f", g_arm.c_str(), pt[0], pt[1], pt[2]);
         cout << "[Piper] Moving " << g_arm << " #" << (idx+1) << "/" << total << endl;
         g_piper_busy = true;
-        if (!sendLineRaw(g_piper_sock, cmd)) { g_piper_busy = false; return false; }
+        if (!sendLineRaw(g_piper_sock, cmd)) { g_piper_busy = false; return ArmResult::ARM_ERROR; }
         string resp, resp_arm; ArmPose pose;
-        if (!recvLine(g_piper_sock, resp, 60000)) { g_piper_busy = false; return false; }
+        if (!recvLine(g_piper_sock, resp, 60000)) { g_piper_busy = false; return ArmResult::ARM_ERROR; }
         if (parsePoseResponse(resp, resp_arm, pose)) {
             g_last_piper_pose = pose;
             computeToolCcs(g_arm);
             g_gaze_x = g_tool_ccs_pos.x; g_gaze_y = g_tool_ccs_pos.y; g_gaze_z = g_tool_ccs_pos.z;
             g_gaze_ready = true; g_gaze_need_send = true;
             g_piper_busy = false;
-            return true;
+            return ArmResult::ARM_OK;
         }
         if (resp.rfind("ERROR:",0) == 0) {
             cout << "[Piper] SKIPPED #" << (idx+1) << " (no solution)" << endl;
@@ -320,13 +331,13 @@ bool moveArmToTarget() {
             continue;
         }
         cerr << "[Piper] Bad response: " << resp << endl;
-        g_piper_busy = false; return false;
+        g_piper_busy = false; return ArmResult::ARM_ERROR;
     }
     bool& done = (g_arm=="upper") ? g_upper_done : g_lower_done;
     done = true; updatePiperSentry();
     cout << "[Piper] " << g_arm << " all targets exhausted!" << endl;
     g_piper_busy = false;
-    return false;
+    return ArmResult::ARM_EXHAUSTED;
 }
 
 // ================== Camera: instantTrigger ==================
@@ -540,6 +551,7 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
                 string line;
                 if(!recvLine(g_cmd_sock,line,300000)){cerr<<"[Cmd] Connection lost - exiting."<<endl;global_running=false;break;}
                 if(line=="INIT_OK"){g_init_ok=true;cout<<"[Cmd] Received INIT_OK from Master."<<endl;}
+                else if(line.rfind("PIPER:",0)==0){/* PIPER:upper:8:done */ size_t c2=line.find(':',6);if(c2!=string::npos){string an=line.substr(6,c2-6);int n=stoi(line.substr(c2+1,line.find(':',c2+1)-c2-1));string st=line.substr(line.find_last_of(':')+1);bool d=(st=="done");if(an=="upper"){g_upper_idx=n;g_upper_done=d;}else{g_lower_idx=n;g_lower_done=d;}g_show_exhausted=d;cout<<"[Cmd] PIPER: "<<an<<" idx="<<n<<" "<<(d?"done":"ok")<<endl;}}
                 else if(line=="GAZE_DONE"){g_gaze_done=true;cout<<"[Cmd] Received GAZE_DONE from Master."<<endl;}
                 else if(line=="TRIGGER"){instantTrigger();net_cmd_record=true;}
                 else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){
@@ -774,8 +786,15 @@ int main() {
         cout<<"[Piper] Arm initialization complete."<<endl;
     }
 
+    // 6.1 Startup exhaustion check
+    if(is_master_pc && ((g_arm=="upper" && g_upper_done) || (g_arm=="lower" && g_lower_done))){
+        g_show_exhausted = true;
+        cout<<"[Piper] WARNING: "<<g_arm<<" exhausted at startup."<<endl;
+    }
+
     // ====== Master signals Slave: all connections ready ======
     if (enable_net_sync && is_master_pc) {
+        syncPiperToSlave();
         cout<<"[Init] All connections established. Signaling Slave to proceed..."<<endl;
         sendLineRaw(g_cmd_sock, "INIT_OK");
     }
@@ -899,6 +918,22 @@ int main() {
         if (need_ui_update && !is_dumping) {
             if (g_fault_active.load()) {
                 showFaultOverlay(g_faulty_cam.load(), g_use_hw_trigger);
+            } else if (g_show_exhausted) {
+                // EXHAUSTED UI — no camera rendering
+                cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
+                string arm_name = g_arm; for(auto& c:arm_name) c=toupper(c);
+                string msg = arm_name + " INST EXHAUSTED";
+                if(g_upper_done && g_lower_done) msg = "BOTH ARMS EXHAUSTED";
+                cv::putText(canvas, msg, cv::Point(g_win_w/4, g_win_h/2-40), cv::FONT_HERSHEY_DUPLEX, 1.2, cv::Scalar(0,0,255), 2);
+                char buf[64];
+                snprintf(buf,sizeof(buf),"Upper: %d/%d %s | Lower: %d/%d %s",
+                    g_upper_idx,(int)g_targets_upper.size(),g_upper_done?"DONE":"ok",
+                    g_lower_idx,(int)g_targets_lower.size(),g_lower_done?"DONE":"ok");
+                cv::putText(canvas,buf,cv::Point(g_win_w/4,g_win_h/2+10),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(255,255,255),1);
+                string hints = "Press 't' to switch arm | 'c' to clear sentry | 'q' to quit";
+                if(g_upper_done&&g_lower_done) hints = "Press 'c' to clear sentry | 'q' to quit";
+                cv::putText(canvas,hints,cv::Point(g_win_w/4,g_win_h/2+50),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,255),1);
+                cv::imshow("Multi-Cam Preview", canvas);
             } else {
                 cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
                 int sel = g_enlarged_cam.load();
@@ -970,13 +1005,27 @@ int main() {
 
                 auto t_par0=chrono::steady_clock::now();
 
+                // 6.4: Check exhaustion BEFORE launching arm thread
+                if(is_master_pc && ((g_arm=="upper" && g_upper_idx >= (int)g_targets_upper.size()) ||
+                                    (g_arm=="lower" && g_lower_idx >= (int)g_targets_lower.size()))) {
+                    g_show_exhausted = true;
+                    cout<<"[Piper] "<<g_arm<<" targets exhausted (pre-check). Skipping ARM."<<endl;
+                }
                 // Master: start arm thread (parallel with HDF5)
                 thread arm_thread;
-                if (is_master_pc) {
-                    int& idx=(g_arm=="upper")?g_upper_idx:g_lower_idx;
-                    idx++; updatePiperSentry();
-                    cout<<"[Piper] Moving to next target (#"<<(idx+1)<<")..."<<endl;
-                    arm_thread=thread([&](){ moveArmToTarget(); });
+                if (is_master_pc && !g_show_exhausted) {
+                    cout<<"[Piper] Moving to next target..."<<endl;
+                    arm_thread=thread([&](){
+                        ArmResult ar = moveArmToTarget();
+                        if(ar==ArmResult::ARM_OK){
+                            int& idx=(g_arm=="upper")?g_upper_idx:g_lower_idx;
+                            idx++; updatePiperSentry();
+                        } else if(ar==ArmResult::ARM_EXHAUSTED){
+                            g_show_exhausted = true;
+                        } else {
+                            logException("ERROR","piper","arm move failed");
+                        }
+                    });
                 }
 
                 // Step 0: Pre-create HDF5 files
@@ -1126,6 +1175,7 @@ int main() {
                     <<") waitSlave="<<g_wait_slave_hdf5_s<<" gazeFwd="<<g_gaze_forward_s
                     <<" sentry="<<d_sentry<<" TOTAL="<<d_total<<"s"<<endl;
                 writeReport(current_record_timestr.empty()?"-":current_record_timestr, g_recording_number, total_record_frames, use_hw_trigger);
+                if(is_master_pc && g_show_exhausted) syncPiperToSlave();
                 cout<<"[Recording #"<<g_recording_number<<"] Done in "<<fixed<<setprecision(1)<<d_total<<"s\n";
                 is_dumping=false;while(cv::waitKey(1)>=0);last_ui_time=chrono::steady_clock::now();
         }}
@@ -1154,7 +1204,15 @@ int main() {
               cv::putText(loading,"Waiting for arm to get in position...",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,200,255),2);
               cv::putText(loading,"Arm: "+g_arm,cv::Point(g_win_w/4,g_win_h/2+40),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(255,255,255),1);
               cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
-            if(moveArmToTarget()){this_thread::sleep_for(chrono::milliseconds(200));g_recording_enabled=true;cout<<"[s] Session started. SPACE to record."<<endl;}
+            ArmResult ar = moveArmToTarget();
+            if(ar==ArmResult::ARM_OK){
+                int& idx=(g_arm=="upper")?g_upper_idx:g_lower_idx; idx++; updatePiperSentry();
+                this_thread::sleep_for(chrono::milliseconds(200));g_recording_enabled=true;
+                cout<<"[s] Session started. SPACE to record."<<endl;
+            } else if(ar==ArmResult::ARM_EXHAUSTED){
+                g_show_exhausted=true; g_recording_enabled=false;
+                cout<<"[s] "<<g_arm<<" exhausted. Press t or c."<<endl;
+            } else { cout<<"[s] Arm ERROR."<<endl; }
         }
         else if(is_master_pc&&key==' '&&!is_recording&&!is_dumping&&!g_piper_busy){
             if(g_recording_enabled){
@@ -1168,8 +1226,9 @@ int main() {
         }
         else if(is_master_pc&&(key=='b'||key=='B')&&!g_piper_busy){zeroArm(g_arm);}
         else if(is_master_pc&&(key=='c'||key=='C')&&!g_piper_busy){
-            g_upper_idx=0; g_lower_idx=0; g_upper_done=false; g_lower_done=false;
+            g_upper_idx=0; g_lower_idx=0; g_upper_done=false; g_lower_done=false; g_show_exhausted=false;
             g_recording_enabled=false; updatePiperSentry();
+            syncPiperToSlave();
             cout<<"[Piper] Sentry cleared."<<endl;
         }
         else if(is_master_pc&&(key=='t'||key=='T')&&!g_piper_busy){
@@ -1177,6 +1236,7 @@ int main() {
             bool nd=(new_arm=="upper")?g_upper_done:g_lower_done;
             if(nd){cout<<"[t] "<<new_arm<<" already done."<<endl;goto next_iter;}
             zeroArm(g_arm); g_arm=new_arm; g_recording_enabled=false;
+            syncPiperToSlave();
             cout<<"[t] Switched to "<<g_arm<<endl;
         }
 

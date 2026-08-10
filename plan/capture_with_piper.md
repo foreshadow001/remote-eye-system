@@ -119,3 +119,174 @@ Slave ARM time = HDF5_write + wait_for_Master_GAZE
 | `b` | 当前臂回零 | 仅 Master |
 | `c` | 清空 piper sentry | 仅 Master |
 | `ESC/q` | 双机械臂回零 → SHUTDOWN → 退出 | 任意时刻 |
+# capture_with_piper — plan
+
+> 最后更新：2026-08-11
+
+## 六、指令耗尽处理
+
+### 6.0 piper sentry 递增方式改进
+
+### 现状
+
+`moveArmToTarget()` 被两处调用：
+
+| 调用位置 | 当前代码 |
+|---------|---------|
+| `s` 键（首次移动） | `moveArmToTarget()` |
+| dump 入口 ARM 阶段 | `idx++; moveArmToTarget()` |
+
+`moveArmToTarget()` 内部在跳过无解目标时已会 `idx++`，成功后不递增。
+
+### 改进
+
+**递增统一放在调用方，且仅在 `moveArmToTarget()` 返回 `ArmResult::OK` 后执行**：
+
+```
+新规则:
+  调用 moveArmToTarget()
+    → OK         → idx++ → updatePiperSentry()
+    → EXHAUSTED  → idx 不变（臂完成）
+    → ERROR      → idx 不变，logException
+    内部跳过无解目标时已自行 idx++（逻辑不变）
+```
+
+**两处调用方修改**：
+
+| 位置 | 修改前 | 修改后 |
+|------|--------|--------|
+| `s` 键 | `moveArmToTarget()` | `if(moveArmToTarget()==OK){idx++; updatePiperSentry();}` |
+| dump 入口 | `idx++; moveArmToTarget()` | `if(moveArmToTarget()==OK){idx++; updatePiperSentry();}` |
+
+### 效果
+
+- `idx` 严格指向**已成功抵达的目标数量**，不再出现 sentry=8 越界的情况
+- 臂完成时 `idx` 停在最后一个成功目标的索引，不递增到无效值
+- `sentry.txt` 值始终有效
+
+### 6.1 启动时越界检查
+
+在渲染 capture UI（10 台相机缩略图 + enlarged 区域）**之前**，检查当前激活臂是否已耗尽。
+
+```
+程序启动 → 读取 piper sentry
+  │
+  ├─ sentry.upper >= targets_upper.size() ？
+  │   是 → upper_done = true
+  │
+  ├─ sentry.lower >= targets_lower.size() ？
+  │   是 → lower_done = true
+  │
+  ├─ 当前激活臂 (默认 upper) done？
+  │   是 → 渲染 EXHAUSTED UI，不渲染 capture UI
+  │         "upper inst exhausted. Press 't' to switch to lower or 'c' to clear sentry."
+  │
+  ├─ 按 t → 切换到 lower → 重新检查 lower
+  │   若 lower 也 done → 显示 "lower inst exhausted. Press 'c' to clear sentry."
+  │                            (两台主机都显示)
+  │
+  └─ 按 c → 清零 piper sentry → upper_done/lower_done = false → 渲染 capture UI
+```
+
+**关键**：Slave 没有 piper 状态。Master 需要在初始化阶段通过 cmd_port 将 `upper_done`/`lower_done` 状态发送给 Slave。
+
+### 6.2 跨主机通信
+
+在 startup sentry handshake **之后**、渲染 capture UI **之前**，Master 发送 piper 状态给 Slave：
+
+```
+Master:  sendLineRaw(g_cmd_sock, "PIPER:upper:8:done")   // 或 "PIPER:upper:3:ok"
+Slave:   cmdWorker recv → 设置 g_upper_done/g_upper_idx
+```
+
+Slave 的 cmdWorker 新增 `PIPER:` 指令处理：
+
+```
+PIPER:upper:8:done  → g_upper_idx=8, g_upper_done=true
+PIPER:upper:3:ok    → g_upper_idx=3, g_upper_done=false
+PIPER:lower:0:ok    → g_lower_idx=0, g_lower_done=false
+```
+
+同样，录制过程中 Master 切换臂、清空 sentry 等操作也需要通过 cmd_port 同步给 Slave。
+
+### 6.3 EXHAUSTED UI 设计
+
+不渲染 10 台相机画面，使用全屏黑底 + 大白字 + 操作提示：
+
+```
+┌─────────────────────────────────────────┐
+│                                         │
+│        UPPER INST EXHAUSTED             │
+│                                         │
+│   Press 't' to switch to lower          │
+│   Press 'c' to clear piper sentry       │
+│   Press 'q' to quit                     │
+│                                         │
+│   Upper: 8/8 done                       │
+│   Lower: 3/8 ok                         │
+│                                         │
+└─────────────────────────────────────────┘
+```
+
+如果两臂都耗尽：
+
+```
+│        BOTH ARMS EXHAUSTED              │
+│   Press 'c' to clear piper sentry       │
+│   Press 'q' to quit                     │
+```
+
+### 6.4 录制后越界检查（调用 moveArmToTarget 之前）
+
+一次录制完成后、dump 的 ARM 阶段启动**之前**，检查 piper sentry 是否已越界。越界则跳过 ARM 阶段，HDF5 阶段照常进行。HDF5 完成后（两台主机都完成，sync 逻辑不变），UI 显示 EXHAUSTED UI，不再渲染 capture UI。
+
+```
+all_done=true
+  │
+  ├─ 检查: idx >= total ?
+  │   否 → 正常: 启动 ARM 线程 + HDF5 并行
+  │   是 → 跳过 ARM: 仅执行 HDF5 阶段
+  │         HDF5 完成后 → sync（GAZE 不更新，直接用旧值）
+  │         → sentry 握手 → 显示 EXHAUSTED UI
+  │         → 等待用户按 t 或 c
+```
+
+**关键**：越界时 `moveArmToTarget` 不调用，所以 6.0 节的递增逻辑不触发。旧 gaze 值保持不变，HDF5 照常写入（写入最后一次成功位置的 gaze）。Slave 通过 PIPER 状态得知越界，也显示 EXHAUSTED UI。
+
+### 6.5 moveArmToTarget() 调用后的越界检查
+
+6.4 处理的是**调用前**已越界（跳过 ARM 阶段）。6.5 处理的是**调用后**返回结果的判断。
+
+`moveArmToTarget()` 当前返回 `bool`，无法区分"指令用完"和"其他异常"。改为三态：
+
+```cpp
+enum class ArmResult { OK, EXHAUSTED, ERROR };
+```
+
+| 返回值 | 含义 | 触发条件 |
+|--------|------|---------|
+| `OK` | 成功移动到一个可解目标 | MOVED 响应 |
+| `EXHAUSTED` | 所有目标尝试完毕，无可用指令 | `while(idx < total)` 循环耗尽 |
+| `ERROR` | 其他异常（网络断开、硬件故障等） | TCP 超时、响应格式错误 |
+
+#### 6.5.1 录制结束时（dump ARM 阶段）
+
+arm 线程调用 `moveArmToTarget()`，根据返回值：
+
+```
+OK        → idx++（调用方按 6.0 递增）, 线程结束
+EXHAUSTED → idx 不变, 设置 g_show_exhausted=true, 线程正常结束
+ERROR     → idx 不变, logException("ERROR",...), 线程结束
+```
+
+**关键**：`EXHAUSTED` 时不立即显示 exhausted UI。ARM 线程结束后，HDF5 阶段照常进行（因为 RAM 中的数据仍需写入磁盘）。HDF5 + sync + sentry 全部完成后，主线程检查 `g_show_exhausted`，若为 true 则渲染 EXHAUSTED UI 而非 capture UI。Slave 通过 Master 在 sync 阶段后发送的 `PIPER` 状态得知越界，也显示 EXHAUSTED UI。
+
+#### 6.5.2 按 's' 时
+
+`s` 键调用 `moveArmToTarget()`，根据返回值：
+
+```
+OK        → idx++（调用方按 6.0 递增）, g_recording_enabled=true
+EXHAUSTED → 显示 EXHAUSTED UI, g_recording_enabled=false
+ERROR     → 显示错误提示, 不进入录制
+```
