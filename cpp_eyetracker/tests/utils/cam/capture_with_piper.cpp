@@ -236,9 +236,16 @@ void updatePiperSentry() {
 void syncPiperToSlave(bool send_init_ok=false) {
     if(g_cmd_sock==INVALID_SOCKET) return;
     char buf[64];
-    snprintf(buf,sizeof(buf),"PIPER:upper:%d:%s",g_upper_idx,g_upper_done?"done":"ok"); sendLineRaw(g_cmd_sock,buf);
-    snprintf(buf,sizeof(buf),"PIPER:lower:%d:%s",g_lower_idx,g_lower_done?"done":"ok"); sendLineRaw(g_cmd_sock,buf);
-    if(send_init_ok) { sendLineRaw(g_cmd_sock,"INIT_OK"); cout<<"[Init] INIT_OK sent to Slave."<<endl; }
+    // Send one message at a time with small delay — prevents TCP buffering
+    // from merging multiple lines into one recv() and confusing recvLine.
+    snprintf(buf,sizeof(buf),"PIPER:upper:%d:%s",g_upper_idx,g_upper_done?"done":"ok");
+    sendLineRaw(g_cmd_sock,buf); this_thread::sleep_for(chrono::milliseconds(50));
+    snprintf(buf,sizeof(buf),"PIPER:lower:%d:%s",g_lower_idx,g_lower_done?"done":"ok");
+    sendLineRaw(g_cmd_sock,buf); this_thread::sleep_for(chrono::milliseconds(50));
+    if(send_init_ok) {
+        sendLineRaw(g_cmd_sock,"INIT_OK"); this_thread::sleep_for(chrono::milliseconds(50));
+        cout<<"[Init] INIT_OK sent to Slave."<<endl;
+    }
 }
 
 // ================== Gaze server (Master) ==================
