@@ -260,7 +260,146 @@ Master                                   Slave
 
 ---
 
-## 六、子进程修改（hdf5_multi_process_child.cpp）
+### 5.7 dump2RAM 结束到下一次录制就绪 —— 实测时序分析
+
+#### Master 端实测数据（连续 7 次录制）
+
+```
+#1: arm=3.53s  launch=3.79s  wait=14.99s  sentry=2.35s  TOTAL=21.16s
+#2: arm=3.88s  launch=4.14s  wait=3.07s   sentry=3.11s  TOTAL=10.33s
+#3: arm=2.56s  launch=2.83s  wait=3.59s   sentry=0.08s  TOTAL=6.51s
+#4: arm=3.03s  launch=3.30s  wait=3.41s   sentry=3.72s  TOTAL=10.46s
+#5: arm=3.49s  launch=3.75s  wait=3.51s   sentry=3.29s  TOTAL=10.57s
+#6: arm=3.79s  launch=4.04s  wait=3.45s   sentry=3.05s  TOTAL=10.55s
+#7: arm=3.35s  launch=3.62s  wait=3.49s   sentry=3.56s  TOTAL=10.67s
+```
+
+#### Slave 端实测数据（同步的 7 次录制）
+
+```
+#1: arm=0.03s  launch=0.05s  wait=14.09s  sentry=7.02s  TOTAL=21.20s
+#2: arm=0.00s  launch=0.04s  wait=3.34s   sentry=7.04s  TOTAL=10.43s
+#3: arm=0.00s  launch=0.04s  wait=3.48s   sentry=3.02s  TOTAL=6.56s
+#4: arm=0.00s  launch=0.04s  wait=3.42s   sentry=7.04s  TOTAL=10.51s
+#5: arm=0.00s  launch=0.04s  wait=3.51s   sentry=7.03s  TOTAL=10.58s
+#6: arm=0.00s  launch=0.04s  wait=3.48s   sentry=7.01s  TOTAL=10.54s
+#7: arm=0.00s  launch=0.04s  wait=3.60s   sentry=7.03s  TOTAL=10.69s
+```
+
+#### 各阶段说明
+
+| 阶段 | 计时含义 | Master 耗时 | Slave 耗时 | 差异原因 |
+|------|---------|------------|-----------|---------|
+| `arm` | 移动机械臂（Slave 无此阶段） | **~3.4s** | 0s | Master 向 Ubuntu 发 MOVE_TO，阻塞等 TCP 响应 |
+| `launch` | CreateProcess 启动 10 个子进程 | **~3.7s**（！） | **~0.04s** | **Master 异常慢，待排查** |
+| `wait` | WaitForMultipleObjects 等子进程写完 | #1: ~15s 后 ~3.4s | #1: ~14s 后 ~3.4s | 首次冷缓存，后续稳定 |
+| `sentry` | TCP 握手 port+300 | 0~4s | **~7s（几乎恒定）** | Slave 先到握手点，阻塞等 Master |
+
+#### Master `launch` 阶段异常分析
+
+Master 的 `launch` 耗时 ~3.7s，Slave 仅 ~0.04s——**差距约 100 倍**。两者执行完全相同的代码路径：`for` 循环中 `CreateProcessA` 启动 10 个 `hdf5_multi_process_child.exe`。
+
+可能原因：
+1. 子进程启动后向父进程的共享内存写入 HDF5 时，与父进程的 gaze server 线程或 cmd worker 线程争抢磁盘 IO
+2. Master 端磁盘（D:/E:）同时承载录制目录和子进程 exe，IO 竞争比 Slave 更严重
+3. Windows Defender 实时扫描子进程 exe
+4. 第一次 CreateProcess 慢（exe 冷加载），后续应缓存
+
+**待验证**：将子进程 exe 放到与 HDF5 写入不同的物理磁盘上，观察 `launch` 时间变化。
+
+#### 首次录制「冷启动」效应
+
+录制 #1 的 `wait` 在两台机器上都是 ~14-15s，远高于后续的 ~3.4s。这是首次创建 `.h5` 文件时的写放大：
+- 首次 `H5F_ACC_TRUNC`：分配 `raw_image` dataset（2000×2048×2448 × 1byte ≈ 10GB 预留空间）
+- 后续 `H5F_ACC_RDWR`：仅 hyperslab 写入 200 帧（~1GB 实际数据）
+- HDF5 首次创建需要初始化内部 B-tree 和 metadata
+
+#### Master-Slave 握手等待时序
+
+以录制 #2 为例推测完整时序：
+
+```
+时间线（从 dump2RAM 完成算起）:
+
+Master:
+  0.0s ─ dump2RAM 完成
+  0.0s ─ 显示 DUMPING 画面
+  0.0s ─ moveArmToTarget() 开始 ──────────────┐
+  3.9s ─ moveArmToTarget() 结束 (arm=3.88s)    │ arm 阶段
+  3.9s ─ Step 0 precreate (0s)                 │
+  3.9s ─ Step 1 CreateProcess x10 ───────┐      │
+  8.0s ─ Step 1 完成 (launch=4.14s)      │  ?   │
+  8.0s ─ Step 2 WaitForMultipleObjects ──┐│      │
+ 11.1s ─ Step 2 完成 (wait=3.07s)   HDF5││      │
+ 11.1s ─ Step 4 Sentry accept() ── 阻塞 ───── 等 Slave
+ 14.2s ─ Sentry 完成 (sentry=3.11s)         │
+ 14.2s ─ TOTAL=10.33s
+
+Slave:
+  0.0s ─ dump2RAM 完成
+  0.0s ─ 显示 DUMPING 画面
+  0.0s ─ (无 arm 阶段)
+  0.0s ─ Step 0 precreate (0s)
+  0.0s ─ Step 1 CreateProcess x10 (0.04s)
+  0.0s ─ Step 2 WaitForMultipleObjects ──┐
+  3.3s ─ Step 2 完成 (wait=3.34s)   HDF5 │
+  3.3s ─ Step 4 Sentry connect() ── 阻塞 ───── 等 Master (等了 ~7.8s!)
+ 10.4s ─ Sentry 完成 (sentry=7.04s)
+ 10.4s ─ TOTAL=10.43s
+```
+
+**关键发现**：
+- Slave 在 3.3s 时就到达了 sentry 握手点，但 Master 要到 ~11s 才到达——Slave 空等了 **~7.8 秒**
+- Slave 的 `sentry=7.04s` 几乎等于 `Master总时间 - Slave自身HDF5时间 ≈ 10.3 - 3.3 = 7.0s`
+- 这 7 秒里 Slave 什么也没做，白白阻塞
+- Master 的 `launch=4.14s` 是 Slave `launch=0.04s` 的 **100 倍**，这是 Master 端 CreateProcess 异常的独立问题
+
+#### 瓶颈排序与改进预期
+
+按每个录制周期分解，分 Master/Slave 和首次/后续：
+
+**首次录制（#1，需创建 .h5）**：
+
+| 阶段 | Master | Slave | 说明 |
+|------|--------|-------|------|
+| arm | **3.5s** | 0s | 向 Ubuntu 发 MOVE_TO，阻塞等 TCP |
+| launch | **3.8s** | **0.05s** | Master 异常：CreateProcess×10 不应超过 0.1s |
+| wait (HDF5) | **15.0s** | **14.1s** | 首次 `H5F_ACC_TRUNC` 分配 raw_image(2000×2048×2448 ≈10GB 预留) + 初始化 metadata |
+| sentry | 2.4s | 7.0s | Slave 先到握手点（它没有 arm+launch 延迟），空等 Master |
+| **TOTAL** | **21.2s** | **21.2s** | |
+
+**后续录制（#2~#7，已有 .h5）**：
+
+| 阶段 | Master | Slave | 说明 |
+|------|--------|-------|------|
+| arm | **3.5s** | 0s | 每次录制前移臂到下一个目标（4 秒量级，与 MoveIt 规划速度一致） |
+| launch | **3.7s** | **0.04s** | Master 异常（100×差距），正常应 ≤0.1s |
+| wait (HDF5) | **3.5s** | **3.5s** | `H5F_ACC_RDWR` 仅 hyperslab 写 200 帧（~1GB），受磁盘 IOPS 限制 |
+| sentry | 3.1s | **7.0s** | Slave 的 7s 几乎恒定——因为它在空等 Master 完成 arm+launch |
+| **TOTAL** | **10.5s** | **10.5s** | |
+
+**每个周期的时间构成**（后续录制）：
+
+```
+Master 时间线:  |-- arm(3.5s) --|-- launch(3.7s 异常) --|-- HDF5(3.5s) --|-- sentry(3.1s) --|
+Slave 时间线:   |-- HDF5(3.5s) --|---------- sentry 空等 Master(7.0s) --------------|
+                                    ↑ Slave 在等 Master 完成 arm + launch + HDF5
+```
+
+**总计 ~10.5s 的分解**：
+
+Slave 侧的 `sentry=7.0s` = Master(arm 3.5s + launch 3.7s) - Slave 与 Master HDF5 时间差 + TCP 开销
+≈ 7.2s - 0s + 0.5s ≈ 7.0s ✓
+
+> 注意：`launch=3.7s`（仅 Master）是 CreateProcess×10 的计时值，但 CreateProcess 本身不应超过 0.1s。这个异常值可能与计时点位置有关（`t_launch` 到 `t_pre1` 之间可能包含了其他代码），需要代码级排查。Merge 到后续版本时优先修复。
+
+若将 arm 移动与 HDF5 dump 并行化（arm 在独立线程中执行），且修复 launch 异常：
+
+```
+改进后: arm(并行) + HDF5(3.5s) + launch(0.1s) + sentry(~0.5s) ≈ 4.0s（提速 2.6 倍）
+```
+
+---
 
 ### 6.1 gaze_target dataset 改为 3 列
 

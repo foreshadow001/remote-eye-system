@@ -885,7 +885,7 @@ int main() {
                     arm_thread=thread([&](){ moveArmToTarget(); });
                 }
 
-                // Step 0: Pre-create HDF5 files
+                // Step 0: Pre-create HDF5 files (runs in parallel with arm thread)
                 auto t_pre0=chrono::steady_clock::now();
                 for (auto& ctx:cam_ctxs){ctx->dump_start_time=chrono::steady_clock::now();
                     stringstream pss;pss<<ctx->hdf5_dir<<"/"<<setw(4)<<setfill('0')<<g_chunk_idx<<".h5";
@@ -897,14 +897,14 @@ int main() {
                         hsize_t vd[1]={(hsize_t)g_hdf5_chunk_capacity};
                         f.createDataSet("valid",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,vd));}
                         catch(const H5::Exception& e){logException("ERROR","hdf5:precreate",e.getCDetailMsg());}}}
-                auto t_pre1=chrono::steady_clock::now();
-
+                auto t_pre_done=chrono::steady_clock::now();
                 // Wait for arm thread to finish (gaze values needed for child args)
                 if(arm_thread.joinable()) arm_thread.join();
                 auto t_arm1=chrono::steady_clock::now();
                 if(is_master_pc) this_thread::sleep_for(chrono::milliseconds(200)); // gaze server flush
 
                 // Step 1: Launch child processes
+                auto t_launch0=chrono::steady_clock::now();
                 char exe_path[MAX_PATH];GetModuleFileNameA(NULL,exe_path,MAX_PATH);
                 string parent_dir=fs::path(exe_path).parent_path().string();
                 string child_exe=parent_dir+"\\hdf5_multi_process_child.exe";
@@ -975,9 +975,9 @@ int main() {
                 else{logException("WARN","hdf5","Child failures - sentry NOT updated");}
 
                 // ---- Per-phase timing ----
-                auto d_arm=chrono::duration<double>(t_arm1-t_arm0).count();
-                auto d_pre=chrono::duration<double>(t_pre1-t_pre0).count();
-                auto d_launch=chrono::duration<double>(t_launch-t_pre1).count();
+                auto d_arm=chrono::duration<double>(t_arm1-t_arm0).count();   // arm thread (parallel with precreate)
+                auto d_pre=chrono::duration<double>(t_pre_done-t_pre0).count(); // precreate (parallel with arm)
+                auto d_launch=chrono::duration<double>(t_launch-t_launch0).count(); // CreateProcess only
                 auto d_wait=chrono::duration<double>(t_wait-t_launch).count();
                 auto d_sentry=chrono::duration<double>(t_sentry1-t_sentry0).count();
                 auto d_total=chrono::duration<double>(t_sentry1-t0).count();
