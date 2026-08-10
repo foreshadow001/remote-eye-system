@@ -168,57 +168,70 @@ Master                                   Slave
   └─ 状态："Ready - press SPACE to record"
 ```
 
-### 5.3 SPACE 按下（Master 通过 TCP 触发 Slave）
+### 5.3 dump 阶段：ARM 阶段 + HDF5 阶段（串行）
+
+录制完成后（all_done=true），dump 分为两个严格串行的阶段。每个阶段 Master 和 Slave 都通过 TCP 握手确认同步后再进入下一阶段。
+
+#### ARM 阶段
+
+**Master**：
+  1. 保存当前 `g_gaze_x/y/z`（本次录制的值，供 HDF5 写入）
+  2. `idx++` → `updatePiperSentry()`
+  3. `moveArmToTarget()` → 阻塞等 TCP 响应（含 auto-skip 无解目标）
+  4. 收到 MOVED → `computeToolCcs()` → 更新 `g_gaze_x/y/z`（下一轮的值）
+  5. 通过 gaze_port 发送 `GAZE:x,y,z` → Slave
+  6. 等待 Slave 回复 `GAZE_ACK`
+  7. UI 显示 "ARM STAGE" + 当前 gaze
+
+**Slave**：
+  1. 保存当前 `g_gaze_x/y/z`（本次录制的值，供 HDF5 写入）
+  2. 等待 Master 通过 gaze_port 发送下一轮的 `GAZE:x,y,z`
+  3. 收到后存入 `g_gaze_x/y/z` → 回复 `GAZE_ACK`
+  4. UI 显示 "ARM STAGE"
+
+#### HDF5 阶段
+
+ARM 阶段完成后，双方 gaze 已同步为下一轮的值，本次录制的 gaze 已保存。进入 HDF5 写入：
+
+**Master + Slave 共同**：
+  1. 预创建 .h5 文件（若跨 chunk）
+  2. CreateProcess 启动子进程（传入**保存的**本次录制 gaze）
+  3. WaitForMultipleObjects
+  4. Sentry 握手 (port+300)：交换 `local_total`，取 min 对齐
+  5. `g_frame_offset += core_frames` → `updateSentry()`
+  6. UI 显示 "DUMPING RAM TO HDF5..."
+
+#### 时序图
 
 ```
-[SPACE] (Master, recording_enabled == true)
-  │
-  ├─ Master: instantTrigger() → 所有相机开始录制
-  ├─ Master: 通过 gaze_port 发送 TRIGGER → Slave
-  │          Slave: 收到 TRIGGER → instantTrigger() → 回复 TRIGGER_ACK
-  ├─ Master: 收到 TRIGGER_ACK → 状态："Recording..."
-  │
-  ├─ 等待 all_done (Master 和 Slave 各自的相机 dump_ready == true)
-  │
-  ├─ === 仅 Master ===
-  │   ├─ armIdx()++ (当前录制已完成，推进 piper sentry)
-  │   ├─ updateSentry() (piper sentry)
-  │   │
-  │   ├─ 自动移动到下一个目标：
-  │   │   loop:
-  │   │     ├─ 若当前臂已完成 → 停止循环
-  │   │     ├─ 发送 MOVE_TO → 等待 MOVED/ERROR
-  │   │     ├─ MOVED → computeToolCcs() → break
-  │   │     └─ ERROR → armIdx()++ → updateSentry() → 继续 loop
-  │   │
-  │   ├─ 发送 GAZE:x,y,z → Slave → 等待 GAZE_ACK
-  │   │
-  │   └─ (此时 gaze 已为**下一次**录制准备好)
-  │
-  ├─ === Master + Slave ===
-  │   ├─ Step 0: 预创建 HDF5 文件 (若需要)
-  │   ├─ Step 1: 启动子进程 (传入 gaze_x gaze_y gaze_z)
-  │   ├─ Step 2: WaitForMultipleObjects
-  │   ├─ Step 3: 检查退出码 → CloseHandle(hJob)
-  │   ├─ Step 4: Sentry 握手 (TCP port+300)
-  │   └─ Step 5: g_frame_offset += core_frames → updateSentry (HDF5 sentry)
-  │
-  └─ 状态："Ready - press SPACE to record"
+all_done=true
+  |
+  +-- ARM 阶段 (Master+Slave, serial sync):
+  |     Master: save gaze -> idx++ -> moveArmToTarget -> recv MOVED
+  |             -> send GAZE:x,y,z -> wait GAZE_ACK
+  |     Slave:  save gaze -> recv GAZE -> send GAZE_ACK
+  |     耗时: ~3.5s (arm) + TCP (<0.1s)
+  |
+  +-- HDF5 阶段:
+  |     precreate -> CreateProcess -> WaitForMultipleObjects -> sentry handshake
+  |     耗时: ~3.5s (首次 ~15s)
+  |
+  +-- SPACE ready
 ```
 
-### 5.4 关键时间点
+#### 关键：gaze 新旧分离
+
+dump 开始时先保存旧值，arm 移动更新新值，HDF5 写旧值：
 
 ```
-时间线 (一次录制):
-  T0: [SPACE] → instantTrigger()
-  T1: 所有相机 dump_ready (录制完成, ~1s)
-  T2: Master 移动机械臂 (MOVE_TO, ~0.5-2s)
-  T3: Master 转发 GAZE → Slave (TCP, ~1ms)
-  T4: 子进程启动 → HDF5 写入 (~1s, 多进程并发)
-  T5: Sentry 握手 (~0.1s)
-  T6: 可接受下一次 SPACE
+rec_gaze = g_gaze_load()         ← 本次录制 arm 所在位置的 gaze
+moveArmToTarget()                ← g_gaze 更新为下一轮位置
+GAZE 转发给 Slave                ← Slave 同步更新
+CreateProcess(rec_gaze)          ← HDF5 写入本次录制的 gaze
+```
 
-总周期: ~3-4s / 次录制
+ARM 阶段的 TCP 阻塞确保了 HDF5 阶段启动时双方 gaze 已同步。
+
 ```
 
 ### 5.5 移动失败自动跳过
@@ -315,91 +328,70 @@ Master 的 `launch` 耗时 ~3.7s，Slave 仅 ~0.04s——**差距约 100 倍**�
 - HDF5 首次创建需要初始化内部 B-tree 和 metadata
 
 #### Master-Slave 握手等待时序
+#### 瓶颈排序与改进预期（修复后数据，launch=0.05s）
 
-以录制 #2 为例推测完整时序：
+**第一次录制（#1，需创建 .h5）**：
 
-```
-时间线（从 dump2RAM 完成算起）:
+Master（TOTAL = 21.1s）：
+  T+0.00s  启动 arm 线程（并行） + precreate(0.03s)
+  T+3.58s  arm 线程 join（arm 移动完成）
+  T+3.63s  CreateProcess ×10 (launch=0.05s)
+  T+3.68s  子进程开始 HDF5 写入
+  T+18.25s 子进程完成 (wait=14.57s) —— 首次 H5F_ACC_TRUNC，分配 10GB raw_image
+  T+20.96s Sentry 握手完成 (sentry=2.71s)
+  T+21.14s 录制完成
 
-Master:
-  0.0s ─ dump2RAM 完成
-  0.0s ─ 显示 DUMPING 画面
-  0.0s ─ moveArmToTarget() 开始 ──────────────┐
-  3.9s ─ moveArmToTarget() 结束 (arm=3.88s)    │ arm 阶段
-  3.9s ─ Step 0 precreate (0s)                 │
-  3.9s ─ Step 1 CreateProcess x10 ───────┐      │
-  8.0s ─ Step 1 完成 (launch=4.14s)      │  ?   │
-  8.0s ─ Step 2 WaitForMultipleObjects ──┐│      │
- 11.1s ─ Step 2 完成 (wait=3.07s)   HDF5││      │
- 11.1s ─ Step 4 Sentry accept() ── 阻塞 ───── 等 Slave
- 14.2s ─ Sentry 完成 (sentry=3.11s)         │
- 14.2s ─ TOTAL=10.33s
+Slave（TOTAL = 21.04s）：
+  T+0.00s  precreate(0.03s) → CreateProcess(0.04s)
+  T+0.07s  子进程开始 HDF5 写入
+  T+14.01s 子进程完成 (wait=13.94s) —— 首次 H5F_ACC_TRUNC
+  T+14.01s Sentry connect() → 阻塞，等 Master 到达
+  T+21.04s 握手完成 (sentry=7.03s = 空等 4.3s + TCP 2.7s)
 
-Slave:
-  0.0s ─ dump2RAM 完成
-  0.0s ─ 显示 DUMPING 画面
-  0.0s ─ (无 arm 阶段)
-  0.0s ─ Step 0 precreate (0s)
-  0.0s ─ Step 1 CreateProcess x10 (0.04s)
-  0.0s ─ Step 2 WaitForMultipleObjects ──┐
-  3.3s ─ Step 2 完成 (wait=3.34s)   HDF5 │
-  3.3s ─ Step 4 Sentry connect() ── 阻塞 ───── 等 Master (等了 ~7.8s!)
- 10.4s ─ Sentry 完成 (sentry=7.04s)
- 10.4s ─ TOTAL=10.43s
-```
+首次瓶颈：wait ~14s（双方），HDF5 首次创建文件时分配 10GB raw_image 空间。
 
-**关键发现**：
-- Slave 在 3.3s 时就到达了 sentry 握手点，但 Master 要到 ~11s 才到达——Slave 空等了 **~7.8 秒**
-- Slave 的 `sentry=7.04s` 几乎等于 `Master总时间 - Slave自身HDF5时间 ≈ 10.3 - 3.3 = 7.0s`
-- 这 7 秒里 Slave 什么也没做，白白阻塞
-- Master 的 `launch=4.14s` 是 Slave `launch=0.04s` 的 **100 倍**，这是 Master 端 CreateProcess 异常的独立问题
+**后续录制（#2，已有 .h5）**：
 
-#### 瓶颈排序与改进预期
+Master（TOTAL = 10.34s）：
+  T+0.00s  启动 arm 线程（并行） + precreate(0s, 跳过)
+  T+3.89s  arm 线程 join（arm 移动完成）
+  T+3.95s  CreateProcess ×10 (launch=0.06s)
+  T+4.01s  子进程开始 HDF5 写入
+  T+6.96s  子进程完成 (wait=2.95s) —— H5F_ACC_RDWR，hyperslab 写 200 帧
+  T+10.17s Sentry 握手完成 (sentry=3.21s)
+  T+10.34s 录制完成
 
-按每个录制周期分解，分 Master/Slave 和首次/后续：
+Slave（TOTAL = 10.48s）：
+  T+0.00s  precreate(0s) → CreateProcess(0.04s)
+  T+0.04s  子进程开始 HDF5 写入
+  T+3.44s  子进程完成 (wait=3.40s)
+  T+3.44s  Sentry connect() → 阻塞，等 Master 到达
+  T+10.47s 握手完成 (sentry=7.03s = 空等 3.5s + TCP 3.5s)
 
-**首次录制（#1，需创建 .h5）**：
+后续瓶颈：Slave 在 sentry 空等 Master 3.5s（Master 先做 arm 再写 HDF5）
 
-| 阶段 | Master | Slave | 说明 |
-|------|--------|-------|------|
-| arm | **3.5s** | 0s | 向 Ubuntu 发 MOVE_TO，阻塞等 TCP |
-| launch | **3.8s** | **0.05s** | Master 异常：CreateProcess×10 不应超过 0.1s |
-| wait (HDF5) | **15.0s** | **14.1s** | 首次 `H5F_ACC_TRUNC` 分配 raw_image(2000×2048×2448 ≈10GB 预留) + 初始化 metadata |
-| sentry | 2.4s | 7.0s | Slave 先到握手点（它没有 arm+launch 延迟），空等 Master |
-| **TOTAL** | **21.2s** | **21.2s** | |
+**Slave sentry=7.0s 的构成**：
+  Slave 到握手点：wait(3.40s) = 3.40s
+  Master 到握手点：arm(3.89s) + launch(0.06s) + wait(2.95s) = 6.90s
+  Slave 空等：6.90 - 3.40 = 3.50s
+  TCP 往返：~3.2s
+  Slave sentry = 3.50 + 3.21 ≈ 6.7~7.0s ✓
 
-**后续录制（#2~#7，已有 .h5）**：
+**各阶段结论（后续录制）**：
 
 | 阶段 | Master | Slave | 说明 |
 |------|--------|-------|------|
-| arm | **3.5s** | 0s | 每次录制前移臂到下一个目标（4 秒量级，与 MoveIt 规划速度一致） |
-| launch | **3.7s** | **0.04s** | Master 异常（100×差距），正常应 ≤0.1s |
-| wait (HDF5) | **3.5s** | **3.5s** | `H5F_ACC_RDWR` 仅 hyperslab 写 200 帧（~1GB），受磁盘 IOPS 限制 |
-| sentry | 3.1s | **7.0s** | Slave 的 7s 几乎恒定——因为它在空等 Master 完成 arm+launch |
-| **TOTAL** | **10.5s** | **10.5s** | |
+| arm | 3.5s（并行） | 0s | Ubuntu MoveIt 规划+执行 |
+| precreate | 0s | 0s | 已有文件时跳过 |
+| launch | 0.06s | 0.04s | CreateProcess×10，正常 ✓ |
+| wait | 3.0s | 3.5s | HDF5 磁盘 IO |
+| sentry | 3.2s | 7.0s | Slave 空等 Master 3.5s |
+| **TOTAL** | **10.3s** | **10.5s** | |
 
-**每个周期的时间构成**（后续录制）：
+改进方向：arm 与 HDF5 写入（wait）并行化。当前 arm 与 precreate 并行（precreate=0s，无收益）。
+若 arm 与 wait 重叠：Master 到握手点 = max(arm 3.9s, HDF5 3.0s) + launch + sentry ≈ 3.9 + 0.06 + 3.2 ≈ 7.2s，
+Slave 不再空等 → sentry ≈ 3.2s → TOTAL ≈ 3.5 + 0.04 + 3.2 ≈ 6.7s（提速 35%）。
 
-```
-Master 时间线:  |-- arm(3.5s) --|-- launch(3.7s 异常) --|-- HDF5(3.5s) --|-- sentry(3.1s) --|
-Slave 时间线:   |-- HDF5(3.5s) --|---------- sentry 空等 Master(7.0s) --------------|
-                                    ↑ Slave 在等 Master 完成 arm + launch + HDF5
-```
-
-**总计 ~10.5s 的分解**：
-
-Slave 侧的 `sentry=7.0s` = Master(arm 3.5s + launch 3.7s) - Slave 与 Master HDF5 时间差 + TCP 开销
-≈ 7.2s - 0s + 0.5s ≈ 7.0s ✓
-
-> 注意：`launch=3.7s`（仅 Master）是 CreateProcess×10 的计时值，但 CreateProcess 本身不应超过 0.1s。这个异常值可能与计时点位置有关（`t_launch` 到 `t_pre1` 之间可能包含了其他代码），需要代码级排查。Merge 到后续版本时优先修复。
-
-若将 arm 移动与 HDF5 dump 并行化（arm 在独立线程中执行），且修复 launch 异常：
-
-```
-改进后: arm(并行) + HDF5(3.5s) + launch(0.1s) + sentry(~0.5s) ≈ 4.0s（提速 2.6 倍）
-```
-
----
 
 ### 6.1 gaze_target dataset 改为 3 列
 
