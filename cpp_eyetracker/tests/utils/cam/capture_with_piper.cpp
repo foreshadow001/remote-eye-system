@@ -130,8 +130,9 @@ string g_session_log_path; int g_recording_number = 0; ofstream g_session_log;
 double g_arm_stage_s = 0;       // ARM stage wall time
 double g_master_hdf5_s = 0;    // Master HDF5 write (hdf5 phase in par)
 double g_slave_hdf5_s = 0;     // Slave HDF5 write (hdf5 phase in par)
-double g_gaze_sync_s = 0;      // Gaze forward + HDF5_DONE handshake
-double g_sentry_sync_s = 0;    // Sentry handshake
+double g_wait_slave_hdf5_s = 0; // Wait for Slave HDF5_DONE
+double g_gaze_forward_s = 0;    // GAZE forward + GAZE_DONE
+double g_sentry_sync_s = 0;     // Sentry handshake
 double g_recording_end_to_end_s = 0; // Total from SPACE to SPACE-ready
 atomic<int> g_exc_fatal{0}, g_exc_error{0}, g_exc_warn{0}, g_exc_info{0};
 int64_t g_peer_first_block_id = -1;
@@ -615,12 +616,19 @@ void writeReport(const string& timestr, int rec_num, int total_frames, bool hw_t
     g_session_log << "|--------|-------|------|\n";
     g_session_log << "| ARM stage | " << fixed << setprecision(2) << g_arm_stage_s << " s | Par. wall clock (arm || HDF5) |\n";
     g_session_log << "| Master HDF5 write | " << g_master_hdf5_s << " s | WaitForMultipleObjects |\n";
-    g_session_log << "| Slave HDF5 write | " << g_slave_hdf5_s << " s | WaitForMultipleObjects |\n";
+    g_session_log << "| Slave HDF5 write | " << g_slave_hdf5_s << " s | WaitForMultipleObjects (via TCP) |\n";
     double max_hdf5 = max(g_master_hdf5_s, g_slave_hdf5_s);
     g_session_log << "| Max HDF5 write | " << max_hdf5 << " s | max(Master, Slave) |\n";
-    g_session_log << "| Gaze sync | " << g_gaze_sync_s << " s | HDF5_DONE + GAZE + GAZE_DONE |\n";
+    g_session_log << "| Wait Slave HDF5_DONE | " << g_wait_slave_hdf5_s << " s | Master idle wait for Slave |\n";
+    g_session_log << "| GAZE forward | " << g_gaze_forward_s << " s | GAZE tx + GAZE_ACK + GAZE_DONE |\n";
     g_session_log << "| Sentry sync | " << g_sentry_sync_s << " s | TCP handshake port+300 |\n";
     g_session_log << "| End-to-end | " << g_recording_end_to_end_s << " s | SPACE→SPACE-ready |\n";
+    int ef=g_exc_fatal.load(), ee=g_exc_error.load(), ew=g_exc_warn.load(), ei=g_exc_info.load();
+    auto b=[](int v){return v>0?"**"+to_string(v)+"**":to_string(v);};
+    g_session_log << "| exceptions_fatal | "<<b(ef)<<" | FATAL count |\n";
+    g_session_log << "| exceptions_error | "<<b(ee)<<" | ERROR count |\n";
+    g_session_log << "| exceptions_warn  | "<<b(ew)<<" | WARN count |\n";
+    g_session_log << "| exceptions_info  | "<<b(ei)<<" | INFO count |\n";
     g_session_log << defaultfloat << flush;
 }
 
@@ -1008,22 +1016,26 @@ int main() {
                 if(arm_thread.joinable()) arm_thread.join();
                 auto t_arm_done=chrono::steady_clock::now();
 
-                // ====== SYNC: Gaze forward + HDF5_DONE handshake ======
+                // ====== SYNC: Wait Slave HDF5 → GAZE forward → GAZE_DONE ======
                 if (is_master_pc) {
-                    // Wait for Slave HDF5_DONE
+                    // (1) Wait for Slave HDF5_DONE
+                    auto t_wait0=chrono::steady_clock::now();
                     cout<<"[Sync] Waiting for Slave HDF5_DONE..."<<endl;
                     while(global_running && !g_slave_hdf5_done.load())
                         this_thread::sleep_for(chrono::milliseconds(50));
                     g_slave_hdf5_done = false;
-                    // Forward gaze to Slave
+                    auto t_wait1=chrono::steady_clock::now();
+                    g_wait_slave_hdf5_s = chrono::duration<double>(t_wait1-t_wait0).count();
+                    // (2)+(3) Forward gaze + GAZE_DONE
                     cout<<"[Gaze] Forwarding to Slave: ("<<g_gaze_x<<","<<g_gaze_y<<","<<g_gaze_z<<")"<<endl;
                     char gbuf[128]; snprintf(gbuf,sizeof(gbuf),"GAZE:%.6f,%.6f,%.6f",g_gaze_x.load(),g_gaze_y.load(),g_gaze_z.load());
                     { lock_guard<mutex> lk(g_gaze_send_mtx);
                       send(g_gaze_sock, (string(gbuf)+"\n").c_str(), (int)strlen(gbuf)+1, 0); }
                     string ack; recvLine(g_gaze_sock, ack, 5000);
                     cout<<"[Gaze] Slave ACK: "<<ack<<endl;
-                    // Signal Slave to proceed to sentry
                     sendLineRaw(g_cmd_sock, "GAZE_DONE");
+                    auto t_gaze_done=chrono::steady_clock::now();
+                    g_gaze_forward_s = chrono::duration<double>(t_gaze_done-t_wait1).count();
                 } else {
                     // Signal Master: HDF5 done + timing
                     char hbuf[64]; snprintf(hbuf,sizeof(hbuf),"HDF5_DONE:%.3f",g_slave_hdf5_s);
@@ -1096,16 +1108,16 @@ int main() {
                 auto d_sentry=chrono::duration<double>(t_sentry1-t_sentry0).count();
                 auto d_total=chrono::duration<double>(t_sentry1-t0).count();
                 // Store for report
-                g_arm_stage_s = d_par;   // ARM wall time (Master=arm||hdf5, Slave=hdf5 only)
+                g_arm_stage_s = d_par;
                 if(is_master_pc) g_master_hdf5_s = d_wait; else g_slave_hdf5_s = d_wait;
-                g_gaze_sync_s = d_sync;
                 g_sentry_sync_s = d_sentry;
                 g_recording_end_to_end_s = d_total;
+                double d_sync_total = d_sync; // keep for console output
                 cout<<"[Timing] par="<<fixed<<setprecision(2)<<d_par
                     <<"s (pre="<<d_pre<<" launch="<<d_launch
                     <<" hdf5="<<d_wait<<" armExtra="<<d_arm_wait
-                    <<") sync="<<d_sync<<" sentry="<<d_sentry
-                    <<"s TOTAL="<<d_total<<"s"<<endl;
+                    <<") waitSlave="<<g_wait_slave_hdf5_s<<" gazeFwd="<<g_gaze_forward_s
+                    <<" sentry="<<d_sentry<<" TOTAL="<<d_total<<"s"<<endl;
                 writeReport(current_record_timestr.empty()?"-":current_record_timestr, g_recording_number, total_record_frames, use_hw_trigger);
                 cout<<"[Recording #"<<g_recording_number<<"] Done in "<<fixed<<setprecision(1)<<d_total<<"s\n";
                 is_dumping=false;while(cv::waitKey(1)>=0);last_ui_time=chrono::steady_clock::now();
