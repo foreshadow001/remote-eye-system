@@ -824,6 +824,13 @@ int main() {
 
     // ====== Startup sentry handshake ======
     if (enable_net_sync) {
+        cv::namedWindow("Multi-Cam Preview",cv::WINDOW_NORMAL);
+        cv::resizeWindow("Multi-Cam Preview",g_win_w,g_win_h);
+        cv::Mat loading=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
+        cv::putText(loading,"Startup sentry handshake in progress...",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,255,255),2);
+        cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1);
+    }
+    if (enable_net_sync) {
         int handshake_port=net_port+300;
         auto local_ci=g_chunk_idx; auto local_fo=g_frame_offset.load();
         int64_t local_total=(int64_t)local_ci*g_hdf5_chunk_capacity+local_fo;
@@ -1143,6 +1150,10 @@ int main() {
             if((g_arm=="upper"&&g_upper_done)||(g_arm=="lower"&&g_lower_done)){
                 cout<<"[s] "<<g_arm<<" done - press T to switch arm"<<endl;goto next_iter;}
             cout<<"[s] Starting session - moving "<<g_arm<<" to sentry target..."<<endl;
+            { cv::Mat loading=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
+              cv::putText(loading,"Waiting for arm to get in position...",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,200,255),2);
+              cv::putText(loading,"Arm: "+g_arm,cv::Point(g_win_w/4,g_win_h/2+40),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(255,255,255),1);
+              cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
             if(moveArmToTarget()){this_thread::sleep_for(chrono::milliseconds(200));g_recording_enabled=true;cout<<"[s] Session started. SPACE to record."<<endl;}
         }
         else if(is_master_pc&&key==' '&&!is_recording&&!is_dumping&&!g_piper_busy){
