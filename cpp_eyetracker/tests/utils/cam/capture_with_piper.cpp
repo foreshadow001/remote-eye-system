@@ -233,11 +233,12 @@ void updatePiperSentry() {
     sf << "upper:" << g_upper_idx << "\nlower:" << g_lower_idx << "\n";
 }
 // ================== Piper: sync state to Slave via cmd_port ==================
-void syncPiperToSlave() {
+void syncPiperToSlave(bool send_init_ok=false) {
     if(g_cmd_sock==INVALID_SOCKET) return;
     char buf[64];
     snprintf(buf,sizeof(buf),"PIPER:upper:%d:%s",g_upper_idx,g_upper_done?"done":"ok"); sendLineRaw(g_cmd_sock,buf);
     snprintf(buf,sizeof(buf),"PIPER:lower:%d:%s",g_lower_idx,g_lower_done?"done":"ok"); sendLineRaw(g_cmd_sock,buf);
+    if(send_init_ok) { sendLineRaw(g_cmd_sock,"INIT_OK"); cout<<"[Init] INIT_OK sent to Slave."<<endl; }
 }
 
 // ================== Gaze server (Master) ==================
@@ -794,15 +795,18 @@ int main() {
 
     // ====== Master signals Slave: all connections ready ======
     if (enable_net_sync && is_master_pc) {
-        syncPiperToSlave();
-        cout<<"[Init] All connections established. Signaling Slave to proceed..."<<endl;
-        sendLineRaw(g_cmd_sock, "INIT_OK");
+        syncPiperToSlave(true);  // sends PIPER + INIT_OK atomically
     }
     if (enable_net_sync && !is_master_pc) {
         cout<<"[Init] Waiting for Master INIT_OK signal..."<<endl;
-        while (global_running && !g_init_ok.load())
+        auto t0=chrono::steady_clock::now();
+        while (global_running && !g_init_ok.load()){
             this_thread::sleep_for(chrono::milliseconds(100));
-        if (!global_running) { cerr<<"[Init] Connection lost before INIT_OK."<<endl; return 1; }
+            if(chrono::duration<double>(chrono::steady_clock::now()-t0).count()>30.0){
+                cerr<<"[Init] Timeout waiting for INIT_OK (30s)."<<endl; break;
+            }
+        }
+        if (!g_init_ok.load()) { cerr<<"[Init] Never received INIT_OK."<<endl; return 1; }
     }
     cout<<"[Init] All 3 hosts ready. Starting camera initialization..."<<endl;
 
