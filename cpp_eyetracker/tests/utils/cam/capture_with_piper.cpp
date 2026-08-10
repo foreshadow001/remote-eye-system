@@ -513,7 +513,7 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
         while(global_running){
             string line;
             if(!recvLine(g_cmd_sock,line,500)) continue;
-            if(line=="HDF5_DONE"){g_slave_hdf5_done=true;cout<<"[Cmd] Slave HDF5 done."<<endl;}
+            if(line.rfind("HDF5_DONE:",0)==0){g_slave_hdf5_done=true;g_slave_hdf5_s=atof(line.c_str()+10);cout<<"[Cmd] Slave HDF5 done ("<<g_slave_hdf5_s<<"s)."<<endl;}
             else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){
                 if(line.length()<=7) continue;
                 char hf=line[6]; int fi=stoi(line.substr(7));
@@ -578,6 +578,8 @@ void writeReport(const string& timestr, int rec_num, int total_frames, bool hw_t
                   << " ArmStage(s) | M-HDF5(s) | S-HDF5(s) |\n";
     g_session_log << "|---|-----|------|-------|------|-----|-------|---------|------------|"
                   << "------------|-----------|-----------|\n";
+    g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列峰值/总帧数 | 首帧触发延迟 | RAM写完-理论完成 |"
+                  << " 并行阶段墙钟 | Master HDF5写入 | Slave HDF5写入 |\n";
 
     double theoretical_s = total_frames / 200.0;
     for (auto& ctx : cam_ctxs) {
@@ -593,6 +595,10 @@ void writeReport(const string& timestr, int rec_num, int total_frames, bool hw_t
         double lat_ms = ctx->first_frame_time.time_since_epoch().count() > 0
             ? chrono::duration<double,milli>(ctx->first_frame_time - global_record_start_time).count() : 0.0;
 
+        // S-HDF5: slave side has direct measurement; master gets it from HDF5_DONE message
+        double show_shdf5 = g_slave_hdf5_s > 0 ? g_slave_hdf5_s : 0.0;
+        double show_mhdf5 = g_master_hdf5_s > 0 ? g_master_hdf5_s : 0.0;
+
         g_session_log << "| " << ctx->index << " | " << ctx->id << " | "
                       << (ctx->is_mono?"mono":"color") << " | "
                       << saved << " | " << dropped << " | "
@@ -600,7 +606,7 @@ void writeReport(const string& timestr, int rec_num, int total_frames, bool hw_t
                       << ctx->max_queue_size.load() << "/" << total_frames << " | "
                       << fixed << setprecision(1) << lat_ms << " | "
                       << fixed << setprecision(3) << ctx->recover2ram_s << " | "
-                      << g_arm_stage_s << " | " << g_master_hdf5_s << " | " << g_slave_hdf5_s << " |\n";
+                      << g_arm_stage_s << " | " << show_mhdf5 << " | " << show_shdf5 << " |\n";
     }
 
     // Summary
@@ -1019,8 +1025,9 @@ int main() {
                     // Signal Slave to proceed to sentry
                     sendLineRaw(g_cmd_sock, "GAZE_DONE");
                 } else {
-                    // Signal Master: HDF5 done
-                    sendLineRaw(g_cmd_sock, "HDF5_DONE");
+                    // Signal Master: HDF5 done + timing
+                    char hbuf[64]; snprintf(hbuf,sizeof(hbuf),"HDF5_DONE:%.3f",g_slave_hdf5_s);
+                    sendLineRaw(g_cmd_sock, hbuf);
                     // Wait for gaze from Master
                     g_gaze_need_send = false;
                     cout<<"[Sync] Waiting for Master GAZE..."<<endl;
