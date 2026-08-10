@@ -897,11 +897,14 @@ int main() {
                     string ack; recvLine(g_gaze_sock, ack, 5000);
                     cout<<"[Gaze] Slave ACK: "<<ack<<endl;
                 } else {
-                    // Slave ARM stage: wait for new gaze from Master
+                    // Slave ARM stage: clear stale flag, then wait for fresh GAZE
+                    g_gaze_need_send = false;  // discard any stale signal from previous cycle
                     cout<<"[Gaze] Waiting for Master to send new gaze..."<<endl;
                     while (global_running && !g_gaze_need_send.load())
                         this_thread::sleep_for(chrono::milliseconds(50));
                     g_gaze_need_send = false;
+                    cout<<"[Gaze] Received new gaze from Master: ("
+                        <<g_gaze_x<<","<<g_gaze_y<<","<<g_gaze_z<<")"<<endl;
                 }
                 auto t_arm1=chrono::steady_clock::now();
 
