@@ -290,3 +290,160 @@ OK        → idx++（调用方按 6.0 递增）, g_recording_enabled=true
 EXHAUSTED → 显示 EXHAUSTED UI, g_recording_enabled=false
 ERROR     → 显示错误提示, 不进入录制
 ```
+
+---
+
+## 七、M5Stack LED 状态识别
+
+第一阶段仅在 Master 的 enlarged 区域左上角显示当前状态的颜色和名称，不涉及真实的 M5Stack 通信。
+
+**状态判定仅在进入主循环后生效**。主循环之前（TCP 握手、双回零、相机初始化、startup sentry handshake）不设置 LED 状态——此时机械臂尚未进入工作流程。
+
+### 7.1 状态枚举
+
+```cpp
+enum class LedState { PIPER_INIT, READY, CAPTURING, WAITING, EXHAUSTED, OVER };
+LedState g_led_state = LedState::PIPER_INIT;
+```
+
+| 状态 | 颜色 | LED 效果 | 含义 |
+|------|------|---------|------|
+| `PIPER_INIT` | 蓝 | 常亮 | 等待按下 `s` 开始采集 |
+| `READY` | 绿 | 饼图倒计时 | `s` 已按下，可采集，等待 SPACE |
+| `CAPTURING` | 绿 | 呼吸灯 | 正在录制 |
+| `WAITING` | 黄 | 常亮 | 录制结束，dump 进行中，等待下次 SPACE |
+| `EXHAUSTED` | 红 | 常亮 | 当前臂指令用尽，等待 `t` 或 `c` |
+| `OVER` | 彩 | 横向流转 | 两臂均完成，实验可结束 |
+
+### 7.2 状态转移
+
+```
+          ┌──────────┐
+          │   PIPER_INIT   │ ← 程序启动 / 按 t 切换臂后
+          │   蓝     │
+          └────┬─────┘
+               │ [s] 成功 → moveArmToTarget() → GAZE 转发完成
+               ▼
+          ┌──────────┐
+          │  READY   │ ← g_recording_enabled=true, 等 SPACE
+          │  绿饼图   │
+          └────┬─────┘
+               │ [SPACE] → instantTrigger()
+               ▼
+          ┌──────────┐
+          │CAPTURING │ ← is_recording=true
+          │ 绿呼吸灯  │
+          └────┬─────┘
+               │ all_done=true → is_dumping=true
+               ▼
+          ┌──────────┐
+          │ WAITING  │ ← dump (ARM+HDF5+sentry) 进行中
+          │   黄     │
+          └────┬─────┘
+               │ is_dumping=false
+               ├─── 正常 ────────────────→ READY
+               ├─── g_show_exhausted ───→ EXHAUSTED
+               │
+          ┌───┴──────┐
+          │EXHAUSTED │ ← 当前臂指令用尽
+          │   红     │
+          └────┬─────┘
+               │ [t] → 切换臂成功 ──────→ PIPER_INIT (新臂)
+               │ [c] → 清 sentry ───────→ PIPER_INIT
+               │ 另一臂也 done ──────────→ OVER
+               │
+          ┌───┴──────┐
+          │  OVER    │ ← g_upper_done && g_lower_done
+          │  彩流转   │
+          └──────────┘
+               │ [c] → 清 sentry ───────→ PIPER_INIT
+```
+
+### 7.3 各状态的精确进入和退出条件
+
+#### PIPER_INIT
+
+| 进入 | 退出 |
+|------|------|
+| 程序主循环首次进入（`g_recording_enabled=false`） | `s` 键：`moveArmToTarget()` 返回 `ARM_OK` 且 GAZE 转发完成 |
+| `t` 键：切换臂后 | |
+| `c` 键：清空 sentry 后 | |
+| `EXHAUSTED` + `t` 切换到非耗尽臂 | |
+
+**条件**：`is_master_pc && !g_recording_enabled && !g_show_exhausted && !(g_upper_done && g_lower_done)`
+
+#### READY
+
+| 进入 | 退出 |
+|------|------|
+| `PIPER_INIT` + `s` 成功 | SPACE 按下（`trigger_start=true`） |
+
+**条件**：`is_master_pc && g_recording_enabled && !is_recording && !is_dumping`
+
+#### CAPTURING
+
+| 进入 | 退出 |
+|------|------|
+| `READY` + SPACE | `all_done=true`（is_dumping 变 true） |
+
+**条件**：`is_recording && !is_dumping`
+
+#### WAITING
+
+| 进入 | 退出 |
+|------|------|
+| `CAPTURING` + `all_done=true` | `is_dumping=false` |
+
+**条件**：`is_dumping`
+
+#### EXHAUSTED
+
+| 进入 | 退出 |
+|------|------|
+| `WAITING` + `g_show_exhausted=true` | `t` 切换到可用臂 |
+| 启动时 piper sentry 越界 | `c` 清空 sentry |
+| `s` 键 `moveArmToTarget()` 返回 `ARM_EXHAUSTED` | |
+
+**条件**：`g_show_exhausted && !(g_upper_done && g_lower_done)`
+
+#### OVER
+
+| 进入 | 退出 |
+|------|------|
+| `g_upper_done && g_lower_done`（两臂均耗尽） | `c` 清空 sentry |
+
+**条件**：`g_upper_done && g_lower_done`
+
+### 7.4 状态优先级
+
+主循环中按优先级从高到低判断，确保不重叠：
+
+```cpp
+if (g_show_exhausted) {
+    if (g_upper_done && g_lower_done) g_led_state = OVER;
+    else                              g_led_state = EXHAUSTED;
+} else if (is_dumping) {
+    g_led_state = WAITING;
+} else if (is_recording) {
+    g_led_state = CAPTURING;
+} else if (g_recording_enabled) {
+    g_led_state = READY;
+} else {
+    g_led_state = PIPER_INIT;
+}
+```
+
+### 7.5 UI 显示
+
+在 enlarged 区域左上角显示一个彩色矩形 + 状态名：
+
+```
+┌──────────────────────────────┐
+│ ┌──┐ READY                  │  ← enlarged 区域左上角
+│ └──┘                        │
+│  绿色方块                    │
+│                             │
+│     (相机画面)               │
+│                             │
+└──────────────────────────────┘
+```

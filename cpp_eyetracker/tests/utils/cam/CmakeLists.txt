@@ -105,3 +105,22 @@ target_include_directories(capture_with_piper
 )
 
 message(STATUS "capture_with_piper will be built")
+
+add_executable(capture_with_LED
+    capture_with_LED.cpp
+)
+
+target_link_libraries(capture_with_LED
+    PRIVATE
+        eyetracker::piper
+        eyetracker::cfg
+        eyetracker::cam
+        ${HDF5_CXX_LIBRARIES}
+)
+
+target_include_directories(capture_with_LED
+    PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+)
+
+message(STATUS "capture_with_LED will be built")
