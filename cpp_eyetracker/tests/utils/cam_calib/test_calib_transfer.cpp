@@ -45,19 +45,37 @@ atomic<bool> g_fault_on_master{false};
 chrono::steady_clock::time_point g_fault_time, g_ready_time;
 atomic<int> g_capture_count{-1}, g_last_idx{-1}; int g_undo_count=0;
 
+// Shared leftover buffer: recvLine may read past the \n into binary data.
+// recvExact must drain this buffer before reading from the socket.
+thread_local string g_tcp_leftover;
+
 // ================== TCP helpers ==================
 bool recvLine(SOCKET s, string& line, int timeout_ms=3000) {
     DWORD to=timeout_ms; setsockopt(s,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));
-    static thread_local string leftover;
-    size_t nl=leftover.find('\n');
-    if(nl!=string::npos){line=leftover.substr(0,nl);if(!line.empty()&&line.back()=='\r')line.pop_back();leftover=leftover.substr(nl+1);return true;}
+    size_t nl=g_tcp_leftover.find('\n');
+    if(nl!=string::npos){line=g_tcp_leftover.substr(0,nl);if(!line.empty()&&line.back()=='\r')line.pop_back();g_tcp_leftover=g_tcp_leftover.substr(nl+1);return true;}
     char buf[256]; auto dl=chrono::steady_clock::now()+chrono::milliseconds(timeout_ms);
-    while(chrono::steady_clock::now()<dl){int n=recv(s,buf,sizeof(buf)-1,0);if(n<=0)return false;buf[n]='\0';leftover+=buf;
-        nl=leftover.find('\n');if(nl!=string::npos){line=leftover.substr(0,nl);if(!line.empty()&&line.back()=='\r')line.pop_back();leftover=leftover.substr(nl+1);return true;}}
+    while(chrono::steady_clock::now()<dl){int n=recv(s,buf,sizeof(buf)-1,0);if(n<=0)return false;buf[n]='\0';g_tcp_leftover+=buf;
+        nl=g_tcp_leftover.find('\n');if(nl!=string::npos){line=g_tcp_leftover.substr(0,nl);if(!line.empty()&&line.back()=='\r')line.pop_back();g_tcp_leftover=g_tcp_leftover.substr(nl+1);return true;}}
     return false;
 }
+
 bool sendLine(SOCKET s,const string& m){string d=m+"\n";return send(s,d.c_str(),(int)d.length(),0)>0;}
 bool recvExact(SOCKET s,void* buf,size_t n){size_t got=0;while(got<n){int r=recv(s,(char*)buf+got,(int)(n-got),0);if(r<=0)return false;got+=r;}return true;}
+
+// Consume from g_tcp_leftover first, then recvExact the rest from socket.
+// Must be called after recvLine's FILE: header — leftover may contain binary JPEG head.
+bool recvExactDrain(SOCKET s, void* buf, size_t n) {
+    size_t from_leftover = 0;
+    if (!g_tcp_leftover.empty()) {
+        from_leftover = min(n, g_tcp_leftover.size());
+        memcpy(buf, g_tcp_leftover.data(), from_leftover);
+        g_tcp_leftover = g_tcp_leftover.substr(from_leftover);
+    }
+    if (from_leftover < n)
+        return recvExact(s, (char*)buf + from_leftover, n - from_leftover);
+    return true;
+}
 
 // ================== Camera ==================
 struct CameraContext {string sn; BaslerCamera cam{""}; bool is_mono=true; thread capture_thread,copy_thread; atomic<bool> running{true};
@@ -131,6 +149,7 @@ int main(){
     g_save_dir=base_dir+"/"+pid+"/pictures"; fs::create_directories(g_save_dir);
     bool test_xfer=false; try{test_xfer=c["test_transfer"].as<bool>();}catch(...){}
     string test_recv; try{test_recv=c["test_transfer_recv_dir"].as<string>();test_recv+="/"+pid+"/pictures";}catch(...){test_recv="D:/calib_transfer_test/"+pid+"/pictures";}
+    if(test_xfer) fs::create_directories(test_recv);
     double fps=c["fps"].as<double>(),gain=c["gain"].as<double>(),gamma=c["gamma"].as<double>(),exp=c["exposure_time"].as<double>(),me=c["calib_mono_exp_ext"].as<double>();
     g_win_w=c["window_width"].as<int>(); g_win_h=c["window_height"].as<int>(); double uif=c["ui_fps"].as<double>();
     cout<<"[Init] Config loaded. Role="<<(g_is_master?"MASTER":"SLAVE")<<" Port="<<port<<" TestXfer="<<(test_xfer?"ON":"OFF")<<endl;
@@ -186,7 +205,7 @@ int main(){
                 xfer_total=(int)mis.size();xfer_status="Transferring "+to_string(xfer_total)+" files...";
                 string xfer="XFER:";for(auto& f:mis)xfer+=f+",";cout<<"[DBG] Sending XFER with "<<mis.size()<<" files..."<<endl;sendLine(g_ctrl_sock,xfer);
                 auto t0=chrono::steady_clock::now();
-                while(true){string l;if(!recvLine(g_ctrl_sock,l,30000)){cerr<<"[DBG] recv timeout/error in XFER loop (got "<<xfer_cnt<<" files)"<<endl;break;}if(l=="XFER_DONE"){cout<<"[DBG] Received XFER_DONE"<<endl;break;}if(l.rfind("FILE:",0)==0){stringstream fs(l.substr(5));string sn,ix,sz;getline(fs,sn,':');getline(fs,ix,':');getline(fs,sz);size_t s=(size_t)stoull(sz);cout<<"[DBG] FILE "<<sn<<"_"<<ix<<" size="<<s<<endl;vector<char> buf(s);if(!recvExact(g_ctrl_sock,buf.data(),s)){cerr<<"[DBG] recvExact FAILED for "<<sn<<"_"<<ix<<endl;break;}xfer_bytes+=s;xfer_cnt++;stringstream fn;fn<<setw(2)<<setfill('0')<<stoi(ix);string path=test_recv+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),s);
+                while(true){string l;if(!recvLine(g_ctrl_sock,l,30000)){cerr<<"[DBG] recv timeout/error in XFER loop (got "<<xfer_cnt<<" files)"<<endl;break;}if(l=="XFER_DONE"){cout<<"[DBG] Received XFER_DONE"<<endl;break;}if(l.rfind("FILE:",0)==0){stringstream fs(l.substr(5));string sn,ix,sz;getline(fs,sn,':');getline(fs,ix,':');getline(fs,sz);size_t s=(size_t)stoull(sz);cout<<"[DBG] FILE "<<sn<<"_"<<ix<<" size="<<s<<endl;vector<char> buf(s);if(!recvExactDrain(g_ctrl_sock,buf.data(),s)){cerr<<"[DBG] recvExact FAILED for "<<sn<<"_"<<ix<<endl;break;}xfer_bytes+=s;xfer_cnt++;stringstream fn;fn<<setw(2)<<setfill('0')<<stoi(ix);string path=test_recv+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),s);
                     auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;}else{cout<<"[DBG] Unknown recv: "<<l.substr(0,min(60,(int)l.length()))<<endl;}}
                 auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;xfer_done=true;
                 cout<<"[XFER] "<<xfer_cnt<<" files, "<<fixed<<setprecision(1)<<(xfer_bytes/1048576.0)<<" MB, "<<dt<<"s, "<<xfer_speed<<" MB/s"<<endl;
@@ -225,7 +244,7 @@ int main(){
             for(auto& ctx:cam_ctxs){cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}if(!snap.empty()){cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);cv::imwrite(g_save_dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg",out);}}}}
         else if((key=='t'||key=='T')&&g_is_master&&g_enable_net_sync){sendLine(g_ctrl_sock,"LIST_REQ");string resp;recvLine(g_ctrl_sock,resp,5000);if(resp.rfind("LIST_RESP:",0)!=0)continue;string lst=resp.substr(10);set<string> sf;stringstream ss(lst);string tok;while(getline(ss,tok,','))if(!tok.empty())sf.insert(tok);set<string> lf=scanFiles(g_save_dir);vector<string> mis;for(auto& f:sf)if(!lf.count(f))mis.push_back(f);if(mis.empty()){cout<<"[XFER] Already in sync."<<endl;continue;}
             cout<<"[XFER] Transferring "<<mis.size()<<" files..."<<endl;string xfer="XFER:";for(auto& f:mis)xfer+=f+",";sendLine(g_ctrl_sock,xfer);
-            int rc=0;size_t tb=0;auto t0=chrono::steady_clock::now();while(true){string l;if(!recvLine(g_ctrl_sock,l,30000))break;if(l=="XFER_DONE")break;if(l.rfind("FILE:",0)==0){stringstream fs(l.substr(5));string sn,ix,sz;getline(fs,sn,':');getline(fs,ix,':');getline(fs,sz);size_t s=(size_t)stoull(sz);vector<char> buf(s);recvExact(g_ctrl_sock,buf.data(),s);tb+=s;rc++;stringstream fn;fn<<setw(2)<<setfill('0')<<stoi(ix);string path=g_save_dir+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),s);}}
+            int rc=0;size_t tb=0;auto t0=chrono::steady_clock::now();while(true){string l;if(!recvLine(g_ctrl_sock,l,30000))break;if(l=="XFER_DONE")break;if(l.rfind("FILE:",0)==0){stringstream fs(l.substr(5));string sn,ix,sz;getline(fs,sn,':');getline(fs,ix,':');getline(fs,sz);size_t s=(size_t)stoull(sz);vector<char> buf(s);recvExactDrain(g_ctrl_sock,buf.data(),s);tb+=s;rc++;stringstream fn;fn<<setw(2)<<setfill('0')<<stoi(ix);string path=g_save_dir+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),s);}}
             auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();cout<<"[XFER] Done: "<<rc<<" files, "<<fixed<<setprecision(1)<<(tb/1048576.0)<<" MB, "<<dt<<"s, "<<(tb/1048576.0/dt)<<" MB/s"<<endl;}
         else if((key=='z'||key=='Z')&&!g_fault_active.load()){int li=g_last_idx.load();if(li<0){cout<<"[Undo] Nothing to undo."<<endl;continue;}stringstream ss;ss<<setw(2)<<setfill('0')<<li;if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir)){string st=e.path().stem().string();if(st.rfind("calib_cam_",0)==0&&st.length()>=2&&st.substr(st.length()-2)==ss.str())fs::remove(e.path());}if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"UNDO:"+to_string(li));g_last_idx.store(li-1);g_undo_count++;if(g_capture_count>0)g_capture_count--;}
         else if((key=='c'||key=='C')&&g_is_master&&g_enable_net_sync){if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;sendLine(g_ctrl_sock,"CLEAR");string ack;recvLine(g_ctrl_sock,ack,2000);cout<<"[Clear] Done."<<endl;}
