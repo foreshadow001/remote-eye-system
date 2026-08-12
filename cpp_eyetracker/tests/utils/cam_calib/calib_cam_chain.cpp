@@ -227,6 +227,7 @@ void action()
     int feat_total = 0, feat_success = 0, feat_failed = 0;
 
     t0 = steady_clock::now();
+    cout << "[Stage 2] Feature extraction: 0/" << num_images << endl;
     for (int imgIdx = 0; imgIdx < num_images; ++imgIdx)
     {
         HTuple imgIdxStr = HTuple(imgIdx).TupleString("02d");
@@ -250,7 +251,14 @@ void action()
                 continue;
             }
         }
+        // Progress bar per image
+        int pct = (imgIdx + 1) * 100 / num_images;
+        int bar_w = 40, filled = (imgIdx + 1) * bar_w / num_images;
+        cout << "\r  [";
+        for (int k = 0; k < bar_w; ++k) cout << (k < filled ? '=' : (k == filled && filled < bar_w ? '>' : ' '));
+        cout << "] " << (imgIdx + 1) << "/" << num_images << " (" << pct << "%)" << flush;
     }
+    cout << endl;
     double dt_feat = duration<double>(steady_clock::now() - t0).count();
     cout << "[Timer] Stage 2 - Feature: " << fixed << setprecision(2) << dt_feat << "s ("
          << feat_total << " calls, " << (dt_feat/feat_total*1000.0) << " ms avg, "
