@@ -225,6 +225,7 @@ void action()
     // ========================================================================
     vector<vector<int>> frame_observations(num_images);
     int feat_total = 0, feat_success = 0, feat_failed = 0;
+    double t_io = 0, t_find = 0;  // sub-stage accumulators
 
     t0 = steady_clock::now();
     cout << "[Stage 2] Feature extraction: 0/" << num_images << endl;
@@ -236,14 +237,18 @@ void action()
             feat_total++;
             HTuple currentFileName = hv_ImagePath + "/calib_cam_" + HTuple(cam_sn_list[camIdx].c_str()) + "_" + imgIdxStr;
             try {
+                auto tio0 = steady_clock::now();
                 ReadImage(&ho_Image, currentFileName);
                 HTuple hv_Channels;
                 CountChannels(ho_Image, &hv_Channels);
                 if (hv_Channels.I() == 3) { Rgb1ToGray(ho_Image, &ho_Image); }
+                auto tio1 = steady_clock::now();
+                t_io += duration<double>(tio1 - tio0).count();
 
                 FindCalibObject(ho_Image, hv_CalibDataID, camIdx, 0, imgIdx,
                                 (HTuple("alpha").Append("sigma")),
                                 (HTuple(0.5).Append(1.0)));
+                t_find += duration<double>(steady_clock::now() - tio1).count();
                 frame_observations[imgIdx].push_back(camIdx);
                 feat_success++;
             } catch (HException &) {
@@ -269,6 +274,8 @@ void action()
     cout << "[Timer] Stage 2 - Feature: " << fixed << setprecision(2) << dt_feat << "s ("
          << feat_total << " calls, " << (dt_feat/feat_total*1000.0) << " ms avg, "
          << feat_success << " success, " << feat_failed << " failed)" << endl;
+    cout << "  ReadImage+preprocess: " << t_io << "s (" << (t_io/dt_feat*100) << "%)" << endl;
+    cout << "  FindCalibObject:      " << t_find << "s (" << (t_find/dt_feat*100) << "%)" << endl;
 
     // ========================================================================
     // Stage 3 — 共视图连通性校验

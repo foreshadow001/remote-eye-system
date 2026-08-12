@@ -1,196 +1,158 @@
-# calib_cam_chain.cpp — 配置迁移 + 分段计时
+# calib_cam_chain.cpp — 特征提取并行化方案
 
-> 当前瓶颈：特征提取阶段 (`FindCalibObject`) 对每张图每个相机串行调用，N×M 次 HALCON 调用，无计时数据。
-> 目标：迁移配置到 `cam_calib.yaml` + participant_id 路径构建，分段计时为后续优化提供数据。
-
----
-
-## 一、配置迁移：`default.yaml` → `cam_calib.yaml`
-
-### 1.1 当前 `default.yaml` 的 `cam_calib` 节点
-
-```yaml
-cam_calib:
-  input_folder: "D:/calib_images"                              # → 废弃，用 calib_save_dir/{pid}/pictures
-  calib_plane: "C:/hitsz/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
-  output_folder: "D:/calib_output"                             # → 废弃，用 calib_save_dir/{pid}/output
-  focus: 0.016           # m
-  pixel_size_x: 2.74e-6  # m
-  pixel_size_y: 2.74e-6  # m
-  center_cam: "40772280" # 可选
-  focus_overrides:       # 可选
-    40772283: 0.075
-    40772276: 0.075
-```
-
-### 1.2 新增到 `cam_calib.yaml` 的 `calib` 节点
-
-新增以下键（与现有 `cam_indices`, `calib_save_dir` 同级）：
-
-```yaml
-calib:
-  # === 已有（不变）===
-  cam_indices: [...]
-  calib_save_dir: "D:/calib_images"
-  # ... (is_master, port, fps, etc.)
-
-  # === 新增：标定算法参数 ===
-  calib_plane: "C:/hitsz/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
-  focus: 0.016                       # m
-  pixel_size_x: 2.74e-6              # m
-  pixel_size_y: 2.74e-6              # m
-  center_cam: "40772283"             # 中心相机 SN（可选），空则默认 cam 0 为参考
-  focus_overrides:                   # 特定相机焦距覆盖 (m), SN → focus（可选）
-    40772283: 0.075
-    40772276: 0.075
-```
-
-### 1.3 路径计算规则（取代硬编码 key）
-
-`calib_cam_chain.cpp` 不再从 YAML 读 `input_folder` / `output_folder`，而是自动计算：
-
-```cpp
-string base_dir  = calib["calib_save_dir"].as<string>();         // "D:/calib_images"
-string pid       = capture["capture"]["participant_id"].as<string>();  // "P001"
-string input_dir = base_dir + "/" + pid + "/pictures";           // 图片输入
-string output_dir = base_dir + "/" + pid + "/output";            // XML 输出
-fs::create_directories(output_dir);
-```
-
-**设计理由**：
-- 图片采集已经存储到 `calib_save_dir/{pid}/pictures/`，标定链自然从这里读
-- 输出 XML 放在 `calib_save_dir/{pid}/output/`，与图片同级，便于管理
-- 删除 `input_folder` 和 `output_folder` 两个冗余配置键
-
-### 1.4 代码变更：`action()` 中的 Cfg 读取
-
-```cpp
-// 旧：
-Cfg cfg;  // reads default.yaml
-HTuple hv_ImagePath = cfg["cam_calib"]["input_folder"].as<string>().c_str();
-HTuple hv_OutputBaseDir = cfg["cam_calib"]["output_folder"].as<string>().c_str();
-double focus = cfg["cam_calib"]["focus"].as<double>();
-
-// 新：
-Cfg cfg("cfg/cam_calib.yaml"); auto& calib = cfg["calib"];
-Cfg cap("cfg/capture.yaml");
-string pid = cap["capture"]["participant_id"].as<string>();
-string base_dir = calib["calib_save_dir"].as<string>();
-string input_dir = base_dir + "/" + pid + "/pictures";
-string output_dir = base_dir + "/" + pid + "/output";
-fs::create_directories(output_dir);
-
-HTuple hv_ImagePath = input_dir.c_str();
-HTuple hv_OutputBaseDir = output_dir.c_str();
-HTuple hv_CalibObjDescr = calib["calib_plane"].as<string>().c_str();
-double focus = calib["focus"].as<double>();
-double pixel_size_x = calib["pixel_size_x"].as<double>();
-double pixel_size_y = calib["pixel_size_y"].as<double>();
-string center_cam_sn;
-try { center_cam_sn = calib["center_cam"].as<string>(); } catch(...) { center_cam_sn = ""; }
-```
+> 当前瓶颈：Stage 2 特征提取 ~180s（200 次 `ReadImage` + `FindCalibObject` 完全串行）
+> 目标：通过并行化 ReadImage 减少磁盘 I/O 等待时间
 
 ---
 
-## 二、分段计时
+## 一、HALCON 并行模型调研结论
 
-### 2.1 计时宏/辅助
+### 1.1 关键发现
 
-在 `action()` 顶部定义计时工具：
+| 结论 | 来源 |
+|------|------|
+| `FindCalibObject` **修改共享的 `CalibDataID`**，多线程必须同步访问 | MVTec operator reference: "access to the value of this parameter must be synchronized if it is used across multiple threads" |
+| `FindCalibObject` 标注为 **"Processed without parallelization"** — AOP 不会自动并行化它 | MVTec reference `set_calib_data_calib_object` |
+| `ReadImage` 是 **reentrant (global scope)** — 可以在不同线程并行调用读不同文件 | MVTec parallel programming guide |
+| `CalibDataID` 不可合并 — 无法多个线程各建一个模型最后合并 | HALCON 无此 API |
+
+### 1.2 结论
+
+**`FindCalibObject` 必须串行化**（共享 `CalibDataID`），但 **`ReadImage` 可以并行化**（每个线程读不同的文件，无共享状态）。
+
+---
+
+## 二、优化方案
+
+### 2.1 方案 A：生产者-消费者管线（推荐）
+
+**思路**：一个 I/O 线程预读下一张图，主线程消费当前图做 `FindCalibObject`。
+
+```
+I/O 线程:    ReadImage(img_1) → [ready] → ReadImage(img_3) → [ready] → ...
+主线程:      FindCalibObject(img_0) → FindCalibObject(img_1) → FindCalibObject(img_2) → ...
+```
+
+**实现**：双缓冲 + `std::condition_variable`
 
 ```cpp
-#include <chrono>
-using namespace std::chrono;
-
-struct StageTimer {
-    steady_clock::time_point t0;
-    const char* name;
-    StageTimer(const char* n) : name(n), t0(steady_clock::now()) {}
-    ~StageTimer() {
-        double dt = duration<double>(steady_clock::now() - t0).count();
-        cout << "[Timer] " << name << ": " << fixed << setprecision(2) << dt << "s" << endl;
-    }
+struct ImageSlot {
+    HObject image;
+    int camIdx, imgIdx;
+    bool ready = false;
 };
+
+ImageSlot slots[2];  // 双缓冲
+mutex mtx;
+condition_variable cv;
+
+// I/O 线程
+void ioThread() {
+    for (auto& task : all_tasks) {
+        // 等待空槽位
+        unique_lock lk(mtx);
+        cv.wait(lk, [&]{ return !slots[write_idx].ready; });
+        // 读取图片到槽位
+        ReadImage(&slots[write_idx].image, filename);
+        slots[write_idx].ready = true;
+        lk.unlock();
+        cv.notify_one();
+    }
+}
+
+// 主线程
+for (auto& task : all_tasks) {
+    // 等待就绪槽位
+    unique_lock lk(mtx);
+    cv.wait(lk, [&]{ return slots[read_idx].ready; });
+    // FindCalibObject
+    FindCalibObject(slots[read_idx].image, hv_CalibDataID, ...);
+    slots[read_idx].ready = false;
+    lk.unlock();
+    cv.notify_one();
+}
 ```
 
-或在每个阶段直接内联：
+**优点**：
+- 内存占用极小（仅 2 张图）
+- I/O 与计算完全重叠
+- 不需要管理大量线程
+
+**预期收益**：
+- 若 ReadImage 占每次调用 30%（~270ms/900ms），则可节省 200 × 0.27s ≈ 54s（30% 提升）
+- 若 ReadImage 占每次调用 50%，可节省 ~90s（50% 提升）
+
+### 2.2 方案 B：多 I/O 线程 + 串行 FindCalibObject
+
+**思路**：多个线程并行 ReadImage，结果放入队列，主线程串行消费。
+
+```
+Worker 1: ReadImage → enqueue → ReadImage → enqueue → ...
+Worker 2: ReadImage → enqueue → ReadImage → enqueue → ...
+Main:     dequeue → FindCalibObject → dequeue → FindCalibObject → ...
+```
+
+**优点**：多磁盘/多文件系统时可以进一步加速 I/O
+
+**缺点**：
+- 需要队列 + 同步开销
+- 内存占用取决于队列深度
+- 对于单 SSD，多线程 I/O 通常不如单线程预读
+
+### 2.3 方案 C：HALCON AOP 调优（防御性）
 
 ```cpp
-auto t0 = steady_clock::now();
-// ... stage work ...
-double dt = duration<double>(steady_clock::now() - t0).count();
-cout << "[Timer] Stage N: " << dt << "s" << endl;
+// 在 action() 开头
+get_system("processor_num", &hv_cores);
+set_system("parallelize_operators", "true");
+set_system("thread_num", hv_cores);  // 或不设，默认用全部核心
 ```
 
-### 2.2 计时粒度
-
-| 阶段 | 计时点 | 关键指标 |
-|------|--------|---------|
-| **0. Scan** | `scan_calib_image_folder()` | 目录扫描耗时 |
-| **1. Init** | 所有相机初始化（读首图 + 设置参数） | 单相机平均耗时 |
-| **2. Feature** | 全部 `FindCalibObject` 调用（N×M 次） | **核心瓶颈**，同时统计成功/失败次数 |
-| **3. Graph** | BFS 连通性检查 | 通常 <1ms |
-| **4. Calibrate** | `CalibrateCameras()` | HALCON 求解耗时 |
-| **5. Rebase** | 位姿变换到中心相机 | 通常 <10ms |
-| **6. Export** | 写出 N 个 XML 文件 | 文件 IO 耗时 |
-| **Total** | 整体 wall-clock | — |
-
-### 2.3 Stage 2 详细计时
-
-特征提取是最耗时的阶段，需要子粒度数据：
-
-```
-[Timer] Stage 2 - Feature Extraction (num_images=20, num_cameras=10)
-  Total:   X s
-  Per img: Y ms avg, Z ms max
-  Success: A / 200 (B%)
-  Failed:  C images
-```
-
-### 2.4 输出示例
-
-```
-=== Multi-Camera Calibration Chain ===
-
-[Timer] Stage 0 - Scan: 0.02s
---- Camera Init ---
-[Timer] Stage 1 - Init: 1.53s (10 cameras, 0.15s avg each)
---- Feature Extraction ---
-[Timer] Stage 2 - Feature: 142.30s (200 calls, 0.71s avg, 185 success, 15 failed)
---- Graph Validation ---
-[Timer] Stage 3 - Graph: 0.00s
---- Calibration ---
-[Timer] Stage 4 - Calibrate: 3.21s
---- Rebase ---
-[Timer] Stage 5 - Rebase: 0.01s
---- Export ---
-[Timer] Stage 6 - Export: 0.15s (10 XML files)
-========================================
-[Timer] Total: 147.22s
-```
+`FindCalibObject` 虽标注 "Processed without parallelization"，但 `ReadImage` 等 I/O 算子可能受益于 AOP。作为基线优化，成本为零。
 
 ---
 
-## 三、实施步骤
+## 三、实施前必须：ReadImage vs FindCalibObject 耗时细分
+
+并行化的收益完全取决于 ReadImage 在每次调用中的占比。需要先在 Stage 2 内部加计时：
+
+```cpp
+double t_read = 0, t_find = 0;
+for (...) {
+    auto tr0 = steady_clock::now();
+    ReadImage(&ho_Image, ...);
+    auto tr1 = steady_clock::now();
+    t_read += duration<double>(tr1 - tr0).count();
+
+    FindCalibObject(...);
+    auto tf1 = steady_clock::now();
+    t_find += duration<double>(tf1 - tr1).count();
+}
+cout << "[Timer] Stage 2 - ReadImage: " << t_read << "s (" << (t_read/dt_feat*100) << "%)" << endl;
+cout << "[Timer] Stage 2 - FindCalibObject: " << t_find << "s (" << (t_find/dt_feat*100) << "%)" << endl;
+```
+
+| ReadImage 占比 | 方案 A 预期收益 | 建议 |
+|---------------|---------------|------|
+| < 20% | < 36s | 不值得并行化，关注 FindCalibObject 参数调优 |
+| 20-40% | 36-72s | **推荐方案 A**（双缓冲管线） |
+| > 40% | > 72s | **推荐方案 B**（多 I/O 线程），考虑内存限制 |
+
+---
+
+## 四、实施步骤
 
 | 序号 | 内容 | 预计 |
 |------|------|------|
-| 1 | 在 `cam_calib.yaml` 添加 `calib_plane`, `focus`, `pixel_size_x/y`, `center_cam`, `focus_overrides` | 3min |
-| 2 | 修改 `calib_cam_chain.cpp` — 从 `cam_calib.yaml` + `capture.yaml` 读取，计算路径 | 10min |
-| 3 | 添加分段计时（7 个阶段 + Stage 2 子统计） | 15min |
-| 4 | 编译 + 实机测试 | 5min |
-| 5 | 分析计时数据，提出优化方案 | — |
-
-**总计：~30 分钟**
+| 1 | Stage 2 内部加 ReadImage / FindCalibObject 细分计时 | 5min |
+| 2 | 运行一次，获取 ReadImage 占比 | 3min（实机） |
+| 3 | 根据占比选择方案 A 或 B，实施并行化 | 20-30min |
+| 4 | 编译 + 实机测速对比 | 5min |
 
 ---
 
-## 四、后续优化方向（基于计时数据）
+## 五、后续优化方向（不依赖并行化）
 
-分段计时完成后，根据 Stage 2 占总时间的比例决定优化策略：
-
-| Stage 2 占比 | 策略 |
-|-------------|------|
-| > 90% | 重点优化 `FindCalibObject`：减少搜索空间、调整 alpha/sigma 参数、跳过已知失败帧 |
-| 50-90% | 并行化 Stage 2（OpenMP 或线程池，每个相机一个线程） |
-| < 50% | 检查其他阶段的瓶颈（Init 的 ReadImage 每次读完整图可优化） |
+1. **减少 ReadImage 次数**：如果多帧图片可以复用（同一相机同一图片用于多帧标定），缓存已读图片
+2. **HDevelop 性能分析器**：用 HALCON 官方工具定位 `FindCalibObject` 内部耗时，调 alpha/sigma 参数减小搜索空间
+3. **排除不必要参数优化**：`set_calib_data(..., 'excluded_settings', ['focus','kappa',...])` 减少 `CalibrateCameras` 求解变量数
