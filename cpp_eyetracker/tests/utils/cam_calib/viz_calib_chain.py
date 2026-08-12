@@ -95,28 +95,26 @@ def euler_gba_to_matrix(alpha_deg, beta_deg, gamma_deg):
 
 # ==================== Visualization ====================
 
-def draw_camera_axes(ax, pos, R, size=0.03, label=None):
+def draw_camera_axes(ax, pos, R, size=0.03, pick_radius=5):
     """
     Draw XYZ axes at position `pos` (in meters), oriented by rotation matrix `R`.
     size: axis length in meters.
+    Returns list of Line2D artists with camera metadata attached.
     """
     origin = np.array(pos)
     x_axis = origin + R @ np.array([size, 0, 0])
     y_axis = origin + R @ np.array([0, size, 0])
     z_axis = origin + R @ np.array([0, 0, size])
 
-    ax.plot([origin[0], x_axis[0]], [origin[1], x_axis[1]], [origin[2], x_axis[2]],
-            c='r', lw=1.5)
-    ax.plot([origin[0], y_axis[0]], [origin[1], y_axis[1]], [origin[2], y_axis[2]],
-            c='g', lw=1.5)
-    ax.plot([origin[0], z_axis[0]], [origin[1], z_axis[1]], [origin[2], z_axis[2]],
-            c='b', lw=1.5)
-
-    # Position label
-    if label:
-        ax.text(origin[0], origin[1], origin[2] + size * 0.3, label,
-                fontsize=7, ha='center', va='bottom',
-                bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
+    lines = []
+    lx, = ax.plot([origin[0], x_axis[0]], [origin[1], x_axis[1]], [origin[2], x_axis[2]],
+                   c='r', lw=1.5, picker=pick_radius)
+    ly, = ax.plot([origin[0], y_axis[0]], [origin[1], y_axis[1]], [origin[2], y_axis[2]],
+                   c='g', lw=1.5, picker=pick_radius)
+    lz, = ax.plot([origin[0], z_axis[0]], [origin[1], z_axis[1]], [origin[2], z_axis[2]],
+                   c='b', lw=1.5, picker=pick_radius)
+    lines.extend([lx, ly, lz])
+    return lines
 
 
 def draw_camera_fov(ax, pos, R, cam_size=0.01, fov_len=0.02):
@@ -202,68 +200,124 @@ def main():
     fig = plt.figure(figsize=(14, 10))
     ax = fig.add_subplot(111, projection='3d')
 
-    # Draw center camera (reference, at origin or its own pose)
-    # Note: poses are already in center_cam coordinate system.
-    # The center camera should be at (0,0,0) with identity rotation.
-    # But due to numerical errors it might be near-zero. Use its actual pose.
-    draw_camera_axes(ax, (0, 0, 0), np.eye(3), size=0.04, label=f"{center_cam['sn']}\n(reference)")
+    # Build mapping: Line2D artist → camera data (for pick events)
+    artist_to_cam = {}  # id(line) → {sn, tx, ty, tz}
 
-    # Draw center camera FOV pyramid
-    # For center camera, it's at origin, rotation is identity (Z forward in HALCON convention)
-    draw_camera_fov(ax, (0, 0, 0), np.eye(3), cam_size=0.015, fov_len=0.03)
+    # Compute position range first (used to scale axes)
+    all_positions = np.array([[0, 0, 0]] + [[c['tx'], c['ty'], c['tz']] for c in others])
+    pos_range = np.max(np.ptp(all_positions, axis=0)) if len(others) > 0 else 1.0
 
-    # Draw all other cameras
-    # Scale from meters to something visible
-    # Actually, positions are in meters. Let's check the range.
-    all_positions = []
-    for c in others:
-        all_positions.append([c['tx'], c['ty'], c['tz']])
+    # Draw center camera axes = world coordinate system (thicker, longer)
+    origin = np.array([0.0, 0.0, 0.0])
+    wsize = max(pos_range * 0.08, 0.08)
+    ax.plot([0, wsize], [0, 0], [0, 0], c='r', lw=2.5)  # X axis
+    ax.plot([0, 0], [0, wsize], [0, 0], c='g', lw=2.5)  # Y axis
+    ax.plot([0, 0], [0, 0], [0, wsize], c='b', lw=2.5)  # Z axis
+    ax.text(wsize * 1.1, 0, 0, "X", color='r', fontsize=11, fontweight='bold')
+    ax.text(0, wsize * 1.1, 0, "Y", color='g', fontsize=11, fontweight='bold')
+    ax.text(0, 0, wsize * 1.1, "Z", color='b', fontsize=11, fontweight='bold')
+    # Center camera dot
+    ax.scatter(*origin, c='k', marker='o', s=60, zorder=5)
+    # Register for picking
+    center_line_ref = ax.plot([0, wsize], [0, 0], [0, 0], c='r', lw=2.5, picker=8)[0]
+    artist_to_cam[id(center_line_ref)] = {'sn': center_cam['sn'], 'tx': 0.0, 'ty': 0.0, 'tz': 0.0, 'is_center': True}
+    draw_camera_fov(ax, (0, 0, 0), np.eye(3), cam_size=wsize * 0.3, fov_len=wsize * 0.5)
 
-    all_positions = np.array(all_positions)
-    if len(all_positions) > 0:
-        pos_range = np.max(np.ptp(all_positions, axis=0))
-    else:
-        pos_range = 1.0
+    # Initial view: from -Z direction, X-left, Y-down
+    ax.view_init(elev=90, azim=90)
 
-    axis_size = max(pos_range * 0.05, 0.02)  # 5% of range, min 2cm
+    # Axis size for other cameras
+    axis_size = max(pos_range * 0.05, 0.02)
 
+    # Draw other cameras (no text labels)
     for c in others:
         pos = np.array([c['tx'], c['ty'], c['tz']])
         R = euler_gba_to_matrix(c['alpha'], c['beta'], c['gamma'])
-
-        # Simple position label
-        label = f"{c['sn']}\n({c['tx']:.3f}, {c['ty']:.3f}, {c['tz']:.3f})"
-        draw_camera_axes(ax, pos, R, size=axis_size, label=label)
+        cam_lines = draw_camera_axes(ax, pos, R, size=axis_size, pick_radius=8)
+        for line in cam_lines:
+            artist_to_cam[id(line)] = {'sn': c['sn'], 'tx': c['tx'], 'ty': c['ty'], 'tz': c['tz'], 'is_center': False}
         draw_camera_fov(ax, pos, R, cam_size=axis_size * 0.5, fov_len=axis_size * 0.8)
+
+    # Floating annotation (initially off-screen)
+    annot = ax.text2D(0, 0, "", fontsize=9, ha='center', va='bottom',
+                      bbox=dict(boxstyle='round,pad=0.4', facecolor='lightyellow', edgecolor='black', alpha=0.95),
+                      transform=ax.transAxes, zorder=100)
+    annot.set_visible(False)
+
+    def on_pick(event):
+        """Show XYZ label for the clicked camera."""
+        cam = None
+        # event.artist might be a single Line2D; check our mapping
+        lid = id(event.artist)
+        if lid in artist_to_cam:
+            cam = artist_to_cam[lid]
+        else:
+            # Check if any of the line collection elements match
+            for art in (event.artist if hasattr(event.artist, '__iter__') else [event.artist]):
+                if id(art) in artist_to_cam:
+                    cam = artist_to_cam[id(art)]
+                    break
+
+        if cam is None:
+            annot.set_visible(False)
+            fig.canvas.draw_idle()
+            return
+
+        if cam.get('is_center'):
+            text = f"{cam['sn']} (reference)\n(0, 0, 0) m"
+        else:
+            text = f"{cam['sn']}\nx={cam['tx']:.4f}  y={cam['ty']:.4f}  z={cam['tz']:.4f} m"
+
+        annot.set_text(text)
+        annot.set_visible(True)
+        # Position annotation in upper-left corner of the axes
+        annot.set_position((0.02, 0.98))
+        annot.set_va('top')
+        annot.set_ha('left')
+        fig.canvas.draw_idle()
+
+    def on_click_outside(event):
+        """Hide annotation when clicking on empty space."""
+        if event.inaxes != ax:
+            return
+        # Check if the click hit any artist
+        contained = False
+        for artist in ax.get_children():
+            if hasattr(artist, 'contains') and artist.contains(event)[0]:
+                contained = True
+                break
+        if not contained:
+            annot.set_visible(False)
+            fig.canvas.draw_idle()
 
     # ==================== Plot settings ====================
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
     ax.set_zlabel('Z (m)')
-    ax.set_title(f'Camera Extrinsics — {len(cameras)} cameras in "{center_cam["sn"]}" frame\n{viz_pid}', fontsize=12)
+    ax.set_title(f'Camera Extrinsics — {len(cameras)} cameras in "{center_cam["sn"]}" frame\n{viz_pid}\nClick a camera to see XYZ', fontsize=12)
 
-    # Auto-range with some margin
-    all_pts = [[0,0,0]]
-    for c in cameras:
-        all_pts.append([c['tx'], c['ty'], c['tz']])
-    all_pts = np.array(all_pts)
-    mid = np.mean(all_pts, axis=0)
-    rng = max(np.max(np.ptp(all_pts, axis=0)) * 0.6, 0.5)  # at least 0.5m
+    mid = np.mean(all_positions, axis=0)
+    rng = max(np.max(np.ptp(all_positions, axis=0)) * 0.6, 0.5)
     ax.set_xlim(mid[0] - rng, mid[0] + rng)
     ax.set_ylim(mid[1] - rng, mid[1] + rng)
     ax.set_zlim(mid[2] - rng, mid[2] + rng)
 
-    # Equal aspect ratio (best effort in 3D)
     try:
         ax.set_box_aspect([1, 1, 1])
     except Exception:
         pass
 
-    # Toggle between views with keyboard
-    print("\nKeyboard shortcuts:")
-    print("  t / f / s : top / front / side view")
-    print("  r         : reset to default 3D view")
-    print("  q         : quit")
+    # Event handlers
+    fig.canvas.mpl_connect('pick_event', on_pick)
+    fig.canvas.mpl_connect('button_press_event', on_click_outside)
+
+    # Keyboard shortcuts
+    print("\nKeyboard / mouse:")
+    print("  Click camera axes → show XYZ")
+    print("  Click empty space  → hide label")
+    print("  t / f / s          → top / front / side view")
+    print("  r                  → reset view")
+    print("  q                  → quit")
 
     def on_key(event):
         if event.key == 't':
@@ -273,7 +327,7 @@ def main():
         elif event.key == 's':
             ax.view_init(elev=0, azim=0)
         elif event.key == 'r':
-            ax.view_init(elev=20, azim=-60)
+            ax.view_init(elev=90, azim=90)
         elif event.key == 'q':
             plt.close()
         fig.canvas.draw_idle()
@@ -281,9 +335,9 @@ def main():
     fig.canvas.mpl_connect('key_press_event', on_key)
 
     print(f"\nCamera count: {len(cameras)}")
-    print(f"Positions range: X [{all_pts[:,0].min():.3f}, {all_pts[:,0].max():.3f}] m")
-    print(f"                 Y [{all_pts[:,1].min():.3f}, {all_pts[:,1].max():.3f}] m")
-    print(f"                 Z [{all_pts[:,2].min():.3f}, {all_pts[:,2].max():.3f}] m")
+    print(f"Positions range: X [{all_positions[:,0].min():.3f}, {all_positions[:,0].max():.3f}] m")
+    print(f"                 Y [{all_positions[:,1].min():.3f}, {all_positions[:,1].max():.3f}] m")
+    print(f"                 Z [{all_positions[:,2].min():.3f}, {all_positions[:,2].max():.3f}] m")
     plt.show()
 
 

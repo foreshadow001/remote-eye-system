@@ -23,18 +23,18 @@ calib:
                                      # participant_id 从 capture.yaml 读取
 
   # 可视化 (viz_calib_chain.py)
-  viz_participant_id: ""              # 留空 → 使用 capture.yaml 的 participant_id
+  viz_participant_id: "P001"              # 留空 → 使用 capture.yaml 的 participant_id
 
   # --- 标定算法参数 (calib_cam_chain.cpp) ---
   # 输入/输出目录 (空字符串 = 自动根据 calib_save_dir/{input_participant_id} 计算)
-  input_participant_id: ""            # 留空 → 使用 capture.yaml 的 participant_id
+  input_participant_id: "P001"            # 留空 → 使用 capture.yaml 的 participant_id
   input_dir: ""                       # 留空 → calib_save_dir/{input_participant_id}/pictures
   output_dir: ""                      # 留空 → calib_save_dir/{input_participant_id}/output
   calib_plane: "C:/hitsz/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
   focus: 0.016                       # m
   pixel_size_x: 2.74e-6              # m
   pixel_size_y: 2.74e-6              # m
-  center_cam: "40772283"             # 中心相机 SN（空则默认 cam 0 为参考）
+  center_cam: "40772280"             # 中心相机 SN（空则默认 cam 0 为参考）
   focus_overrides:                   # 特定相机焦距覆盖 (m), SN → focus
     40772283: 0.075
     40772276: 0.075

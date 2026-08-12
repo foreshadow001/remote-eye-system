@@ -32,3 +32,9 @@
 cmake --preset vs2022-vcpkg
 cmake --build build --config Release
 ```
+
+# Viz
+```Powershell
+$env:MPLBACKEND = "TkAgg"
+python cpp_eyetracker\tests\utils\cam_calib\viz_calib_chain.py
+```
