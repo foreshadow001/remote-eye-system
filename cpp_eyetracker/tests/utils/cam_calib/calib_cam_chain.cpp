@@ -7,6 +7,8 @@
 #include <map>
 #include <stdexcept>
 #include <queue>
+#include <thread>
+#include <atomic>
 
 #include "HalconCpp.h"
 #include "cfg/config.hpp"
@@ -224,58 +226,98 @@ void action()
     // Stage 2 — 特征提取 (核心瓶颈)
     // ========================================================================
     vector<vector<int>> frame_observations(num_images);
-    int feat_total = 0, feat_success = 0, feat_failed = 0;
-    double t_io = 0, t_find = 0;  // sub-stage accumulators
+    int feat_total = num_images * num_cams;
+    int feat_success = 0, feat_failed = 0;
 
-    t0 = steady_clock::now();
-    cout << "[Stage 2] Feature extraction: 0/" << num_images << endl;
-    for (int imgIdx = 0; imgIdx < num_images; ++imgIdx)
-    {
+    // Build flat task list for parallel preload
+    struct Task { int camIdx, imgIdx; string fn; };
+    vector<Task> tasks; tasks.reserve(feat_total);
+    for (int imgIdx = 0; imgIdx < num_images; ++imgIdx) {
         HTuple imgIdxStr = HTuple(imgIdx).TupleString("02d");
-        for (int camIdx = 0; camIdx < num_cams; ++camIdx)
-        {
-            feat_total++;
-            HTuple currentFileName = hv_ImagePath + "/calib_cam_" + HTuple(cam_sn_list[camIdx].c_str()) + "_" + imgIdxStr;
-            try {
-                auto tio0 = steady_clock::now();
-                ReadImage(&ho_Image, currentFileName);
-                HTuple hv_Channels;
-                CountChannels(ho_Image, &hv_Channels);
-                if (hv_Channels.I() == 3) { Rgb1ToGray(ho_Image, &ho_Image); }
-                auto tio1 = steady_clock::now();
-                t_io += duration<double>(tio1 - tio0).count();
+        for (int camIdx = 0; camIdx < num_cams; ++camIdx) {
+            string fn = (hv_ImagePath + "/calib_cam_" + HTuple(cam_sn_list[camIdx].c_str()) + "_" + imgIdxStr).S();
+            tasks.push_back({camIdx, imgIdx, fn});
+        }
+    }
 
-                FindCalibObject(ho_Image, hv_CalibDataID, camIdx, 0, imgIdx,
-                                (HTuple("alpha").Append("sigma")),
-                                (HTuple(0.5).Append(1.0)));
-                t_find += duration<double>(steady_clock::now() - tio1).count();
-                frame_observations[imgIdx].push_back(camIdx);
-                feat_success++;
+    // Pre-allocate image buffer + per-task success flag
+    vector<HObject> preloaded(feat_total);
+    vector<bool> load_ok(feat_total, false);
+
+    // ---- Stage 2a: Parallel ReadImage ----
+    t0 = steady_clock::now();
+    unsigned int hw_threads = thread::hardware_concurrency();
+    int n_workers = max(1u, min(hw_threads, (unsigned int)feat_total));
+    atomic<int> task_idx{0};
+    atomic<int> loaded_cnt{0};
+
+    auto worker = [&]() {
+        while (true) {
+            int i = task_idx.fetch_add(1);
+            if (i >= feat_total) break;
+            auto& t = tasks[i];
+            try {
+                ReadImage(&preloaded[i], HTuple(t.fn.c_str()));
+                HTuple hv_Channels;
+                CountChannels(preloaded[i], &hv_Channels);
+                if (hv_Channels.I() == 3) { Rgb1ToGray(preloaded[i], &preloaded[i]); }
+                load_ok[i] = true;
+                loaded_cnt.fetch_add(1);
             } catch (HException &) {
-                feat_failed++;
-                continue;
+                // image stays as default HObject, load_ok stays false
             }
         }
-        // Progress bar per image with speed / elapsed / ETA
-        double dt_sofar = duration<double>(steady_clock::now() - t0).count();
-        double img_per_s = (imgIdx + 1) / dt_sofar;
-        double eta = dt_sofar / (imgIdx + 1) * (num_images - imgIdx - 1);
-        int pct = (imgIdx + 1) * 100 / num_images;
-        int bar_w = 30, filled = (imgIdx + 1) * bar_w / num_images;
-        cout << "\r  [";
-        for (int k = 0; k < bar_w; ++k) cout << (k < filled ? '=' : (k == filled && filled < bar_w ? '>' : ' '));
-        cout << "] " << (imgIdx + 1) << "/" << num_images
-             << " | " << fixed << setprecision(1) << dt_sofar << "s"
-             << " | " << setprecision(2) << img_per_s << " img/s"
-             << " | ETA " << (int)(eta + 0.5) << "s" << flush;
+    };
+
+    cout << "[Stage 2a] Parallel preload (" << feat_total << " images, " << n_workers << " threads)..." << endl;
+    vector<thread> workers;
+    for (int w = 0; w < n_workers; ++w) workers.emplace_back(worker);
+    for (auto& w : workers) w.join();
+
+    double dt_load = duration<double>(steady_clock::now() - t0).count();
+    cout << "[Timer] Stage 2a - Preload: " << fixed << setprecision(2) << dt_load << "s ("
+         << loaded_cnt.load() << " loaded, " << (feat_total - loaded_cnt.load()) << " failed)" << endl;
+
+    // ---- Stage 2b: Serial FindCalibObject ----
+    t0 = steady_clock::now();
+    cout << "[Stage 2b] Serial FindCalibObject..." << endl;
+    for (int i = 0; i < feat_total; ++i) {
+        if (!load_ok[i]) { feat_failed++; continue; }
+        auto& t = tasks[i];
+        try {
+            FindCalibObject(preloaded[i], hv_CalibDataID, t.camIdx, 0, t.imgIdx,
+                            (HTuple("alpha").Append("sigma")),
+                            (HTuple(0.5).Append(1.0)));
+            frame_observations[t.imgIdx].push_back(t.camIdx);
+            feat_success++;
+        } catch (HException &) {
+            feat_failed++;
+            continue;
+        }
+        // Progress bar per task
+        if ((i + 1) % num_cams == 0 || i == feat_total - 1) {
+            int img_done = (i + 1) / num_cams;
+            double dt_sofar = duration<double>(steady_clock::now() - t0).count();
+            double img_per_s = img_done / dt_sofar;
+            double eta = dt_sofar / img_done * (num_images - img_done);
+            int pct = img_done * 100 / num_images;
+            int bar_w = 30, filled = img_done * bar_w / num_images;
+            cout << "\r  [";
+            for (int k = 0; k < bar_w; ++k) cout << (k < filled ? '=' : (k == filled && filled < bar_w ? '>' : ' '));
+            cout << "] " << img_done << "/" << num_images
+                 << " | " << fixed << setprecision(1) << dt_sofar << "s"
+                 << " | " << setprecision(2) << img_per_s << " img/s"
+                 << " | ETA " << (int)(eta + 0.5) << "s" << flush;
+        }
     }
     cout << endl;
-    double dt_feat = duration<double>(steady_clock::now() - t0).count();
+    double dt_find = duration<double>(steady_clock::now() - t0).count();
+    double dt_feat = dt_load + dt_find;
     cout << "[Timer] Stage 2 - Feature: " << fixed << setprecision(2) << dt_feat << "s ("
-         << feat_total << " calls, " << (dt_feat/feat_total*1000.0) << " ms avg, "
-         << feat_success << " success, " << feat_failed << " failed)" << endl;
-    cout << "  ReadImage+preprocess: " << t_io << "s (" << (t_io/dt_feat*100) << "%)" << endl;
-    cout << "  FindCalibObject:      " << t_find << "s (" << (t_find/dt_feat*100) << "%)" << endl;
+         << feat_total << " calls, " << feat_success << " success, " << feat_failed << " failed)" << endl;
+    cout << "  Preload (parallel):   " << dt_load << "s (" << (dt_load/dt_feat*100) << "%)" << endl;
+    cout << "  FindCalibObject (ser): " << dt_find << "s (" << (dt_find/dt_feat*100) << "%)" << endl;
+    preloaded.clear(); vector<HObject>().swap(preloaded);  // free ~2.4GB
 
     // ========================================================================
     // Stage 3 — 共视图连通性校验
