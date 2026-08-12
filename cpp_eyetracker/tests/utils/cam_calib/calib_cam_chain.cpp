@@ -1,16 +1,19 @@
 #include <iostream>
+#include <iomanip>
+#include <chrono>
 #include <vector>
 #include <string>
 #include <filesystem>
 #include <map>
 #include <stdexcept>
-#include <queue> // 引入队列，用于BFS图论校验
+#include <queue>
 
 #include "HalconCpp.h"
 #include "cfg/config.hpp"
 
 using namespace HalconCpp;
 using namespace std;
+using namespace std::chrono;
 
 // --- 辅助函数：关闭更新 ---
 void dev_update_off() { return; }
@@ -110,45 +113,79 @@ void scan_calib_image_folder(
 
 void action()
 {
+    auto t_total_0 = steady_clock::now();
+
     // ========================================================================
-    // 1. 配置区域与初始化
+    // 0. 配置读取 (cam_calib.yaml + capture.yaml)
     // ========================================================================
-    Cfg cfg;
-    HTuple hv_ImagePath = cfg["cam_calib"]["input_folder"].as<std::string>().c_str();
-    HTuple hv_CalibObjDescr = cfg["cam_calib"]["calib_plane"].as<std::string>().c_str();
-    HTuple hv_OutputBaseDir = cfg["cam_calib"]["output_folder"].as<std::string>().c_str();
-    std::string center_cam_sn;
-    try { center_cam_sn = cfg["cam_calib"]["center_cam"].as<std::string>(); }
+    Cfg cfg("cfg/cam_calib.yaml"); auto& calib = cfg["calib"];
+    Cfg cap("cfg/capture.yaml");
+    string cap_pid = cap["capture"]["participant_id"].as<string>();
+
+    // input_participant_id: 优先使用 cam_calib.yaml 配置，空则 fallback 到 capture.yaml
+    string pid;
+    try { pid = calib["input_participant_id"].as<string>(); } catch(...) { pid = ""; }
+    if (pid.empty()) pid = cap_pid;
+
+    string base_dir = calib["calib_save_dir"].as<string>();
+
+    // input_dir: 优先使用配置值，空则自动计算
+    string input_dir, output_dir;
+    try { input_dir = calib["input_dir"].as<string>(); } catch(...) { input_dir = ""; }
+    if (input_dir.empty()) input_dir = base_dir + "/" + pid + "/pictures";
+
+    // output_dir: 优先使用配置值，空则自动计算
+    try { output_dir = calib["output_dir"].as<string>(); } catch(...) { output_dir = ""; }
+    if (output_dir.empty()) output_dir = base_dir + "/" + pid + "/output";
+
+    filesystem::create_directories(output_dir);
+
+    HTuple hv_ImagePath      = input_dir.c_str();
+    HTuple hv_CalibObjDescr  = calib["calib_plane"].as<string>().c_str();
+    HTuple hv_OutputBaseDir   = output_dir.c_str();
+
+    double focus         = calib["focus"].as<double>();
+    double pixel_size_x  = calib["pixel_size_x"].as<double>();
+    double pixel_size_y  = calib["pixel_size_y"].as<double>();
+    string center_cam_sn;
+    try { center_cam_sn = calib["center_cam"].as<string>(); }
     catch (...) { center_cam_sn = ""; }
 
-    std::string output_folder= cfg["cam_calib"]["output_folder"].as<std::string>();
-    std::filesystem::create_directories(output_folder);
+    cout << "\n=== Multi-Camera Calibration Chain ===\n" << endl;
+    cout << "Input  : " << input_dir << endl;
+    cout << "Output : " << output_dir << endl;
+    cout << "Plate  : " << hv_CalibObjDescr.S() << endl;
+    cout << "Focus  : " << focus * 1000.0 << " mm" << endl;
+    cout << "Pixel  : " << pixel_size_x * 1e6 << " x " << pixel_size_y * 1e6 << " um" << endl;
+    if (!center_cam_sn.empty()) cout << "Center : " << center_cam_sn << endl;
 
-    HTuple hv_NumCameras;
-    HTuple hv_NumCalibImages;
-    std::vector<std::string> cam_sn_list;
+    // ========================================================================
+    // Stage 0 — 目录扫描
+    // ========================================================================
+    HTuple hv_NumCameras, hv_NumCalibImages;
+    vector<string> cam_sn_list;
 
+    auto t0 = steady_clock::now();
     scan_calib_image_folder(hv_ImagePath, &hv_NumCameras, &hv_NumCalibImages, &cam_sn_list);
+    double dt_scan = duration<double>(steady_clock::now() - t0).count();
+    cout << "[Timer] Stage 0 - Scan: " << fixed << setprecision(2) << dt_scan << "s" << endl;
 
-    double focus = cfg["cam_calib"]["focus"].as<double>();
-    double pixel_size_x = cfg["cam_calib"]["pixel_size_x"].as<double>();
-    double pixel_size_y = cfg["cam_calib"]["pixel_size_y"].as<double>();
-    
+    int num_cams   = hv_NumCameras.I();
+    int num_images = hv_NumCalibImages.I();
+
     HObject ho_Image;
-    HTuple hv_CalibDataID; // 只需要一个主句柄
+    HTuple hv_CalibDataID;
     HTuple hv_StartCamParam;
     HTuple hv_Width, hv_Height;
     HTuple hv_Errors;
 
-    int num_cams = hv_NumCameras.I();
-    int num_images = hv_NumCalibImages.I();
-
-    std::cout << "\n--- Starting Robust Multi-Camera Calibration ---\n" << std::endl;
-
     CreateCalibData("calibration_object", hv_NumCameras, 1, &hv_CalibDataID);
     SetCalibDataCalibObject(hv_CalibDataID, 0, hv_CalibObjDescr);
 
-    std::cout << "--- Initializing Cameras ---" << std::endl;
+    // ========================================================================
+    // Stage 1 — 相机初始化
+    // ========================================================================
+    t0 = steady_clock::now();
     for (int camIdx = 0; camIdx < num_cams; ++camIdx)
     {
         HTuple hv_CurrentFile = hv_ImagePath + "/calib_cam_" + HTuple(cam_sn_list[camIdx].c_str()) + "_01";
@@ -156,116 +193,91 @@ void action()
             ReadImage(&ho_Image, hv_CurrentFile);
             HTuple hv_Channels;
             CountChannels(ho_Image, &hv_Channels);
-            if (hv_Channels.I() == 3) {
-                Rgb1ToGray(ho_Image, &ho_Image);
-            }
+            if (hv_Channels.I() == 3) { Rgb1ToGray(ho_Image, &ho_Image); }
             GetImageSize(ho_Image, &hv_Width, &hv_Height);
 
-            // 检查该相机是否有特定的焦距覆盖
             double cam_focus = focus;
             try {
-                auto& overrides = cfg["cam_calib"]["focus_overrides"];
+                auto& overrides = calib["focus_overrides"];
                 cam_focus = overrides[cam_sn_list[camIdx]].as<double>();
-                std::cout << "Camera " << camIdx << " (" << cam_sn_list[camIdx]
-                          << ") focus override: " << cam_focus * 1000.0 << "mm" << std::endl;
-            } catch (const std::runtime_error&) {
-                // 没有覆盖，使用默认焦距
-            }
+                cout << "  Camera " << camIdx << " (" << cam_sn_list[camIdx]
+                     << ") focus override: " << cam_focus * 1000.0 << " mm" << endl;
+            } catch (const runtime_error&) {}
 
             gen_cam_par_area_scan_division(cam_focus, 0, pixel_size_x, pixel_size_y,
                                            hv_Width/2, hv_Height/2, hv_Width, hv_Height,
                                            &hv_StartCamParam);
-            
             SetCalibDataCamParam(hv_CalibDataID, camIdx, HTuple(), hv_StartCamParam);
-            std::cout << "Camera " << camIdx << " initialized (" << hv_Width.L() << "x" << hv_Height.L() << ")" << std::endl;
         }
         catch (HException &ex) {
-            std::cerr << "Fatal Error: Cannot read init image: " << hv_CurrentFile.S() << std::endl;
+            cerr << "[Error] Cannot read init image: " << hv_CurrentFile.S() << endl;
             throw ex;
         }
     }
+    double dt_init = duration<double>(steady_clock::now() - t0).count();
+    cout << "[Timer] Stage 1 - Init: " << fixed << setprecision(2) << dt_init << "s ("
+         << num_cams << " cameras, " << (dt_init/num_cams) << "s avg each)" << endl;
 
     // ========================================================================
-    // 2. 阶段一：完全解耦的特征提取 (Independent Observation)
+    // Stage 2 — 特征提取 (核心瓶颈)
     // ========================================================================
-    std::cout << "\n--- Processing Frames (Decoupled Observation) ---" << std::endl;
-    
-    // 数据结构：记录每一帧有哪些相机成功检测到了标定板
-    std::vector<std::vector<int>> frame_observations(num_images);
+    vector<vector<int>> frame_observations(num_images);
+    int feat_total = 0, feat_success = 0, feat_failed = 0;
 
+    t0 = steady_clock::now();
     for (int imgIdx = 0; imgIdx < num_images; ++imgIdx)
     {
         HTuple imgIdxStr = HTuple(imgIdx).TupleString("02d");
-        
         for (int camIdx = 0; camIdx < num_cams; ++camIdx)
         {
+            feat_total++;
             HTuple currentFileName = hv_ImagePath + "/calib_cam_" + HTuple(cam_sn_list[camIdx].c_str()) + "_" + imgIdxStr;
             try {
                 ReadImage(&ho_Image, currentFileName);
-
-                // 彩色图转为灰度，保证标定一致性
                 HTuple hv_Channels;
                 CountChannels(ho_Image, &hv_Channels);
-                if (hv_Channels.I() == 3) {
-                    Rgb1ToGray(ho_Image, &ho_Image);
-                }
+                if (hv_Channels.I() == 3) { Rgb1ToGray(ho_Image, &ho_Image); }
 
-                // 尝试提取特征并直接添加到模型
                 FindCalibObject(ho_Image, hv_CalibDataID, camIdx, 0, imgIdx,
-                                (HTuple("alpha").Append("sigma")), 
+                                (HTuple("alpha").Append("sigma")),
                                 (HTuple(0.5).Append(1.0)));
-                
-                // 走到这里说明提取成功，记录该相机观测到了当前帧
                 frame_observations[imgIdx].push_back(camIdx);
-                
+                feat_success++;
             } catch (HException &) {
-                // 静默跳过：该相机在这帧没拍到或读图失败，不影响其他相机
-                continue; 
+                feat_failed++;
+                continue;
             }
         }
-        
-        if (!frame_observations[imgIdx].empty()) {
-            std::cout << "Frame " << imgIdx << " processed. Cams found: " << frame_observations[imgIdx].size() << std::endl;
-        }
     }
+    double dt_feat = duration<double>(steady_clock::now() - t0).count();
+    cout << "[Timer] Stage 2 - Feature: " << fixed << setprecision(2) << dt_feat << "s ("
+         << feat_total << " calls, " << (dt_feat/feat_total*1000.0) << " ms avg, "
+         << feat_success << " success, " << feat_failed << " failed)" << endl;
 
     // ========================================================================
-    // 3. 阶段二：连通图校验 (Graph Connectivity Validation)
+    // Stage 3 — 共视图连通性校验
     // ========================================================================
-    std::cout << "\n--- Validating Camera Co-visibility Graph ---" << std::endl;
-    
-    // 参数：两个相机至少需要共同看到多少帧，才认为它们之间的位姿边是可靠的
-    const int MIN_COVISIBILITY = 3; 
-    
-    // 构建邻接矩阵记录共视次数
-    std::vector<std::vector<int>> adj_matrix(num_cams, std::vector<int>(num_cams, 0));
-    
+    t0 = steady_clock::now();
+    const int MIN_COVISIBILITY = 3;
+    vector<vector<int>> adj_matrix(num_cams, vector<int>(num_cams, 0));
+
     for (const auto& obs_list : frame_observations) {
-        // 如果一帧中有多个相机看到标定板，它们两两之间增加一次共视记录
         for (size_t i = 0; i < obs_list.size(); ++i) {
             for (size_t j = i + 1; j < obs_list.size(); ++j) {
-                int c1 = obs_list[i];
-                int c2 = obs_list[j];
-                adj_matrix[c1][c2]++;
-                adj_matrix[c2][c1]++;
+                int c1 = obs_list[i], c2 = obs_list[j];
+                adj_matrix[c1][c2]++; adj_matrix[c2][c1]++;
             }
         }
     }
 
-    // 使用 BFS (广度优先搜索) 检查连通性，以 Cam 0 为参考基准
-    std::vector<bool> visited(num_cams, false);
-    std::queue<int> q;
-    
-    q.push(0);
-    visited[0] = true;
+    vector<bool> visited(num_cams, false);
+    queue<int> q;
+    q.push(0); visited[0] = true;
     int connected_count = 1;
 
     while (!q.empty()) {
-        int curr = q.front();
-        q.pop();
-        
+        int curr = q.front(); q.pop();
         for (int next_cam = 0; next_cam < num_cams; ++next_cam) {
-            // 如果未访问过，且共视次数达到阈值，则认为连通
             if (!visited[next_cam] && adj_matrix[curr][next_cam] >= MIN_COVISIBILITY) {
                 visited[next_cam] = true;
                 q.push(next_cam);
@@ -274,41 +286,37 @@ void action()
         }
     }
 
-    // 判断连通结果
     if (connected_count < num_cams) {
-        std::cerr << "[ERROR] Camera Graph is Disconnected! Calibration will fail." << std::endl;
-        std::cerr << "The following cameras lack sufficient co-visibility (minimum " << MIN_COVISIBILITY << " required):" << std::endl;
+        cerr << "[Error] Camera Graph is Disconnected! (min " << MIN_COVISIBILITY << " co-visibility required)" << endl;
         for (int i = 0; i < num_cams; ++i) {
-            if (!visited[i]) {
-                std::cerr << " -> Camera " << i << " is isolated." << std::endl;
-            }
+            if (!visited[i]) cerr << "  -> Camera " << i << " is isolated." << endl;
         }
-        ClearCalibData(hv_CalibDataID);
-        return; // 提前安全终止，防止内部崩溃
-    } else {
-        std::cout << "Graph Check Passed: All cameras are safely connected to the reference frame." << std::endl;
-    }
-
-    // ========================================================================
-    // 4. 阶段三：执行标定 (Execution)
-    // ========================================================================
-    std::cout << "\n--- Calculating Calibration Parameters ---" << std::endl;
-    try {
-        CalibrateCameras(hv_CalibDataID, &hv_Errors);
-        std::cout << "Calibration Complete. Average Error: " << hv_Errors.D() << " pixels" << std::endl;
-    } catch (HException &ex) {
-        std::cerr << "Calibration Calculation Failed: " << ex.ErrorMessage().TextA() << std::endl;
         ClearCalibData(hv_CalibDataID);
         return;
     }
+    double dt_graph = duration<double>(steady_clock::now() - t0).count();
+    cout << "[Timer] Stage 3 - Graph: " << fixed << setprecision(2) << dt_graph << "s (connected)" << endl;
 
     // ========================================================================
-    // 5. 重基准到中心相机
+    // Stage 4 — 执行标定
     // ========================================================================
-    std::cout << "\n--- Re-basing to Center Camera: " << center_cam_sn << " ---" << std::endl;
+    t0 = steady_clock::now();
+    try {
+        CalibrateCameras(hv_CalibDataID, &hv_Errors);
+    } catch (HException &ex) {
+        cerr << "[Error] Calibration failed: " << ex.ErrorMessage().TextA() << endl;
+        ClearCalibData(hv_CalibDataID);
+        return;
+    }
+    double dt_calib = duration<double>(steady_clock::now() - t0).count();
+    cout << "[Timer] Stage 4 - Calibrate: " << fixed << setprecision(2) << dt_calib
+         << "s (error=" << hv_Errors.D() << " px)" << endl;
 
-    // 获取各相机在 cam0 坐标系下的位姿
-    std::vector<HTuple> poses_in_cam0(num_cams);
+    // ========================================================================
+    // Stage 5 — 重基准到中心相机
+    // ========================================================================
+    t0 = steady_clock::now();
+    vector<HTuple> poses_in_cam0(num_cams);
     for (int camIdx = 0; camIdx < num_cams; ++camIdx) {
         if (camIdx == 0)
             CreatePose(0, 0, 0, 0, 0, 0, "Rp+T", "gba", "point", &poses_in_cam0[camIdx]);
@@ -316,39 +324,34 @@ void action()
             GetCalibData(hv_CalibDataID, "camera", camIdx, "pose", &poses_in_cam0[camIdx]);
     }
 
-    // 找到中心相机索引
     int center_idx = -1;
-    for (int i = 0; i < num_cams; ++i) {
-        if (cam_sn_list[i] == center_cam_sn) { center_idx = i; break; }
-    }
-    if (center_idx < 0) {
-        std::cerr << "[Error] Center camera " << center_cam_sn << " not in camera list!" << std::endl;
+    if (!center_cam_sn.empty()) {
+        for (int i = 0; i < num_cams; ++i) {
+            if (cam_sn_list[i] == center_cam_sn) { center_idx = i; break; }
+        }
+        if (center_idx < 0) cerr << "[Warn] Center camera " << center_cam_sn << " not found, using cam 0" << endl;
     }
 
-    // T_center_to_cam0 = pose of center camera in cam0 frame
-    // T_cam0_to_center = inv(T_center_to_cam0)
-    // T_cam_i_to_center = T_cam0_to_center * T_cam_i_to_cam0
     HTuple T_center_to_cam0, T_cam0_to_center;
     if (center_idx >= 0) {
         T_center_to_cam0 = poses_in_cam0[center_idx];
         PoseInvert(T_center_to_cam0, &T_cam0_to_center);
     }
 
-    // 计算各相机在中心相机坐标系下的位姿
-    std::vector<HTuple> poses_in_center(num_cams);
+    vector<HTuple> poses_in_center(num_cams);
     for (int camIdx = 0; camIdx < num_cams; ++camIdx) {
-        if (center_idx >= 0) {
+        if (center_idx >= 0)
             PoseCompose(T_cam0_to_center, poses_in_cam0[camIdx], &poses_in_center[camIdx]);
-        } else {
-            poses_in_center[camIdx] = poses_in_cam0[camIdx];  // fallback
-        }
+        else
+            poses_in_center[camIdx] = poses_in_cam0[camIdx];
     }
+    double dt_rebase = duration<double>(steady_clock::now() - t0).count();
+    cout << "[Timer] Stage 5 - Rebase: " << fixed << setprecision(2) << dt_rebase << "s" << endl;
 
     // ========================================================================
-    // 6. 导出参数
+    // Stage 6 — 导出 XML
     // ========================================================================
-    std::cout << "\n--- Exporting Parameters ---" << std::endl;
-
+    t0 = steady_clock::now();
     for (int camIdx = 0; camIdx < num_cams; ++camIdx)
     {
         HTuple hv_CurrentCamParam, hv_CurrentPose, hv_StringPose;
@@ -359,12 +362,10 @@ void action()
 
         HTuple outFileName = hv_OutputBaseDir + "/" + HTuple(cam_sn_list[camIdx].c_str()) + "_Data.xml";
         OpenFile(outFileName, "output", &hv_FileHandle);
-        
-        // Write XML Header
+
         FwriteString(hv_FileHandle, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         FwriteString(hv_FileHandle, "<CameraData>\n");
-        
-        // Internal Params
+
         FwriteString(hv_FileHandle, "  <InternalParameters>\n");
         HTuple type = ((const HTuple&)hv_CurrentCamParam)[0];
         HTuple vals = hv_CurrentCamParam.TupleSelectRange(1, hv_CurrentCamParam.TupleLength()-1);
@@ -374,40 +375,53 @@ void action()
         FwriteString(hv_FileHandle, ("    <RawData>" + hv_FullParamString) + "</RawData>\n");
         FwriteString(hv_FileHandle, "  </InternalParameters>\n");
 
-        // External Params
         FwriteString(hv_FileHandle, "  <ExternalParameters>\n");
         TupleString(hv_CurrentPose, ".12g", &hv_StringPose);
-        
         FwriteString(hv_FileHandle, "    <Translation>\n");
         FwriteString(hv_FileHandle, ("      <X>" + HTuple(hv_StringPose[0])) + "</X>\n");
         FwriteString(hv_FileHandle, ("      <Y>" + HTuple(hv_StringPose[1])) + "</Y>\n");
         FwriteString(hv_FileHandle, ("      <Z>" + HTuple(hv_StringPose[2])) + "</Z>\n");
         FwriteString(hv_FileHandle, "    </Translation>\n");
-        
+
         FwriteString(hv_FileHandle, "    <Rotation>\n");
         FwriteString(hv_FileHandle, ("      <Alpha>" + HTuple(hv_StringPose[3])) + "</Alpha>\n");
         FwriteString(hv_FileHandle, ("      <Beta>" + HTuple(hv_StringPose[4])) + "</Beta>\n");
         FwriteString(hv_FileHandle, ("      <Gamma>" + HTuple(hv_StringPose[5])) + "</Gamma>\n");
         FwriteString(hv_FileHandle, "    </Rotation>\n");
-        
-        // Meta
+
         FwriteString(hv_FileHandle, "    <Meta>\n");
         FwriteString(hv_FileHandle, ("      <PoseTypeCode>" + HTuple(hv_StringPose[6])) + "</PoseTypeCode>\n");
         FwriteString(hv_FileHandle, "      <OrderOfTransform>Rp+T</OrderOfTransform>\n");
         FwriteString(hv_FileHandle, "      <OrderOfRotation>gba</OrderOfRotation>\n");
         FwriteString(hv_FileHandle, "      <ViewOfTransform>point</ViewOfTransform>\n");
         FwriteString(hv_FileHandle, "    </Meta>\n");
-        
+
         FwriteString(hv_FileHandle, ("    <RawPose>" + ((hv_StringPose + " ").TupleSum())) + "</RawPose>\n");
         FwriteString(hv_FileHandle, "  </ExternalParameters>\n");
         FwriteString(hv_FileHandle, "</CameraData>\n");
-        
-        CloseFile(hv_FileHandle);
-        std::cout << "Saved: " << outFileName.S() << std::endl;
-    }
 
-    // 清理所有句柄
+        CloseFile(hv_FileHandle);
+    }
+    double dt_export = duration<double>(steady_clock::now() - t0).count();
+    cout << "[Timer] Stage 6 - Export: " << fixed << setprecision(2) << dt_export
+         << "s (" << num_cams << " XML files)" << endl;
+
     ClearCalibData(hv_CalibDataID);
+
+    // ========================================================================
+    // Total
+    // ========================================================================
+    double dt_total = duration<double>(steady_clock::now() - t_total_0).count();
+    cout << "========================================" << endl;
+    cout << "[Timer] Total: " << fixed << setprecision(2) << dt_total << "s" << endl;
+    cout << "  Scan:    " << setw(8) << dt_scan   << "s (" << (dt_scan/dt_total*100)  << "%)" << endl;
+    cout << "  Init:    " << setw(8) << dt_init   << "s (" << (dt_init/dt_total*100)  << "%)" << endl;
+    cout << "  Feature: " << setw(8) << dt_feat   << "s (" << (dt_feat/dt_total*100)  << "%)" << endl;
+    cout << "  Graph:   " << setw(8) << dt_graph  << "s (" << (dt_graph/dt_total*100) << "%)" << endl;
+    cout << "  Calibrate:" << setw(7) << dt_calib << "s (" << (dt_calib/dt_total*100) << "%)" << endl;
+    cout << "  Rebase:  " << setw(8) << dt_rebase << "s (" << (dt_rebase/dt_total*100)<< "%)" << endl;
+    cout << "  Export:  " << setw(8) << dt_export << "s (" << (dt_export/dt_total*100)<< "%)" << endl;
+    cout << endl;
 }
 
 // --- Main Entry Point ---
