@@ -120,7 +120,6 @@ int main(){
     WSADATA wsa; WSAStartup(MAKEWORD(2,2),&wsa);
 #endif
     Cfg cfg("cfg/cam_calib.yaml"); auto& c=cfg["calib"];
-    Pylon::PylonInitialize();
     g_is_master=c["is_master"].as<bool>(); string mip=c["master_ip"].as<string>(),sip=c["slave_ip"].as<string>();
     int port=c["port"].as<int>(); g_enable_net_sync=c["enable_net_sync"].as<bool>();
     vector<string> sns=c["cam_indices"].as<vector<string>>();
@@ -131,6 +130,7 @@ int main(){
     string test_recv; try{test_recv=c["test_transfer_recv_dir"].as<string>();test_recv+="/"+pid+"/pictures";}catch(...){test_recv="D:/calib_transfer_test/"+pid+"/pictures";}
     double fps=c["fps"].as<double>(),gain=c["gain"].as<double>(),gamma=c["gamma"].as<double>(),exp=c["exposure_time"].as<double>(),me=c["calib_mono_exp_ext"].as<double>();
     g_win_w=c["window_width"].as<int>(); g_win_h=c["window_height"].as<int>(); double uif=c["ui_fps"].as<double>();
+    cout<<"[Init] Config loaded. Role="<<(g_is_master?"MASTER":"SLAVE")<<" Port="<<port<<" TestXfer="<<(test_xfer?"ON":"OFF")<<endl;
 
     // ---- TCP setup ----
     thread cmd_thread;
@@ -188,6 +188,7 @@ int main(){
     }
 
     // ---- Camera init (non-test mode) ----
+    Pylon::PylonInitialize();
     for(size_t i=0;i<sns.size();++i){auto ctx=make_shared<CameraContext>(sns[i]);cam_ctxs.push_back(ctx);}
     for(auto& ctx:cam_ctxs){ctx->running=true;ctx->copy_thread=thread(copyWorker,ctx);ctx->capture_thread=thread(captureWorker,ctx,fps,gain,gamma,exp,me);}
 

@@ -19,7 +19,7 @@ calib:
   port: 49200                       # TCP 控制 + 文件传输端口
   enable_net_sync: true
 
-  calib_save_dir: "D:/calib_arm"    # 总目录, 完整路径 = calib_save_dir/{participant_id}
+  calib_save_dir: "D:/calib_images"    # 总目录, 完整路径 = calib_save_dir/{participant_id}
                                      # participant_id 从 capture.yaml 读取
 
   fps: 100
