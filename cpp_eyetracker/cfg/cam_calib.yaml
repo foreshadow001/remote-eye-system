@@ -32,5 +32,5 @@ calib:
   ui_fps: 20.0
 
   # 传输测试 (跳过相机初始化)
-  test_transfer: true              # true = 跳过主循环, 直接测试 TCP 传输速度
+  test_transfer: false              # true = 跳过主循环, 直接测试 TCP 传输速度
   test_transfer_recv_dir: "D:/calib_transfer_test"  # Master 测试接收目录
