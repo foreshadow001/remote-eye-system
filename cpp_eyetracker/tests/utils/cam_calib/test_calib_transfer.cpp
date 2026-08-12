@@ -131,9 +131,11 @@ int main(){
     double fps=c["fps"].as<double>(),gain=c["gain"].as<double>(),gamma=c["gamma"].as<double>(),exp=c["exposure_time"].as<double>(),me=c["calib_mono_exp_ext"].as<double>();
     g_win_w=c["window_width"].as<int>(); g_win_h=c["window_height"].as<int>(); double uif=c["ui_fps"].as<double>();
     cout<<"[Init] Config loaded. Role="<<(g_is_master?"MASTER":"SLAVE")<<" Port="<<port<<" TestXfer="<<(test_xfer?"ON":"OFF")<<endl;
+    cout<<"[Init] net_sync="<<g_enable_net_sync<<" is_master="<<g_is_master<<endl;
 
     // ---- TCP setup ----
     thread cmd_thread;
+    cout<<"[TCP] Entering setup block..."<<endl;
     if(g_enable_net_sync){
         if(g_is_master){ g_listen_sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); int opt=1;setsockopt(g_listen_sock,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
             sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(port);sa.sin_addr.s_addr=INADDR_ANY;::bind(g_listen_sock,(sockaddr*)&sa,sizeof(sa));listen(g_listen_sock,1);
