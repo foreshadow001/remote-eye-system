@@ -118,8 +118,10 @@ void action()
     // ========================================================================
     // 0. 配置读取 (cam_calib.yaml + capture.yaml)
     // ========================================================================
-    Cfg cfg("cfg/cam_calib.yaml"); auto& calib = cfg["calib"];
-    Cfg cap("cfg/capture.yaml");
+    namespace fs = std::filesystem;
+    fs::path cfg_dir = fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path() / "cfg";
+    Cfg cfg((cfg_dir / "cam_calib.yaml").string()); auto& calib = cfg["calib"];
+    Cfg cap((cfg_dir / "capture.yaml").string());
     string cap_pid = cap["capture"]["participant_id"].as<string>();
 
     // input_participant_id: 优先使用 cam_calib.yaml 配置，空则 fallback 到 capture.yaml
@@ -443,6 +445,11 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Error #%u in %s: %s\n", exception.ErrorCode(),
             exception.ProcName().TextA(),
             exception.ErrorMessage().TextA());
+        ret = 1;
+    }
+    catch (const std::exception& e)
+    {
+        fprintf(stderr, "[Fatal] %s\n", e.what());
         ret = 1;
     }
     return ret;
