@@ -61,6 +61,7 @@ bool recvLine(SOCKET s, string& line, int timeout_ms=3000) {
 }
 
 bool sendLine(SOCKET s,const string& m){string d=m+"\n";return send(s,d.c_str(),(int)d.length(),0)>0;}
+bool sendExact(SOCKET s,const void* buf,size_t n){size_t sent=0;while(sent<n){int r=send(s,(const char*)buf+sent,(int)(n-sent),0);if(r<=0)return false;sent+=r;}return true;}
 bool recvExact(SOCKET s,void* buf,size_t n){size_t got=0;while(got<n){int r=recv(s,(char*)buf+got,(int)(n-got),0);if(r<=0)return false;got+=r;}return true;}
 
 // Consume from g_tcp_leftover first, then recvExact the rest from socket.
@@ -122,13 +123,14 @@ void slaveCmdWorker(SOCKET s){
         else if(line=="LIST_REQ"){stringstream fl;for(auto& f:scanFiles(g_save_dir))fl<<f<<",";sendLine(s,"LIST_RESP:"+fl.str());}
         else if(line=="CLEAR"){if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;g_last_idx=-1;sendLine(s,"CLEAR_DONE");}
         else if(line.rfind("XFER:",0)==0){string lst=line.substr(5);stringstream ss(lst);string tok;vector<string> files;while(getline(ss,tok,','))if(!tok.empty())files.push_back(tok);
-            cout<<"[Slave] XFER: sending "<<files.size()<<" files"<<endl;
+            int total=(int)files.size(),cnt=0;size_t total_bytes=0;
+            cout<<"[Slave] XFER: sending "<<total<<" files"<<endl;
             for(auto& f:files){size_t u=f.rfind('_');string sn=f.substr(0,u);int idx=stoi(f.substr(u+1));stringstream fn;fn<<setw(2)<<setfill('0')<<idx;string path=g_save_dir+"/calib_cam_"+sn+"_"+fn.str()+".jpg";
                 ifstream in(path,ios::binary|ios::ate);if(in){size_t sz=in.tellg();in.seekg(0);vector<char> data(sz);in.read(data.data(),sz);in.close();
-                    char hdr[128];snprintf(hdr,sizeof(hdr),"FILE:%s:%d:%zu",sn.c_str(),idx,sz);sendLine(s,hdr);send(s,data.data(),(int)sz,0);
-                    cout<<"[Slave] Sent "<<sn<<"_"<<fn.str()<<" ("<<sz<<" bytes)"<<endl;}
+                    char hdr[128];snprintf(hdr,sizeof(hdr),"FILE:%s:%d:%zu",sn.c_str(),idx,sz);sendLine(s,hdr);if(!sendExact(s,data.data(),sz)){cerr<<"[Slave] sendExact FAILED for "<<sn<<"_"<<fn.str()<<endl;break;}
+                    total_bytes+=sz;cnt++;if(cnt%50==0||cnt==total)cout<<"[Slave] Progress: "<<cnt<<"/"<<total<<" ("<<(total_bytes/1048576.0)<<" MB)"<<endl;}
                 else{cerr<<"[Slave] Cannot read "<<path<<endl;}}
-            sendLine(s,"XFER_DONE");cout<<"[Slave] XFER_DONE sent."<<endl;}
+            sendLine(s,"XFER_DONE");cout<<"[Slave] XFER_DONE sent. "<<cnt<<" files, "<<(total_bytes/1048576.0)<<" MB"<<endl;}
         else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){/*handle fault*/}
         else if(line=="SHUTDOWN"){global_running=false;}
     }
@@ -154,6 +156,8 @@ int main(){
     g_win_w=c["window_width"].as<int>(); g_win_h=c["window_height"].as<int>(); double uif=c["ui_fps"].as<double>();
     cout<<"[Init] Config loaded. Role="<<(g_is_master?"MASTER":"SLAVE")<<" Port="<<port<<" TestXfer="<<(test_xfer?"ON":"OFF")<<endl;
     cout<<"[Init] net_sync="<<g_enable_net_sync<<" is_master="<<g_is_master<<endl;
+    cout<<"[Init] g_save_dir="<<g_save_dir<<endl;
+    if(test_xfer) cout<<"[Init] test_recv="<<test_recv<<endl;
 
     // ---- TCP setup ----
     thread cmd_thread;
@@ -205,8 +209,10 @@ int main(){
                 xfer_total=(int)mis.size();xfer_status="Transferring "+to_string(xfer_total)+" files...";
                 string xfer="XFER:";for(auto& f:mis)xfer+=f+",";cout<<"[DBG] Sending XFER with "<<mis.size()<<" files..."<<endl;sendLine(g_ctrl_sock,xfer);
                 auto t0=chrono::steady_clock::now();
-                while(true){string l;if(!recvLine(g_ctrl_sock,l,30000)){cerr<<"[DBG] recv timeout/error in XFER loop (got "<<xfer_cnt<<" files)"<<endl;break;}if(l=="XFER_DONE"){cout<<"[DBG] Received XFER_DONE"<<endl;break;}if(l.rfind("FILE:",0)==0){stringstream fs(l.substr(5));string sn,ix,sz;getline(fs,sn,':');getline(fs,ix,':');getline(fs,sz);size_t s=(size_t)stoull(sz);cout<<"[DBG] FILE "<<sn<<"_"<<ix<<" size="<<s<<endl;vector<char> buf(s);if(!recvExactDrain(g_ctrl_sock,buf.data(),s)){cerr<<"[DBG] recvExact FAILED for "<<sn<<"_"<<ix<<endl;break;}xfer_bytes+=s;xfer_cnt++;stringstream fn;fn<<setw(2)<<setfill('0')<<stoi(ix);string path=test_recv+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),s);
-                    auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;}else{cout<<"[DBG] Unknown recv: "<<l.substr(0,min(60,(int)l.length()))<<endl;}}
+                while(true){string l;if(!recvLine(g_ctrl_sock,l,30000)){cerr<<"[XFER] recv timeout (got "<<xfer_cnt<<"/"<<xfer_total<<" files)"<<endl;break;}if(l=="XFER_DONE"){cout<<"[XFER] Received XFER_DONE"<<endl;break;}if(l.rfind("FILE:",0)==0){stringstream fs(l.substr(5));string sn,ix,sz;getline(fs,sn,':');getline(fs,ix,':');getline(fs,sz);size_t s=(size_t)stoull(sz);vector<char> buf(s);if(!recvExactDrain(g_ctrl_sock,buf.data(),s)){cerr<<"[XFER] recvExact FAILED for "<<sn<<"_"<<ix<<endl;break;}xfer_bytes+=s;xfer_cnt++;stringstream fn;fn<<setw(2)<<setfill('0')<<stoi(ix);string path=test_recv+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),s);
+                    auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;
+                    if(xfer_cnt%50==0||xfer_cnt==xfer_total)cout<<"[XFER] Progress: "<<xfer_cnt<<"/"<<xfer_total<<" ("<<(xfer_bytes/1048576.0)<<" MB, "<<xfer_speed<<" MB/s)"<<endl;}
+                else{cout<<"[XFER] Unexpected line: "<<l.substr(0,min(60,(int)l.length()))<<endl;}}
                 auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;xfer_done=true;
                 cout<<"[XFER] "<<xfer_cnt<<" files, "<<fixed<<setprecision(1)<<(xfer_bytes/1048576.0)<<" MB, "<<dt<<"s, "<<xfer_speed<<" MB/s"<<endl;
             }
