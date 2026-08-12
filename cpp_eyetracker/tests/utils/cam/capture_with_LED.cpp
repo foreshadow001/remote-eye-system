@@ -76,8 +76,10 @@ void drawLedIndicator(cv::Mat& canvas) {
         case LedState::EXHAUSTED:  color={0,0,255};   text="EXHAUSTED"; break;
         case LedState::OVER:       color={255,0,255}; text="OVER"; break;
     }
-    cv::rectangle(canvas, cv::Rect(10, 10, 20, 20), color, -1);
-    cv::putText(canvas, text, cv::Point(38, 25), cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv::LINE_AA);
+    int cw=canvas.cols, ch=canvas.rows;
+    int bx=cw-160, by=ch-35;
+    cv::rectangle(canvas, cv::Rect(bx, by, 20, 20), color, -1);
+    cv::putText(canvas, text, cv::Point(bx+26, by+15), cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv::LINE_AA);
 }
 
 // ================== Piper arm state (Master only) ==================
@@ -959,8 +961,8 @@ int main() {
         // ===== LED state update (Master only) =====
         if (is_master_pc) {
             if (g_show_exhausted) {
-                if (g_upper_done && g_lower_done) g_led_state = LedState::OVER;
-                else                              g_led_state = LedState::EXHAUSTED;
+                // TODO: OVER state when both arms done (reserved)
+                g_led_state = LedState::EXHAUSTED;
             } else if (is_dumping) {
                 g_led_state = LedState::WAITING;
             } else if (is_recording) {
@@ -1050,6 +1052,7 @@ int main() {
             for(auto& ctx:cam_ctxs) if(!ctx->dump_ready.load()){all_done=false;break;}
             if (all_done) {
                 g_consecutive_faults=0; is_recording=false; is_dumping=true; g_recording_number++;
+                if(is_master_pc) g_led_state = LedState::WAITING;  // update before loading screens
                 auto t0=chrono::steady_clock::now();
 
                 // Save old gaze (recording #N position) before arm overwrites it
@@ -1058,11 +1061,11 @@ int main() {
                 double rec_gaze_z = g_gaze_z.load();
 
                 // ====== PARALLEL: ARM (thread) + HDF5 (main thread) ======
-                { cv::Mat loading=cv::Mat::zeros(400,600,CV_8UC3);
+                { cv::Mat loading=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
                   cv::putText(loading,"ARM + HDF5 STAGE ("+to_string(cam_ctxs.size())+" cameras)",
-                              cv::Point(50,200),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,200,255),2);
+                              cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,1.0,cv::Scalar(0,200,255),2);
                   char gb[128];snprintf(gb,sizeof(gb),"Gaze (rec #%d): [%.4f, %.4f, %.4f]",g_recording_number,rec_gaze_x,rec_gaze_y,rec_gaze_z);
-                  cv::putText(loading,gb,cv::Point(50,240),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,0),1);
+                  cv::putText(loading,gb,cv::Point(g_win_w/4,g_win_h/2+40),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,0),1);
                   if(is_master_pc) drawLedIndicator(loading);
                   cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
 
