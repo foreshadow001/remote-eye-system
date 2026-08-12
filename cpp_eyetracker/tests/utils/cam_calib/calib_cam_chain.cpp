@@ -262,7 +262,7 @@ void action()
         cout << "] " << (imgIdx + 1) << "/" << num_images
              << " | " << fixed << setprecision(1) << dt_sofar << "s"
              << " | " << setprecision(2) << img_per_s << " img/s"
-             << " | ETA " << setprecision(0) << eta << "s" << flush;
+             << " | ETA " << (int)(eta + 0.5) << "s" << flush;
     }
     cout << endl;
     double dt_feat = duration<double>(steady_clock::now() - t0).count();
@@ -325,14 +325,8 @@ void action()
         return;
     }
     double dt_calib = duration<double>(steady_clock::now() - t0).count();
-    cout << "[Timer] Stage 4 - Calibrate: " << fixed << setprecision(2) << dt_calib << "s" << endl;
-    cout << "  Errors tuple length: " << hv_Errors.Length() << endl;
-    if (hv_Errors.Length() > 1) {
-        cout << "  Per-camera errors (px):" << endl;
-        for (Hlong i = 0; i < hv_Errors.Length(); ++i)
-            cout << "    Cam " << i << ": " << hv_Errors[i].D() << " px" << endl;
-    }
-    cout << "  Overall RMS error: " << (hv_Errors.Length() > 1 ? hv_Errors.TupleMean().D() : hv_Errors.D()) << " px" << endl;
+    cout << "[Timer] Stage 4 - Calibrate: " << fixed << setprecision(2) << dt_calib
+         << "s (RMS error=" << hv_Errors.D() << " px)" << endl;
 
     // ========================================================================
     // Stage 5 — 重基准到中心相机
