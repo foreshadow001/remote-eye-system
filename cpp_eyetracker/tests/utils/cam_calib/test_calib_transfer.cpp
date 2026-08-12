@@ -104,10 +104,13 @@ void slaveCmdWorker(SOCKET s){
         else if(line=="LIST_REQ"){stringstream fl;for(auto& f:scanFiles(g_save_dir))fl<<f<<",";sendLine(s,"LIST_RESP:"+fl.str());}
         else if(line=="CLEAR"){if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;g_last_idx=-1;sendLine(s,"CLEAR_DONE");}
         else if(line.rfind("XFER:",0)==0){string lst=line.substr(5);stringstream ss(lst);string tok;vector<string> files;while(getline(ss,tok,','))if(!tok.empty())files.push_back(tok);
+            cout<<"[Slave] XFER: sending "<<files.size()<<" files"<<endl;
             for(auto& f:files){size_t u=f.rfind('_');string sn=f.substr(0,u);int idx=stoi(f.substr(u+1));stringstream fn;fn<<setw(2)<<setfill('0')<<idx;string path=g_save_dir+"/calib_cam_"+sn+"_"+fn.str()+".jpg";
                 ifstream in(path,ios::binary|ios::ate);if(in){size_t sz=in.tellg();in.seekg(0);vector<char> data(sz);in.read(data.data(),sz);in.close();
-                    char hdr[128];snprintf(hdr,sizeof(hdr),"FILE:%s:%d:%zu",sn.c_str(),idx,sz);sendLine(s,hdr);send(s,data.data(),(int)sz,0);}}
-            sendLine(s,"XFER_DONE");}
+                    char hdr[128];snprintf(hdr,sizeof(hdr),"FILE:%s:%d:%zu",sn.c_str(),idx,sz);sendLine(s,hdr);send(s,data.data(),(int)sz,0);
+                    cout<<"[Slave] Sent "<<sn<<"_"<<fn.str()<<" ("<<sz<<" bytes)"<<endl;}
+                else{cerr<<"[Slave] Cannot read "<<path<<endl;}}
+            sendLine(s,"XFER_DONE");cout<<"[Slave] XFER_DONE sent."<<endl;}
         else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){/*handle fault*/}
         else if(line=="SHUTDOWN"){global_running=false;}
     }
@@ -171,16 +174,20 @@ int main(){
             else if((key=='c'||key=='C')&&g_is_master){xfer_cnt=0;xfer_bytes=0;xfer_total=0;xfer_done=false;xfer_status="";if(fs::exists(test_recv))for(auto& e:fs::directory_iterator(test_recv))if(e.path().extension()==".jpg")fs::remove(e.path());cout<<"[Clear] Master test dir cleared. Slave untouched."<<endl;}
             else if((key=='t'||key=='T')&&g_is_master&&g_enable_net_sync){
                 xfer_status="Transferring...";xfer_cnt=0;xfer_bytes=0;xfer_done=false;
-                sendLine(g_ctrl_sock,"LIST_REQ");string resp;recvLine(g_ctrl_sock,resp,5000);
+                cout<<"[DBG] Sending LIST_REQ..."<<endl;sendLine(g_ctrl_sock,"LIST_REQ");
+                string resp; if(!recvLine(g_ctrl_sock,resp,5000)){cerr<<"[DBG] LIST_REQ timeout"<<endl;continue;}
+                cout<<"[DBG] LIST_RESP len="<<resp.length()<<" preview="<<resp.substr(0,min(80,(int)resp.length()))<<endl;
                 if(resp.rfind("LIST_RESP:",0)!=0){xfer_status="LIST_REQ failed";continue;}
                 string lst=resp.substr(10);set<string> sf;stringstream ss(lst);string tok;while(getline(ss,tok,','))if(!tok.empty())sf.insert(tok);
+                cout<<"[DBG] Slave has "<<sf.size()<<" files."<<endl;
                 set<string> lf=scanFiles(test_recv);vector<string> mis;for(auto& f:sf)if(!lf.count(f))mis.push_back(f);
+                cout<<"[DBG] Master has "<<lf.size()<<" files, missing "<<mis.size()<<endl;
                 if(mis.empty()){xfer_status="Already in sync.";xfer_done=true;continue;}
                 xfer_total=(int)mis.size();xfer_status="Transferring "+to_string(xfer_total)+" files...";
-                string xfer="XFER:";for(auto& f:mis)xfer+=f+",";sendLine(g_ctrl_sock,xfer);
+                string xfer="XFER:";for(auto& f:mis)xfer+=f+",";cout<<"[DBG] Sending XFER with "<<mis.size()<<" files..."<<endl;sendLine(g_ctrl_sock,xfer);
                 auto t0=chrono::steady_clock::now();
-                while(true){string l;if(!recvLine(g_ctrl_sock,l,30000))break;if(l=="XFER_DONE")break;if(l.rfind("FILE:",0)==0){stringstream fs(l.substr(5));string sn,ix,sz;getline(fs,sn,':');getline(fs,ix,':');getline(fs,sz);size_t s=(size_t)stoull(sz);vector<char> buf(s);recvExact(g_ctrl_sock,buf.data(),s);xfer_bytes+=s;xfer_cnt++;stringstream fn;fn<<setw(2)<<setfill('0')<<stoi(ix);string path=test_recv+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),s);
-                    auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;}}
+                while(true){string l;if(!recvLine(g_ctrl_sock,l,30000)){cerr<<"[DBG] recv timeout/error in XFER loop (got "<<xfer_cnt<<" files)"<<endl;break;}if(l=="XFER_DONE"){cout<<"[DBG] Received XFER_DONE"<<endl;break;}if(l.rfind("FILE:",0)==0){stringstream fs(l.substr(5));string sn,ix,sz;getline(fs,sn,':');getline(fs,ix,':');getline(fs,sz);size_t s=(size_t)stoull(sz);cout<<"[DBG] FILE "<<sn<<"_"<<ix<<" size="<<s<<endl;vector<char> buf(s);if(!recvExact(g_ctrl_sock,buf.data(),s)){cerr<<"[DBG] recvExact FAILED for "<<sn<<"_"<<ix<<endl;break;}xfer_bytes+=s;xfer_cnt++;stringstream fn;fn<<setw(2)<<setfill('0')<<stoi(ix);string path=test_recv+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),s);
+                    auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;}else{cout<<"[DBG] Unknown recv: "<<l.substr(0,min(60,(int)l.length()))<<endl;}}
                 auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;xfer_done=true;
                 cout<<"[XFER] "<<xfer_cnt<<" files, "<<fixed<<setprecision(1)<<(xfer_bytes/1048576.0)<<" MB, "<<dt<<"s, "<<xfer_speed<<" MB/s"<<endl;
             }
