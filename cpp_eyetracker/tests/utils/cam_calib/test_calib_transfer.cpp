@@ -38,15 +38,16 @@ bool g_is_master = false, g_enable_net_sync = false;
 string g_save_dir;  // calib_save_dir/{participant_id}
 int g_win_w=1600, g_win_h=800, g_left_w, g_right_x, g_right_w, g_thumb_w, g_thumb_h;
 atomic<int> g_enlarged_cam{-1};
-SOCKET g_ctrl_sock = INVALID_SOCKET;  // TCP for all communication
+SOCKET g_ctrl_sock = INVALID_SOCKET;  // TCP control channel (text commands)
 SOCKET g_listen_sock = INVALID_SOCKET;
+int g_ctrl_port = 0;                 // control port; data port = g_ctrl_port + 1
+string g_master_ip;                  // Slave needs this to connect to data port
 atomic<bool> g_fault_active{false}; atomic<int> g_faulty_cam{-1};
 atomic<bool> g_fault_on_master{false};
 chrono::steady_clock::time_point g_fault_time, g_ready_time;
 atomic<int> g_capture_count{-1}, g_last_idx{-1}; int g_undo_count=0;
 
-// Shared leftover buffer: recvLine may read past the \n into binary data.
-// recvExact must drain this buffer before reading from the socket.
+// recvLine leftover: catches data past \n when multiple lines arrive in one TCP segment
 thread_local string g_tcp_leftover;
 
 // ================== TCP helpers ==================
@@ -63,20 +64,6 @@ bool recvLine(SOCKET s, string& line, int timeout_ms=3000) {
 bool sendExact(SOCKET s,const void* buf,size_t n){size_t sent=0;while(sent<n){int r=send(s,(const char*)buf+sent,(int)(n-sent),0);if(r<=0)return false;sent+=r;}return true;}
 bool sendLine(SOCKET s,const string& m){string d=m+"\n";return sendExact(s,d.c_str(),d.length());}
 bool recvExact(SOCKET s,void* buf,size_t n){size_t got=0;while(got<n){int r=recv(s,(char*)buf+got,(int)(n-got),0);if(r<=0)return false;got+=r;}return true;}
-
-// Consume from g_tcp_leftover first, then recvExact the rest from socket.
-// Must be called after recvLine's FILE: header — leftover may contain binary JPEG head.
-bool recvExactDrain(SOCKET s, void* buf, size_t n) {
-    size_t from_leftover = 0;
-    if (!g_tcp_leftover.empty()) {
-        from_leftover = min(n, g_tcp_leftover.size());
-        memcpy(buf, g_tcp_leftover.data(), from_leftover);
-        g_tcp_leftover = g_tcp_leftover.substr(from_leftover);
-    }
-    if (from_leftover < n)
-        return recvExact(s, (char*)buf + from_leftover, n - from_leftover);
-    return true;
-}
 
 // ================== Camera ==================
 struct CameraContext {string sn; BaslerCamera cam{""}; bool is_mono=true; thread capture_thread,copy_thread; atomic<bool> running{true};
@@ -123,14 +110,20 @@ void slaveCmdWorker(SOCKET s){
         else if(line=="LIST_REQ"){stringstream fl;for(auto& f:scanFiles(g_save_dir))fl<<f<<",";sendLine(s,"LIST_RESP:"+fl.str());}
         else if(line=="CLEAR"){if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;g_last_idx=-1;sendLine(s,"CLEAR_DONE");}
         else if(line.rfind("XFER:",0)==0){string lst=line.substr(5);stringstream ss(lst);string tok;vector<string> files;while(getline(ss,tok,','))if(!tok.empty())files.push_back(tok);
-            int total=(int)files.size(),cnt=0;size_t total_bytes=0;
-            cout<<"[Slave] XFER: sending "<<total<<" files"<<endl;
+            int total=(int)files.size(),cnt=0;size_t total_bytes=0;int data_port=g_ctrl_port+1;
+            cout<<"[Slave] XFER: sending "<<total<<" files via data port "<<data_port<<endl;
+            // Connect to Master's data port
+            SOCKET ds=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+            sockaddr_in dsa{};dsa.sin_family=AF_INET;dsa.sin_port=htons(data_port);inet_pton(AF_INET,g_master_ip.c_str(),&dsa.sin_addr);
+            {int rtry=0;while(connect(ds,(sockaddr*)&dsa,sizeof(dsa))!=0){if(++rtry>30){cerr<<"[Slave] Data port connect timeout"<<endl;closesocket(ds);goto xfer_done_ctrl;}this_thread::sleep_for(chrono::milliseconds(200));}}
             for(auto& f:files){size_t u=f.rfind('_');string sn=f.substr(0,u);int idx=stoi(f.substr(u+1));stringstream fn;fn<<setw(2)<<setfill('0')<<idx;string path=g_save_dir+"/calib_cam_"+sn+"_"+fn.str()+".jpg";
                 ifstream in(path,ios::binary|ios::ate);if(in){size_t sz=in.tellg();in.seekg(0);vector<char> data(sz);in.read(data.data(),sz);in.close();
-                    char hdr[128];snprintf(hdr,sizeof(hdr),"FILE:%s:%d:%zu",sn.c_str(),idx,sz);sendLine(s,hdr);if(!sendExact(s,data.data(),sz)){cerr<<"[Slave] sendExact FAILED for "<<sn<<"_"<<fn.str()<<endl;break;}
+                    uint32_t sz_be=htonl((uint32_t)sz);
+                    if(!sendExact(ds,&sz_be,4)||!sendExact(ds,data.data(),sz)){cerr<<"[Slave] sendExact FAILED for "<<sn<<"_"<<fn.str()<<endl;break;}
                     total_bytes+=sz;cnt++;if(cnt%50==0||cnt==total)cout<<"[Slave] Progress: "<<cnt<<"/"<<total<<" ("<<(total_bytes/1048576.0)<<" MB)"<<endl;}
                 else{cerr<<"[Slave] Cannot read "<<path<<endl;}}
-            sendLine(s,"XFER_DONE");cout<<"[Slave] XFER_DONE sent. "<<cnt<<" files, "<<(total_bytes/1048576.0)<<" MB"<<endl;}
+            {uint32_t zero=0;sendExact(ds,&zero,4);}closesocket(ds);
+            xfer_done_ctrl:sendLine(s,"XFER_DONE");cout<<"[Slave] XFER_DONE sent. "<<cnt<<" files, "<<(total_bytes/1048576.0)<<" MB"<<endl;}
         else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){/*handle fault*/}
         else if(line=="SHUTDOWN"){global_running=false;}
     }
@@ -143,8 +136,9 @@ int main(){
     WSADATA wsa; WSAStartup(MAKEWORD(2,2),&wsa);
 #endif
     Cfg cfg("cfg/cam_calib.yaml"); auto& c=cfg["calib"];
-    g_is_master=c["is_master"].as<bool>(); string mip=c["master_ip"].as<string>(),sip=c["slave_ip"].as<string>();
-    int port=c["port"].as<int>(); g_enable_net_sync=c["enable_net_sync"].as<bool>();
+    g_is_master=c["is_master"].as<bool>(); g_master_ip=c["master_ip"].as<string>();
+    string sip=c["slave_ip"].as<string>();
+    g_ctrl_port=c["port"].as<int>(); g_enable_net_sync=c["enable_net_sync"].as<bool>();
     vector<string> sns=c["cam_indices"].as<vector<string>>();
     string base_dir=c["calib_save_dir"].as<string>();
     string pid="P001"; try{Cfg cfg_cap("cfg/capture.yaml");pid=cfg_cap["capture"]["participant_id"].as<string>();}catch(...){}
@@ -153,8 +147,9 @@ int main(){
     string test_recv; try{test_recv=c["test_transfer_recv_dir"].as<string>();test_recv+="/"+pid+"/pictures";}catch(...){test_recv="D:/calib_transfer_test/"+pid+"/pictures";}
     if(test_xfer) fs::create_directories(test_recv);
     double fps=c["fps"].as<double>(),gain=c["gain"].as<double>(),gamma=c["gamma"].as<double>(),exp=c["exposure_time"].as<double>(),me=c["calib_mono_exp_ext"].as<double>();
+    int data_port=g_ctrl_port+1;
     g_win_w=c["window_width"].as<int>(); g_win_h=c["window_height"].as<int>(); double uif=c["ui_fps"].as<double>();
-    cout<<"[Init] Config loaded. Role="<<(g_is_master?"MASTER":"SLAVE")<<" Port="<<port<<" TestXfer="<<(test_xfer?"ON":"OFF")<<endl;
+    cout<<"[Init] Config loaded. Role="<<(g_is_master?"MASTER":"SLAVE")<<" CtrlPort="<<g_ctrl_port<<" DataPort="<<data_port<<" TestXfer="<<(test_xfer?"ON":"OFF")<<endl;
     cout<<"[Init] net_sync="<<g_enable_net_sync<<" is_master="<<g_is_master<<endl;
     cout<<"[Init] g_save_dir="<<g_save_dir<<endl;
     if(test_xfer) cout<<"[Init] test_recv="<<test_recv<<endl;
@@ -164,12 +159,12 @@ int main(){
     cout<<"[TCP] Entering setup block..."<<endl;
     if(g_enable_net_sync){
         if(g_is_master){ g_listen_sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); int opt=1;setsockopt(g_listen_sock,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
-            sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(port);sa.sin_addr.s_addr=INADDR_ANY;::bind(g_listen_sock,(sockaddr*)&sa,sizeof(sa));listen(g_listen_sock,1);
-            cout<<"[TCP] Master listening ::"<<port<<endl; sockaddr_in ca;socklen_t cl=sizeof(ca);g_ctrl_sock=accept(g_listen_sock,(sockaddr*)&ca,&cl);
+            sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(g_ctrl_port);sa.sin_addr.s_addr=INADDR_ANY;::bind(g_listen_sock,(sockaddr*)&sa,sizeof(sa));listen(g_listen_sock,1);
+            cout<<"[TCP] Master listening ::"<<g_ctrl_port<<endl; sockaddr_in ca;socklen_t cl=sizeof(ca);g_ctrl_sock=accept(g_listen_sock,(sockaddr*)&ca,&cl);
             string hl; recvLine(g_ctrl_sock,hl,10000); if(hl=="READY") sendLine(g_ctrl_sock,"ACK"); else{cerr<<"[TCP] Handshake fail"<<endl;return 1;}
             cout<<"[TCP] Slave connected + handshake OK."<<endl;}
-        else{ g_ctrl_sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(port);inet_pton(AF_INET,mip.c_str(),&sa.sin_addr);
-            cout<<"[TCP] Slave connecting to "<<mip<<":"<<port<<"..."<<endl;
+        else{ g_ctrl_sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(g_ctrl_port);inet_pton(AF_INET,g_master_ip.c_str(),&sa.sin_addr);
+            cout<<"[TCP] Slave connecting to "<<g_master_ip<<":"<<g_ctrl_port<<"..."<<endl;
             int retry=0; while(connect(g_ctrl_sock,(sockaddr*)&sa,sizeof(sa))!=0){if(++retry%10==1)cerr<<"[TCP] Connect retry #"<<retry<<"..."<<endl;this_thread::sleep_for(chrono::milliseconds(500));}
             sendLine(g_ctrl_sock,"READY"); string hl; recvLine(g_ctrl_sock,hl,10000); if(hl!="ACK"){cerr<<"[TCP] Handshake fail"<<endl;return 1;}
             cout<<"[TCP] Connected to Master + handshake OK."<<endl;cmd_thread=thread(slaveCmdWorker,g_ctrl_sock);}
@@ -207,15 +202,27 @@ int main(){
                 cout<<"[DBG] Master has "<<lf.size()<<" files, missing "<<mis.size()<<endl;
                 if(mis.empty()){xfer_status="Already in sync.";xfer_done=true;continue;}
                 xfer_total=(int)mis.size();xfer_status="Transferring "+to_string(xfer_total)+" files...";
-                string xfer="XFER:";for(auto& f:mis)xfer+=f+",";cout<<"[DBG] Sending XFER with "<<mis.size()<<" files..."<<endl;sendLine(g_ctrl_sock,xfer);
-                g_tcp_leftover.clear();  // ensure clean state before binary stream
-                auto t0=chrono::steady_clock::now();
-                while(true){string l;if(!recvLine(g_ctrl_sock,l,30000)){cerr<<"[XFER] recv timeout (got "<<xfer_cnt<<"/"<<xfer_total<<" files)"<<endl;break;}if(l=="XFER_DONE"){cout<<"[XFER] Received XFER_DONE"<<endl;break;}if(l.rfind("FILE:",0)==0){stringstream fs(l.substr(5));string sn,ix,sz;getline(fs,sn,':');getline(fs,ix,':');getline(fs,sz);size_t s=(size_t)stoull(sz);vector<char> buf(s);if(!recvExactDrain(g_ctrl_sock,buf.data(),s)){cerr<<"[XFER] recvExact FAILED for "<<sn<<"_"<<ix<<endl;break;}xfer_bytes+=s;xfer_cnt++;stringstream fn;fn<<setw(2)<<setfill('0')<<stoi(ix);string path=test_recv+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),s);
+                string xfer="XFER:";for(auto& f:mis)xfer+=f+",";cout<<"[XFER] Sending XFER with "<<mis.size()<<" files..."<<endl;sendLine(g_ctrl_sock,xfer);
+                // Listen on data port for binary file stream
+                SOCKET dl=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+                {int opt=1;setsockopt(dl,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
+                sockaddr_in dsa{};dsa.sin_family=AF_INET;dsa.sin_port=htons(data_port);dsa.sin_addr.s_addr=INADDR_ANY;
+                ::bind(dl,(sockaddr*)&dsa,sizeof(dsa));listen(dl,1);}
+                SOCKET ds=accept(dl,nullptr,nullptr);
+                auto t0=chrono::steady_clock::now();int file_idx=0;
+                while(true){uint32_t sz_be;if(!recvExact(ds,&sz_be,4)){cerr<<"[XFER] Failed to read size header"<<endl;break;}
+                    size_t sz=ntohl(sz_be);if(sz==0)break;
+                    if(file_idx>=(int)mis.size()){cerr<<"[XFER] Too many files!"<<endl;break;}
+                    vector<char> buf(sz);if(!recvExact(ds,buf.data(),sz)){cerr<<"[XFER] recvExact FAILED at file "<<file_idx<<endl;break;}
+                    xfer_bytes+=sz;xfer_cnt++;file_idx++;
+                    auto& f=mis[file_idx-1];size_t u=f.rfind('_');string sn=f.substr(0,u);int idx=stoi(f.substr(u+1));stringstream fn;fn<<setw(2)<<setfill('0')<<idx;
+                    string path=test_recv+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),sz);
                     auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;
                     if(xfer_cnt%50==0||xfer_cnt==xfer_total)cout<<"[XFER] Progress: "<<xfer_cnt<<"/"<<xfer_total<<" ("<<(xfer_bytes/1048576.0)<<" MB, "<<xfer_speed<<" MB/s)"<<endl;}
-                else{cout<<"[XFER] Unexpected line: "<<l.substr(0,min(60,(int)l.length()))<<endl;}}
+                closesocket(ds);closesocket(dl);
+                {string l;if(recvLine(g_ctrl_sock,l,10000)&&l=="XFER_DONE")cout<<"[XFER] Received XFER_DONE"<<endl;}
                 auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;xfer_done=true;
-                cout<<"[XFER] "<<xfer_cnt<<" files, "<<fixed<<setprecision(1)<<(xfer_bytes/1048576.0)<<" MB, "<<dt<<"s, "<<xfer_speed<<" MB/s"<<endl;
+                cout<<"[XFER] Done: "<<xfer_cnt<<" files, "<<fixed<<setprecision(1)<<(xfer_bytes/1048576.0)<<" MB, "<<dt<<"s, "<<xfer_speed<<" MB/s"<<endl;
             }
         }
         if(cmd_thread.joinable())cmd_thread.join();
@@ -251,8 +258,21 @@ int main(){
             for(auto& ctx:cam_ctxs){cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}if(!snap.empty()){cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);cv::imwrite(g_save_dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg",out);}}}}
         else if((key=='t'||key=='T')&&g_is_master&&g_enable_net_sync){sendLine(g_ctrl_sock,"LIST_REQ");string resp;recvLine(g_ctrl_sock,resp,5000);if(resp.rfind("LIST_RESP:",0)!=0)continue;string lst=resp.substr(10);set<string> sf;stringstream ss(lst);string tok;while(getline(ss,tok,','))if(!tok.empty())sf.insert(tok);set<string> lf=scanFiles(g_save_dir);vector<string> mis;for(auto& f:sf)if(!lf.count(f))mis.push_back(f);if(mis.empty()){cout<<"[XFER] Already in sync."<<endl;continue;}
             cout<<"[XFER] Transferring "<<mis.size()<<" files..."<<endl;string xfer="XFER:";for(auto& f:mis)xfer+=f+",";sendLine(g_ctrl_sock,xfer);
-            g_tcp_leftover.clear();
-            int rc=0;size_t tb=0;auto t0=chrono::steady_clock::now();while(true){string l;if(!recvLine(g_ctrl_sock,l,30000))break;if(l=="XFER_DONE")break;if(l.rfind("FILE:",0)==0){stringstream fs(l.substr(5));string sn,ix,sz;getline(fs,sn,':');getline(fs,ix,':');getline(fs,sz);size_t s=(size_t)stoull(sz);vector<char> buf(s);recvExactDrain(g_ctrl_sock,buf.data(),s);tb+=s;rc++;stringstream fn;fn<<setw(2)<<setfill('0')<<stoi(ix);string path=g_save_dir+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),s);}}
+            SOCKET dl=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+            {int opt=1;setsockopt(dl,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
+            sockaddr_in dsa{};dsa.sin_family=AF_INET;dsa.sin_port=htons(data_port);dsa.sin_addr.s_addr=INADDR_ANY;
+            ::bind(dl,(sockaddr*)&dsa,sizeof(dsa));listen(dl,1);}
+            SOCKET ds=accept(dl,nullptr,nullptr);
+            int rc=0,fi=0;size_t tb=0;auto t0=chrono::steady_clock::now();
+            while(true){uint32_t sz_be;if(!recvExact(ds,&sz_be,4)){cerr<<"[XFER] recvExact size header failed"<<endl;break;}
+                size_t sz=ntohl(sz_be);if(sz==0)break;
+                if(fi>=(int)mis.size()){cerr<<"[XFER] Too many files!"<<endl;break;}
+                vector<char> buf(sz);if(!recvExact(ds,buf.data(),sz)){cerr<<"[XFER] recvExact data failed at file "<<fi<<endl;break;}
+                tb+=sz;rc++;fi++;auto& f=mis[fi-1];size_t u=f.rfind('_');string sn=f.substr(0,u);int idx=stoi(f.substr(u+1));stringstream fn;fn<<setw(2)<<setfill('0')<<idx;
+                string path=g_save_dir+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),sz);
+                if(rc%50==0||rc==(int)mis.size())cout<<"[XFER] Progress: "<<rc<<"/"<<mis.size()<<" ("<<(tb/1048576.0)<<" MB)"<<endl;}
+            closesocket(ds);closesocket(dl);
+            {string l;recvLine(g_ctrl_sock,l,10000);} // consume XFER_DONE
             auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();cout<<"[XFER] Done: "<<rc<<" files, "<<fixed<<setprecision(1)<<(tb/1048576.0)<<" MB, "<<dt<<"s, "<<(tb/1048576.0/dt)<<" MB/s"<<endl;}
         else if((key=='z'||key=='Z')&&!g_fault_active.load()){int li=g_last_idx.load();if(li<0){cout<<"[Undo] Nothing to undo."<<endl;continue;}stringstream ss;ss<<setw(2)<<setfill('0')<<li;if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir)){string st=e.path().stem().string();if(st.rfind("calib_cam_",0)==0&&st.length()>=2&&st.substr(st.length()-2)==ss.str())fs::remove(e.path());}if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"UNDO:"+to_string(li));g_last_idx.store(li-1);g_undo_count++;if(g_capture_count>0)g_capture_count--;}
         else if((key=='c'||key=='C')&&g_is_master&&g_enable_net_sync){if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;sendLine(g_ctrl_sock,"CLEAR");string ack;recvLine(g_ctrl_sock,ack,2000);cout<<"[Clear] Done."<<endl;}
