@@ -113,25 +113,6 @@ void slaveCmdWorker(SOCKET s){
     }
 }
 
-// ================== TCP transfer (test mode) ==================
-void runTransferTest(bool is_master,const string& recv_dir){
-    if(is_master){ cout<<"[Transfer] Master: receiving..."<<endl; fs::create_directories(recv_dir);
-        sendLine(g_ctrl_sock,"LIST_REQ"); string resp; recvLine(g_ctrl_sock,resp,5000);
-        if(resp.rfind("LIST_RESP:",0)!=0){cerr<<"No LIST_RESP"<<endl;return;} string lst=resp.substr(10);
-        set<string> slave_f; stringstream ss(lst); string tok; while(getline(ss,tok,',')) if(!tok.empty()) slave_f.insert(tok);
-        cout<<"[Transfer] Slave has "<<slave_f.size()<<" files."<<endl;
-        string xfer="XFER:"; for(auto& f:slave_f) xfer+=f+","; sendLine(g_ctrl_sock,xfer);
-        auto t0=chrono::steady_clock::now(); int cnt=0; size_t total=0;
-        while(true){string line; if(!recvLine(g_ctrl_sock,line,60000))break; if(line=="XFER_DONE")break;
-            if(line.rfind("FILE:",0)==0){stringstream fs(line.substr(5));string sn,ix,sz;getline(fs,sn,':');getline(fs,ix,':');getline(fs,sz);size_t s=(size_t)stoull(sz);
-                vector<char> buf(s);recvExact(g_ctrl_sock,buf.data(),s);total+=s;cnt++;
-                stringstream fn;fn<<setw(2)<<setfill('0')<<stoi(ix);string path=recv_dir+"/calib_cam_"+sn+"_"+fn.str()+".jpg";
-                ofstream out(path,ios::binary);out.write(buf.data(),s);}}
-        auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();
-        cout<<"[Transfer] Done: "<<cnt<<" files, "<<fixed<<setprecision(1)<<(total/1048576.0)<<" MB, "<<setprecision(1)<<dt<<"s, "<<(total/1048576.0/dt)<<" MB/s"<<endl;
-    }else{ cout<<"[Transfer] Slave: sending..."<<endl; /* handled by slaveCmdWorker thread */ }
-}
-
 // ================== main ==================
 int main(){
     cout<<"=== Calibration Image Capture (TCP) ==="<<endl;
@@ -161,11 +142,48 @@ int main(){
             while(connect(g_ctrl_sock,(sockaddr*)&sa,sizeof(sa))!=0){this_thread::sleep_for(chrono::milliseconds(500));}cout<<"[TCP] Connected to Master."<<endl;cmd_thread=thread(slaveCmdWorker,g_ctrl_sock);}
     }
 
-    // ---- test_transfer mode (skip cameras) ----
-    if(test_xfer){ cout<<"[Mode] Test transfer — skipping camera init."<<endl; runTransferTest(g_is_master,test_recv);
-        global_running=false; if(cmd_thread.joinable())cmd_thread.join(); goto cleanup; }
+    // ---- test_transfer mode (skip cameras, show transfer UI) ----
+    if(test_xfer){
+        cout<<"[Mode] Test transfer — no cameras, transfer UI only."<<endl;
+        bool xfer_done=false; string xfer_status; int xfer_cnt=0; size_t xfer_bytes=0; int xfer_total=0; double xfer_speed=0;
+        cv::namedWindow("Calib Transfer Test",cv::WINDOW_NORMAL);cv::resizeWindow("Calib Transfer Test",800,400);
+        auto uii=chrono::milliseconds((int)(1000.0/uif));auto lui=chrono::steady_clock::now()-uii;
+        while(global_running){
+            auto now=chrono::steady_clock::now();bool nu=(now-lui)>=uii;
+            if(nu){cv::Mat cv=cv::Mat::zeros(400,800,CV_8UC3);int y=60;
+                cv::putText(cv,"TCP Transfer Speed Test",cv::Point(200,y),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,255,255),2);y+=40;
+                if(!xfer_done){cv::putText(cv,"Press [T] to start transfer  [Q] to quit",cv::Point(150,y),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(200,200,200),1);y+=30;
+                    if(!xfer_status.empty()){cv::putText(cv,xfer_status,cv::Point(100,y),cv::FONT_HERSHEY_SIMPLEX,0.5,cv::Scalar(0,255,0),1);y+=24;}}
+                else{char b[128];snprintf(b,sizeof(b),"DONE: %d files, %.1f MB in %.1fs (%.1f MB/s)",xfer_cnt,xfer_bytes/1048576.0,(xfer_bytes/1048576.0)/(xfer_speed>0?xfer_speed:1),xfer_speed);cv::putText(cv,b,cv::Point(80,y),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,255,0),2);y+=40;
+                    cv::putText(cv,"Press [T] to test again  [Q] to quit",cv::Point(180,y),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(200,200,200),1);}
+                // Progress bar
+                if(xfer_total>0){cv::rectangle(cv,cv::Rect(100,300,600,30),cv::Scalar(80,80,80),1);int pw=(int)(600.0*xfer_cnt/xfer_total);cv::rectangle(cv,cv::Rect(100,300,pw,30),cv::Scalar(0,255,0),-1);char pct[32];snprintf(pct,sizeof(pct),"%d/%d",xfer_cnt,xfer_total);cv::putText(cv,pct,cv::Point(340,320),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(255,255,255),1);}
+                cv::imshow("Calib Transfer Test",cv);lui=now;}
+            char key=(char)cv::waitKey(30);
+            if(key=='q'||key==27){if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"SHUTDOWN");global_running=false;}
+            else if((key=='c'||key=='C')&&g_is_master){xfer_cnt=0;xfer_bytes=0;xfer_total=0;xfer_done=false;xfer_status="";if(fs::exists(test_recv))for(auto& e:fs::directory_iterator(test_recv))if(e.path().extension()==".jpg")fs::remove(e.path());cout<<"[Clear] Master test dir cleared. Slave untouched."<<endl;}
+            else if((key=='t'||key=='T')&&g_is_master&&g_enable_net_sync){
+                xfer_status="Transferring...";xfer_cnt=0;xfer_bytes=0;xfer_done=false;
+                sendLine(g_ctrl_sock,"LIST_REQ");string resp;recvLine(g_ctrl_sock,resp,5000);
+                if(resp.rfind("LIST_RESP:",0)!=0){xfer_status="LIST_REQ failed";continue;}
+                string lst=resp.substr(10);set<string> sf;stringstream ss(lst);string tok;while(getline(ss,tok,','))if(!tok.empty())sf.insert(tok);
+                set<string> lf=scanFiles(test_recv);vector<string> mis;for(auto& f:sf)if(!lf.count(f))mis.push_back(f);
+                if(mis.empty()){xfer_status="Already in sync.";xfer_done=true;continue;}
+                xfer_total=(int)mis.size();xfer_status="Transferring "+to_string(xfer_total)+" files...";
+                string xfer="XFER:";for(auto& f:mis)xfer+=f+",";sendLine(g_ctrl_sock,xfer);
+                auto t0=chrono::steady_clock::now();
+                while(true){string l;if(!recvLine(g_ctrl_sock,l,30000))break;if(l=="XFER_DONE")break;if(l.rfind("FILE:",0)==0){stringstream fs(l.substr(5));string sn,ix,sz;getline(fs,sn,':');getline(fs,ix,':');getline(fs,sz);size_t s=(size_t)stoull(sz);vector<char> buf(s);recvExact(g_ctrl_sock,buf.data(),s);xfer_bytes+=s;xfer_cnt++;stringstream fn;fn<<setw(2)<<setfill('0')<<stoi(ix);string path=test_recv+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),s);
+                    auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;}}
+                auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;xfer_done=true;
+                cout<<"[XFER] "<<xfer_cnt<<" files, "<<fixed<<setprecision(1)<<(xfer_bytes/1048576.0)<<" MB, "<<dt<<"s, "<<xfer_speed<<" MB/s"<<endl;
+            }
+        }
+        if(cmd_thread.joinable())cmd_thread.join();
+        if(g_listen_sock!=INVALID_SOCKET)closesocket(g_listen_sock);if(g_ctrl_sock!=INVALID_SOCKET)closesocket(g_ctrl_sock);
+        cv::destroyAllWindows();WSACleanup();return 0;
+    }
 
-    // ---- Camera init ----
+    // ---- Camera init (non-test mode) ----
     for(size_t i=0;i<sns.size();++i){auto ctx=make_shared<CameraContext>(sns[i]);cam_ctxs.push_back(ctx);}
     for(auto& ctx:cam_ctxs){ctx->running=true;ctx->copy_thread=thread(copyWorker,ctx);ctx->capture_thread=thread(captureWorker,ctx,fps,gain,gamma,exp,me);}
 
@@ -200,7 +218,6 @@ int main(){
 
     for(auto& ctx:cam_ctxs){ctx->running=false;ctx->copy_cv.notify_all();if(ctx->capture_thread.joinable())ctx->capture_thread.join();if(ctx->copy_thread.joinable())ctx->copy_thread.join();}
     if(cmd_thread.joinable())cmd_thread.join();
-cleanup:
     if(g_listen_sock!=INVALID_SOCKET)closesocket(g_listen_sock);if(g_ctrl_sock!=INVALID_SOCKET)closesocket(g_ctrl_sock);
     cv::destroyAllWindows();Pylon::PylonTerminate();
 #ifdef _WIN32
