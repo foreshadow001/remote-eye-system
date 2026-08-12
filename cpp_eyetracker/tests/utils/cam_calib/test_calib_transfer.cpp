@@ -143,7 +143,8 @@ int main(){
             string hl; recvLine(g_ctrl_sock,hl,10000); if(hl=="READY") sendLine(g_ctrl_sock,"ACK"); else{cerr<<"[TCP] Handshake fail"<<endl;return 1;}
             cout<<"[TCP] Slave connected + handshake OK."<<endl;}
         else{ g_ctrl_sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(port);inet_pton(AF_INET,mip.c_str(),&sa.sin_addr);
-            while(connect(g_ctrl_sock,(sockaddr*)&sa,sizeof(sa))!=0){this_thread::sleep_for(chrono::milliseconds(500));}
+            cout<<"[TCP] Slave connecting to "<<mip<<":"<<port<<"..."<<endl;
+            int retry=0; while(connect(g_ctrl_sock,(sockaddr*)&sa,sizeof(sa))!=0){if(++retry%10==1)cerr<<"[TCP] Connect retry #"<<retry<<"..."<<endl;this_thread::sleep_for(chrono::milliseconds(500));}
             sendLine(g_ctrl_sock,"READY"); string hl; recvLine(g_ctrl_sock,hl,10000); if(hl!="ACK"){cerr<<"[TCP] Handshake fail"<<endl;return 1;}
             cout<<"[TCP] Connected to Master + handshake OK."<<endl;cmd_thread=thread(slaveCmdWorker,g_ctrl_sock);}
     }
