@@ -105,14 +105,16 @@ void slaveCmdWorker(SOCKET s){
     while(global_running){
         string line; if(!recvLine(s,line,500)) continue;
         if(line.rfind("PHOTO:",0)==0){int idx=stoi(line.substr(6));stringstream ss;ss<<setw(2)<<setfill('0')<<idx;g_last_idx.store(idx);g_capture_count++;
-            for(auto& ctx:cam_ctxs){cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}if(!snap.empty()){cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);cv::imwrite(g_save_dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg",out);}}}
-        else if(line.rfind("UNDO:",0)==0){int idx=stoi(line.substr(5));stringstream ss;ss<<setw(2)<<setfill('0')<<idx;if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir)){string st=e.path().stem().string();if(st.rfind("calib_cam_",0)==0&&st.length()>=2&&st.substr(st.length()-2)==ss.str())fs::remove(e.path());}g_last_idx.store(idx-1);if(g_capture_count>0)g_capture_count--;}
-        else if(line=="LIST_REQ"){stringstream fl;for(auto& f:scanFiles(g_save_dir))fl<<f<<",";sendLine(s,"LIST_RESP:"+fl.str());}
-        else if(line=="CLEAR"){if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;g_last_idx=-1;sendLine(s,"CLEAR_DONE");}
+            cout<<"[Slave] PHOTO "<<idx<<endl;
+            for(auto& ctx:cam_ctxs){cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}if(!snap.empty()){cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);string fn=g_save_dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg";cv::imwrite(fn,out);cout<<"  -> Saved "<<fn<<endl;}}}
+        else if(line.rfind("UNDO:",0)==0){int idx=stoi(line.substr(5));stringstream ss;ss<<setw(2)<<setfill('0')<<idx;
+            cout<<"[Slave] UNDO index "<<ss.str()<<endl;
+            if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir)){string st=e.path().stem().string();if(st.rfind("calib_cam_",0)==0&&st.length()>=2&&st.substr(st.length()-2)==ss.str())fs::remove(e.path());}g_last_idx.store(idx-1);if(g_capture_count>0)g_capture_count--;}
+        else if(line=="LIST_REQ"){cout<<"[Slave] LIST request"<<endl;stringstream fl;for(auto& f:scanFiles(g_save_dir))fl<<f<<",";sendLine(s,"LIST_RESP:"+fl.str());cout<<"[Slave] Sent file list"<<endl;}
+        else if(line=="CLEAR"){cout<<"[Slave] CLEAR \xe2\x80\x94 removing all calibration photos"<<endl;if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;g_last_idx=-1;sendLine(s,"CLEAR_DONE");cout<<"[Slave] Cleared."<<endl;}
         else if(line.rfind("XFER:",0)==0){string lst=line.substr(5);stringstream ss(lst);string tok;vector<string> files;while(getline(ss,tok,','))if(!tok.empty())files.push_back(tok);
             int total=(int)files.size(),cnt=0;size_t total_bytes=0;int data_port=g_ctrl_port+1;
-            cout<<"[Slave] XFER: sending "<<total<<" files via data port "<<data_port<<endl;
-            // Connect to Master's data port
+            cout<<"[Slave] Transfer started — "<<total<<" files via data port "<<data_port<<endl;
             SOCKET ds=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
             sockaddr_in dsa{};dsa.sin_family=AF_INET;dsa.sin_port=htons(data_port);inet_pton(AF_INET,g_master_ip.c_str(),&dsa.sin_addr);
             {int rtry=0;while(connect(ds,(sockaddr*)&dsa,sizeof(dsa))!=0){if(++rtry>30){cerr<<"[Slave] Data port connect timeout"<<endl;closesocket(ds);goto xfer_done_ctrl;}this_thread::sleep_for(chrono::milliseconds(200));}}
@@ -120,12 +122,12 @@ void slaveCmdWorker(SOCKET s){
                 ifstream in(path,ios::binary|ios::ate);if(in){size_t sz=in.tellg();in.seekg(0);vector<char> data(sz);in.read(data.data(),sz);in.close();
                     uint32_t sz_be=htonl((uint32_t)sz);
                     if(!sendExact(ds,&sz_be,4)||!sendExact(ds,data.data(),sz)){cerr<<"[Slave] sendExact FAILED for "<<sn<<"_"<<fn.str()<<endl;break;}
-                    total_bytes+=sz;cnt++;if(cnt%50==0||cnt==total)cout<<"[Slave] Progress: "<<cnt<<"/"<<total<<" ("<<(total_bytes/1048576.0)<<" MB)"<<endl;}
+                    total_bytes+=sz;cnt++;}
                 else{cerr<<"[Slave] Cannot read "<<path<<endl;}}
             {uint32_t zero=0;sendExact(ds,&zero,4);}closesocket(ds);
-            xfer_done_ctrl:sendLine(s,"XFER_DONE");cout<<"[Slave] XFER_DONE sent. "<<cnt<<" files, "<<(total_bytes/1048576.0)<<" MB"<<endl;}
+            xfer_done_ctrl:sendLine(s,"XFER_DONE");cout<<"[Slave] Transfer ended — "<<cnt<<" files, "<<(total_bytes/1048576.0)<<" MB"<<endl;}
         else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){/*handle fault*/}
-        else if(line=="SHUTDOWN"){global_running=false;}
+        else if(line=="SHUTDOWN"){cout<<"[Slave] Received SHUTDOWN from master."<<endl;global_running=false;}
     }
 }
 
@@ -198,20 +200,21 @@ int main(){
                 cv::imshow("Calib Transfer Test",cv);lui=now;}
             char key=(char)cv::waitKey(30);
             if(key=='q'||key==27){if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"SHUTDOWN");global_running=false;}
-            else if((key=='c'||key=='C')&&g_is_master){xfer_cnt=0;xfer_bytes=0;xfer_total=0;xfer_done=false;xfer_status="";if(fs::exists(test_recv))for(auto& e:fs::directory_iterator(test_recv))if(e.path().extension()==".jpg")fs::remove(e.path());cout<<"[Clear] Master test dir cleared. Slave untouched."<<endl;}
+            else if((key=='c'||key=='C')&&g_is_master){xfer_cnt=0;xfer_bytes=0;xfer_total=0;xfer_done=false;xfer_status="";
+                cout<<"\n[Clear] Removing test transfer images..."<<endl;
+                if(fs::exists(test_recv))for(auto& e:fs::directory_iterator(test_recv))if(e.path().extension()==".jpg")fs::remove(e.path());
+                cout<<"[Clear] Local photos removed.\n"<<endl;}
             else if((key=='t'||key=='T')&&g_is_master&&g_enable_net_sync){
                 xfer_status="Transferring...";xfer_cnt=0;xfer_bytes=0;xfer_done=false;
-                cout<<"[DBG] Sending LIST_REQ..."<<endl;sendLine(g_ctrl_sock,"LIST_REQ");
-                string resp; if(!recvLine(g_ctrl_sock,resp,5000)){cerr<<"[DBG] LIST_REQ timeout"<<endl;continue;}
-                cout<<"[DBG] LIST_RESP len="<<resp.length()<<" preview="<<resp.substr(0,min(80,(int)resp.length()))<<endl;
+                sendLine(g_ctrl_sock,"LIST_REQ");
+                string resp; if(!recvLine(g_ctrl_sock,resp,5000)){cerr<<"[Error] No response from slave."<<endl;continue;}
                 if(resp.rfind("LIST_RESP:",0)!=0){xfer_status="LIST_REQ failed";continue;}
                 string lst=resp.substr(10);set<string> sf;stringstream ss(lst);string tok;while(getline(ss,tok,','))if(!tok.empty())sf.insert(tok);
-                cout<<"[DBG] Slave has "<<sf.size()<<" files."<<endl;
                 set<string> lf=scanFiles(test_recv);vector<string> mis;for(auto& f:sf)if(!lf.count(f))mis.push_back(f);
-                cout<<"[DBG] Master has "<<lf.size()<<" files, missing "<<mis.size()<<endl;
                 if(mis.empty()){xfer_status="Already in sync.";xfer_done=true;continue;}
                 xfer_total=(int)mis.size();xfer_status="Transferring "+to_string(xfer_total)+" files...";
-                string xfer="XFER:";for(auto& f:mis)xfer+=f+",";cout<<"[XFER] Sending XFER with "<<mis.size()<<" files..."<<endl;sendLine(g_ctrl_sock,xfer);
+                cout<<"\n[Transfer] "<<mis.size()<<" files missing. Starting transfer..."<<endl;
+                string xfer="XFER:";for(auto& f:mis)xfer+=f+",";sendLine(g_ctrl_sock,xfer);
                 // Listen on data port for binary file stream
                 SOCKET dl=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
                 {int opt=1;setsockopt(dl,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
@@ -229,9 +232,9 @@ int main(){
                     auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;
                     if(xfer_cnt%50==0||xfer_cnt==xfer_total)cout<<"[XFER] Progress: "<<xfer_cnt<<"/"<<xfer_total<<" ("<<(xfer_bytes/1048576.0)<<" MB, "<<xfer_speed<<" MB/s)"<<endl;}
                 closesocket(ds);closesocket(dl);
-                {string l;if(recvLine(g_ctrl_sock,l,10000)&&l=="XFER_DONE")cout<<"[XFER] Received XFER_DONE"<<endl;}
+                {string l;recvLine(g_ctrl_sock,l,10000);} // consume XFER_DONE
                 auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;xfer_done=true;
-                cout<<"[XFER] Done: "<<xfer_cnt<<" files, "<<fixed<<setprecision(1)<<(xfer_bytes/1048576.0)<<" MB, "<<dt<<"s, "<<xfer_speed<<" MB/s"<<endl;
+                cout<<"[Transfer] "<<xfer_cnt<<" files, "<<fixed<<setprecision(1)<<(xfer_bytes/1048576.0)<<" MB, "<<dt<<"s, "<<xfer_speed<<" MB/s\n"<<endl;
             }
         }
         if(cmd_thread.joinable())cmd_thread.join();
@@ -253,7 +256,7 @@ int main(){
     while(global_running){
         auto now=chrono::steady_clock::now();bool nu=(now-lui)>=uii;
         // Health check
-        if(!g_fault_active.load()){for(size_t i=0;i<cam_ctxs.size();++i){if(!cam_ctxs[i]->has_streamed.load())continue;if(chrono::duration<double>(now-cam_ctxs[i]->last_frame_time.load()).count()>1.0){cerr<<"[FAULT] Cam "<<cam_ctxs[i]->sn<<" stalled!"<<endl;g_fault_active.store(true);g_faulty_cam.store((int)i);g_fault_on_master.store(g_is_master);if(g_enable_net_sync)sendLine(g_ctrl_sock,"FAULT:"+string(g_is_master?"M":"S")+to_string(i));for(auto& c:cam_ctxs){c->running=false;c->copy_cv.notify_all();}for(auto& c:cam_ctxs){if(c->capture_thread.joinable())c->capture_thread.join();if(c->copy_thread.joinable())c->copy_thread.join();}break;}}}
+        if(!g_fault_active.load()){for(size_t i=0;i<cam_ctxs.size();++i){if(!cam_ctxs[i]->has_streamed.load())continue;if(chrono::duration<double>(now-cam_ctxs[i]->last_frame_time.load()).count()>1.0){cerr<<"[Fault] Cam "<<cam_ctxs[i]->sn<<" stalled!"<<endl;g_fault_active.store(true);g_faulty_cam.store((int)i);g_fault_on_master.store(g_is_master);if(g_enable_net_sync)sendLine(g_ctrl_sock,"FAULT:"+string(g_is_master?"M":"S")+to_string(i));for(auto& c:cam_ctxs){c->running=false;c->copy_cv.notify_all();}for(auto& c:cam_ctxs){if(c->capture_thread.joinable())c->capture_thread.join();if(c->copy_thread.joinable())c->copy_thread.join();}break;}}}
         // UI
         if(nu){cv::Mat cv;if(g_fault_active.load()){cv=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);cv::putText(cv,"CAMERA FAULT",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,1.2,cv::Scalar(0,0,255),2);}
         else{cv=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);int sel=g_enlarged_cam.load();renderGrid(cv,sel);renderEnlarged(cv,sel);cv::line(cv,cv::Point(g_left_w,0),cv::Point(g_left_w,g_win_h),cv::Scalar(60,60,60),2);
@@ -264,10 +267,11 @@ int main(){
         char key=(char)cv::waitKey(1);
         if(key==27||key=='q'){if(g_enable_net_sync&&g_is_master){sendLine(g_ctrl_sock,"SHUTDOWN");this_thread::sleep_for(chrono::milliseconds(200));}if(!g_enable_net_sync||g_is_master||g_fault_active.load())global_running=false;}
         else if(g_fault_active.load()){}
-        else if(key==' '){if(g_enable_net_sync&&!g_is_master){}else{int ctr=getNextCounter(g_save_dir);stringstream ss;ss<<setw(2)<<setfill('0')<<ctr;if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"PHOTO:"+to_string(ctr));g_last_idx.store(ctr);g_capture_count++;cout<<"[Photo] "<<ctr<<endl;
-            for(auto& ctx:cam_ctxs){cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}if(!snap.empty()){cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);cv::imwrite(g_save_dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg",out);}}}}
-        else if((key=='t'||key=='T')&&g_is_master&&g_enable_net_sync){sendLine(g_ctrl_sock,"LIST_REQ");string resp;recvLine(g_ctrl_sock,resp,5000);if(resp.rfind("LIST_RESP:",0)!=0)continue;string lst=resp.substr(10);set<string> sf;stringstream ss(lst);string tok;while(getline(ss,tok,','))if(!tok.empty())sf.insert(tok);set<string> lf=scanFiles(g_save_dir);vector<string> mis;for(auto& f:sf)if(!lf.count(f))mis.push_back(f);if(mis.empty()){cout<<"[XFER] Already in sync."<<endl;continue;}
-            cout<<"[XFER] Transferring "<<mis.size()<<" files..."<<endl;string xfer="XFER:";for(auto& f:mis)xfer+=f+",";sendLine(g_ctrl_sock,xfer);
+        else if(key==' '){if(g_enable_net_sync&&!g_is_master){}else{int ctr=getNextCounter(g_save_dir);stringstream ss;ss<<setw(2)<<setfill('0')<<ctr;if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"PHOTO:"+to_string(ctr));g_last_idx.store(ctr);g_capture_count++;
+            cout<<"\n[Photo] Capturing index "<<ctr<<endl;
+            for(auto& ctx:cam_ctxs){cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}if(!snap.empty()){cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);string fn=g_save_dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg";cv::imwrite(fn,out);cout<<"  -> Saved "<<fn<<endl;}}}}
+        else if((key=='t'||key=='T')&&g_is_master&&g_enable_net_sync){sendLine(g_ctrl_sock,"LIST_REQ");string resp;recvLine(g_ctrl_sock,resp,5000);if(resp.rfind("LIST_RESP:",0)!=0)continue;string lst=resp.substr(10);set<string> sf;stringstream ss(lst);string tok;while(getline(ss,tok,','))if(!tok.empty())sf.insert(tok);set<string> lf=scanFiles(g_save_dir);vector<string> mis;for(auto& f:sf)if(!lf.count(f))mis.push_back(f);if(mis.empty()){cout<<"[Transfer] Already in sync.\n"<<endl;continue;}
+            cout<<"\n[Transfer] "<<mis.size()<<" files missing. Starting transfer..."<<endl;string xfer="XFER:";for(auto& f:mis)xfer+=f+",";sendLine(g_ctrl_sock,xfer);
             SOCKET dl=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
             {int opt=1;setsockopt(dl,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
             sockaddr_in dsa{};dsa.sin_family=AF_INET;dsa.sin_port=htons(data_port);dsa.sin_addr.s_addr=INADDR_ANY;
@@ -279,15 +283,22 @@ int main(){
                 if(fi>=(int)mis.size()){cerr<<"[XFER] Too many files!"<<endl;break;}
                 vector<char> buf(sz);if(!recvExact(ds,buf.data(),sz)){cerr<<"[XFER] recvExact data failed at file "<<fi<<endl;break;}
                 tb+=sz;rc++;fi++;auto& f=mis[fi-1];size_t u=f.rfind('_');string sn=f.substr(0,u);int idx=stoi(f.substr(u+1));stringstream fn;fn<<setw(2)<<setfill('0')<<idx;
-                string path=g_save_dir+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),sz);
-                if(rc%50==0||rc==(int)mis.size())cout<<"[XFER] Progress: "<<rc<<"/"<<mis.size()<<" ("<<(tb/1048576.0)<<" MB)"<<endl;}
+                string path=g_save_dir+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),sz);}
             closesocket(ds);closesocket(dl);
             {string l;recvLine(g_ctrl_sock,l,10000);} // consume XFER_DONE
-            auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();cout<<"[XFER] Done: "<<rc<<" files, "<<fixed<<setprecision(1)<<(tb/1048576.0)<<" MB, "<<dt<<"s, "<<(tb/1048576.0/dt)<<" MB/s"<<endl;}
-        else if((key=='z'||key=='Z')&&!g_fault_active.load()){int li=g_last_idx.load();if(li<0){cout<<"[Undo] Nothing to undo."<<endl;continue;}stringstream ss;ss<<setw(2)<<setfill('0')<<li;if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir)){string st=e.path().stem().string();if(st.rfind("calib_cam_",0)==0&&st.length()>=2&&st.substr(st.length()-2)==ss.str())fs::remove(e.path());}if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"UNDO:"+to_string(li));g_last_idx.store(li-1);g_undo_count++;if(g_capture_count>0)g_capture_count--;}
-        else if((key=='c'||key=='C')&&g_is_master&&g_enable_net_sync){if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;sendLine(g_ctrl_sock,"CLEAR");string ack;recvLine(g_ctrl_sock,ack,2000);cout<<"[Clear] Done."<<endl;}
+            auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();double spd=dt>0?(tb/1048576.0/dt):0;
+            cout<<"[Transfer] "<<rc<<" files, "<<fixed<<setprecision(1)<<(tb/1048576.0)<<" MB, "<<dt<<"s, "<<spd<<" MB/s\n"<<endl;}
+        else if((key=='z'||key=='Z')&&!g_fault_active.load()){int li=g_last_idx.load();if(li<0){cout<<"[Undo] No previous capture to undo."<<endl;continue;}stringstream ss;ss<<setw(2)<<setfill('0')<<li;
+            cout<<"\n[Undo] Deleting capture index "<<ss.str()<<endl;
+            if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir)){string st=e.path().stem().string();if(st.rfind("calib_cam_",0)==0&&st.length()>=2&&st.substr(st.length()-2)==ss.str())fs::remove(e.path());}if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"UNDO:"+to_string(li));g_last_idx.store(li-1);g_undo_count++;if(g_capture_count>0)g_capture_count--;
+            cout<<"[Undo] Done.\n"<<endl;}
+        else if((key=='c'||key=='C')&&g_is_master&&g_enable_net_sync){
+            cout<<"\n[Clear] Removing local calibration photos..."<<endl;
+            if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;sendLine(g_ctrl_sock,"CLEAR");string ack;recvLine(g_ctrl_sock,ack,2000);
+            cout<<"[Clear] Local photos removed.\n"<<endl;}
     }
 
+    cout<<"[System] Shutting down..."<<endl;
     for(auto& ctx:cam_ctxs){ctx->running=false;ctx->copy_cv.notify_all();if(ctx->capture_thread.joinable())ctx->capture_thread.join();if(ctx->copy_thread.joinable())ctx->copy_thread.join();}
     if(cmd_thread.joinable())cmd_thread.join();
     if(g_listen_sock!=INVALID_SOCKET)closesocket(g_listen_sock);if(g_ctrl_sock!=INVALID_SOCKET)closesocket(g_ctrl_sock);
