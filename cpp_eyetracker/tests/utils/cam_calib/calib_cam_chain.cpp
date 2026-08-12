@@ -251,12 +251,18 @@ void action()
                 continue;
             }
         }
-        // Progress bar per image
+        // Progress bar per image with speed / elapsed / ETA
+        double dt_sofar = duration<double>(steady_clock::now() - t0).count();
+        double img_per_s = (imgIdx + 1) / dt_sofar;
+        double eta = dt_sofar / (imgIdx + 1) * (num_images - imgIdx - 1);
         int pct = (imgIdx + 1) * 100 / num_images;
-        int bar_w = 40, filled = (imgIdx + 1) * bar_w / num_images;
+        int bar_w = 30, filled = (imgIdx + 1) * bar_w / num_images;
         cout << "\r  [";
         for (int k = 0; k < bar_w; ++k) cout << (k < filled ? '=' : (k == filled && filled < bar_w ? '>' : ' '));
-        cout << "] " << (imgIdx + 1) << "/" << num_images << " (" << pct << "%)" << flush;
+        cout << "] " << (imgIdx + 1) << "/" << num_images
+             << " | " << fixed << setprecision(1) << dt_sofar << "s"
+             << " | " << setprecision(2) << img_per_s << " img/s"
+             << " | ETA " << setprecision(0) << eta << "s" << flush;
     }
     cout << endl;
     double dt_feat = duration<double>(steady_clock::now() - t0).count();
@@ -319,8 +325,14 @@ void action()
         return;
     }
     double dt_calib = duration<double>(steady_clock::now() - t0).count();
-    cout << "[Timer] Stage 4 - Calibrate: " << fixed << setprecision(2) << dt_calib
-         << "s (error=" << hv_Errors.D() << " px)" << endl;
+    cout << "[Timer] Stage 4 - Calibrate: " << fixed << setprecision(2) << dt_calib << "s" << endl;
+    cout << "  Errors tuple length: " << hv_Errors.Length() << endl;
+    if (hv_Errors.Length() > 1) {
+        cout << "  Per-camera errors (px):" << endl;
+        for (Hlong i = 0; i < hv_Errors.Length(); ++i)
+            cout << "    Cam " << i << ": " << hv_Errors[i].D() << " px" << endl;
+    }
+    cout << "  Overall RMS error: " << (hv_Errors.Length() > 1 ? hv_Errors.TupleMean().D() : hv_Errors.D()) << " px" << endl;
 
     // ========================================================================
     // Stage 5 — 重基准到中心相机
