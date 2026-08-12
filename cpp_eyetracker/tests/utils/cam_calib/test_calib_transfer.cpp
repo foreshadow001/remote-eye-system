@@ -149,30 +149,39 @@ int main(){
     double fps=c["fps"].as<double>(),gain=c["gain"].as<double>(),gamma=c["gamma"].as<double>(),exp=c["exposure_time"].as<double>(),me=c["calib_mono_exp_ext"].as<double>();
     int data_port=g_ctrl_port+1;
     g_win_w=c["window_width"].as<int>(); g_win_h=c["window_height"].as<int>(); double uif=c["ui_fps"].as<double>();
-    cout<<"[Init] Config loaded. Role="<<(g_is_master?"MASTER":"SLAVE")<<" CtrlPort="<<g_ctrl_port<<" DataPort="<<data_port<<" TestXfer="<<(test_xfer?"ON":"OFF")<<endl;
-    cout<<"[Init] net_sync="<<g_enable_net_sync<<" is_master="<<g_is_master<<endl;
-    cout<<"[Init] g_save_dir="<<g_save_dir<<endl;
-    if(test_xfer) cout<<"[Init] test_recv="<<test_recv<<endl;
+    cout<<"\n--- Calibration Transfer Configuration ---"<<endl;
+    cout<<"Role      : "<<(g_is_master?"MASTER":"SLAVE")<<endl;
+    cout<<"Net Sync  : "<<(g_enable_net_sync?"ON":"OFF")<<endl;
+    if(g_enable_net_sync){cout<<"Master IP : "<<g_master_ip<<endl;cout<<"Slave IP  : "<<sip<<endl;
+        cout<<"Ctrl Port : "<<g_ctrl_port<<endl;cout<<"Data Port : "<<data_port<<endl;}
+    cout<<"Test Xfer : "<<(test_xfer?"ON":"OFF")<<endl;
+    cout<<"Save dir  : "<<g_save_dir<<endl;
+    if(test_xfer) cout<<"Recv dir  : "<<test_recv<<endl;
+    cout<<"Cameras   : "<<sns.size()<<endl;
+    for(size_t i=0;i<sns.size();++i)cout<<"  "<<i<<": SN="<<sns[i]<<endl;
+    cout<<"FPS       : "<<fps<<endl;
+    cout<<"Exposure  : "<<exp<<" us"<<endl;
+    cout<<"Window    : "<<g_win_w<<"x"<<g_win_h<<endl;
+    cout<<"------------------------------------------\n"<<endl;
 
-    // ---- TCP setup ----
+    // ---- TCP handshake ----
     thread cmd_thread;
-    cout<<"[TCP] Entering setup block..."<<endl;
     if(g_enable_net_sync){
         if(g_is_master){ g_listen_sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); int opt=1;setsockopt(g_listen_sock,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
             sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(g_ctrl_port);sa.sin_addr.s_addr=INADDR_ANY;::bind(g_listen_sock,(sockaddr*)&sa,sizeof(sa));listen(g_listen_sock,1);
-            cout<<"[TCP] Master listening ::"<<g_ctrl_port<<endl; sockaddr_in ca;socklen_t cl=sizeof(ca);g_ctrl_sock=accept(g_listen_sock,(sockaddr*)&ca,&cl);
-            string hl; recvLine(g_ctrl_sock,hl,10000); if(hl=="READY") sendLine(g_ctrl_sock,"ACK"); else{cerr<<"[TCP] Handshake fail"<<endl;return 1;}
-            cout<<"[TCP] Slave connected + handshake OK."<<endl;}
+            cout<<"[TCP] Listening on ::"<<g_ctrl_port<<" ..."<<endl; sockaddr_in ca;socklen_t cl=sizeof(ca);g_ctrl_sock=accept(g_listen_sock,(sockaddr*)&ca,&cl);
+            string hl; recvLine(g_ctrl_sock,hl,10000); if(hl=="READY") sendLine(g_ctrl_sock,"ACK"); else{cerr<<"[Error] TCP handshake failed"<<endl;return 1;}
+            cout<<"[TCP] Slave connected. Handshake OK."<<endl;}
         else{ g_ctrl_sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(g_ctrl_port);inet_pton(AF_INET,g_master_ip.c_str(),&sa.sin_addr);
-            cout<<"[TCP] Slave connecting to "<<g_master_ip<<":"<<g_ctrl_port<<"..."<<endl;
+            cout<<"[TCP] Connecting to "<<g_master_ip<<":"<<g_ctrl_port<<" ..."<<endl;
             int retry=0; while(connect(g_ctrl_sock,(sockaddr*)&sa,sizeof(sa))!=0){if(++retry%10==1)cerr<<"[TCP] Connect retry #"<<retry<<"..."<<endl;this_thread::sleep_for(chrono::milliseconds(500));}
-            sendLine(g_ctrl_sock,"READY"); string hl; recvLine(g_ctrl_sock,hl,10000); if(hl!="ACK"){cerr<<"[TCP] Handshake fail"<<endl;return 1;}
-            cout<<"[TCP] Connected to Master + handshake OK."<<endl;cmd_thread=thread(slaveCmdWorker,g_ctrl_sock);}
+            sendLine(g_ctrl_sock,"READY"); string hl; recvLine(g_ctrl_sock,hl,10000); if(hl!="ACK"){cerr<<"[Error] TCP handshake failed"<<endl;return 1;}
+            cout<<"[TCP] Connected to Master. Handshake OK."<<endl;cmd_thread=thread(slaveCmdWorker,g_ctrl_sock);}
     }
 
     // ---- test_transfer mode (skip cameras, show transfer UI) ----
     if(test_xfer){
-        cout<<"[Mode] Test transfer — no cameras, transfer UI only."<<endl;
+        cout<<"[System] Test transfer mode — skipping camera init."<<endl;
         bool xfer_done=false; string xfer_status; int xfer_cnt=0; size_t xfer_bytes=0; int xfer_total=0; double xfer_speed=0;
         cv::namedWindow("Calib Transfer Test",cv::WINDOW_NORMAL);cv::resizeWindow("Calib Transfer Test",800,400);
         auto uii=chrono::milliseconds((int)(1000.0/uif));auto lui=chrono::steady_clock::now()-uii;
@@ -231,6 +240,7 @@ int main(){
     }
 
     // ---- Camera init (non-test mode) ----
+    cout<<"[System] Initializing cameras..."<<endl;
     Pylon::PylonInitialize();
     for(size_t i=0;i<sns.size();++i){auto ctx=make_shared<CameraContext>(sns[i]);cam_ctxs.push_back(ctx);}
     for(auto& ctx:cam_ctxs){ctx->running=true;ctx->copy_thread=thread(copyWorker,ctx);ctx->capture_thread=thread(captureWorker,ctx,fps,gain,gamma,exp,me);}
@@ -238,7 +248,7 @@ int main(){
     // ---- UI ----
     cv::namedWindow("Calib Capture",cv::WINDOW_NORMAL);cv::resizeWindow("Calib Capture",g_win_w,g_win_h);updateLayout();cv::setMouseCallback("Calib Capture",onMouse);
     auto uii=chrono::milliseconds((int)(1000.0/uif));auto lui=chrono::steady_clock::now()-uii;
-    g_capture_count=getNextCounter(g_save_dir);cout<<"[Init] Existing captures: "<<g_capture_count<<endl;g_ready_time=chrono::steady_clock::now();
+    g_capture_count=getNextCounter(g_save_dir);cout<<"[System] Existing captures: "<<g_capture_count<<endl;g_ready_time=chrono::steady_clock::now();
 
     while(global_running){
         auto now=chrono::steady_clock::now();bool nu=(now-lui)>=uii;
