@@ -137,9 +137,13 @@ int main(){
     if(g_enable_net_sync){
         if(g_is_master){ g_listen_sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); int opt=1;setsockopt(g_listen_sock,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
             sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(port);sa.sin_addr.s_addr=INADDR_ANY;::bind(g_listen_sock,(sockaddr*)&sa,sizeof(sa));listen(g_listen_sock,1);
-            cout<<"[TCP] Master listening ::"<<port<<endl; sockaddr_in ca;socklen_t cl=sizeof(ca);g_ctrl_sock=accept(g_listen_sock,(sockaddr*)&ca,&cl);cout<<"[TCP] Slave connected."<<endl;}
+            cout<<"[TCP] Master listening ::"<<port<<endl; sockaddr_in ca;socklen_t cl=sizeof(ca);g_ctrl_sock=accept(g_listen_sock,(sockaddr*)&ca,&cl);
+            string hl; recvLine(g_ctrl_sock,hl,10000); if(hl=="READY") sendLine(g_ctrl_sock,"ACK"); else{cerr<<"[TCP] Handshake fail"<<endl;return 1;}
+            cout<<"[TCP] Slave connected + handshake OK."<<endl;}
         else{ g_ctrl_sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(port);inet_pton(AF_INET,mip.c_str(),&sa.sin_addr);
-            while(connect(g_ctrl_sock,(sockaddr*)&sa,sizeof(sa))!=0){this_thread::sleep_for(chrono::milliseconds(500));}cout<<"[TCP] Connected to Master."<<endl;cmd_thread=thread(slaveCmdWorker,g_ctrl_sock);}
+            while(connect(g_ctrl_sock,(sockaddr*)&sa,sizeof(sa))!=0){this_thread::sleep_for(chrono::milliseconds(500));}
+            sendLine(g_ctrl_sock,"READY"); string hl; recvLine(g_ctrl_sock,hl,10000); if(hl!="ACK"){cerr<<"[TCP] Handshake fail"<<endl;return 1;}
+            cout<<"[TCP] Connected to Master + handshake OK."<<endl;cmd_thread=thread(slaveCmdWorker,g_ctrl_sock);}
     }
 
     // ---- test_transfer mode (skip cameras, show transfer UI) ----
