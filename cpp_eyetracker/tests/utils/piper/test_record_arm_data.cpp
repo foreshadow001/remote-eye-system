@@ -398,11 +398,10 @@ int main() {
     }
 #endif
 
-    // --- 读取 calib_arm.yaml + capture.yaml ---
+    // --- 读取 calib_arm.yaml ---
     namespace fs = std::filesystem;
     fs::path cfg_dir = fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path() / "cfg";
     Cfg arm_cfg((cfg_dir / "calib_arm.yaml").string());
-    Cfg cap_cfg((cfg_dir / "capture.yaml").string());
 
     // 网络配置
     g_ubuntu_ip = arm_cfg["network"]["ubuntu_ip"].as<string>();
@@ -411,8 +410,8 @@ int main() {
     // 相机配置
     auto& rcfg = arm_cfg["record"];
     vector<string> camera_ids = rcfg["cam_indices"].as<vector<string>>();
-    string pid = cap_cfg["capture"]["participant_id"].as<string>();
-    g_calib_save_dir = rcfg["calib_save_dir"].as<string>() + "/" + pid;
+    string day_id = rcfg["day_id"].as<string>();
+    g_calib_save_dir = rcfg["calib_save_dir"].as<string>() + "/" + day_id;
 
     double target_fps = rcfg["fps"].as<double>();
     double gain_val   = rcfg["gain"].as<double>();
