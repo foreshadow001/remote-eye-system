@@ -1144,14 +1144,6 @@ int main() {
     g_ready_time = std::chrono::steady_clock::now();
 
     while (global_running) {
-        // E1: check if no camera has started streaming within 30s
-        static bool startup_checked = false;
-        if (!startup_checked && chrono::duration<double>(chrono::steady_clock::now() - g_ready_time).count() > 30.0) {
-            startup_checked = true;
-            bool any_streaming = false;
-            for (auto& ctx : cam_ctxs) if (ctx->has_streamed.load()) { any_streaming = true; break; }
-            if (!any_streaming) logException("ERROR", "startup", "No camera streaming after 30s");
-        }
         auto current_time = std::chrono::steady_clock::now();
         bool need_ui_update = (current_time - last_ui_time) >= ui_interval;
 
@@ -1191,48 +1183,6 @@ int main() {
                         cout << "[System] Received SHUTDOWN from peer. Exiting." << endl;
                         global_running = false;
                     }
-                }
-            }
-        }
-
-        // ===== 1. 相机健康检查 =====
-        if (!g_fault_active.load() && !is_dumping.load()) {
-            auto now = std::chrono::steady_clock::now();
-            for (size_t i = 0; i < cam_ctxs.size(); ++i) {
-                if (!cam_ctxs[i]->has_streamed.load()) continue;
-                if (std::chrono::duration<double>(now - cam_ctxs[i]->last_frame_time.load()).count() > 1.0) {
-                    cerr << "\n[FAULT] Camera " << cam_ctxs[i]->id
-                         << " (index " << i << ") stalled!" << endl;
-                    // [DBG] 全景状态: 各相机 状态 / 是否出过回调 / 处理帧数 / 队列长度
-                    for (auto& cc : cam_ctxs) {
-                        int qs = 0;
-                        { lock_guard<mutex> lk(cc->copy_mtx); qs = (int)cc->copy_queue.size(); }
-                        cout << "[DBG Stall] cam " << cc->id
-                             << " status=" << cc->status_msg
-                             << " streamed=" << (cc->has_streamed.load() ? "Y" : "N")
-                             << " captured=" << cc->captured_frames.load()
-                             << " qlen=" << qs << endl;
-                    }
-                    g_fault_time = std::chrono::steady_clock::now();
-                    g_fault_active.store(true); g_faulty_cam.store((int)i);
-                    g_fault_on_master.store(is_master_pc);
-                    if (enable_net_sync && g_fault_sock != INVALID_SOCKET) {
-                        string fm = "FAULT:" + string(is_master_pc ? "M" : "S") + to_string(i);
-                        sendto(g_fault_sock, fm.c_str(), (int)fm.length(), 0,
-                               (sockaddr*)&g_peer_fault_addr, sizeof(g_peer_fault_addr));
-                    }
-                    // Close all cameras
-                    for (auto& ctx : cam_ctxs) {
-                        ctx->running = false;
-                        ctx->copy_cv.notify_all();
-                    }
-                    for (auto& ctx : cam_ctxs) {
-                        if (ctx->capture_thread.joinable()) ctx->capture_thread.join();
-                        if (ctx->copy_thread.joinable()) ctx->copy_thread.join();
-                    }
-                    is_recording = false;
-                    cout << "[Fault] All cameras stopped. Press ESC to exit both hosts." << endl;
-                    break;
                 }
             }
         }

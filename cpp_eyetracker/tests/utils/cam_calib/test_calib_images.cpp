@@ -982,35 +982,6 @@ int main() {
             }
         }
 
-        // ===== 1. 相机健康检查 =====
-        if (!g_fault_active.load()) {
-            auto now = chrono::steady_clock::now();
-            for (size_t i = 0; i < cam_ctxs.size(); ++i) {
-                if (!cam_ctxs[i]->has_streamed.load()) continue;
-                if (chrono::duration<double>(now - cam_ctxs[i]->last_frame_time.load()).count() > 1.0) {
-                    cerr << "\n[FAULT] Camera " << cam_ctxs[i]->sn
-                         << " (index " << i << ") stalled!" << endl;
-                    g_fault_time = chrono::steady_clock::now();
-                    g_fault_active.store(true); g_faulty_cam.store((int)i);
-                    g_fault_on_master.store(g_is_master);
-                    if (g_enable_net_sync)
-                        fastUdpSend(g_peer_fault_addr,
-                                    "FAULT:" + string(g_is_master ? "M" : "S") + to_string(i));
-                    // Close all cameras
-                    for (auto& ctx : cam_ctxs) {
-                        ctx->running = false;
-                        ctx->copy_cv.notify_all();
-                    }
-                    for (auto& ctx : cam_ctxs) {
-                        if (ctx->capture_thread.joinable()) ctx->capture_thread.join();
-                        if (ctx->copy_thread.joinable()) ctx->copy_thread.join();
-                    }
-                    cout << "[Fault] All cameras stopped. Press ESC to exit both hosts." << endl;
-                    break;
-                }
-            }
-        }
-
         // ===== 2. UI 渲染 =====
         if (need_ui_update) {
             if (g_fault_active.load()) {
