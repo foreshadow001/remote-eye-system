@@ -116,6 +116,9 @@ hand_eye_calib:
     - 40772277
     - 40772284
 
+save_piper_chain:
+  use_calibrated_arm_in_ccs: false              # true = 用刚标定的 arm_in_ccs/board_in_flange; false = 用 init_value
+
 resolve_calib_board_pose:
   focus: 0.016                                    # 默认焦距 (m)
   pixel_size_x: 2.74e-6

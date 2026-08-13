@@ -137,13 +137,14 @@ int main(){
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2,2),&wsa);
 #endif
-    Cfg cfg("cfg/cam_calib.yaml"); auto& c=cfg["calib"];
+    auto cfg_dir=(fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()/"cfg").string();
+    Cfg cfg(cfg_dir+"/cam_calib.yaml"); auto& c=cfg["calib"];
     g_is_master=c["is_master"].as<bool>(); g_master_ip=c["master_ip"].as<string>();
     string sip=c["slave_ip"].as<string>();
     g_ctrl_port=c["port"].as<int>(); g_enable_net_sync=c["enable_net_sync"].as<bool>();
     vector<string> sns=c["cam_indices"].as<vector<string>>();
     string base_dir=c["calib_save_dir"].as<string>();
-    string pid="P001"; try{Cfg cfg_cap("cfg/capture.yaml");pid=cfg_cap["capture"]["participant_id"].as<string>();}catch(...){}
+    string pid="P001"; try{Cfg cfg_cap(cfg_dir+"/capture.yaml");pid=cfg_cap["capture"]["participant_id"].as<string>();}catch(...){}
     g_save_dir=base_dir+"/"+pid+"/pictures"; fs::create_directories(g_save_dir);
     bool test_xfer=false; try{test_xfer=c["test_transfer"].as<bool>();}catch(...){}
     string test_recv; try{test_recv=c["test_transfer_recv_dir"].as<string>();test_recv+="/"+pid+"/pictures";}catch(...){test_recv="D:/calib_transfer_test/"+pid+"/pictures";}

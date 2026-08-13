@@ -173,7 +173,8 @@ int main(int argc, char* argv[]) {
     vector<string> roots;
     vector<string> sns;
     try {
-        Cfg cfg("cfg/capture.yaml");
+        auto cfg_dir = (fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()/"cfg").string();
+        Cfg cfg(cfg_dir+"/capture.yaml");
         // Append participant_id to each root
         string participant_id;
         try { participant_id = cfg["capture"]["participant_id"].as<string>(); } catch (...) { participant_id = "P001"; }

@@ -799,6 +799,16 @@ int main() {
     bool is_master_pc=g_is_master;
     g_use_hw_trigger=use_hw_trigger;
 
+    // ---- 配置打印: 输入/输出目录 ----
+    cout<<"\n--- Data Directories ---"<<endl;
+    cout<<"Participant ID   : "<<participant_id<<endl;
+    for(size_t i=0;i<g_participant_roots.size();++i)
+        cout<<"ParticipantRoot["<<i<<"]: "<<g_participant_roots[i]<<endl;
+    cout<<"Sentry root      : "<<g_sentry_root<<endl;
+    cout<<"HDF5 chunk cap   : "<<g_hdf5_chunk_capacity<<endl;
+    cout<<"Cameras          : "<<camera_ids.size()<<endl;
+    cout<<"----------------------------------\n"<<endl;
+
     cout<<"\n--- Network Sync Configuration ---"<<endl;
     cout<<"Role             : "<<(is_master_pc?"MASTER (Sender)":"SLAVE (Receiver)")<<endl;
     cout<<"Master IP        : "<<g_master_ip<<endl;

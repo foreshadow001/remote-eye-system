@@ -1057,7 +1057,8 @@ int main() {
     }
 #endif
 
-    Cfg cfg("cfg/capture.yaml");
+    auto cfg_dir = (fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()/"cfg").string();
+    Cfg cfg(cfg_dir+"/capture.yaml");
     auto& cap = cfg["capture"];
     Pylon::PylonInitialize();
 
