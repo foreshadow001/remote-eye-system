@@ -576,16 +576,6 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
             ctx->copy_queue.pop();
         }
 
-        // [DBG] 一次性诊断: 每台相机打印首帧 实际分辨率 / payload / 像素格式
-        if (!ctx->has_streamed.exchange(true)) {
-            size_t ps = task.first->GetPayloadSize();
-            cout << "[DBG Frame] cam " << ctx->id << ": " << task.first->GetWidth() << "x"
-                 << task.first->GetHeight() << " payload=" << ps
-                 << " (w*h=" << task.first->GetWidth() * task.first->GetHeight() << ")"
-                 << " pixfmt=" << task.first->GetPixelType()
-                 << " is_mono=" << (ctx->is_mono ? 1 : 0) << endl;
-        }
-
         if (ctx->recording) {
             int seq = ctx->recorded_frames.load(std::memory_order_relaxed);
             if (seq < ctx->total_record_frames) {
@@ -672,12 +662,6 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
     ctx->cam.setFrameCallback([ctx, state, use_hw_trigger, enable_offset](const Pylon::CBaslerUniversalGrabResultPtr& ptr, FrameMeta meta) {
         state->frame_counter++;
         ctx->status = CamStatus::STREAMING;
-
-        // [DBG] 首个回调: 判断触发是否到达该相机
-        if (state->frame_counter == 1) {
-            cout << "[DBG CB] cam " << ctx->id << " FIRST callback (blockID=" << meta.blockID
-                 << ")" << endl;
-        }
 
         if (!ctx->offset_initialized && state->frame_counter > 1) {
             // [修改] 如果是硬件触发 或者 软件触发但未开启偏移补偿，直接将偏移置0

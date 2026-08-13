@@ -38,6 +38,45 @@ namespace fs = std::filesystem;
 using namespace std;
 using namespace gazeestimation;
 
+// ================== 控制台时间戳 (每行前缀 [YYYY-MM-DD HH:MM:SS]) ==================
+string nowTimestamp() {
+    auto t = chrono::system_clock::to_time_t(chrono::system_clock::now());
+    tm tmv{};
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    char buf[32];
+    strftime(buf, sizeof(buf), "[%Y-%m-%d %H:%M:%S] ", &tmv);
+    return string(buf);
+}
+
+// 自定义 streambuf: 每个换行后的行首自动插入时间戳
+class TimestampBuf : public std::streambuf {
+    std::streambuf* dst_;
+    bool at_line_start_ = true;
+    mutex mtx_;  // 序列化输出, 防止多线程行交错
+public:
+    explicit TimestampBuf(std::streambuf* dst) : dst_(dst) {}
+protected:
+    int_type overflow(int_type c) override {
+        if (c == traits_type::eof()) return c;
+        lock_guard<mutex> lk(mtx_);
+        if (at_line_start_) {
+            string ts = nowTimestamp();
+            for (char ch : ts) dst_->sputc(ch);
+            at_line_start_ = false;
+        }
+        if (c == '\n') at_line_start_ = true;
+        return dst_->sputc((char)c);
+    }
+    int sync() override {
+        lock_guard<mutex> lk(mtx_);
+        return dst_->pubsync();
+    }
+};
+
 // ================== UI / Recording globals ==================
 atomic<bool> global_running{true};
 atomic<bool> net_cmd_record{false};
@@ -193,6 +232,32 @@ bool recvLine(SOCKET sock, string& line, int timeout_ms = 3000) {
     }
     return false;
 }
+
+// 带状态返回的 recvLine: 0=收到一行, 1=超时(无数据), 2=连接关闭/错误
+int recvLineStatus(SOCKET sock, string& line, int timeout_ms = 3000) {
+    DWORD to = timeout_ms;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+    char buf[256]; string acc;
+    auto deadline = chrono::steady_clock::now() + chrono::milliseconds(timeout_ms);
+    while (chrono::steady_clock::now() < deadline) {
+        int n = recv(sock, buf, sizeof(buf)-1, 0);
+        if (n == 0) return 2;                     // 对端正常关闭
+        if (n < 0) {
+#ifdef _WIN32
+            int e = WSAGetLastError();
+            if (e == WSAETIMEDOUT) return 1;      // 空闲超时, 不是断连
+#else
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+#endif
+            return 2;                              // 其他错误视为断连
+        }
+        buf[n] = '\0'; acc += buf;
+        size_t nl = acc.find('\n');
+        if (nl != string::npos) { line = acc.substr(0,nl);
+            if (!line.empty() && line.back()=='\r') line.pop_back(); return 0; }
+    }
+    return 1;
+}
 bool sendLineRaw(SOCKET sock, const string& msg) {
     string data = msg + "\n";
     return send(sock, data.c_str(), (int)data.length(), 0) > 0;
@@ -314,7 +379,9 @@ void gazeClientWorker(const string& master_ip, int gaze_port) {
         cout << "[Gaze] Slave connected to Master." << endl;
         while (global_running) {
             string line;
-            if (!recvLine(sock, line, 300000)) { cerr<<"[Gaze] Connection lost - exiting."<<endl;global_running=false;break; }
+            int st = recvLineStatus(sock, line, 300000);
+            if (st == 2) { cerr<<"[Gaze] Connection closed by Master - reconnecting."<<endl; break; }  // 真断连 → 重连, 不退出
+            if (st == 1) continue;  // 空闲超时 → 继续等待
             if (line.rfind("GAZE:",0) == 0) {
                 double gx,gy,gz; sscanf_s(line.c_str()+5, "%lf,%lf,%lf", &gx, &gy, &gz);
                 g_gaze_x=gx; g_gaze_y=gy; g_gaze_z=gz;
@@ -547,24 +614,27 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
         while(global_running){sockaddr_in ca;socklen_t cl=sizeof(ca);
             g_cmd_sock=accept(g_cmd_listen_sock,(sockaddr*)&ca,&cl); if(g_cmd_sock==INVALID_SOCKET) break;
             cout<<"[Cmd] Slave connected. Handshaking..."<<endl;
-            string hl; if(recvLine(g_cmd_sock,hl,10000)&&hl=="READY"){sendLineRaw(g_cmd_sock,"ACK");cout<<"[Cmd] Handshake OK."<<endl;break;}
-            else{cerr<<"[Cmd] Handshake FAILED (recv:'"<<hl<<"'). Reconnecting..."<<endl;closesocket(g_cmd_sock);g_cmd_sock=INVALID_SOCKET;}}
-        if(g_cmd_sock==INVALID_SOCKET) return;
-        while(global_running){
-            string line;
-            if(!recvLine(g_cmd_sock,line,500)) continue;
-            if(line.rfind("HDF5_DONE:",0)==0){g_slave_hdf5_done=true;g_slave_hdf5_s=atof(line.c_str()+10);cout<<"[Cmd] Slave HDF5 done ("<<g_slave_hdf5_s<<"s)."<<endl;}
-            else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){
-                if(line.length()<=7) continue;
-                char hf=line[6]; int fi=stoi(line.substr(7));
-                if(fi<0||fi>=(int)cam_ctxs.size()) continue;
-                cout<<"[Fault] Received from SLAVE: cam "<<fi<<endl;
-                g_fault_time=chrono::steady_clock::now();
-                g_fault_active.store(true);g_faulty_cam.store(fi);g_fault_on_master.store(false);
-                for(auto& c:cam_ctxs){c->running=false;c->copy_cv.notify_all();}
-                for(auto& c:cam_ctxs){if(c->capture_thread.joinable())c->capture_thread.join();if(c->copy_thread.joinable())c->copy_thread.join();}
-                cout<<"[Fault] All cameras stopped. Press ESC to exit."<<endl;
+            string hl; if(recvLine(g_cmd_sock,hl,10000)&&hl=="READY"){sendLineRaw(g_cmd_sock,"ACK");cout<<"[Cmd] Handshake OK."<<endl;}
+            else{cerr<<"[Cmd] Handshake FAILED (recv:'"<<hl<<"'). Reconnecting..."<<endl;closesocket(g_cmd_sock);g_cmd_sock=INVALID_SOCKET;continue;}
+            while(global_running){
+                string line;
+                int st=recvLineStatus(g_cmd_sock,line,500);
+                if(st==2){cerr<<"[Cmd] Slave disconnected - re-accepting."<<endl;break;}  // 真断连 → 重新 accept
+                if(st==1)continue;  // 500ms 轮询超时
+                if(line.rfind("HDF5_DONE:",0)==0){g_slave_hdf5_done=true;g_slave_hdf5_s=atof(line.c_str()+10);cout<<"[Cmd] Slave HDF5 done ("<<g_slave_hdf5_s<<"s)."<<endl;}
+                else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){
+                    if(line.length()<=7) continue;
+                    char hf=line[6]; int fi=stoi(line.substr(7));
+                    if(fi<0||fi>=(int)cam_ctxs.size()) continue;
+                    cout<<"[Fault] Received from SLAVE: cam "<<fi<<endl;
+                    g_fault_time=chrono::steady_clock::now();
+                    g_fault_active.store(true);g_faulty_cam.store(fi);g_fault_on_master.store(false);
+                    for(auto& c:cam_ctxs){c->running=false;c->copy_cv.notify_all();}
+                    for(auto& c:cam_ctxs){if(c->capture_thread.joinable())c->capture_thread.join();if(c->copy_thread.joinable())c->copy_thread.join();}
+                    cout<<"[Fault] All cameras stopped. Press ESC to exit."<<endl;
+                }
             }
+            closesocket(g_cmd_sock);g_cmd_sock=INVALID_SOCKET;
         }
     } else {
         while(global_running){
@@ -577,7 +647,9 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
             cout<<"[Cmd] Handshake OK."<<endl;
             while(global_running){
                 string line;
-                if(!recvLine(g_cmd_sock,line,300000)){cerr<<"[Cmd] Connection lost - exiting."<<endl;global_running=false;break;}
+                int st=recvLineStatus(g_cmd_sock,line,300000);
+                if(st==2){cerr<<"[Cmd] Connection closed by Master - reconnecting."<<endl;break;}  // 真断连 → 重连, 不退出
+                if(st==1)continue;  // 空闲超时 → 继续等待
                 if(line=="INIT_OK"){g_init_ok=true;cout<<"[Cmd] Received INIT_OK from Master."<<endl;}
                 else if(line.rfind("PIPER:",0)==0){
                     size_t c2=line.find(':',6); if(c2==string::npos) continue;
@@ -687,6 +759,11 @@ void writeReport(const string& timestr, int rec_num, int total_frames, bool hw_t
 // ================== main ==================
 int main() {
     _putenv("HDF5_USE_FILE_LOCKING=FALSE");
+    // 安装时间戳输出 (所有 cout/cerr 行自动加 [YYYY-MM-DD HH:MM:SS] 前缀)
+    static TimestampBuf tsb_out(cout.rdbuf());
+    static TimestampBuf tsb_err(cerr.rdbuf());
+    cout.rdbuf(&tsb_out);
+    cerr.rdbuf(&tsb_err);
     cout<<"=== [TEST] Multi-Basler Camera Tool (Sync Network Node + Piper) ==="<<endl;
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2,2),&wsa);

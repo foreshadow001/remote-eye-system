@@ -114,17 +114,13 @@ bool BaslerCamera::start() {
     try {
         if (!camera_.IsOpen()) return false;
 
-        // [DBG] 步骤级诊断
-        { lock_guard<mutex> lk(g_print_mtx); cout << "[Basler] " << serialNumber_ << " start(): MaxNumBuffer=150..." << flush; }
         camera_.MaxNumBuffer.SetValue(maxNumBuffer_);
-        { lock_guard<mutex> lk(g_print_mtx); cout << "OK. Register handler..." << flush; }
+
         camera_.RegisterImageEventHandler(this, RegistrationMode_ReplaceAll, Cleanup_None);
-        { lock_guard<mutex> lk(g_print_mtx); cout << "OK. StartGrabbing..." << flush; }
         camera_.StartGrabbing(GrabStrategy_OneByOne, Pylon::GrabLoop_ProvidedByInstantCamera);
-        { lock_guard<mutex> lk(g_print_mtx); cout << "OK. Streaming!" << endl; }
         return true;
     } catch (const std::exception& e) {
-        std::cerr << "[Basler Start Error] SN=" << serialNumber_ << ": " << e.what() << std::endl;
+        std::cerr << "[Basler Start Error] " << e.what() << std::endl;
         return false;
     }
 }
