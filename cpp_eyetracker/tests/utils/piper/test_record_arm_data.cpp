@@ -332,7 +332,18 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
             ctx->copy_queue.pop();
         }
 
-        cv::Mat temp(task.first->GetHeight(), task.first->GetWidth(), CV_8UC1, task.first->GetBuffer());
+        // 校验帧有效性: 抓取失败或尺寸异常时跳过, 保留上一帧好图
+        if (!task.first->GrabSucceeded()) {
+            cerr << "[Warn] Cam " << ctx->sn << " dropped invalid frame (grab failed)" << endl;
+            continue;
+        }
+        int w = task.first->GetWidth(), h = task.first->GetHeight();
+        if (w < 100 || h < 100 || w > 10000 || h > 10000) {
+            cerr << "[Warn] Cam " << ctx->sn << " invalid frame size: " << w << "x" << h << endl;
+            continue;
+        }
+
+        cv::Mat temp(h, w, CV_8UC1, task.first->GetBuffer());
         cv::Mat clone_img = temp.clone();
         {
             lock_guard<mutex> lock(ctx->frame_mtx);
@@ -359,6 +370,7 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
     } catch (...) {}
 
     ctx->cam.setFrameCallback([ctx](const Pylon::CBaslerUniversalGrabResultPtr& ptr, FrameMeta meta) {
+        if (!ptr->GrabSucceeded()) return;  // 丢弃抓取失败的帧
         lock_guard<mutex> lock(ctx->copy_mtx);
         if (ctx->copy_queue.size() < 2) {
             ctx->copy_queue.push({ptr, meta});
