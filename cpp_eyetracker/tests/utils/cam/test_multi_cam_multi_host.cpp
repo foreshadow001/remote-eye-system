@@ -576,11 +576,30 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
             ctx->copy_queue.pop();
         }
 
+        // [DBG] 一次性诊断: 每台相机打印首帧 实际分辨率 / payload / 像素格式
+        if (!ctx->has_streamed.exchange(true)) {
+            size_t ps = task.first->GetPayloadSize();
+            cout << "[DBG Frame] cam " << ctx->id << ": " << task.first->GetWidth() << "x"
+                 << task.first->GetHeight() << " payload=" << ps
+                 << " (w*h=" << task.first->GetWidth() * task.first->GetHeight() << ")"
+                 << " pixfmt=" << task.first->GetPixelType()
+                 << " is_mono=" << (ctx->is_mono ? 1 : 0) << endl;
+        }
+
         if (ctx->recording) {
             int seq = ctx->recorded_frames.load(std::memory_order_relaxed);
             if (seq < ctx->total_record_frames) {
                 void* pBuffer = task.first->GetBuffer();
                 size_t payload_size = task.first->GetWidth() * task.first->GetHeight();
+
+                // [DBG] 溢出检测: payload 超过预分配 RAM buffer 会破坏堆
+                if (payload_size > ctx->ram_buffer[seq].total() * ctx->ram_buffer[seq].elemSize()) {
+                    cerr << "[DBG OVERFLOW] cam " << ctx->id << " seq=" << seq
+                         << ": payload=" << payload_size
+                         << " > ram_buffer=" << (ctx->ram_buffer[seq].total() * ctx->ram_buffer[seq].elemSize())
+                         << " — SKIPPING memcpy to avoid heap corruption" << endl;
+                    continue;
+                }
 
                 memcpy(ctx->ram_buffer[seq].data, pBuffer, payload_size);
                 ctx->meta_buffer[seq] = task.second;
