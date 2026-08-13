@@ -673,6 +673,12 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
         state->frame_counter++;
         ctx->status = CamStatus::STREAMING;
 
+        // [DBG] 首个回调: 判断触发是否到达该相机
+        if (state->frame_counter == 1) {
+            cout << "[DBG CB] cam " << ctx->id << " FIRST callback (blockID=" << meta.blockID
+                 << ")" << endl;
+        }
+
         if (!ctx->offset_initialized && state->frame_counter > 1) {
             // [修改] 如果是硬件触发 或者 软件触发但未开启偏移补偿，直接将偏移置0
             if (use_hw_trigger || !enable_offset) {
@@ -1197,6 +1203,16 @@ int main() {
                 if (std::chrono::duration<double>(now - cam_ctxs[i]->last_frame_time.load()).count() > 1.0) {
                     cerr << "\n[FAULT] Camera " << cam_ctxs[i]->id
                          << " (index " << i << ") stalled!" << endl;
+                    // [DBG] 全景状态: 各相机 状态 / 是否出过回调 / 处理帧数 / 队列长度
+                    for (auto& cc : cam_ctxs) {
+                        int qs = 0;
+                        { lock_guard<mutex> lk(cc->copy_mtx); qs = (int)cc->copy_queue.size(); }
+                        cout << "[DBG Stall] cam " << cc->id
+                             << " status=" << cc->status_msg
+                             << " streamed=" << (cc->has_streamed.load() ? "Y" : "N")
+                             << " captured=" << cc->captured_frames.load()
+                             << " qlen=" << qs << endl;
+                    }
                     g_fault_time = std::chrono::steady_clock::now();
                     g_fault_active.store(true); g_faulty_cam.store((int)i);
                     g_fault_on_master.store(is_master_pc);
