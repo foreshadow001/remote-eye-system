@@ -26,3 +26,12 @@ record:                               # 从 piper.yaml test_record_arm_data 节�
   ui_fps: 20.0
   cam_width: 2448
   cam_height: 2048
+
+# 标定板位姿解算 (resolve_calib_board_pose.cpp, 从 piper.yaml 搬迁)
+resolve:
+  focus: 0.016                                    # 默认焦距 (m)
+  pixel_size_x: 2.74e-6
+  pixel_size_y: 2.74e-6
+  center_cam: "40772280"
+  only_use_center_cam: false                       # true = 只用中心相机, 用于对比多相机效果
+  use_calibrated_arm_in_ccs: true                  # true = save_piper_chain 用标定后的 arm_in_ccs; false = 用 init_value

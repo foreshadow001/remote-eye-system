@@ -387,20 +387,24 @@ int main(int argc, char* argv[]) {
         SetSystem("use_window_thread", "true");
 #endif
 
-        auto piper_path = (fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()
-                           / "cfg" / "piper.yaml").string();
-        Cfg cfg(piper_path);
-        Cfg default_cfg;
-        auto& rcfg = cfg["resolve_calib_board_pose"];
+        auto cfg_root = fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()
+                        / "cfg";
+        Cfg arm_cfg((cfg_root / "calib_arm.yaml").string());
+        Cfg cam_cfg((cfg_root / "cam_calib.yaml").string());
+        auto& rcfg = arm_cfg["resolve"];
 
-        string img_base   = cfg["test_record_arm_data"]["calib_save_dir"].as<string>();
-        string out_dir    = img_base;
-        HTuple hv_cp      = default_cfg["cam_calib"]["calib_plane"].as<string>().c_str();
+        // 输入目录 = calib_arm.yaml: record.calib_save_dir / record.day_id (无需单独配置)
+        string img_base   = arm_cfg["record"]["calib_save_dir"].as<string>()
+                          + "/" + arm_cfg["record"]["day_id"].as<string>();
+        string out_dir    = img_base;   // 输出目录与输入目录一致
+        // 相机标定 XML = cam_calib.yaml: calib.calib_save_dir / calib_arm.yaml: record.day_id / output
+        string xml_dir    = cam_cfg["calib"]["calib_save_dir"].as<string>()
+                          + "/" + arm_cfg["record"]["day_id"].as<string>() + "/output";
+        HTuple hv_cp      = cam_cfg["calib"]["calib_plane"].as<string>().c_str();
         double focus      = rcfg["focus"].as<double>();
         double px_sx      = rcfg["pixel_size_x"].as<double>();
         double px_sy      = rcfg["pixel_size_y"].as<double>();
         string center_sn  = rcfg["center_cam"].as<string>();
-        string xml_dir    = default_cfg["cam_calib"]["output_folder"].as<string>();
 
         cout << "=== Resolve Calibration Board Pose ===" << endl;
         cout << "Image base:  " << img_base << endl;

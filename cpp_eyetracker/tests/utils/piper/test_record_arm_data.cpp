@@ -45,6 +45,9 @@ using namespace gazeestimation;
 // ================== 全局状态 ==================
 atomic<bool> global_running{true};
 
+// ================== Resolve 子进程 (r 键触发) ==================
+PROCESS_INFORMATION g_resolve_pi{};
+
 // ================== TCP 通信 ==================
 SOCKET g_arm_sock = INVALID_SOCKET;
 string g_ubuntu_ip;
@@ -486,6 +489,7 @@ int main() {
     cout << "\n=== Ready ===" << endl;
     cout << "  SPACE - Capture photo + flange pose" << endl;
     cout << "  t     - Switch arm (upper/lower), current: " << g_current_arm << endl;
+    cout << "  r     - Launch resolve_calib_board_pose.exe" << endl;
     cout << "  Q/ESC - Quit\n" << endl;
 
     while (global_running) {
@@ -537,7 +541,7 @@ int main() {
             int hx = g_right_x + 10, hy = g_win_h - 45;
             string hints = g_calib_mode
                 ? "[a] exit  [space] capture  [z] undo  Camera: " + g_calib_cam_sn
-                : "[t] switch  [space] capture  [z] undo  [a] calib  [c] clear  [q] quit";
+                : "[t] switch  [space] capture  [z] undo  [a] calib  [r] resolve  [c] clear  [q] quit";
             cv::putText(canvas, hints, cv::Point(hx, hy),
                         cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
             hy += 18;
@@ -567,6 +571,35 @@ int main() {
         else if (key == 't' || key == 'T') {
             g_current_arm = (g_current_arm == "upper") ? "lower" : "upper";
             cout << "[Arm] Switched to: " << g_current_arm << endl;
+        }
+        else if (key == 'r' || key == 'R') {
+            // 触发 resolve_calib_board_pose.exe (与自身同目录)
+            if (g_resolve_pi.hProcess) {
+                DWORD ec = 0;
+                if (GetExitCodeProcess(g_resolve_pi.hProcess, &ec) && ec == STILL_ACTIVE) {
+                    cout << "[Resolve] Already running. Please wait." << endl;
+                } else {
+                    CloseHandle(g_resolve_pi.hProcess); CloseHandle(g_resolve_pi.hThread);
+                    ZeroMemory(&g_resolve_pi, sizeof(g_resolve_pi));
+                }
+            }
+            if (!g_resolve_pi.hProcess) {
+                char self_path[MAX_PATH];
+                GetModuleFileNameA(NULL, self_path, MAX_PATH);
+                fs::path exe = fs::path(self_path).parent_path() / "resolve_calib_board_pose.exe";
+                if (!fs::exists(exe)) {
+                    cerr << "[Resolve] Not found: " << exe.string() << endl;
+                } else {
+                    STARTUPINFOA si{}; si.cb = sizeof(si);
+                    if (CreateProcessA(exe.string().c_str(), NULL, NULL, NULL, FALSE, 0,
+                                       NULL, NULL, &si, &g_resolve_pi)) {
+                        cout << "[Resolve] Launched resolve_calib_board_pose.exe" << endl;
+                    } else {
+                        cerr << "[Resolve] Launch failed (error " << GetLastError() << "): "
+                             << exe.string() << endl;
+                    }
+                }
+            }
         }
         else if (key == 'z' || key == 'Z') {
             if (g_calib_mode) {
