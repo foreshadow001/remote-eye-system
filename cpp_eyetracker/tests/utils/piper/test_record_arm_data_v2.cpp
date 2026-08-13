@@ -1,3 +1,9 @@
+// ================== test_record_arm_data_v2.cpp ==================
+// 与 test_record_arm_data.cpp 功能一致，唯一区别：
+// 相机上下文用 deque 值存储 + 引用传递 (完全无指针)，替代 shared_ptr/make_shared。
+// 用于对比测试内存模型。
+// ====================================================================
+
 // ================== 网络与系统核心头文件 (必须放在最前面) ==================
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -25,6 +31,7 @@
 #include <thread>
 #include <filesystem>
 #include <vector>
+#include <deque>
 #include <mutex>
 #include <queue>
 #include <atomic>
@@ -52,7 +59,7 @@ int g_arm_port = 0;
 mutex g_arm_mtx;
 string g_current_arm = "upper";  // 't' to toggle
 
-// ================== 相机上下文 (同 test_calib_images) ==================
+// ================== 相机上下文 ==================
 struct CameraContext {
     string sn;
     BaslerCamera cam{""};
@@ -73,7 +80,7 @@ struct CameraContext {
     explicit CameraContext(string cam_sn) : sn(cam_sn), cam(cam_sn) {}
 };
 
-vector<shared_ptr<CameraContext>> cam_ctxs;
+deque<CameraContext> cam_ctxs;  // 【V2】值存储, 完全无指针 (deque 元素地址稳定, 支持不可移动类型)
 atomic<int> g_enlarged_cam{-1};
 int g_last_capture_index = -1;
 string g_last_capture_arm;
@@ -253,12 +260,12 @@ void renderThumbnailGrid(cv::Mat& canvas, int selected_idx) {
         if (i < n) {
             cv::Mat local_raw;
             {
-                lock_guard<mutex> lock(cam_ctxs[i]->frame_mtx);
-                local_raw = cam_ctxs[i]->latest_frame;
+                lock_guard<mutex> lock(cam_ctxs[i].frame_mtx);
+                local_raw = cam_ctxs[i].latest_frame;
             }
             cv::Mat cell;
             if (!local_raw.empty()) {
-                if (cam_ctxs[i]->is_mono) cv::cvtColor(local_raw, cell, cv::COLOR_GRAY2RGB);
+                if (cam_ctxs[i].is_mono) cv::cvtColor(local_raw, cell, cv::COLOR_GRAY2RGB);
                 else cv::cvtColor(local_raw, cell, cv::COLOR_BayerRG2RGB);
                 double scale = min(static_cast<double>(g_thumb_w) / cell.cols,
                                    static_cast<double>(g_thumb_h) / cell.rows);
@@ -272,7 +279,7 @@ void renderThumbnailGrid(cv::Mat& canvas, int selected_idx) {
                 cell = cv::Mat::zeros(g_thumb_h, g_thumb_w, CV_8UC3);
             }
 
-            string label = cam_ctxs[i]->sn;
+            string label = cam_ctxs[i].sn;
             int baseline = 0;
             double font_scale = 0.45;
             cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, font_scale, 1, &baseline);
@@ -300,14 +307,14 @@ void renderEnlargedView(cv::Mat& canvas, int cam_idx) {
 
     cv::Mat local_raw;
     {
-        lock_guard<mutex> lock(cam_ctxs[cam_idx]->frame_mtx);
-        local_raw = cam_ctxs[cam_idx]->latest_frame;
+        lock_guard<mutex> lock(cam_ctxs[cam_idx].frame_mtx);
+        local_raw = cam_ctxs[cam_idx].latest_frame;
     }
 
     if (local_raw.empty()) { canvas(right_roi) = cv::Scalar(0, 0, 0); return; }
 
     cv::Mat img;
-    if (cam_ctxs[cam_idx]->is_mono) cv::cvtColor(local_raw, img, cv::COLOR_GRAY2RGB);
+    if (cam_ctxs[cam_idx].is_mono) cv::cvtColor(local_raw, img, cv::COLOR_GRAY2RGB);
     else cv::cvtColor(local_raw, img, cv::COLOR_BayerRG2RGB);
 
     double scale = min(static_cast<double>(g_right_w) / img.cols,
@@ -320,59 +327,59 @@ void renderEnlargedView(cv::Mat& canvas, int cam_idx) {
     resized.copyTo(canvas(cv::Rect(off_x, off_y, dst_w, dst_h)));
 }
 
-// ================== copyWorker (同 test_calib_images) ==================
-void copyWorker(shared_ptr<CameraContext> ctx) {
-    while (ctx->running) {
+// ================== copyWorker ==================
+void copyWorker(CameraContext& ctx) {  // 【V2】引用, 无指针
+    while (ctx.running) {
         pair<Pylon::CBaslerUniversalGrabResultPtr, FrameMeta> task;
         {
-            unique_lock<mutex> lock(ctx->copy_mtx);
-            ctx->copy_cv.wait(lock, [&]{ return !ctx->copy_queue.empty() || !ctx->running; });
-            if (!ctx->running && ctx->copy_queue.empty()) break;
-            task = ctx->copy_queue.front();
-            ctx->copy_queue.pop();
+            unique_lock<mutex> lock(ctx.copy_mtx);
+            ctx.copy_cv.wait(lock, [&]{ return !ctx.copy_queue.empty() || !ctx.running; });
+            if (!ctx.running && ctx.copy_queue.empty()) break;
+            task = ctx.copy_queue.front();
+            ctx.copy_queue.pop();
         }
 
         cv::Mat temp(task.first->GetHeight(), task.first->GetWidth(), CV_8UC1, task.first->GetBuffer());
         cv::Mat clone_img = temp.clone();
         {
-            lock_guard<mutex> lock(ctx->frame_mtx);
-            ctx->latest_frame = clone_img;
-            ctx->latest_meta = task.second;
+            lock_guard<mutex> lock(ctx.frame_mtx);
+            ctx.latest_frame = clone_img;
+            ctx.latest_meta = task.second;
         }
     }
 }
 
-// ================== captureWorker (同 test_calib_images) ==================
-void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time) {
-    if (!ctx->cam.open(TriggerMode::Software)) {
-        cerr << "[Error] Failed to open camera " << ctx->sn << endl;
+// ================== captureWorker ==================
+void captureWorker(CameraContext& ctx, double fps, double gain, double gamma, double exp_time) {  // 【V2】引用
+    if (!ctx.cam.open(TriggerMode::Software)) {
+        cerr << "[Error] Failed to open camera " << ctx.sn << endl;
         return;
     }
 
-    ctx->is_mono = ctx->cam.isMono();
+    ctx.is_mono = ctx.cam.isMono();
 
     try {
-        ctx->cam.setFrameRate(fps);
-        ctx->cam.setGain(gain);
-        ctx->cam.setGamma(gamma);
-        ctx->cam.setExposureTime(exp_time);
+        ctx.cam.setFrameRate(fps);
+        ctx.cam.setGain(gain);
+        ctx.cam.setGamma(gamma);
+        ctx.cam.setExposureTime(exp_time);
     } catch (...) {}
 
-    ctx->cam.setFrameCallback([ctx](const Pylon::CBaslerUniversalGrabResultPtr& ptr, FrameMeta meta) {
-        lock_guard<mutex> lock(ctx->copy_mtx);
-        if (ctx->copy_queue.size() < 2) {
-            ctx->copy_queue.push({ptr, meta});
-            ctx->copy_cv.notify_one();
+    ctx.cam.setFrameCallback([&ctx](const Pylon::CBaslerUniversalGrabResultPtr& ptr, FrameMeta meta) {
+        lock_guard<mutex> lock(ctx.copy_mtx);
+        if (ctx.copy_queue.size() < 2) {
+            ctx.copy_queue.push({ptr, meta});
+            ctx.copy_cv.notify_one();
         }
     });
 
-    if (!ctx->cam.start()) {
-        cerr << "[Error] Failed to start camera " << ctx->sn << endl;
+    if (!ctx.cam.start()) {
+        cerr << "[Error] Failed to start camera " << ctx.sn << endl;
         return;
     }
 
-    while (ctx->running) this_thread::sleep_for(chrono::milliseconds(50));
-    ctx->cam.close();
+    while (ctx.running) this_thread::sleep_for(chrono::milliseconds(50));
+    ctx.cam.close();
 }
 
 // ================== 辅助函数 ==================
@@ -395,7 +402,7 @@ int getNextCalibCounter(const string& save_dir) {
 
 // ================== 主函数 ==================
 int main() {
-    cout << "=== [TEST] Record Arm Data (Camera + Flange Pose) ===" << endl;
+    cout << "=== [TEST V2] Record Arm Data (deque value storage, no pointers) ===" << endl;
 
 #ifdef _WIN32
     WSADATA wsaData;
@@ -430,7 +437,7 @@ int main() {
     double ui_fps = rcfg["ui_fps"].as<double>();
 
     // --- 打印配置 ---
-    cout << "\n--- Record Arm Data Configuration ---" << endl;
+    cout << "\n--- Record Arm Data Configuration (V2 no-pointer) ---" << endl;
     cout << "Ubuntu IP : " << g_ubuntu_ip << ":" << g_arm_port << endl;
     cout << "Current arm: " << g_current_arm << "  [t] to switch" << endl;
     cout << "Save dir   : " << g_calib_save_dir << endl;
@@ -461,17 +468,16 @@ int main() {
     cout << "[Camera] Initializing cameras..." << endl;
     Pylon::PylonInitialize();
 
-    // --- 创建相机上下文 ---
+    // --- 创建相机上下文 (【V2】deque 值存储, 无指针) ---
     for (size_t i = 0; i < camera_ids.size(); ++i) {
-        auto ctx = make_shared<CameraContext>(camera_ids[i]);
-        cam_ctxs.push_back(ctx);
+        cam_ctxs.emplace_back(camera_ids[i]);
     }
 
-    // --- 启动相机线程 ---
+    // --- 启动相机线程 (【V2】std::ref 引用传递) ---
     for (auto& ctx : cam_ctxs) {
-        ctx->running = true;
-        ctx->copy_thread = thread(copyWorker, ctx);
-        ctx->capture_thread = thread(captureWorker, ctx, target_fps, gain_val, gamma_val, exp_time);
+        ctx.running = true;
+        ctx.copy_thread = thread(copyWorker, ref(ctx));
+        ctx.capture_thread = thread(captureWorker, ref(ctx), target_fps, gain_val, gamma_val, exp_time);
     }
 
     // --- UI 窗口 ---
@@ -507,7 +513,7 @@ int main() {
             cv::line(canvas, cv::Point(cx, cy - cl), cv::Point(cx, cy + cl), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
 
             // Top-left: SN + capture mode
-            string sn_text = (sel >= 0 && sel < (int)cam_ctxs.size()) ? cam_ctxs[sel]->sn : "NO SELECTION";
+            string sn_text = (sel >= 0 && sel < (int)cam_ctxs.size()) ? cam_ctxs[sel].sn : "NO SELECTION";
             cv::putText(canvas, sn_text, cv::Point(g_right_x + 10, 35),
                         cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 215, 255), 2, cv::LINE_AA);
             string mode_text = g_calib_mode ? "MODE: INTRINSIC" : "MODE: ARM CALIB";
@@ -618,7 +624,7 @@ int main() {
                 cout << "[Calib] No camera selected. Click a thumbnail first." << endl;
             } else {
                 g_calib_mode = true;
-                g_calib_cam_sn = cam_ctxs[cam_idx]->sn;
+                g_calib_cam_sn = cam_ctxs[cam_idx].sn;
                 string calib_dir = g_calib_save_dir + "/" + g_current_arm + "/" + g_calib_cam_sn;
                 fs::create_directories(calib_dir);
                 g_calib_counter = getNextCalibCounter(calib_dir);
@@ -668,15 +674,15 @@ int main() {
                 stringstream ss; ss << setw(2) << setfill('0') << g_calib_counter;
                 int cam_idx = -1;
                 for (int i = 0; i < (int)cam_ctxs.size(); ++i)
-                    if (cam_ctxs[i]->sn == g_calib_cam_sn) { cam_idx = i; break; }
+                    if (cam_ctxs[i].sn == g_calib_cam_sn) { cam_idx = i; break; }
                 if (cam_idx < 0) { cout << "[Calib] Camera not found!" << endl; }
                 else {
                     cv::Mat snapshot;
-                    { lock_guard<mutex> lock(cam_ctxs[cam_idx]->frame_mtx);
-                      snapshot = cam_ctxs[cam_idx]->latest_frame.clone(); }
+                    { lock_guard<mutex> lock(cam_ctxs[cam_idx].frame_mtx);
+                      snapshot = cam_ctxs[cam_idx].latest_frame.clone(); }
                     if (!snapshot.empty()) {
                         cv::Mat out_img;
-                        if (cam_ctxs[cam_idx]->is_mono) out_img = snapshot.clone();
+                        if (cam_ctxs[cam_idx].is_mono) out_img = snapshot.clone();
                         else cv::cvtColor(snapshot, out_img, cv::COLOR_BayerRG2RGB);
                         string fn = calib_dir + "/calib_" + ss.str() + ".jpg";
                         cv::imwrite(fn, out_img);
@@ -698,17 +704,17 @@ int main() {
                 if (cam_idx < 0 || cam_idx >= (int)cam_ctxs.size()) {
                     cout << "  [Warn] No camera selected. Click a thumbnail to enlarge it first." << endl;
                 } else {
-                    auto& ctx = cam_ctxs[cam_idx];
+                    CameraContext& ctx = cam_ctxs[cam_idx];  // 【V2】引用
                     cv::Mat snapshot;
-                    { lock_guard<mutex> lock(ctx->frame_mtx);
-                      snapshot = ctx->latest_frame.clone(); }
+                    { lock_guard<mutex> lock(ctx.frame_mtx);
+                      snapshot = ctx.latest_frame.clone(); }
                     if (!snapshot.empty()) {
                         cv::Mat out_img;
-                        if (ctx->is_mono) out_img = snapshot.clone();
+                        if (ctx.is_mono) out_img = snapshot.clone();
                         else cv::cvtColor(snapshot, out_img, cv::COLOR_BayerRG2RGB);
-                        string fn = g_calib_save_dir + "/calib_cam_" + ctx->sn + "_" + idx_str + ".jpg";
+                        string fn = g_calib_save_dir + "/calib_cam_" + ctx.sn + "_" + idx_str + ".jpg";
                         cv::imwrite(fn, out_img);
-                        cout << "  -> " << fn << " (cam " << cam_idx << ": " << ctx->sn << ")" << endl;
+                        cout << "  -> " << fn << " (cam " << cam_idx << ": " << ctx.sn << ")" << endl;
                     }
                 }
 
@@ -738,11 +744,12 @@ int main() {
     // ================== 清理 ==================
     cout << "[System] Shutting down..." << endl;
     for (auto& ctx : cam_ctxs) {
-        ctx->running = false;
-        ctx->copy_cv.notify_all();
-        if (ctx->capture_thread.joinable()) ctx->capture_thread.join();
-        if (ctx->copy_thread.joinable()) ctx->copy_thread.join();
+        ctx.running = false;
+        ctx.copy_cv.notify_all();
+        if (ctx.capture_thread.joinable()) ctx.capture_thread.join();
+        if (ctx.copy_thread.joinable()) ctx.copy_thread.join();
     }
+    // 【V2】deque 自动析构, 无需 delete
 
     disconnectArmServer();
     cv::destroyAllWindows();

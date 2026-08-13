@@ -26,6 +26,18 @@ target_link_libraries(test_record_arm_data
         ${OpenCV_LIBS}
 )
 
+# V2: 裸指针版本 (对比测试, 去掉 make_shared)
+add_executable(test_record_arm_data_v2
+    test_record_arm_data_v2.cpp
+)
+
+target_link_libraries(test_record_arm_data_v2
+    PRIVATE
+        eyetracker::cfg
+        eyetracker::cam
+        ${OpenCV_LIBS}
+)
+
 add_executable(test_piper_to_cam
     test_piper_to_cam.cpp
 )
