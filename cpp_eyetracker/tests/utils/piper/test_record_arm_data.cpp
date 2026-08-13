@@ -149,31 +149,38 @@ bool parsePoseResponse(const string& resp, string& arm, ArmPose& pose) {
 }
 
 bool connectToArmServer() {
-    g_arm_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (g_arm_sock == INVALID_SOCKET) return false;
+    // 重试连接 (Ubuntu 端可能后启动, 参照 test_calib_images 的重试逻辑)
+    int retry = 0;
+    while (global_running) {
+        g_arm_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (g_arm_sock == INVALID_SOCKET) return false;
 
-    sockaddr_in server{};
-    server.sin_family = AF_INET;
-    server.sin_port = htons(g_arm_port);
-    inet_pton(AF_INET, g_ubuntu_ip.c_str(), &server.sin_addr);
+        sockaddr_in server{};
+        server.sin_family = AF_INET;
+        server.sin_port = htons(g_arm_port);
+        inet_pton(AF_INET, g_ubuntu_ip.c_str(), &server.sin_addr);
 
-    if (connect(g_arm_sock, (sockaddr*)&server, sizeof(server)) != 0) {
-        closesocket(g_arm_sock);
-        g_arm_sock = INVALID_SOCKET;
-        return false;
+        if (connect(g_arm_sock, (sockaddr*)&server, sizeof(server)) == 0) {
+            // 已连接, 尝试握手
+            sendLine(g_arm_sock, "READY");
+            string hl;
+            if (recvLine(g_arm_sock, hl, 10000) && hl == "ACK") {
+                cout << "[Arm] Handshake OK." << endl;
+                return true;
+            }
+            cerr << "[Arm] Handshake fail: " << (hl.empty() ? "no response" : hl) << endl;
+            closesocket(g_arm_sock);
+            g_arm_sock = INVALID_SOCKET;
+        } else {
+            closesocket(g_arm_sock);
+            g_arm_sock = INVALID_SOCKET;
+        }
+
+        if (++retry % 10 == 1)
+            cerr << "[Arm] Connect retry #" << retry << " (" << g_ubuntu_ip << ":" << g_arm_port << ")..." << endl;
+        this_thread::sleep_for(chrono::milliseconds(500));
     }
-
-    // Handshake: READY → ACK (same semantics as test_calib_images)
-    sendLine(g_arm_sock, "READY");
-    string hl;
-    if (!recvLine(g_arm_sock, hl, 10000) || hl != "ACK") {
-        cerr << "[Arm] Handshake fail: " << (hl.empty() ? "no response" : hl) << endl;
-        closesocket(g_arm_sock);
-        g_arm_sock = INVALID_SOCKET;
-        return false;
-    }
-    cout << "[Arm] Handshake OK." << endl;
-    return true;
+    return false;
 }
 
 void disconnectArmServer() {
@@ -422,8 +429,6 @@ int main() {
     g_win_h = rcfg["window_height"].as<int>();
     double ui_fps = rcfg["ui_fps"].as<double>();
 
-    Pylon::PylonInitialize();
-
     // --- 打印配置 ---
     cout << "\n--- Record Arm Data Configuration ---" << endl;
     cout << "Ubuntu IP : " << g_ubuntu_ip << ":" << g_arm_port << endl;
@@ -436,12 +441,10 @@ int main() {
 
     fs::create_directories(g_calib_save_dir);
 
-    // --- 连接 Ubuntu arm server ---
+    // --- 连接 Ubuntu arm server (带重试握手) ---
     cout << "[Arm] Connecting to " << g_ubuntu_ip << ":" << g_arm_port << " ... " << flush;
     if (!connectToArmServer()) {
         cerr << "FAILED. Arm pose query will be unavailable." << endl;
-    } else {
-        cout << "OK" << endl;
     }
 
     // --- 位姿映射文件 (upper / lower 分别存储) ---
@@ -453,6 +456,10 @@ int main() {
         if (!exists) f << "# index arm x y z qx qy qz qw alpha beta gamma\n";
         cout << "[Mapping] " << mf << endl;
     }
+
+    // --- 初始化相机 ---
+    cout << "[Camera] Initializing cameras..." << endl;
+    Pylon::PylonInitialize();
 
     // --- 创建相机上下文 ---
     for (size_t i = 0; i < camera_ids.size(); ++i) {
