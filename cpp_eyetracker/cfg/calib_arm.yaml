@@ -2,7 +2,7 @@
 
 network:                              # 从 piper.yaml network 节点迁移
   ubuntu_ip: "192.168.10.4"
-  port: 49300                         # windows_end_monitor.py (flange pose query)
+  ctrl_port: 49301                    # piper_windows_ctrl_server.py (movement + pose query)
 
 record:                               # 从 piper.yaml test_record_arm_data 节点迁移
   cam_indices:

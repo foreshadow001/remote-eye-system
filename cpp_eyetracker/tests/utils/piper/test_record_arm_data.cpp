@@ -95,6 +95,59 @@ const string& currentMappingFile() {
 
 // ================== TCP 辅助 ==================
 
+bool recvLine(SOCKET sock, string& line, int timeout_ms = 10000) {
+#ifdef _WIN32
+    DWORD to = timeout_ms;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+#endif
+    char buf[256];
+    string acc;
+    auto deadline = chrono::steady_clock::now() + chrono::milliseconds(timeout_ms);
+
+    while (chrono::steady_clock::now() < deadline) {
+        int n = recv(sock, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) return false;
+        buf[n] = '\0';
+        acc += buf;
+        size_t nl = acc.find('\n');
+        if (nl != string::npos) {
+            line = acc.substr(0, nl);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool sendLine(SOCKET sock, const string& msg) {
+    string data = msg + "\n";
+    return send(sock, data.c_str(), (int)data.length(), 0) > 0;
+}
+
+// Parse "MOVED:arm:x,y,z,qx,qy,qz,qw,alpha,beta,gamma" or "POSE:arm:..."
+// (shared format — POSE and MOVED both carry 10 comma-separated values)
+struct ArmPose { double x,y,z, qx,qy,qz,qw, alpha,beta,gamma; bool valid=false; };
+
+bool parsePoseResponse(const string& resp, string& arm, ArmPose& pose) {
+    if (resp.rfind("MOVED:", 0) != 0 && resp.rfind("POSE:", 0) != 0) return false;
+    size_t colon1 = resp.find(':');
+    size_t colon2 = resp.find(':', colon1 + 1);
+    if (colon1 == string::npos || colon2 == string::npos) return false;
+    arm = resp.substr(colon1 + 1, colon2 - colon1 - 1);
+    string vals = resp.substr(colon2 + 1);
+    vector<double> nums;
+    stringstream ss(vals); string token;
+    while (getline(ss, token, ',')) {
+        try { nums.push_back(stod(token)); } catch (...) { return false; }
+    }
+    if (nums.size() != 10) return false;
+    pose.x=nums[0]; pose.y=nums[1]; pose.z=nums[2];
+    pose.qx=nums[3]; pose.qy=nums[4]; pose.qz=nums[5]; pose.qw=nums[6];
+    pose.alpha=nums[7]; pose.beta=nums[8]; pose.gamma=nums[9];
+    pose.valid = true;
+    return true;
+}
+
 bool connectToArmServer() {
     g_arm_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (g_arm_sock == INVALID_SOCKET) return false;
@@ -109,6 +162,17 @@ bool connectToArmServer() {
         g_arm_sock = INVALID_SOCKET;
         return false;
     }
+
+    // Handshake: READY → ACK (same semantics as test_calib_images)
+    sendLine(g_arm_sock, "READY");
+    string hl;
+    if (!recvLine(g_arm_sock, hl, 10000) || hl != "ACK") {
+        cerr << "[Arm] Handshake fail: " << (hl.empty() ? "no response" : hl) << endl;
+        closesocket(g_arm_sock);
+        g_arm_sock = INVALID_SOCKET;
+        return false;
+    }
+    cout << "[Arm] Handshake OK." << endl;
     return true;
 }
 
@@ -119,28 +183,23 @@ void disconnectArmServer() {
     }
 }
 
-// 向 Ubuntu 查询 flange 位姿。返回 POSE 响应字符串，失败返回空
-string queryFlangePose(const string& arm) {
+// 向 Ubuntu 查询 flange 位姿 (GET_POSE on ctrl_port 49301)
+ArmPose queryFlangePose(const string& arm) {
     lock_guard<mutex> lock(g_arm_mtx);
     if (g_arm_sock == INVALID_SOCKET) return {};
 
-    string cmd = "GET_POSE:" + arm + "\n";
-    if (send(g_arm_sock, cmd.c_str(), (int)cmd.length(), 0) <= 0) return {};
+    if (!sendLine(g_arm_sock, "GET_POSE:" + arm)) return {};
 
-#ifdef _WIN32
-    DWORD timeout = 3000;
-    setsockopt(g_arm_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-#endif
-    char buf[512];
-    int n = recv(g_arm_sock, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) return {};
+    string resp;
+    if (!recvLine(g_arm_sock, resp, 3000)) {
+        cerr << "[Arm] GET_POSE timeout for " << arm << endl;
+        return {};
+    }
 
-    buf[n] = '\0';
-    string resp(buf);
-    // 去掉尾随换行
-    while (!resp.empty() && (resp.back() == '\n' || resp.back() == '\r'))
-        resp.pop_back();
-    return resp;
+    string resp_arm; ArmPose pose;
+    if (parsePoseResponse(resp, resp_arm, pose)) return pose;
+    cerr << "[Arm] GET_POSE error: " << resp << endl;
+    return {};
 }
 
 // ================== UI 布局 ==================
@@ -347,7 +406,7 @@ int main() {
 
     // 网络配置
     g_ubuntu_ip = arm_cfg["network"]["ubuntu_ip"].as<string>();
-    g_arm_port  = arm_cfg["network"]["port"].as<int>();
+    g_arm_port  = arm_cfg["network"]["ctrl_port"].as<int>();
 
     // 相机配置
     auto& rcfg = arm_cfg["record"];
@@ -490,6 +549,13 @@ int main() {
         char key = static_cast<char>(cv::waitKey(1));
 
         if (key == 'q' || key == 27) {
+            // 通知 Ubuntu 端退出
+            if (g_arm_sock != INVALID_SOCKET) {
+                lock_guard<mutex> lock(g_arm_mtx);
+                sendLine(g_arm_sock, "SHUTDOWN");
+                string ack;
+                if (recvLine(g_arm_sock, ack, 2000)) cout << "[Arm] Server: " << ack << endl;
+            }
             global_running = false;
         }
         else if (key == 't' || key == 'T') {
@@ -641,32 +707,23 @@ int main() {
                 }
 
                 // 查询当前机械臂 flange 位姿
-                string resp = queryFlangePose(g_current_arm);
-                if (!resp.empty() && resp.rfind("POSE:", 0) == 0) {
-                    string data = resp.substr(5);
-                    size_t p = data.find(':');
-                    string arm_name = data.substr(0, p);
-                    string vals = data.substr(p + 1);
-                    vector<double> nums; stringstream vss(vals); string token;
-                    while (getline(vss, token, ',')) nums.push_back(stod(token));
-                    if (nums.size() == 10) {
-                        cout << fixed << setprecision(4);
-                        cout << "  Pose  XYZ (m):      [" << nums[0] << ", " << nums[1] << ", " << nums[2] << "]" << endl;
-                        cout << "        Quat (wxyz):   [" << nums[6] << ", " << nums[3] << ", " << nums[4] << ", " << nums[5] << "]" << endl;
-                        cout << fixed << setprecision(2);
-                        cout << "        Euler ZXZ'':   [" << nums[7] << ", " << nums[8] << ", " << nums[9] << "] deg" << endl;
-                        string mf_path = currentMappingFile();
-                        ofstream mf(mf_path, ios::app);
-                        mf << fixed << setprecision(6);
-                        mf << idx_str << " " << arm_name;
-                        for (double v : nums) mf << " " << v;
-                        mf << endl;
-                        cout << "  -> saved to " << mf_path << endl;
-                    }
-                } else if (resp.empty()) {
-                    cerr << "  [Warn] No response from arm server. Pose NOT recorded." << endl;
+                ArmPose pose = queryFlangePose(g_current_arm);
+                if (pose.valid) {
+                    cout << fixed << setprecision(4);
+                    cout << "  Pose  XYZ (m):      [" << pose.x << ", " << pose.y << ", " << pose.z << "]" << endl;
+                    cout << "        Quat (wxyz):   [" << pose.qw << ", " << pose.qx << ", " << pose.qy << ", " << pose.qz << "]" << endl;
+                    cout << fixed << setprecision(2);
+                    cout << "        Euler ZXZ'':   [" << pose.alpha << ", " << pose.beta << ", " << pose.gamma << "] deg" << endl;
+                    string mf_path = currentMappingFile();
+                    ofstream mf(mf_path, ios::app);
+                    mf << fixed << setprecision(6);
+                    mf << idx_str << " " << g_current_arm
+                       << " " << pose.x << " " << pose.y << " " << pose.z
+                       << " " << pose.qx << " " << pose.qy << " " << pose.qz << " " << pose.qw
+                       << " " << pose.alpha << " " << pose.beta << " " << pose.gamma << endl;
+                    cout << "  -> saved to " << mf_path << endl;
                 } else {
-                    cerr << "  [Warn] Arm server: " << resp << endl;
+                    cerr << "  [Warn] No response from arm server. Pose NOT recorded." << endl;
                 }
             }  // end else (!g_calib_mode)
         }  // end SPACE handler
