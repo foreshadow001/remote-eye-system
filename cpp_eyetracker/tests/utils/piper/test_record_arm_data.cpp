@@ -339,21 +339,21 @@ int main() {
     }
 #endif
 
-    // --- 读取 piper.yaml ---
+    // --- 读取 calib_arm.yaml + capture.yaml ---
     namespace fs = std::filesystem;
-    auto piper_path = (fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()
-                       / "cfg" / "piper.yaml").string();
-
-    Cfg piper_cfg(piper_path);
+    fs::path cfg_dir = fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path() / "cfg";
+    Cfg arm_cfg((cfg_dir / "calib_arm.yaml").string());
+    Cfg cap_cfg((cfg_dir / "capture.yaml").string());
 
     // 网络配置
-    g_ubuntu_ip = piper_cfg["network"]["ubuntu_ip"].as<string>();
-    g_arm_port  = piper_cfg["network"]["port"].as<int>();
+    g_ubuntu_ip = arm_cfg["network"]["ubuntu_ip"].as<string>();
+    g_arm_port  = arm_cfg["network"]["port"].as<int>();
 
     // 相机配置
-    auto& rcfg = piper_cfg["test_record_arm_data"];
+    auto& rcfg = arm_cfg["record"];
     vector<string> camera_ids = rcfg["cam_indices"].as<vector<string>>();
-    g_calib_save_dir = rcfg["calib_save_dir"].as<string>();
+    string pid = cap_cfg["capture"]["participant_id"].as<string>();
+    g_calib_save_dir = rcfg["calib_save_dir"].as<string>() + "/" + pid;
 
     double target_fps = rcfg["fps"].as<double>();
     double gain_val   = rcfg["gain"].as<double>();
@@ -433,39 +433,54 @@ int main() {
             int sel = g_enlarged_cam.load();
             renderThumbnailGrid(canvas, sel);
             renderEnlargedView(canvas, sel);
+            cv::line(canvas, cv::Point(g_left_w, 0), cv::Point(g_left_w, g_win_h),
+                     cv::Scalar(60, 60, 60), 2);
 
-            // Prominent arm indicator (top of right panel)
+            // Center crosshair in enlarged area
+            int cx = g_right_x + g_right_w / 2, cy = g_win_h / 2, cl = 20;
+            cv::line(canvas, cv::Point(cx - cl, cy), cv::Point(cx + cl, cy), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
+            cv::line(canvas, cv::Point(cx, cy - cl), cv::Point(cx, cy + cl), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
+
+            // Top-left: SN + capture mode
+            string sn_text = (sel >= 0 && sel < (int)cam_ctxs.size()) ? cam_ctxs[sel]->sn : "NO SELECTION";
+            cv::putText(canvas, sn_text, cv::Point(g_right_x + 10, 35),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 215, 255), 2, cv::LINE_AA);
+            string mode_text = g_calib_mode ? "MODE: INTRINSIC" : "MODE: ARM CALIB";
+            cv::Scalar mode_color = g_calib_mode ? cv::Scalar(0, 255, 0) : cv::Scalar(200, 80, 255);
+            cv::putText(canvas, mode_text, cv::Point(g_right_x + 10, 62),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, mode_color, 2, cv::LINE_AA);
+
+            // Top-right: capture count
+            int capture_count = g_calib_mode ? g_calib_counter : (g_last_capture_index + 1);
+            string cnt = "Captures: " + to_string(capture_count);
+            cv::Size cnt_sz = cv::getTextSize(cnt, cv::FONT_HERSHEY_SIMPLEX, 0.8, 2, 0);
+            cv::putText(canvas, cnt,
+                        cv::Point(g_right_x + g_right_w - cnt_sz.width - 15, 35),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 215, 255), 2, cv::LINE_AA);
+
+            // Bottom-right: arm indicator
             string arm_label = (g_current_arm == "upper") ? "UPPER" : "LOWER";
             cv::Scalar arm_color = (g_current_arm == "upper")
                                    ? cv::Scalar(0, 215, 255)    // gold
                                    : cv::Scalar(200, 80, 255);   // purple
-            int arm_cx = g_right_x + g_right_w / 2;
-            cv::Size arm_sz = cv::getTextSize(arm_label, cv::FONT_HERSHEY_SIMPLEX, 1.4, 3, 0);
+            cv::Size arm_sz = cv::getTextSize(arm_label, cv::FONT_HERSHEY_SIMPLEX, 1.0, 2, 0);
             cv::putText(canvas, arm_label,
-                        cv::Point(arm_cx - arm_sz.width / 2, 55),
-                        cv::FONT_HERSHEY_SIMPLEX, 1.4, arm_color, 3, cv::LINE_AA);
-
-            // Calib mode banner
-            if (g_calib_mode) {
-                string cb = "INTRINSIC CALIB  Cam:" + g_calib_cam_sn
-                          + "  cnt:" + to_string(g_calib_counter);
-                cv::putText(canvas, cb, cv::Point(arm_cx - 200, 85),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-            }
+                        cv::Point(g_right_x + g_right_w - arm_sz.width - 15, g_win_h - 15),
+                        cv::FONT_HERSHEY_SIMPLEX, 1.0, arm_color, 2, cv::LINE_AA);
 
             // Bottom-left hints
-            int tx = g_right_x + 10, ty = g_win_h - 60;
+            int hx = g_right_x + 10, hy = g_win_h - 45;
             string hints = g_calib_mode
                 ? "[a] exit  [space] capture  [z] undo  Camera: " + g_calib_cam_sn
                 : "[t] switch  [space] capture  [z] undo  [a] calib  [c] clear  [q] quit";
-            cv::putText(canvas, hints, cv::Point(tx, ty),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(150, 150, 150), 1, cv::LINE_AA);
-            ty += 22;
+            cv::putText(canvas, hints, cv::Point(hx, hy),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
+            hy += 18;
             string saving = g_calib_mode
                 ? ("-> " + g_calib_save_dir + "/" + g_current_arm + "/" + g_calib_cam_sn + "/calib_XX.jpg")
-                : ("Saving to: flange_pose_mapping_" + g_current_arm + ".txt");
-            cv::putText(canvas, saving, cv::Point(tx, ty),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(120, 120, 120), 1, cv::LINE_AA);
+                : ("Arm: " + g_current_arm + "  |  Saving to: flange_pose_mapping_" + g_current_arm + ".txt");
+            cv::putText(canvas, saving, cv::Point(hx, hy),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(110, 110, 110), 1, cv::LINE_AA);
 
             cv::imshow("Record Arm Data", canvas);
             last_ui_time = current_time;

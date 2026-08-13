@@ -1,0 +1,28 @@
+# calib_arm.yaml — 机械臂标定数据采集 (test_record_arm_data.cpp)
+
+network:                              # 从 piper.yaml network 节点迁移
+  ubuntu_ip: "192.168.10.4"
+  port: 49300                         # windows_end_monitor.py (flange pose query)
+
+record:                               # 从 piper.yaml test_record_arm_data 节点迁移
+  cam_indices:
+    - 40772278
+    - 40777498
+    - 40772280
+    - 40772279
+    - 40777497
+    - 40772277
+    - 40772284
+
+  calib_save_dir: "D:/calib_arm"      # 总目录, 完整路径 = calib_save_dir/{participant_id}
+                                      # participant_id 从 capture.yaml 读取
+
+  fps: 100
+  gain: 0.0
+  gamma: 1.0
+  exposure_time: 8000.0
+  window_width: 1600
+  window_height: 800
+  ui_fps: 20.0
+  cam_width: 2448
+  cam_height: 2048
