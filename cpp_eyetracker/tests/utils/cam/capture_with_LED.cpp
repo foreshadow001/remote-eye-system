@@ -342,11 +342,12 @@ void gazeServerWorker(int gaze_port) {
     sa.sin_addr.s_addr=INADDR_ANY;
     ::bind(g_gaze_listen_sock, (sockaddr*)&sa, sizeof(sa));
     listen(g_gaze_listen_sock, 1);
+    {DWORD to=500;setsockopt(g_gaze_listen_sock,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));}  // accept 可中断
     cout << "[Gaze] Master listening TCP ::" << gaze_port << endl;
     while (global_running) {
         sockaddr_in ca; socklen_t cl=sizeof(ca);
         SOCKET cs = accept(g_gaze_listen_sock, (sockaddr*)&ca, &cl);
-        if (cs == INVALID_SOCKET) break;
+        if (cs == INVALID_SOCKET) { if (!global_running) break; continue; }  // 超时轮询, 退出时结束
         g_gaze_sock = cs; g_gaze_connected = true;
         cout << "[Gaze] Slave connected." << endl;
         // Loop: wait for main thread to signal new gaze data, then send
@@ -619,9 +620,11 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
         int opt=1;setsockopt(g_cmd_listen_sock,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
         sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(cmd_port);sa.sin_addr.s_addr=INADDR_ANY;
         ::bind(g_cmd_listen_sock,(sockaddr*)&sa,sizeof(sa));listen(g_cmd_listen_sock,1);
+        {DWORD to=500;setsockopt(g_cmd_listen_sock,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));}  // accept 可中断
         cout<<"[Cmd] Master listening TCP ::"<<cmd_port<<endl;
         while(global_running){sockaddr_in ca;socklen_t cl=sizeof(ca);
-            g_cmd_sock=accept(g_cmd_listen_sock,(sockaddr*)&ca,&cl); if(g_cmd_sock==INVALID_SOCKET) break;
+            g_cmd_sock=accept(g_cmd_listen_sock,(sockaddr*)&ca,&cl);
+            if(g_cmd_sock==INVALID_SOCKET){if(!global_running)break;continue;}  // 超时轮询, 退出时结束
             cout<<"[Cmd] Slave connected. Handshaking..."<<endl;
             string hl; if(recvLine(g_cmd_sock,hl,10000)&&hl=="READY"){sendLineRaw(g_cmd_sock,"ACK");cout<<"[Cmd] Handshake OK."<<endl;}
             else{cerr<<"[Cmd] Handshake FAILED (recv:'"<<hl<<"'). Reconnecting..."<<endl;closesocket(g_cmd_sock);g_cmd_sock=INVALID_SOCKET;continue;}
