@@ -114,6 +114,14 @@ vector<shared_ptr<CameraContext>> cam_ctxs;
 
 void copyWorker(shared_ptr<CameraContext> ctx){while(ctx->running){pair<Pylon::CBaslerUniversalGrabResultPtr,FrameMeta> t;
     {unique_lock<mutex> lk(ctx->copy_mtx);ctx->copy_cv.wait(lk,[&]{return !ctx->copy_queue.empty()||!ctx->running;});if(!ctx->running&&ctx->copy_queue.empty())break;t=ctx->copy_queue.front();ctx->copy_queue.pop();}
+    // [DBG] 坏帧诊断: 只打印不跳过 — 抓"坏帧到达"还是"缓冲被改"
+    {size_t w=t.first->GetWidth(),h=t.first->GetHeight(),ps=t.first->GetPayloadSize();
+        bool gs=t.first->GrabSucceeded();
+        if(!gs||ps!=w*h)
+            cerr<<"[BadFrame] cam "<<ctx->sn<<" blk="<<t.second.blockID
+                <<" grab="<<(gs?"OK":"FAIL")
+                <<" size="<<w<<"x"<<h<<" payload="<<ps
+                <<(ps==w*h?" (match)":" (MISMATCH)")<<endl;}
     cv::Mat tmp(t.first->GetHeight(),t.first->GetWidth(),CV_8UC1,t.first->GetBuffer());cv::Mat c=tmp.clone();{lock_guard<mutex> lk(ctx->frame_mtx);ctx->latest_frame=c;ctx->latest_meta=t.second;}
     ctx->last_block_id.store(t.second.blockID,memory_order_relaxed);ctx->last_frame_time.store(chrono::steady_clock::now(),memory_order_relaxed);ctx->has_streamed.store(true,memory_order_relaxed);}}
 
