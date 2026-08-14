@@ -1038,22 +1038,6 @@ int main() {
         auto current_time=chrono::steady_clock::now();
         bool need_ui_update=(current_time-last_ui_time)>=ui_interval;
 
-        // ---- Health check ----
-        if (!g_fault_active.load()&&!is_dumping.load()) {
-            auto now=chrono::steady_clock::now();
-            for (size_t i=0;i<cam_ctxs.size();++i) {
-                if(!cam_ctxs[i]->has_streamed.load()) continue;
-                if(chrono::duration<double>(now-cam_ctxs[i]->last_frame_time.load()).count()>1.0){
-                    cerr<<"\n[FAULT] Camera "<<cam_ctxs[i]->id<<" stalled!"<<endl;
-                    g_fault_active.store(true);g_faulty_cam.store((int)i);g_fault_on_master.store(is_master_pc);
-                    g_consecutive_faults++;
-                    if(g_consecutive_faults>=3){logException("FATAL","health","3 consecutive failures. Exiting.");global_running=false;break;}
-                    if(enable_net_sync&&g_cmd_sock!=INVALID_SOCKET){string fm="FAULT:"+string(is_master_pc?"M":"S")+to_string(i);sendLineRaw(g_cmd_sock,fm);}
-                    for(auto& c:cam_ctxs){c->running=false;c->copy_cv.notify_all();}
-                    for(auto& c:cam_ctxs){if(c->capture_thread.joinable())c->capture_thread.join();if(c->copy_thread.joinable())c->copy_thread.join();}
-                    is_recording=false;break;
-        }}}
-
         // ===== LED state update (Master only) =====
         if (is_master_pc) {
             if (g_show_exhausted) {
