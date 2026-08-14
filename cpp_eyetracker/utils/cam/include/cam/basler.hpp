@@ -34,11 +34,6 @@ public:
     bool start();
     void close();
 
-    // Pylon Viewer 式取流 (GrabLoop_ProvidedByUser + RetrieveResult):
-    // 缓冲由 GrabResultPtr 引用计数保护, 替代事件处理器路径
-    bool startUserLoop();
-    bool retrieveResult(Pylon::CBaslerUniversalGrabResultPtr& res, uint32_t timeout_ms);
-
     void setFrameCallback(FrameCallback cb) { callback_ = cb; }
 
     virtual void OnImageGrabbed(CBaslerUniversalInstantCamera& camera, const CBaslerUniversalGrabResultPtr& ptrGrabResult) override;
@@ -56,7 +51,7 @@ public:
     bool isMono() const { return isMono_; }
 
 private:
-    int maxNumBuffer_ = 16;  // 实验A: 150 → 10 (CXP 流缓冲过大疑似导致缓冲复用/花屏)
+    int maxNumBuffer_ = 1;   // 实验1: 单缓冲 — 验证"某些缓冲布局有缺陷"假说 (blk%16 掩码)
     Pylon::PylonAutoInitTerm autoInit_;
     Pylon::CBaslerUniversalInstantCamera camera_;
     std::string serialNumber_;
