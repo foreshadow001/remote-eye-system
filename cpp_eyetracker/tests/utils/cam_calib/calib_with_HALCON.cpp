@@ -120,6 +120,7 @@ void copyWorker(shared_ptr<CameraContext> ctx){while(ctx->running){pair<cv::Mat,
 void captureWorker(shared_ptr<CameraContext> ctx,double fps,double gain,double gamma,double exp,double me){
     if(!ctx->cam.open(TriggerMode::Software))return;ctx->is_mono=ctx->cam.isMono();if(ctx->is_mono&&me>1.0){exp*=me;fps/=me;}
     try{ctx->cam.setFrameRate(fps);ctx->cam.setGain(gain);ctx->cam.setGamma(gamma);ctx->cam.setExposureTime(exp);}catch(...){}
+    ctx->cam.dumpConfig();  // [DBG] 全节点转储 (诊断中, 定位后删除)
     // 回调内同步拷贝: 采集卡缓冲只在回调期间被持有, 随后立即归还驱动
     ctx->cam.setFrameCallback([ctx](const Pylon::CBaslerUniversalGrabResultPtr& p,FrameMeta m){
         cv::Mat tmp(p->GetHeight(),p->GetWidth(),CV_8UC1,p->GetBuffer());

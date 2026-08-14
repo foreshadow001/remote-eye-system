@@ -129,36 +129,30 @@ void BaslerCamera::dumpConfig() {
     if (!isOpen_) { cerr << "[Basler] dumpConfig: camera not open" << endl; return; }
     lock_guard<mutex> lk(g_print_mtx);
     cout << "===== [Config Dump] SN=" << serialNumber_ << " =====" << endl;
-    auto put = [](GenApi::INodeMap& nm, const char* name) {
-        GenApi::CNodePtr n = nm.GetNode(name);
-        if (!n || !GenApi::IsAvailable(n) || !GenApi::IsReadable(n)) { cout << "  " << name << " = N/A" << endl; return; }
-        try { GenApi::CValuePtr v(n); cout << "  " << name << " = " << v->ToString() << endl; }
-        catch (...) { cout << "  " << name << " = (unreadable)" << endl; }
+    auto dumpMapRef = [](GenApi::INodeMap& nm, const char* section) {
+        cout << "--- " << section << " ---" << endl;
+        GenApi::NodeList_t nodes;
+        nm.GetNodes(nodes);
+        for (auto& n : nodes) {
+            if (!GenApi::IsAvailable(n) || !GenApi::IsReadable(n)) continue;
+            GenApi::CValuePtr v(n);
+            try {
+                string val = v->ToString();
+                if (val.size() > 120) val = val.substr(0, 120) + "...";
+                cout << "  " << n->GetName() << " = " << val << endl;
+            } catch (...) {}
+        }
     };
-    cout << "--- Camera ---" << endl;
-    GenApi::INodeMap* nm = &camera_.GetNodeMap();
-    const char* cam_nodes[] = {
-        "DeviceModelName","DeviceVersion",
-        "Width","Height","OffsetX","OffsetY","PixelFormat","PayloadSize",
-        "BinningHorizontal","BinningVertical","DecimationHorizontal","DecimationVertical",
-        "AcquisitionFrameRateEnable","AcquisitionFrameRate","ResultingFrameRate",
-        "ExposureTime","Gain","Gamma",
-        "CxpLinkConfiguration","CxpLinkSpeed","CxpLinkState",
-        "DeviceLinkThroughputLimit","DeviceLinkCurrentThroughput",
-        "TriggerMode","TriggerSource","TriggerActivation","ChunkModeActive",
-        "DeviceTemperature"
+    auto dumpMapPtr = [&](GenApi::INodeMap* nm, const char* section) {
+        if (!nm) { cout << "--- " << section << " --- (unavailable)" << endl; return; }
+        dumpMapRef(*nm, section);
     };
-    for (auto* name : cam_nodes) put(*nm, name);
-    cout << "--- Stream (TL) ---" << endl;
-    try {
-        GenApi::INodeMap* snm = camera_.GetStreamGrabberParams().GetNodeMap();
-        const char* stream_nodes[] = {
-            "MaxNumBuffer","MaxBufferSize","MaxTransferSize","NumMaxQueuedUrbs",
-            "PayloadSize","AutoPacketSize","StreamBufferHandlingMode",
-            "BufferUnderrunCount","FailedBufferCount","FailedPacketCount","MissedFrameCount","ResynchronizationCount"
-        };
-        for (auto* name : stream_nodes) put(*snm, name);
-    } catch (...) { cout << "  (stream params unavailable)" << endl; }
+    try { dumpMapRef(camera_.GetNodeMap(), "Camera (all nodes)"); }
+    catch (...) { cout << "  (camera node map unavailable)" << endl; }
+    try { dumpMapPtr(camera_.GetStreamGrabberParams().GetNodeMap(), "Stream (all nodes)"); }
+    catch (...) { cout << "  (stream node map unavailable)" << endl; }
+    try { dumpMapRef(camera_.GetTLNodeMap(), "TL (all nodes)"); }
+    catch (...) { cout << "  (TL node map unavailable)" << endl; }
     cout << "===== [Config Dump End] =====" << endl;
 }
 
