@@ -2,6 +2,19 @@
 
 find_package(OpenCV CONFIG REQUIRED)
 
+add_executable(test_calib_images
+    test_calib_images.cpp
+)
+
+target_link_libraries(test_calib_images
+    PRIVATE
+        eyetracker::cfg
+        eyetracker::cam
+        ${OpenCV_LIBS}
+)
+
+message(STATUS "test_calib_images will be built")
+
 add_executable(calib_with_HALCON
     calib_with_HALCON.cpp
 )

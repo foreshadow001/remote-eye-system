@@ -85,7 +85,7 @@ struct CameraContext {
     int total_record_frames = 0;
     atomic<bool> dump_ready{false};
 
-    queue<pair<Pylon::CBaslerUniversalGrabResultPtr, FrameMeta>> copy_queue;
+    queue<pair<cv::Mat, FrameMeta>> copy_queue; // [Fix] 队列存已拷贝 Mat, 回调内同步拷贝
     mutex copy_mtx;
     condition_variable copy_cv;
 
@@ -563,70 +563,23 @@ void showFaultOverlay(int faulty_cam, bool is_hw) {
 }
 
 // ================== 后台异步拷贝线程 ==================
+// [Fix] 采集卡缓冲只允许在回调内读取：队列现在存已拷贝的 Mat，
+//       copyWorker 只负责把预览帧发布到 latest_frame（录制逻辑已移入回调）
 void copyWorker(shared_ptr<CameraContext> ctx) {
     while (ctx->running) {
-        pair<Pylon::CBaslerUniversalGrabResultPtr, FrameMeta> task;
+        pair<cv::Mat, FrameMeta> task;
         {
             unique_lock<mutex> lock(ctx->copy_mtx);
             ctx->copy_cv.wait(lock, [&]{ return !ctx->copy_queue.empty() || !ctx->running; });
             if (!ctx->running && ctx->copy_queue.empty()) break;
-            // ---- queue pressure: record BEFORE pop (total queue length) ----
-            int qs = (int)ctx->copy_queue.size();
-            if (qs > ctx->max_queue_size.load()) ctx->max_queue_size = qs;
             task = ctx->copy_queue.front();
             ctx->copy_queue.pop();
         }
 
-        if (ctx->recording) {
-            int seq = ctx->recorded_frames.load(std::memory_order_relaxed);
-            if (seq < ctx->total_record_frames) {
-                // DMA: store GrabResultPtr — keeps Pylon DMA buffer alive, zero CPU copy
-                ctx->dma_frames[seq] = task.first;
-                ctx->meta_buffer[seq] = task.second;
-
-                // UI preview: one-frame clone of the DMA buffer
-                {
-                    lock_guard<mutex> lock(ctx->frame_mtx);
-                    ctx->latest_frame = cv::Mat(task.first->GetHeight(), task.first->GetWidth(),
-                                                CV_8UC1, task.first->GetBuffer()).clone();
-                    ctx->latest_meta = task.second;
-                }
-
-                if (seq == 0) {
-                    ctx->first_recorded_block_id = task.second.blockID;
-                    ctx->first_frame_time = chrono::steady_clock::now();
-                }
-                // ---- metrics: last frame + drop detection ----
-                ctx->last_recorded_block_id = task.second.blockID;
-                if (ctx->prev_block_id != -1) {
-                    int64_t diff = task.second.blockID - ctx->prev_block_id;
-                    if (diff > 1) ctx->dropped_frames += (int)(diff - 1);
-                }
-                ctx->prev_block_id = task.second.blockID;
-
-                int next_seq = seq + 1;
-                ctx->recorded_frames.store(next_seq, std::memory_order_relaxed);
-
-                if (next_seq == ctx->total_record_frames) {
-                    ctx->recording = false;
-                    ctx->dump_ready = true;
-                    ctx->recording_end_time = chrono::steady_clock::now();  // t_last
-                }
-            }
-            ctx->last_block_id.store(task.second.blockID, memory_order_relaxed);
-            ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
-            ctx->has_streamed.store(true, memory_order_relaxed);
-        } else {
-            // Standby: clone single frame for UI preview
-            cv::Mat temp(task.first->GetHeight(), task.first->GetWidth(), CV_8UC1, task.first->GetBuffer());
-            {
-                lock_guard<mutex> lock(ctx->frame_mtx);
-                ctx->latest_frame = temp.clone();
-                ctx->latest_meta = task.second;
-            }
-            ctx->last_block_id.store(task.second.blockID, memory_order_relaxed);
-            ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
-            ctx->has_streamed.store(true, memory_order_relaxed);
+        {
+            lock_guard<mutex> lock(ctx->frame_mtx);
+            ctx->latest_frame = task.first;
+            ctx->latest_meta = task.second;
         }
     }
 }
@@ -685,18 +638,54 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
             ctx->captured_frames++;
 
 
-            lock_guard<mutex> lock(ctx->copy_mtx);
+            // [Fix] 采集卡缓冲只允许在回调内读取：DMA 模式在回调内持有 GrabResultPtr
+            //       使 Pylon DMA 缓冲保持存活（零 CPU 拷贝），预览克隆也在回调内完成
             if (ctx->recording) {
-                if ((int)ctx->copy_queue.size() < ctx->total_record_frames) {
-                    ctx->copy_queue.push({ptr, meta});
-                    ctx->copy_cv.notify_one();
+                int seq = ctx->recorded_frames.load(std::memory_order_relaxed);
+                if (seq < ctx->total_record_frames) {
+                    // DMA: store GrabResultPtr — keeps Pylon DMA buffer alive, zero CPU copy
+                    ctx->dma_frames[seq] = ptr;
+                    ctx->meta_buffer[seq] = meta;
+
+                    // UI preview: one-frame clone of the DMA buffer
+                    {
+                        lock_guard<mutex> lock(ctx->frame_mtx);
+                        ctx->latest_frame = cv::Mat(ptr->GetHeight(), ptr->GetWidth(),
+                                                    CV_8UC1, ptr->GetBuffer()).clone();
+                        ctx->latest_meta = meta;
+                    }
+
+                    if (seq == 0) {
+                        ctx->first_recorded_block_id = meta.blockID;
+                        ctx->first_frame_time = chrono::steady_clock::now();
+                    }
+                    // ---- metrics: last frame + drop detection ----
+                    ctx->last_recorded_block_id = meta.blockID;
+                    if (ctx->prev_block_id != -1) {
+                        int64_t diff = meta.blockID - ctx->prev_block_id;
+                        if (diff > 1) ctx->dropped_frames += (int)(diff - 1);
+                    }
+                    ctx->prev_block_id = meta.blockID;
+
+                    int next_seq = seq + 1;
+                    ctx->recorded_frames.store(next_seq, std::memory_order_relaxed);
+
+                    if (next_seq == ctx->total_record_frames) {
+                        ctx->recording = false;
+                        ctx->dump_ready = true;
+                        ctx->recording_end_time = chrono::steady_clock::now();  // t_last
+                    }
                 }
             } else {
-                if (ctx->copy_queue.size() < 2) {
-                    ctx->copy_queue.push({ptr, meta});
-                    ctx->copy_cv.notify_one();
-                }
+                // [Fix] 回调内同步拷贝
+                cv::Mat temp(ptr->GetHeight(), ptr->GetWidth(), CV_8UC1, ptr->GetBuffer());
+                cv::Mat clone_img = temp.clone();
+                lock_guard<mutex> lock(ctx->copy_mtx);
+                if (ctx->copy_queue.size() < 2) { ctx->copy_queue.push({clone_img, meta}); ctx->copy_cv.notify_one(); }
             }
+            ctx->last_block_id.store(meta.blockID, memory_order_relaxed);
+            ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
+            ctx->has_streamed.store(true, memory_order_relaxed);
         }
     });
 

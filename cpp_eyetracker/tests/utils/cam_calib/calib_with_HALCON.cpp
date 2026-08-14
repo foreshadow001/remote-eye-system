@@ -120,19 +120,10 @@ void copyWorker(shared_ptr<CameraContext> ctx){while(ctx->running){pair<cv::Mat,
 void captureWorker(shared_ptr<CameraContext> ctx,double fps,double gain,double gamma,double exp,double me){
     if(!ctx->cam.open(TriggerMode::Software))return;ctx->is_mono=ctx->cam.isMono();if(ctx->is_mono&&me>1.0){exp*=me;fps/=me;}
     try{ctx->cam.setFrameRate(fps);ctx->cam.setGain(gain);ctx->cam.setGamma(gamma);ctx->cam.setExposureTime(exp);}catch(...){}
-    ctx->cam.dumpConfig();  // [DBG] 全量配置打印 (set 之后 → 运行时真实配置)
-    // [Fix] 回调内立即拷贝: 采集卡缓冲只在回调期间被持有, 随后立即归还驱动
+    // 回调内同步拷贝: 采集卡缓冲只在回调期间被持有, 随后立即归还驱动
     ctx->cam.setFrameCallback([ctx](const Pylon::CBaslerUniversalGrabResultPtr& p,FrameMeta m){
-        // [DBG] 坏帧诊断: 只打印不跳过
-        {size_t w=p->GetWidth(),h=p->GetHeight(),ps=p->GetPayloadSize();
-            bool gs=p->GrabSucceeded();
-            if(!gs||ps!=w*h)
-                cerr<<"[BadFrame] cam "<<ctx->sn<<" blk="<<m.blockID
-                    <<" grab="<<(gs?"OK":"FAIL")
-                    <<" size="<<w<<"x"<<h<<" payload="<<ps
-                    <<(ps==w*h?" (match)":" (MISMATCH)")<<endl;}
         cv::Mat tmp(p->GetHeight(),p->GetWidth(),CV_8UC1,p->GetBuffer());
-        cv::Mat clone_img=tmp.clone();  // 同步拷贝, p 出作用域即归还缓冲
+        cv::Mat clone_img=tmp.clone();
         lock_guard<mutex> lk(ctx->copy_mtx);
         if(ctx->copy_queue.size()<2){ctx->copy_queue.push({clone_img,m});ctx->copy_cv.notify_one();}
     });

@@ -247,7 +247,7 @@ struct CameraContext {
     FrameMeta latest_meta;
     mutex frame_mtx;
 
-    queue<pair<Pylon::CBaslerUniversalGrabResultPtr, FrameMeta>> copy_queue;
+    queue<pair<cv::Mat, FrameMeta>> copy_queue;  // [Fix] 队列存已拷贝 Mat, 回调内同步拷贝
     mutex copy_mtx;
     condition_variable copy_cv;
 
@@ -545,7 +545,7 @@ int getNextCalibCounter(const string& save_dir) {
 // ================== 后台拷贝线程 ==================
 void copyWorker(shared_ptr<CameraContext> ctx) {
     while (ctx->running) {
-        pair<Pylon::CBaslerUniversalGrabResultPtr, FrameMeta> task;
+        pair<cv::Mat, FrameMeta> task;
         {
             unique_lock<mutex> lock(ctx->copy_mtx);
             ctx->copy_cv.wait(lock, [&]{ return !ctx->copy_queue.empty() || !ctx->running; });
@@ -554,16 +554,12 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
             ctx->copy_queue.pop();
         }
 
-        cv::Mat temp(task.first->GetHeight(), task.first->GetWidth(), CV_8UC1, task.first->GetBuffer());
-        cv::Mat clone_img = temp.clone();
+        // [Fix] 队列只存已拷贝的 Mat (回调内同步拷贝完成), 直接使用
         {
             lock_guard<mutex> lock(ctx->frame_mtx);
-            ctx->latest_frame = clone_img;
+            ctx->latest_frame = task.first;
             ctx->latest_meta = task.second;
         }
-        ctx->last_block_id.store(task.second.blockID, memory_order_relaxed);
-        ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
-        ctx->has_streamed.store(true, memory_order_relaxed);
     }
 }
 
@@ -590,11 +586,17 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
     } catch (...) {}
 
     ctx->cam.setFrameCallback([ctx](const Pylon::CBaslerUniversalGrabResultPtr& ptr, FrameMeta meta) {
+        // [Fix] 回调内同步拷贝: 采集卡缓冲只在回调期间被持有
+        cv::Mat temp(ptr->GetHeight(), ptr->GetWidth(), CV_8UC1, ptr->GetBuffer());
+        cv::Mat clone_img = temp.clone();
         lock_guard<mutex> lock(ctx->copy_mtx);
         if (ctx->copy_queue.size() < 2) {
-            ctx->copy_queue.push({ptr, meta});
+            ctx->copy_queue.push({clone_img, meta});
             ctx->copy_cv.notify_one();
         }
+        ctx->last_block_id.store(meta.blockID, memory_order_relaxed);
+        ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
+        ctx->has_streamed.store(true, memory_order_relaxed);
     });
 
     if (!ctx->cam.start()) {

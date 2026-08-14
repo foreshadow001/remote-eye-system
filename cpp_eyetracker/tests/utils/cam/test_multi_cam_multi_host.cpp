@@ -84,7 +84,7 @@ struct CameraContext {
     int total_record_frames = 0;
     atomic<bool> dump_ready{false};
 
-    queue<pair<Pylon::CBaslerUniversalGrabResultPtr, FrameMeta>> copy_queue;
+    queue<pair<cv::Mat, FrameMeta>> copy_queue; // [Fix] 队列存已拷贝 Mat, 回调内同步拷贝
     mutex copy_mtx;
     condition_variable copy_cv;
 
@@ -562,80 +562,23 @@ void showFaultOverlay(int faulty_cam, bool is_hw) {
 }
 
 // ================== 后台异步拷贝线程 ==================
+// [Fix] 采集卡缓冲只允许在回调内读取：队列现在存已拷贝的 Mat，
+//       copyWorker 只负责把预览帧发布到 latest_frame（录制逻辑已移入回调）
 void copyWorker(shared_ptr<CameraContext> ctx) {
     while (ctx->running) {
-        pair<Pylon::CBaslerUniversalGrabResultPtr, FrameMeta> task;
+        pair<cv::Mat, FrameMeta> task;
         {
             unique_lock<mutex> lock(ctx->copy_mtx);
             ctx->copy_cv.wait(lock, [&]{ return !ctx->copy_queue.empty() || !ctx->running; });
             if (!ctx->running && ctx->copy_queue.empty()) break;
-            // ---- queue pressure: record BEFORE pop (total queue length) ----
-            int qs = (int)ctx->copy_queue.size();
-            if (qs > ctx->max_queue_size.load()) ctx->max_queue_size = qs;
             task = ctx->copy_queue.front();
             ctx->copy_queue.pop();
         }
 
-        if (ctx->recording) {
-            int seq = ctx->recorded_frames.load(std::memory_order_relaxed);
-            if (seq < ctx->total_record_frames) {
-                void* pBuffer = task.first->GetBuffer();
-                size_t payload_size = task.first->GetWidth() * task.first->GetHeight();
-
-                // [DBG] 溢出检测: payload 超过预分配 RAM buffer 会破坏堆
-                if (payload_size > ctx->ram_buffer[seq].total() * ctx->ram_buffer[seq].elemSize()) {
-                    cerr << "[DBG OVERFLOW] cam " << ctx->id << " seq=" << seq
-                         << ": payload=" << payload_size
-                         << " > ram_buffer=" << (ctx->ram_buffer[seq].total() * ctx->ram_buffer[seq].elemSize())
-                         << " — SKIPPING memcpy to avoid heap corruption" << endl;
-                    continue;
-                }
-
-                memcpy(ctx->ram_buffer[seq].data, pBuffer, payload_size);
-                ctx->meta_buffer[seq] = task.second;
-
-                {
-                    lock_guard<mutex> lock(ctx->frame_mtx);
-                    ctx->latest_frame = ctx->ram_buffer[seq];
-                    ctx->latest_meta = task.second;
-                }
-
-                // ---- metrics: first frame ----
-                if (seq == 0) {
-                    ctx->first_recorded_block_id = task.second.blockID;
-                    ctx->first_frame_time = chrono::steady_clock::now();
-                }
-                // ---- metrics: last frame + drop detection ----
-                ctx->last_recorded_block_id = task.second.blockID;
-                if (ctx->prev_block_id != -1) {
-                    int64_t diff = task.second.blockID - ctx->prev_block_id;
-                    if (diff > 1) ctx->dropped_frames += (int)(diff - 1);
-                }
-                ctx->prev_block_id = task.second.blockID;
-
-                int next_seq = seq + 1;
-                ctx->recorded_frames.store(next_seq, std::memory_order_relaxed);
-
-                if (next_seq == ctx->total_record_frames) {
-                    ctx->recording = false;
-                    ctx->dump_ready = true;
-                    ctx->recording_end_time = chrono::steady_clock::now();  // t_last
-                }
-            }
-            ctx->last_block_id.store(task.second.blockID, memory_order_relaxed);
-            ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
-            ctx->has_streamed.store(true, memory_order_relaxed);
-        } else {
-            cv::Mat temp(task.first->GetHeight(), task.first->GetWidth(), CV_8UC1, task.first->GetBuffer());
-            cv::Mat clone_img = temp.clone();
-            {
-                lock_guard<mutex> lock(ctx->frame_mtx);
-                ctx->latest_frame = clone_img;
-                ctx->latest_meta = task.second;
-            }
-            ctx->last_block_id.store(task.second.blockID, memory_order_relaxed);
-            ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
-            ctx->has_streamed.store(true, memory_order_relaxed);
+        {
+            lock_guard<mutex> lock(ctx->frame_mtx);
+            ctx->latest_frame = task.first;
+            ctx->latest_meta = task.second;
         }
     }
 }
@@ -693,19 +636,62 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
             meta.blockID = meta.blockID - ctx->frame_offset; 
             ctx->captured_frames++;
 
-            lock_guard<mutex> lock(ctx->copy_mtx);
+            // [Fix] 采集卡缓冲只允许在回调内读取：录制帧在这里同步 memcpy 到预分配 RAM
             if (ctx->recording) {
-                if ((int)ctx->copy_queue.size() < ctx->total_record_frames) {
-                    ctx->copy_queue.push({ptr, meta});
-                    ctx->copy_cv.notify_one();
+                int seq = ctx->recorded_frames.load(std::memory_order_relaxed);
+                if (seq < ctx->total_record_frames) {
+                    void* pBuffer = ptr->GetBuffer();
+                    size_t payload_size = ptr->GetWidth() * ptr->GetHeight();
+
+                    // [DBG] 溢出检测: payload 超过预分配 RAM buffer 会破坏堆
+                    if (payload_size > ctx->ram_buffer[seq].total() * ctx->ram_buffer[seq].elemSize()) {
+                        cerr << "[DBG OVERFLOW] cam " << ctx->id << " seq=" << seq
+                             << ": payload=" << payload_size
+                             << " > ram_buffer=" << (ctx->ram_buffer[seq].total() * ctx->ram_buffer[seq].elemSize())
+                             << " — SKIPPING memcpy to avoid heap corruption" << endl;
+                    } else {
+                        memcpy(ctx->ram_buffer[seq].data, pBuffer, payload_size);
+                        ctx->meta_buffer[seq] = meta;
+
+                        {
+                            lock_guard<mutex> lock(ctx->frame_mtx);
+                            ctx->latest_frame = ctx->ram_buffer[seq];
+                            ctx->latest_meta = meta;
+                        }
+
+                        // ---- metrics: first frame ----
+                        if (seq == 0) {
+                            ctx->first_recorded_block_id = meta.blockID;
+                            ctx->first_frame_time = chrono::steady_clock::now();
+                        }
+                        // ---- metrics: last frame + drop detection ----
+                        ctx->last_recorded_block_id = meta.blockID;
+                        if (ctx->prev_block_id != -1) {
+                            int64_t diff = meta.blockID - ctx->prev_block_id;
+                            if (diff > 1) ctx->dropped_frames += (int)(diff - 1);
+                        }
+                        ctx->prev_block_id = meta.blockID;
+
+                        int next_seq = seq + 1;
+                        ctx->recorded_frames.store(next_seq, std::memory_order_relaxed);
+
+                        if (next_seq == ctx->total_record_frames) {
+                            ctx->recording = false;
+                            ctx->dump_ready = true;
+                            ctx->recording_end_time = chrono::steady_clock::now();  // t_last
+                        }
+                    }
                 }
-                // else: queue full, frame silently dropped (will show as BlockID gap)
             } else {
-                if (ctx->copy_queue.size() < 2) {
-                    ctx->copy_queue.push({ptr, meta});
-                    ctx->copy_cv.notify_one();
-                }
+                // [Fix] 回调内同步拷贝
+                cv::Mat temp(ptr->GetHeight(), ptr->GetWidth(), CV_8UC1, ptr->GetBuffer());
+                cv::Mat clone_img = temp.clone();
+                lock_guard<mutex> lock(ctx->copy_mtx);
+                if (ctx->copy_queue.size() < 2) { ctx->copy_queue.push({clone_img, meta}); ctx->copy_cv.notify_one(); }
             }
+            ctx->last_block_id.store(meta.blockID, memory_order_relaxed);
+            ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
+            ctx->has_streamed.store(true, memory_order_relaxed);
         }
     });
 

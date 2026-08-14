@@ -64,7 +64,7 @@ struct CameraContext {
     int total_record_frames = 0;
     atomic<bool> dump_ready{false};
 
-    queue<pair<Pylon::CBaslerUniversalGrabResultPtr, FrameMeta>> copy_queue;
+    queue<pair<cv::Mat, FrameMeta>> copy_queue;  // [Fix] 队列存已拷贝 Mat, 回调内同步拷贝
     mutex copy_mtx;
     condition_variable copy_cv;
 
@@ -94,7 +94,7 @@ vector<shared_ptr<CameraContext>> cam_ctxs;
 // ================== 后台异步拷贝线程 ==================
 void copyWorker(shared_ptr<CameraContext> ctx) {
     while (ctx->running) {
-        pair<Pylon::CBaslerUniversalGrabResultPtr, FrameMeta> task;
+        pair<cv::Mat, FrameMeta> task;
         {
             unique_lock<mutex> lock(ctx->copy_mtx);
             ctx->copy_cv.wait(lock, [&]{ return !ctx->copy_queue.empty() || !ctx->running; });
@@ -103,37 +103,11 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
             ctx->copy_queue.pop();
         }
 
-        if (ctx->recording) {
-            int seq = ctx->recorded_frames.load(std::memory_order_relaxed);
-            if (seq < ctx->total_record_frames) {
-                void* pBuffer = task.first->GetBuffer();
-                size_t payload_size = task.first->GetWidth() * task.first->GetHeight();
-                
-                memcpy(ctx->ram_buffer[seq].data, pBuffer, payload_size);
-                ctx->meta_buffer[seq] = task.second;
-                
-                {
-                    lock_guard<mutex> lock(ctx->frame_mtx);
-                    ctx->latest_frame = ctx->ram_buffer[seq]; 
-                    ctx->latest_meta = task.second;
-                }
-
-                int next_seq = seq + 1;
-                ctx->recorded_frames.store(next_seq, std::memory_order_relaxed);
-
-                if (next_seq == ctx->total_record_frames) {
-                    ctx->recording = false;
-                    ctx->dump_ready = true;
-                }
-            }
-        } else {
-            cv::Mat temp(task.first->GetHeight(), task.first->GetWidth(), CV_8UC1, task.first->GetBuffer());
-            cv::Mat clone_img = temp.clone(); 
-            {
-                lock_guard<mutex> lock(ctx->frame_mtx);
-                ctx->latest_frame = clone_img;
-                ctx->latest_meta = task.second;
-            }
+        // [Fix] 队列只存已拷贝的 Mat (回调内同步拷贝完成), 直接使用
+        {
+            lock_guard<mutex> lock(ctx->frame_mtx);
+            ctx->latest_frame = task.first;
+            ctx->latest_meta = task.second;
         }
     }
 }
@@ -178,16 +152,42 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
         }
 
         if (ctx->offset_initialized) {
-            meta.blockID = meta.blockID - ctx->frame_offset; 
+            meta.blockID = meta.blockID - ctx->frame_offset;
             ctx->captured_frames++;
 
-            lock_guard<mutex> lock(ctx->copy_mtx);
+            // [Fix] 回调内同步拷贝: 采集卡缓冲只在回调期间被持有
             if (ctx->recording) {
-                ctx->copy_queue.push({ptr, meta});
-                ctx->copy_cv.notify_one();
+                // ---- 录制路径: 直接写入 ram_buffer (录制期间不使用队列) ----
+                int seq = ctx->recorded_frames.load(std::memory_order_relaxed);
+                if (seq < ctx->total_record_frames) {
+                    void* pBuffer = ptr->GetBuffer();
+                    size_t payload_size = ptr->GetWidth() * ptr->GetHeight();
+                    if (payload_size <= ctx->ram_buffer[seq].total() * ctx->ram_buffer[seq].elemSize()) {  // 溢出防护
+                        memcpy(ctx->ram_buffer[seq].data, pBuffer, payload_size);
+                        ctx->meta_buffer[seq] = meta;
+
+                        {
+                            lock_guard<mutex> lock(ctx->frame_mtx);
+                            ctx->latest_frame = ctx->ram_buffer[seq];
+                            ctx->latest_meta = meta;
+                        }
+
+                        int next_seq = seq + 1;
+                        ctx->recorded_frames.store(next_seq, std::memory_order_relaxed);
+
+                        if (next_seq == ctx->total_record_frames) {
+                            ctx->recording = false;
+                            ctx->dump_ready = true;
+                        }
+                    }
+                }
             } else {
+                // [Fix] 回调内同步拷贝: 采集卡缓冲只在回调期间被持有
+                cv::Mat temp(ptr->GetHeight(), ptr->GetWidth(), CV_8UC1, ptr->GetBuffer());
+                cv::Mat clone_img = temp.clone();
+                lock_guard<mutex> lock(ctx->copy_mtx);
                 if (ctx->copy_queue.size() < 2) {
-                    ctx->copy_queue.push({ptr, meta});
+                    ctx->copy_queue.push({clone_img, meta});
                     ctx->copy_cv.notify_one();
                 }
             }
