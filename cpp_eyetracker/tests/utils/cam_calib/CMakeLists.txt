@@ -26,6 +26,18 @@ target_link_libraries(calib_with_HALCON
         ${OpenCV_LIBS}
 )
 
+# [DBG] 全节点转储版 (配置对比用)
+add_executable(calib_dump
+    calib_dump.cpp
+)
+
+target_link_libraries(calib_dump
+    PRIVATE
+        eyetracker::cfg
+        eyetracker::cam
+        ${OpenCV_LIBS}
+)
+
 
 message(STATUS "✅ calib_with_HALCON will be built")
 
