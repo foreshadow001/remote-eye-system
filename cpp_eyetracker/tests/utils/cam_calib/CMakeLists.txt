@@ -26,41 +26,6 @@ target_link_libraries(calib_with_HALCON
         ${OpenCV_LIBS}
 )
 
-# [DBG] 全节点转储版 (配置对比用)
-add_executable(calib_dump
-    calib_dump.cpp
-)
-
-target_link_libraries(calib_dump
-    PRIVATE
-        eyetracker::cfg
-        eyetracker::cam
-        ${OpenCV_LIBS}
-)
-
-# [Minimal] 不设置相机参数版 — 二进制定位触发参数 (对齐 Viewer 默认)
-add_executable(calib_minimal
-    calib_minimal.cpp
-)
-
-target_link_libraries(calib_minimal
-    PRIVATE
-        eyetracker::cfg
-        eyetracker::cam
-        ${OpenCV_LIBS}
-)
-
-# [Viewer] 与 Pylon Viewer 完全平行: 纯 Open, 无 BaslerCamera 封装, 无任何参数设置
-add_executable(calib_viewer
-    calib_viewer.cpp
-)
-
-target_link_libraries(calib_viewer
-    PRIVATE
-        eyetracker::cfg
-        eyetracker::cam
-        ${OpenCV_LIBS}
-)
 
 
 message(STATUS "✅ calib_with_HALCON will be built")

@@ -1402,7 +1402,7 @@ int main() {
     }
 
     // ---- Cleanup ----
-    cout<<"[System] Shutting down..."<<flush<<endl;
+    cout<<"[System] Shutting down..."<<endl;
     for(auto& ctx:cam_ctxs){ctx->running=false;ctx->copy_cv.notify_all();}
     if(g_piper_sock!=INVALID_SOCKET) closesocket(g_piper_sock);
     if(g_gaze_sock!=INVALID_SOCKET) closesocket(g_gaze_sock);
@@ -1411,18 +1411,11 @@ int main() {
     if(g_cmd_sock!=INVALID_SOCKET) closesocket(g_cmd_sock);
     if(g_cmd_listen_sock!=INVALID_SOCKET) closesocket(g_cmd_listen_sock);  // 打断 accept
     for(auto& ctx:cam_ctxs){
-        cout<<"[Cleanup] joining cam "<<ctx->id<<" capture_thread..."<<flush<<endl;
         if(ctx->capture_thread.joinable())ctx->capture_thread.join();
-        cout<<"[Cleanup] cam "<<ctx->id<<" capture_thread joined."<<flush<<endl;
         if(ctx->copy_thread.joinable())ctx->copy_thread.join();
-        cout<<"[Cleanup] cam "<<ctx->id<<" copy_thread joined."<<flush<<endl;
     }
-    cout<<"[Cleanup] joining cmd_thread..."<<flush<<endl;
     if(cmd_thread.joinable()) cmd_thread.join();
-    cout<<"[Cleanup] cmd_thread joined."<<flush<<endl;
-    cout<<"[Cleanup] joining gaze_thread..."<<flush<<endl;
     if(gaze_thread.joinable()) gaze_thread.join();
-    cout<<"[Cleanup] gaze_thread joined."<<flush<<endl;
     if(g_session_log.is_open()) g_session_log.close();
     cv::destroyAllWindows(); Pylon::PylonTerminate();
 #ifdef _WIN32

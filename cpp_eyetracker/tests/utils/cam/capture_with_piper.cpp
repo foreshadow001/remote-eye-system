@@ -1365,14 +1365,17 @@ int main() {
 
     // ---- Cleanup ----
     cout<<"[System] Shutting down..."<<endl;
-    for(auto& ctx:cam_ctxs){ctx->running=false;ctx->copy_cv.notify_all();
-        if(ctx->capture_thread.joinable())ctx->capture_thread.join();
-        if(ctx->copy_thread.joinable())ctx->copy_thread.join();}
+    for(auto& ctx:cam_ctxs){ctx->running=false;ctx->copy_cv.notify_all();}
     if(g_piper_sock!=INVALID_SOCKET) closesocket(g_piper_sock);
     if(g_gaze_sock!=INVALID_SOCKET) closesocket(g_gaze_sock);
     if(g_gaze_listen_sock!=INVALID_SOCKET) closesocket(g_gaze_listen_sock);
     global_running=false;
     if(g_cmd_sock!=INVALID_SOCKET) closesocket(g_cmd_sock);
+    if(g_cmd_listen_sock!=INVALID_SOCKET) closesocket(g_cmd_listen_sock);  // 打断 accept
+    for(auto& ctx:cam_ctxs){
+        if(ctx->capture_thread.joinable())ctx->capture_thread.join();
+        if(ctx->copy_thread.joinable())ctx->copy_thread.join();
+    }
     if(cmd_thread.joinable()) cmd_thread.join();
     if(gaze_thread.joinable()) gaze_thread.join();
     if(g_session_log.is_open()) g_session_log.close();
