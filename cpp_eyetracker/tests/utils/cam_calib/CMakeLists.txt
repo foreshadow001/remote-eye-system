@@ -16,18 +16,18 @@ target_link_libraries(test_calib_images
 
 message(STATUS "✅ test_calib_images will be built")
 
-add_executable(test_calib_transfer
-    test_calib_transfer.cpp
+add_executable(calib_with_HALCON
+    calib_with_HALCON.cpp
 )
 
-target_link_libraries(test_calib_transfer
+target_link_libraries(calib_with_HALCON
     PRIVATE
         eyetracker::cfg
         eyetracker::cam
         ${OpenCV_LIBS}
 )
 
-message(STATUS "✅ test_calib_transfer will be built")
+message(STATUS "✅ calib_with_HALCON will be built")
 
 # ---- cam_calib / cam_calib_chain: 需要 HALCON ----
 if(NOT DEFINED ENV{HALCONROOT})

@@ -1,5 +1,6 @@
-// test_calib_transfer.cpp — TCP-based calibration image capture + transfer
-// Replaces UDP with a single TCP connection for all communication.
+// calib_with_HALCON.cpp — 标定图片采集 + TCP 传输 + 触发 HALCON 标定链 (正式版)
+// Master: 相机预览 + 从 Slave 拉取缺失图片 (TCP, 独立数据端口) + 启动 calib_cam_chain
+// Slave:  相机预览 + 响应 Master 的 LIST/XFER 请求
 // ====================================================================
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -36,6 +37,7 @@ using namespace gazeestimation;
 atomic<bool> global_running{true};
 bool g_is_master = false, g_enable_net_sync = false;
 string g_save_dir;  // calib_save_dir/{participant_id}
+string g_xml_dir;   // 标定 XML 输出目录 = cam_calib.yaml: calib_save_dir/{input_participant_id}/output
 int g_win_w=1600, g_win_h=800, g_left_w, g_right_x, g_right_w, g_thumb_w, g_thumb_h;
 atomic<int> g_enlarged_cam{-1};
 SOCKET g_ctrl_sock = INVALID_SOCKET;  // TCP control channel (text commands)
@@ -46,6 +48,9 @@ atomic<bool> g_fault_active{false}; atomic<int> g_faulty_cam{-1};
 atomic<bool> g_fault_on_master{false};
 chrono::steady_clock::time_point g_fault_time, g_ready_time;
 atomic<int> g_capture_count{-1}, g_last_idx{-1}; int g_undo_count=0;
+#ifdef _WIN32
+PROCESS_INFORMATION g_halcon_pi{};   // calib_cam_chain 子进程 (t 键传输完成后触发)
+#endif
 
 // recvLine leftover: catches data past \n when multiple lines arrive in one TCP segment
 thread_local string g_tcp_leftover;
@@ -64,6 +69,40 @@ bool recvLine(SOCKET s, string& line, int timeout_ms=3000) {
 bool sendExact(SOCKET s,const void* buf,size_t n){size_t sent=0;while(sent<n){int r=send(s,(const char*)buf+sent,(int)(n-sent),0);if(r<=0)return false;sent+=r;}return true;}
 bool sendLine(SOCKET s,const string& m){string d=m+"\n";return sendExact(s,d.c_str(),d.length());}
 bool recvExact(SOCKET s,void* buf,size_t n){size_t got=0;while(got<n){int r=recv(s,(char*)buf+got,(int)(n-got),0);if(r<=0)return false;got+=r;}return true;}
+
+// ================== HALCON 标定链子进程 ==================
+#ifdef _WIN32
+// 启动同目录下的 calib_cam_chain.exe (已运行则跳过)
+void launchHalconChain() {
+    if (g_halcon_pi.hProcess) {
+        DWORD ec = 0;
+        if (GetExitCodeProcess(g_halcon_pi.hProcess, &ec) && ec == STILL_ACTIVE) {
+            cout << "[HALCON] calib_cam_chain already running. Please wait." << endl;
+            return;
+        }
+        CloseHandle(g_halcon_pi.hProcess); CloseHandle(g_halcon_pi.hThread);
+        ZeroMemory(&g_halcon_pi, sizeof(g_halcon_pi));
+    }
+    char self_path[MAX_PATH];
+    GetModuleFileNameA(NULL, self_path, MAX_PATH);
+    fs::path exe = fs::path(self_path).parent_path() / "calib_cam_chain.exe";
+    if (!fs::exists(exe)) {
+        cerr << "[HALCON] Not found: " << exe.string()
+             << " (需设置 HALCONROOT 并编译 cam_calib_chain)" << endl;
+        return;
+    }
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    if (CreateProcessA(exe.string().c_str(), NULL, NULL, NULL, FALSE, 0,
+                       NULL, NULL, &si, &g_halcon_pi)) {
+        cout << "[HALCON] Launched calib_cam_chain.exe" << endl;
+    } else {
+        cerr << "[HALCON] Launch failed (error " << GetLastError() << "): "
+             << exe.string() << endl;
+    }
+}
+#else
+void launchHalconChain() { cerr << "[HALCON] Not supported on this platform." << endl; }
+#endif
 
 // ================== Camera ==================
 struct CameraContext {string sn; BaslerCamera cam{""}; bool is_mono=true; thread capture_thread,copy_thread; atomic<bool> running{true};
@@ -146,6 +185,11 @@ int main(){
     string base_dir=c["calib_save_dir"].as<string>();
     string pid="P001"; try{Cfg cfg_cap(cfg_dir+"/capture.yaml");pid=cfg_cap["capture"]["participant_id"].as<string>();}catch(...){}
     g_save_dir=base_dir+"/"+pid+"/pictures"; fs::create_directories(g_save_dir);
+    // 标定 XML 输出目录 (calib_cam_chain 的输出, 与 calib_cam_chain.cpp 的计算一致)
+    {
+        string xpid=pid; try{xpid=c["input_participant_id"].as<string>();if(xpid.empty())xpid=pid;}catch(...){}
+        g_xml_dir=base_dir+"/"+xpid+"/output";
+    }
     bool test_xfer=false; try{test_xfer=c["test_transfer"].as<bool>();}catch(...){}
     string test_recv; try{test_recv=c["test_transfer_recv_dir"].as<string>();test_recv+="/"+pid+"/pictures";}catch(...){test_recv="D:/calib_transfer_test/"+pid+"/pictures";}
     if(test_xfer) fs::create_directories(test_recv);
@@ -159,6 +203,7 @@ int main(){
         cout<<"Ctrl Port : "<<g_ctrl_port<<endl;cout<<"Data Port : "<<data_port<<endl;}
     cout<<"Test Xfer : "<<(test_xfer?"ON":"OFF")<<endl;
     cout<<"Save dir  : "<<g_save_dir<<endl;
+    cout<<"XML dir   : "<<g_xml_dir<<endl;
     if(test_xfer) cout<<"Recv dir  : "<<test_recv<<endl;
     cout<<"Cameras   : "<<sns.size()<<endl;
     for(size_t i=0;i<sns.size();++i)cout<<"  "<<i<<": SN="<<sns[i]<<endl;
@@ -198,6 +243,9 @@ int main(){
                     cv::putText(cv,"Press [T] to test again  [Q] to quit",cv::Point(180,y),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(200,200,200),1);}
                 // Progress bar
                 if(xfer_total>0){cv::rectangle(cv,cv::Rect(100,300,600,30),cv::Scalar(80,80,80),1);int pw=(int)(600.0*xfer_cnt/xfer_total);cv::rectangle(cv,cv::Rect(100,300,pw,30),cv::Scalar(0,255,0),-1);char pct[32];snprintf(pct,sizeof(pct),"%d/%d",xfer_cnt,xfer_total);cv::putText(cv,pct,cv::Point(340,320),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(255,255,255),1);}
+                // Bottom-right: save dir + XML dir
+                cv::putText(cv,"Save: "+g_save_dir,cv::Point(20,385),cv::FONT_HERSHEY_SIMPLEX,0.35,cv::Scalar(140,140,140),1,cv::LINE_AA);
+                cv::putText(cv,"XML : "+g_xml_dir,cv::Point(20,398),cv::FONT_HERSHEY_SIMPLEX,0.35,cv::Scalar(140,140,140),1,cv::LINE_AA);
                 cv::imshow("Calib Transfer Test",cv);lui=now;}
             char key=(char)cv::waitKey(30);
             if(key=='q'||key==27){if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"SHUTDOWN");global_running=false;}
@@ -261,8 +309,13 @@ int main(){
         // UI
         if(nu){cv::Mat cv;if(g_fault_active.load()){cv=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);cv::putText(cv,"CAMERA FAULT",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,1.2,cv::Scalar(0,0,255),2);}
         else{cv=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);int sel=g_enlarged_cam.load();renderGrid(cv,sel);renderEnlarged(cv,sel);cv::line(cv,cv::Point(g_left_w,0),cv::Point(g_left_w,g_win_h),cv::Scalar(60,60,60),2);
-            string hints=g_enable_net_sync&&!g_is_master?"[SPACE][z][c][t][ESC/q] disabled (Slave)":"[SPACE] capture  [z] undo  [c] clear  [t] transfer  [ESC/q] quit";cv::putText(cv,hints,cv::Point(g_right_x+10,g_win_h-45),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(140,140,140),1,cv::LINE_AA);
-            string cnt="Captures: "+to_string(g_capture_count);cv::putText(cv,cnt,cv::Point(g_right_x+g_right_w-200,35),cv::FONT_HERSHEY_SIMPLEX,0.8,cv::Scalar(0,215,255),2,cv::LINE_AA);}
+            string hints=g_enable_net_sync&&!g_is_master?"[SPACE][z][c][t][ESC/q] disabled (Slave)":"[SPACE] capture  [z] undo  [c] clear  [t] transfer+calib  [ESC/q] quit";cv::putText(cv,hints,cv::Point(g_right_x+10,g_win_h-45),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(140,140,140),1,cv::LINE_AA);
+            string cnt="Captures: "+to_string(g_capture_count);cv::putText(cv,cnt,cv::Point(g_right_x+g_right_w-200,35),cv::FONT_HERSHEY_SIMPLEX,0.8,cv::Scalar(0,215,255),2,cv::LINE_AA);
+            // Bottom-right: save dir + XML dir (右对齐)
+            string sdir="Save: "+g_save_dir;cv::Size ssz=cv::getTextSize(sdir,cv::FONT_HERSHEY_SIMPLEX,0.35,1,0);
+            cv::putText(cv,sdir,cv::Point(g_right_x+g_right_w-ssz.width-10,g_win_h-35),cv::FONT_HERSHEY_SIMPLEX,0.35,cv::Scalar(140,140,140),1,cv::LINE_AA);
+            string xdir="XML : "+g_xml_dir;cv::Size xsz=cv::getTextSize(xdir,cv::FONT_HERSHEY_SIMPLEX,0.35,1,0);
+            cv::putText(cv,xdir,cv::Point(g_right_x+g_right_w-xsz.width-10,g_win_h-20),cv::FONT_HERSHEY_SIMPLEX,0.35,cv::Scalar(140,140,140),1,cv::LINE_AA);}
         cv::imshow("Calib Capture",cv);lui=now;}
 
         char key=(char)cv::waitKey(1);
@@ -288,7 +341,9 @@ int main(){
             closesocket(ds);closesocket(dl);
             {string l;recvLine(g_ctrl_sock,l,10000);} // consume XFER_DONE
             auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();double spd=dt>0?(tb/1048576.0/dt):0;
-            cout<<"[Transfer] "<<rc<<" files, "<<fixed<<setprecision(1)<<(tb/1048576.0)<<" MB, "<<dt<<"s, "<<spd<<" MB/s\n"<<endl;}
+            cout<<"[Transfer] "<<rc<<" files, "<<fixed<<setprecision(1)<<(tb/1048576.0)<<" MB, "<<dt<<"s, "<<spd<<" MB/s\n"<<endl;
+            // 传输完成 → 启动 HALCON 标定链
+            launchHalconChain();}
         else if((key=='z'||key=='Z')&&!g_fault_active.load()){int li=g_last_idx.load();if(li<0){cout<<"[Undo] No previous capture to undo."<<endl;continue;}stringstream ss;ss<<setw(2)<<setfill('0')<<li;
             cout<<"\n[Undo] Deleting capture index "<<ss.str()<<endl;
             if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir)){string st=e.path().stem().string();if(st.rfind("calib_cam_",0)==0&&st.length()>=2&&st.substr(st.length()-2)==ss.str())fs::remove(e.path());}if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"UNDO:"+to_string(li));g_last_idx.store(li-1);g_undo_count++;if(g_capture_count>0)g_capture_count--;
