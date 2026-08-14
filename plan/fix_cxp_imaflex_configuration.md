@@ -1,5 +1,12 @@
 # CXP-12 相机 + imaFlex 采集卡 — 花屏/坏帧根因排查计划
 
+> ✅ **已解决 (2026-08-14)**：根因 = **imaFlex GenTL 驱动流初始化非线程安全**。
+> 10 线程并发 Open+StartGrabbing → 部分流行排序/DMA 配置错乱 → 零行掩码/图像拼接/花屏/蓝屏。
+> 修复：`BaslerCamera::open()/start()` 全局互斥锁串行化 + 200ms 流建立间隔（basler.cpp）。
+> 全部 14 个采集程序已编译生效；MaxNumBuffer 恢复 16。
+>
+> 历史记录（排查过程）保留在下方，供参考。
+
 > 症状：master 花屏 + `cv::resize` 崩溃 (`inv_scale_x > 0`)。坏帧特征：`grab=OK`、帧高度逐帧变化（2043~2047）、payload = w×h + n×16。
 > 硬件：Basler a2A2448-210cc/cm（ace 2 CXP-12, IMX537, 2448×2048 默认, 212fps 满速）
 > 采集卡：Basler imaFlex CXP-12 Quad（4 端口 × 12.5Gbps, PCIe 3.0 x8, 1.5GB DDR4, PoCXP 17W/端口）× 3 张

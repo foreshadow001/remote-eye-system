@@ -1,5 +1,7 @@
-#include "cam/basler.hpp" 
+#include "cam/basler.hpp"
 #include <filesystem>
+#include <thread>
+#include <chrono>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -14,6 +16,9 @@ bool local_debug = false;
 namespace gazeestimation {
 
 static std::mutex g_print_mtx;  // serialize console output across threads
+// [RootFix] imaFlex CXP GenTL 驱动流初始化非线程安全: 并发 Open+StartGrabbing 会
+// 导致流行排序/DMA 配置错乱 (零行掩码/图像拼接/花屏/蓝屏)。必须全局串行化开流。
+static std::mutex g_stream_init_mtx;
 
 BaslerCamera::BaslerCamera(const std::string& serialNumber)
     : serialNumber_(serialNumber), isOpen_(false), recording_(false), writerInitialized_(false) {
@@ -33,6 +38,7 @@ BaslerCamera::~BaslerCamera() { close(); }
 
 bool BaslerCamera::open(TriggerMode mode) {
     if (!camera_.IsPylonDeviceAttached()) return false;
+    std::lock_guard<std::mutex> lk(g_stream_init_mtx);  // [RootFix] 串行化设备打开
     try {
         camera_.Open();
         currentMode_ = mode;
@@ -111,6 +117,7 @@ bool BaslerCamera::open(TriggerMode mode) {
 }
 
 bool BaslerCamera::start() {
+    std::lock_guard<std::mutex> lk(g_stream_init_mtx);  // [RootFix] 串行化流建立
     try {
         if (!camera_.IsOpen()) return false;
 
@@ -118,6 +125,7 @@ bool BaslerCamera::start() {
 
         camera_.RegisterImageEventHandler(this, RegistrationMode_ReplaceAll, Cleanup_None);
         camera_.StartGrabbing(GrabStrategy_OneByOne, Pylon::GrabLoop_ProvidedByInstantCamera);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));  // [RootFix] 流建立间隔
         return true;
     } catch (const std::exception& e) {
         std::cerr << "[Basler Start Error] " << e.what() << std::endl;

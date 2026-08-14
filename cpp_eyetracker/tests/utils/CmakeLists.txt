@@ -1,6 +1,6 @@
 # /tests/utils/CMakeLists.txt
 
-# add_subdirectory(cam)
+add_subdirectory(cam)
 add_subdirectory(cam_calib)
-# add_subdirectory(piper)
+add_subdirectory(piper)
 # add_subdirectory(glint_detection)

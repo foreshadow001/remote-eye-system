@@ -51,7 +51,7 @@ public:
     bool isMono() const { return isMono_; }
 
 private:
-    int maxNumBuffer_ = 1;   // 实验1: 单缓冲 — 验证"某些缓冲布局有缺陷"假说 (blk%16 掩码)
+    int maxNumBuffer_ = 16;  // CXP 流缓冲数 (150 会加重坏帧, 10-16 正常)
     Pylon::PylonAutoInitTerm autoInit_;
     Pylon::CBaslerUniversalInstantCamera camera_;
     std::string serialNumber_;
