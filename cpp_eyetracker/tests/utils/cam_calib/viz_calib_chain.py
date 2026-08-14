@@ -148,14 +148,13 @@ def main():
     # Load config
     cfg_dir = find_config_dir()
     calib_cfg = load_yaml(cfg_dir / "cam_calib.yaml")
-    cap_cfg   = load_yaml(cfg_dir / "capture.yaml")
 
     calib = calib_cfg.get("calib", {})
     base_dir  = calib.get("calib_save_dir", "D:/calib_images")
     center_sn = calib.get("center_cam", "")
-    viz_pid   = calib.get("viz_participant_id", "")
-    if not viz_pid:
-        viz_pid = cap_cfg.get("capture", {}).get("participant_id", "P001")
+    # participant_id 由 cam_calib.yaml 自带 (P001 / D001 系列), viz_participant_id 留空时回退到它
+    base_pid  = calib.get("participant_id", "P001")
+    viz_pid   = calib.get("viz_participant_id", "") or base_pid
 
     # Locate XML files
     xml_dir = os.path.join(base_dir, viz_pid, "output")

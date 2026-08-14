@@ -1,4 +1,4 @@
-# cam_calib.yaml — 标定图像采集 (test_calib_transfer.cpp)
+# cam_calib.yaml — 标定图像采集 (calib_with_HALCON.cpp) + 标定链 (calib_cam_chain.cpp) + 可视化 (viz_calib_chain.py)
 
 calib:
   cam_indices:
@@ -20,14 +20,16 @@ calib:
   enable_net_sync: true
 
   calib_save_dir: "D:/calib_images"    # 总目录, 完整路径 = calib_save_dir/{participant_id}
-                                     # participant_id 从 capture.yaml 读取
+
+  participant_id: "P001"              # 本标定集 ID (P001 / D001 等), 不再从 capture.yaml 读取
+                                      # 标定可能承担 P001 和 D001 系列, 按需修改
 
   # 可视化 (viz_calib_chain.py)
-  viz_participant_id: "P001"              # 留空 → 使用 capture.yaml 的 participant_id
+  viz_participant_id: ""              # 留空 → participant_id
 
   # --- 标定算法参数 (calib_cam_chain.cpp) ---
   # 输入/输出目录 (空字符串 = 自动根据 calib_save_dir/{input_participant_id} 计算)
-  input_participant_id: "P001"            # 留空 → 使用 capture.yaml 的 participant_id
+  input_participant_id: ""            # 留空 → participant_id
   input_dir: ""                       # 留空 → calib_save_dir/{input_participant_id}/pictures
   output_dir: ""                      # 留空 → calib_save_dir/{input_participant_id}/output
   calib_plane: "C:/hitsz/apps/MVTec/multiple_cameras/calib/HG-180.cpd"

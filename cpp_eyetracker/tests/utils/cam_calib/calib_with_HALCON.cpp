@@ -183,7 +183,7 @@ int main(){
     g_ctrl_port=c["port"].as<int>(); g_enable_net_sync=c["enable_net_sync"].as<bool>();
     vector<string> sns=c["cam_indices"].as<vector<string>>();
     string base_dir=c["calib_save_dir"].as<string>();
-    string pid="P001"; try{Cfg cfg_cap(cfg_dir+"/capture.yaml");pid=cfg_cap["capture"]["participant_id"].as<string>();}catch(...){}
+    string pid=c["participant_id"].as<string>();   // cam_calib.yaml 自带 (P001 / D001 系列)
     g_save_dir=base_dir+"/"+pid+"/pictures"; fs::create_directories(g_save_dir);
     // 标定 XML 输出目录 (calib_cam_chain 的输出, 与 calib_cam_chain.cpp 的计算一致)
     {

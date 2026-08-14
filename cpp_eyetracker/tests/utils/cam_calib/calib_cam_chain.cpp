@@ -118,18 +118,17 @@ void action()
     auto t_total_0 = steady_clock::now();
 
     // ========================================================================
-    // 0. 配置读取 (cam_calib.yaml + capture.yaml)
+    // 0. 配置读取 (cam_calib.yaml)
     // ========================================================================
     namespace fs = std::filesystem;
     fs::path cfg_dir = fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path() / "cfg";
     Cfg cfg((cfg_dir / "cam_calib.yaml").string()); auto& calib = cfg["calib"];
-    Cfg cap((cfg_dir / "capture.yaml").string());
-    string cap_pid = cap["capture"]["participant_id"].as<string>();
+    string base_pid = calib["participant_id"].as<string>();   // cam_calib.yaml 自带 (P001 / D001 系列)
 
-    // input_participant_id: 优先使用 cam_calib.yaml 配置，空则 fallback 到 capture.yaml
+    // input_participant_id: 优先使用 cam_calib.yaml 配置，空则 fallback 到 participant_id
     string pid;
     try { pid = calib["input_participant_id"].as<string>(); } catch(...) { pid = ""; }
-    if (pid.empty()) pid = cap_pid;
+    if (pid.empty()) pid = base_pid;
 
     string base_dir = calib["calib_save_dir"].as<string>();
 
