@@ -34,6 +34,11 @@ public:
     bool start();
     void close();
 
+    // Pylon Viewer 式取流 (GrabLoop_ProvidedByUser + RetrieveResult):
+    // 缓冲由 GrabResultPtr 引用计数保护, 替代事件处理器路径
+    bool startUserLoop();
+    bool retrieveResult(Pylon::CBaslerUniversalGrabResultPtr& res, uint32_t timeout_ms);
+
     void setFrameCallback(FrameCallback cb) { callback_ = cb; }
 
     virtual void OnImageGrabbed(CBaslerUniversalInstantCamera& camera, const CBaslerUniversalGrabResultPtr& ptrGrabResult) override;

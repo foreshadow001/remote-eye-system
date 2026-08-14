@@ -38,6 +38,18 @@ target_link_libraries(calib_debug
         ${OpenCV_LIBS}
 )
 
+# [Verify] Pylon Viewer 式取流 (GrabLoop_ProvidedByUser + RetrieveResult)
+add_executable(calib_retrieve
+    calib_retrieve.cpp
+)
+
+target_link_libraries(calib_retrieve
+    PRIVATE
+        eyetracker::cfg
+        eyetracker::cam
+        ${OpenCV_LIBS}
+)
+
 message(STATUS "✅ calib_with_HALCON will be built")
 
 # ---- cam_calib / cam_calib_chain: 需要 HALCON ----

@@ -125,6 +125,27 @@ bool BaslerCamera::start() {
     }
 }
 
+bool BaslerCamera::startUserLoop() {
+    try {
+        if (!camera_.IsOpen()) return false;
+        camera_.MaxNumBuffer.SetValue(maxNumBuffer_);
+        camera_.StartGrabbing(GrabStrategy_OneByOne, Pylon::GrabLoop_ProvidedByUser);
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[Basler Start Error] " << e.what() << std::endl;
+        return false;
+    }
+}
+
+bool BaslerCamera::retrieveResult(Pylon::CBaslerUniversalGrabResultPtr& res, uint32_t timeout_ms) {
+    try {
+        return camera_.RetrieveResult(timeout_ms, res, TimeoutHandling_Return);
+    } catch (const std::exception& e) {
+        std::cerr << "[Basler Retrieve Error] " << e.what() << std::endl;
+        return false;
+    }
+}
+
 void BaslerCamera::dumpConfig() {
     if (!isOpen_) { cerr << "[Basler] dumpConfig: camera not open" << endl; return; }
     lock_guard<mutex> lk(g_print_mtx);
