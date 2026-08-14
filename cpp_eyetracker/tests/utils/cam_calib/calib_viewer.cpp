@@ -139,6 +139,9 @@ struct ViewerImageHandler : public Pylon::CImageEventHandler {
     }
 };
 
+// [实验] 串行化开流 — 驱动流初始化可能非线程安全
+mutex g_stream_init_mtx;
+
 void captureWorker(shared_ptr<CameraContext> ctx){
     try {
         Pylon::CDeviceInfo info;
@@ -146,10 +149,15 @@ void captureWorker(shared_ptr<CameraContext> ctx){
         Pylon::IPylonDevice* dev = Pylon::CTlFactory::GetInstance().CreateFirstDevice(info);
         if(!dev){cerr<<"[Error] Device not found: "<<ctx->sn<<endl;return;}
         Pylon::CInstantCamera camera(dev);
-        camera.Open();  // 纯 Open — 无 TriggerMode / PixelFormat / fps / exposure 任何设置
-        camera.RegisterImageEventHandler(new ViewerImageHandler(ctx),
-                                         Pylon::RegistrationMode_ReplaceAll, Pylon::Cleanup_Delete);
-        camera.StartGrabbing(Pylon::GrabStrategy_OneByOne, Pylon::GrabLoop_ProvidedByInstantCamera);
+        {
+            lock_guard<mutex> lk(g_stream_init_mtx);  // 串行化: 一次只初始化一个流
+            camera.Open();  // 纯 Open — 无 TriggerMode / PixelFormat / fps / exposure 任何设置
+            camera.RegisterImageEventHandler(new ViewerImageHandler(ctx),
+                                             Pylon::RegistrationMode_ReplaceAll, Pylon::Cleanup_Delete);
+            camera.StartGrabbing(Pylon::GrabStrategy_OneByOne, Pylon::GrabLoop_ProvidedByInstantCamera);
+            cout<<"[Stream] cam "<<ctx->sn<<" started."<<endl;
+            this_thread::sleep_for(chrono::milliseconds(200));  // 流建立间隔
+        }
         while(ctx->running)this_thread::sleep_for(chrono::milliseconds(50));
         camera.StopGrabbing(); camera.Close();
     } catch(const Pylon::GenericException& e) {
