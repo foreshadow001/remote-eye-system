@@ -107,29 +107,35 @@ void launchHalconChain() { cerr << "[HALCON] Not supported on this platform." <<
 // ================== Camera ==================
 struct CameraContext {string sn; BaslerCamera cam{""}; bool is_mono=true; thread capture_thread,copy_thread; atomic<bool> running{true};
     cv::Mat latest_frame; FrameMeta latest_meta; mutex frame_mtx;
-    queue<pair<Pylon::CBaslerUniversalGrabResultPtr,FrameMeta>> copy_queue; mutex copy_mtx; condition_variable copy_cv;
+    queue<pair<cv::Mat,FrameMeta>> copy_queue; mutex copy_mtx; condition_variable copy_cv;  // [Fix] 队列存已拷贝 Mat, 不持有采集卡缓冲
     atomic<int64_t> last_block_id{-1}; atomic<chrono::steady_clock::time_point> last_frame_time{chrono::steady_clock::now()}; atomic<bool> has_streamed{false};
     explicit CameraContext(string s):sn(s),cam(s){}};
 vector<shared_ptr<CameraContext>> cam_ctxs;
 
-void copyWorker(shared_ptr<CameraContext> ctx){while(ctx->running){pair<Pylon::CBaslerUniversalGrabResultPtr,FrameMeta> t;
+void copyWorker(shared_ptr<CameraContext> ctx){while(ctx->running){pair<cv::Mat,FrameMeta> t;
     {unique_lock<mutex> lk(ctx->copy_mtx);ctx->copy_cv.wait(lk,[&]{return !ctx->copy_queue.empty()||!ctx->running;});if(!ctx->running&&ctx->copy_queue.empty())break;t=ctx->copy_queue.front();ctx->copy_queue.pop();}
-    // [DBG] 坏帧诊断: 只打印不跳过 — 抓"坏帧到达"还是"缓冲被改"
-    {size_t w=t.first->GetWidth(),h=t.first->GetHeight(),ps=t.first->GetPayloadSize();
-        bool gs=t.first->GrabSucceeded();
-        if(!gs||ps!=w*h)
-            cerr<<"[BadFrame] cam "<<ctx->sn<<" blk="<<t.second.blockID
-                <<" grab="<<(gs?"OK":"FAIL")
-                <<" size="<<w<<"x"<<h<<" payload="<<ps
-                <<(ps==w*h?" (match)":" (MISMATCH)")<<endl;}
-    cv::Mat tmp(t.first->GetHeight(),t.first->GetWidth(),CV_8UC1,t.first->GetBuffer());cv::Mat c=tmp.clone();{lock_guard<mutex> lk(ctx->frame_mtx);ctx->latest_frame=c;ctx->latest_meta=t.second;}
+    {lock_guard<mutex> lk(ctx->frame_mtx);ctx->latest_frame=t.first;ctx->latest_meta=t.second;}
     ctx->last_block_id.store(t.second.blockID,memory_order_relaxed);ctx->last_frame_time.store(chrono::steady_clock::now(),memory_order_relaxed);ctx->has_streamed.store(true,memory_order_relaxed);}}
 
 void captureWorker(shared_ptr<CameraContext> ctx,double fps,double gain,double gamma,double exp,double me){
     if(!ctx->cam.open(TriggerMode::Software))return;ctx->is_mono=ctx->cam.isMono();if(ctx->is_mono&&me>1.0){exp*=me;fps/=me;}
-    ctx->cam.dumpConfig();  // [DBG] 全量配置打印
     try{ctx->cam.setFrameRate(fps);ctx->cam.setGain(gain);ctx->cam.setGamma(gamma);ctx->cam.setExposureTime(exp);}catch(...){}
-    ctx->cam.setFrameCallback([ctx](const Pylon::CBaslerUniversalGrabResultPtr& p,FrameMeta m){lock_guard<mutex> lk(ctx->copy_mtx);if(ctx->copy_queue.size()<2){ctx->copy_queue.push({p,m});ctx->copy_cv.notify_one();}});
+    ctx->cam.dumpConfig();  // [DBG] 全量配置打印 (set 之后 → 运行时真实配置)
+    // [Fix] 回调内立即拷贝: 采集卡缓冲只在回调期间被持有, 随后立即归还驱动
+    ctx->cam.setFrameCallback([ctx](const Pylon::CBaslerUniversalGrabResultPtr& p,FrameMeta m){
+        // [DBG] 坏帧诊断: 只打印不跳过
+        {size_t w=p->GetWidth(),h=p->GetHeight(),ps=p->GetPayloadSize();
+            bool gs=p->GrabSucceeded();
+            if(!gs||ps!=w*h)
+                cerr<<"[BadFrame] cam "<<ctx->sn<<" blk="<<m.blockID
+                    <<" grab="<<(gs?"OK":"FAIL")
+                    <<" size="<<w<<"x"<<h<<" payload="<<ps
+                    <<(ps==w*h?" (match)":" (MISMATCH)")<<endl;}
+        cv::Mat tmp(p->GetHeight(),p->GetWidth(),CV_8UC1,p->GetBuffer());
+        cv::Mat clone_img=tmp.clone();  // 同步拷贝, p 出作用域即归还缓冲
+        lock_guard<mutex> lk(ctx->copy_mtx);
+        if(ctx->copy_queue.size()<2){ctx->copy_queue.push({clone_img,m});ctx->copy_cv.notify_one();}
+    });
     if(!ctx->cam.start())return;while(ctx->running)this_thread::sleep_for(chrono::milliseconds(50));ctx->cam.close();}
 
 int getNextCounter(const string& dir){int mx=-1;if(!fs::exists(dir))return 0;for(auto& e:fs::directory_iterator(dir)){if(e.path().extension()==".jpg"){try{string s=e.path().stem().string();size_t u=s.find_last_of('_');if(u!=string::npos)mx=max(mx,stoi(s.substr(u+1)));}catch(...){}}}return mx+1;}
