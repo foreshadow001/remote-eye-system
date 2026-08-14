@@ -127,6 +127,7 @@ void copyWorker(shared_ptr<CameraContext> ctx){while(ctx->running){pair<Pylon::C
 
 void captureWorker(shared_ptr<CameraContext> ctx,double fps,double gain,double gamma,double exp,double me){
     if(!ctx->cam.open(TriggerMode::Software))return;ctx->is_mono=ctx->cam.isMono();if(ctx->is_mono&&me>1.0){exp*=me;fps/=me;}
+    ctx->cam.dumpConfig();  // [DBG] 全量配置打印
     try{ctx->cam.setFrameRate(fps);ctx->cam.setGain(gain);ctx->cam.setGamma(gamma);ctx->cam.setExposureTime(exp);}catch(...){}
     ctx->cam.setFrameCallback([ctx](const Pylon::CBaslerUniversalGrabResultPtr& p,FrameMeta m){lock_guard<mutex> lk(ctx->copy_mtx);if(ctx->copy_queue.size()<2){ctx->copy_queue.push({p,m});ctx->copy_cv.notify_one();}});
     if(!ctx->cam.start())return;while(ctx->running)this_thread::sleep_for(chrono::milliseconds(50));ctx->cam.close();}

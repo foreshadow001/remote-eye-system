@@ -44,6 +44,9 @@ public:
     void setExposureTime(double microseconds);
     void setMaxNumBuffer(int n) { maxNumBuffer_ = n; }
 
+    // 打印相机 + 流(TL)全量配置, 用于配置排查
+    void dumpConfig();
+
     std::string getSerialNumber() const { return serialNumber_; }
     bool isMono() const { return isMono_; }
 
