@@ -304,8 +304,6 @@ int main(){
 
     while(global_running){
         auto now=chrono::steady_clock::now();bool nu=(now-lui)>=uii;
-        // Health check
-        if(!g_fault_active.load()){for(size_t i=0;i<cam_ctxs.size();++i){if(!cam_ctxs[i]->has_streamed.load())continue;if(chrono::duration<double>(now-cam_ctxs[i]->last_frame_time.load()).count()>1.0){cerr<<"[Fault] Cam "<<cam_ctxs[i]->sn<<" stalled!"<<endl;g_fault_active.store(true);g_faulty_cam.store((int)i);g_fault_on_master.store(g_is_master);if(g_enable_net_sync)sendLine(g_ctrl_sock,"FAULT:"+string(g_is_master?"M":"S")+to_string(i));for(auto& c:cam_ctxs){c->running=false;c->copy_cv.notify_all();}for(auto& c:cam_ctxs){if(c->capture_thread.joinable())c->capture_thread.join();if(c->copy_thread.joinable())c->copy_thread.join();}break;}}}
         // UI
         if(nu){cv::Mat cv;if(g_fault_active.load()){cv=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);cv::putText(cv,"CAMERA FAULT",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,1.2,cv::Scalar(0,0,255),2);}
         else{cv=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);int sel=g_enlarged_cam.load();renderGrid(cv,sel);renderEnlarged(cv,sel);cv::line(cv,cv::Point(g_left_w,0),cv::Point(g_left_w,g_win_h),cv::Scalar(60,60,60),2);
