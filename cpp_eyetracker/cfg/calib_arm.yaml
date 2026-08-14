@@ -27,6 +27,20 @@ record:                               # 从 piper.yaml test_record_arm_data 节�
   cam_width: 2448
   cam_height: 2048
 
+# 手眼标定 (test_piper_hand_eye_calib.cpp, 从 piper.yaml 搬迁)
+hand_eye_calib:
+  rotation_weight: 1.0            # 旋转残差权重 (<1 = 位置优先)
+  upper:
+    - 40772278
+    - 40777498
+    - 40772280
+    - 40772279
+  lower:
+    - 40772280
+    - 40777497
+    - 40772277
+    - 40772284
+
 # 标定板位姿解算 (resolve_calib_board_pose.cpp, 从 piper.yaml 搬迁)
 resolve:
   focus: 0.016                                    # 默认焦距 (m)

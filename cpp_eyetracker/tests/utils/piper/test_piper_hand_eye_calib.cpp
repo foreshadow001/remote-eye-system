@@ -168,6 +168,9 @@ int main() {
     cout << "=========================================\n" << endl;
 
     PiperHandEyeCalib calib((cfg_root / "piper.yaml").string());
+    // 旋转权重从 calib_arm.yaml 读取后注入
+    try { calib.setRotationWeight(arm_cfg["hand_eye_calib"]["rotation_weight"].as<double>()); }
+    catch (...) {}
 
     vector<ArmCalibResult> results;
 
@@ -179,9 +182,9 @@ int main() {
             continue;
         }
 
-        // 读取该 arm 允许的相机 SN 列表
+        // 读取该 arm 允许的相机 SN 列表 (calib_arm.yaml)
         vector<string> allowed_sns;
-        try { allowed_sns = cfg["hand_eye_calib"][arm].as<vector<string>>(); }
+        try { allowed_sns = arm_cfg["hand_eye_calib"][arm].as<vector<string>>(); }
         catch (...) {}
         // 构建允许帧集合: 任一 allowed SN 有照片的帧索引
         set<int> allowed_frames;

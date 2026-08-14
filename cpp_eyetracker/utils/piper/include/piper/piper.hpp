@@ -67,8 +67,12 @@ public:
     void saveArmInCcs(const std::string& arm, const std::vector<double>& result) const;
     void saveCalibBoard(const std::string& arm, const std::vector<double>& result) const;
 
+    // 旋转残差权重 (由调用方从 calib_arm.yaml 读取后注入, 默认 0.3)
+    void setRotationWeight(double w) { rotation_weight_ = w; }
+
 private:
     std::string yaml_path_;
+    double rotation_weight_ = 0.3;
     struct Bounds { std::vector<std::pair<double,double>> t, r; };  // translation + rotation bounds
     struct ArmInit { std::vector<double> ct, cr;  // ccs init: tx,ty,tz, rx,ry,rz (m, deg)
                      std::vector<double> bt, br; }; // board init: tx,ty,tz, rx,ry,rz (m, deg)

@@ -103,19 +103,6 @@ test_record_arm_data:
   cam_width: 2448
   cam_height: 2048
 
-hand_eye_calib:
-  rotation_weight: 1.0            # 旋转残差权重 (<1 = 位置优先)
-  upper:
-    - 40772278
-    - 40777498
-    - 40772280
-    - 40772279
-  lower:
-    - 40772280
-    - 40777497
-    - 40772277
-    - 40772284
-
 save_piper_chain:
   use_calibrated_arm_in_ccs: false              # true = 用刚标定的 arm_in_ccs/board_in_flange; false = 用 init_value
 

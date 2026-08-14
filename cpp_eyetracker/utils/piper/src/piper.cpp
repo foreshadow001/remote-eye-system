@@ -255,11 +255,8 @@ PiperHandEyeCalib::CalibResult PiperHandEyeCalib::calibrate(
     const auto& ai = it->second.first;
     const auto& [abnd, cbnd] = it->second.second;
 
-    // 读取旋转权重
-    Cfg cfg(yaml_path_);
-    double rot_weight = 0.3;
-    try { rot_weight = cfg["hand_eye_calib"]["rotation_weight"].as<double>(); }
-    catch (...) {}
+    // 旋转残差权重 (由调用方从 calib_arm.yaml 读取后注入)
+    double rot_weight = rotation_weight_;
 
     std::vector<double> ccs_init = ai.ct; ccs_init.insert(ccs_init.end(), ai.cr.begin(), ai.cr.end());
     std::vector<double> cb_init  = ai.bt; cb_init.insert(cb_init.end(), ai.br.begin(), ai.br.end());
