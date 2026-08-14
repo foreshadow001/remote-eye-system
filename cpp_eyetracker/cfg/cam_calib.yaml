@@ -21,7 +21,7 @@ calib:
 
   calib_save_dir: "D:/calib_images"    # 总目录, 完整路径 = calib_save_dir/{participant_id}
 
-  participant_id: "P001"              # 本标定集 ID (P001 / D001 等), 不再从 capture.yaml 读取
+  participant_id: "P000"              # 本标定集 ID (P001 / D001 等), 不再从 capture.yaml 读取
                                       # 标定可能承担 P001 和 D001 系列, 按需修改
 
   # 可视化 (viz_calib_chain.py)

@@ -1,31 +1,81 @@
-# calib_with_HALCON.cpp — CXP-12 相机 + imaFlex 采集卡正确配置计划
+# CXP-12 相机 + imaFlex 采集卡 — 花屏/坏帧根因排查计划
 
-> 症状：master 花屏 + `cv::resize` 崩溃 (`inv_scale_x > 0`)。Pylon Viewer 同时采集 10 台正常、无花屏。
-> 结论方向：我们的采集配置与 Pylon Viewer 不一致，某些流参数设置不当。
+> 症状：master 花屏 + `cv::resize` 崩溃 (`inv_scale_x > 0`)。坏帧特征：`grab=OK`、帧高度逐帧变化（2043~2047）、payload = w×h + n×16。
 > 硬件：Basler a2A2448-210cc/cm（ace 2 CXP-12, IMX537, 2448×2048 默认, 212fps 满速）
-> 采集卡：Basler imaFlex CXP-12 Quad（4 端口 × 12.5Gbps, PCIe 3.0 x8, 1.5GB DDR4, PoCXP 17W/端口）
+> 采集卡：Basler imaFlex CXP-12 Quad（4 端口 × 12.5Gbps, PCIe 3.0 x8, 1.5GB DDR4, PoCXP 17W/端口）× 3 张
 > Pylon 26.01
 
 ---
 
-## 一、官方文档关键事实
+## 〇、已完成的排查（截至 2026-08-14）
 
-| 项目 | 事实 | 来源 |
-|------|------|------|
-| 相机接口 | CoaXPress 2.0, HDBNC 单链路 (a2A2448-210 为单口 CXP-12 相机) | Basler a2A2448-210cc 产品页 |
-| 默认分辨率 | 2448×2048（全幅 2464×2064） | 同上 |
-| 最大帧率 | CXP-12 下 212fps | 同上 |
-| 链路配置参数 | `CxpLinkConfiguration`: Auto / CXP12_X1 / X2 / X4 | Basler pylon API 文档 |
-| 采集卡端口数 | 4 个 CXP-12 端口, 每端口 12.5Gbps | imaFlex CXP-12 Quad 产品页 |
-| PCIe | 3.0 x8（典型 6.5GB/s） | 同上 |
-| PoCXP | 17W/端口（a2A2448 功耗 ~5.5W, 充足） | 同上 |
-| **流缓冲参数** | 官方示例: `MaxNumBuffer=16`, `MaxTransferSize=1048568`, `NumMaxQueuedUrbs=64` | docs.baslerweb.com Stream Grabber Parameters |
+| 项目 | 结论 |
+|------|------|
+| 相机/流配置 | ✅ 全对（BayerRG8, PayloadSize=5013504, MaxBufferSize=5760000, CxpLinkConfiguration=Auto） |
+| MaxNumBuffer 调优 | ✅ 150→10/16（150 会加重故障；配置本身无罪） |
+| 回调内同步拷贝（消除缓冲延迟持有） | ✅ 已推广到全部 10 个采集程序；短跑无花屏，**长跑后花屏复发** → 非唯一根因 |
+| stall 检查误杀 | ✅ 已全部移除（CXP 链路训练 >1s） |
+| Pylon Viewer 短测（~1 分钟） | 正常 —— 但**未做过与故障同条件的长跑** |
+| 坏风扇卡 | 拔过又插回；**当前安装状态未确认** |
 
-**⚠️ 核心疑点**：我们代码强制 `MaxNumBuffer=150`（`basler.cpp` 默认值），是官方示例值的 ~10 倍。150 × 5MB × 10 台 = 7.5GB DMA 缓冲。若驱动/采集卡的排队深度（URB 队列, 官方示例 64）或 DMA 描述符上限低于 150，驱动可能**静默复用仍在使用中的缓冲** → 缓冲被覆盖 → 花屏 + 帧元数据损坏 → `cv::resize` 崩溃。Pylon Viewer 用驱动默认缓冲数（远小于 150），所以正常。
+## ★ 新证据指向的新假设（按优先级）
+
+**失败模式的关键事实**：运行开始时干净 → 运行一段时间后 BadFrame 从少到多（洪水）→ 曾经 BSOD（无 WER 转储 = 硬件级故障）。同一配置不同运行结果不同。
+
+| 优先级 | 假设 | 依据 |
+|--------|------|------|
+| **H1 热故障**（坏风扇卡仍在机箱内） | 干净启动 → 温度爬升 → CXP 链路错误指数增长 → 截断帧 | 渐进式失败曲线 + 已知风扇脱焊 + BSOD |
+| **H2 PCIe 电源管理/ASPM** | Windows 更新重置电源计划 → PCIe 链路降功耗 → DMA 间歇截断（16 字节粒度） | 16 字节对齐截断 + 与负载/帧率无关 + 间歇性 |
+| **H3 PCIe 插槽带宽/布线** | 卡插在 x4 电气插槽或与 NVMe 共享带宽 | 未验证过 |
+| **H4 链路速率协商过低** | 链路训练在 CXP-6/3 而非 CXP-12（CxpLinkSpeed 节点 N/A 未读到） | 未验证过 |
 
 ---
 
-## 二、诊断阶段：先收集证据（不改逻辑）
+## 一、诊断阶段 2.0：新证据收集（按 H1→H4 顺序）
+
+### 1.1 【H1】硬件状态确认（10 分钟）
+
+1. 确认机箱内**哪几张卡在、坏风扇卡是否在**
+2. 安装 HWiNFO64 → 记录 3 张卡的 **GPU/PCIe 温度** 曲线
+3. 跑 100fps × 10 台，记录 **首次 BadFrame 出现时间** 与 **温度的关系**
+4. 若洪水出现时某卡温度 >85°C → H1 坐实
+
+### 1.2 【H2】PCIe 电源管理（5 分钟，零成本）
+
+1. 控制面板 → 电源选项 → 高性能计划 → 更改计划设置 → 更改高级电源设置
+2. **PCI Express → 链接状态电源管理 → 关闭**（Windows 更新可能重置过）
+3. 重跑 30 分钟对比
+
+### 1.3 【H3】PCIe 链路宽度确认（5 分钟）
+
+HWiNFO/GPU-Z → Bus Interface 页 → 每张 imaFlex 的 **实际链路宽度 × 速率**（应为 x8 @ Gen3）。
+
+### 1.4 【H4】链路速率 + 精细事件（基于官方示例 FG_Events_GenApi_Notifications）
+
+官方示例显示 imaFlex 有独立的 TL 事件系统（`camera.GetTLParams()` + GenApi 回调）：
+- `EventFrameTriggerMissedSoftCounter`、`EventCustomSignalEvent0SoftCounter`
+- 流统计（若节点可见）：`FailedBufferCount` / `ResynchronizationCount` / `MissedFrameCount`
+- 采集卡接口侧参数：`CInterfaceInfo` + `BaslerGenTlCxpDeviceClass` 打开卡接口读取
+
+新建 `tests/utils/cam/diag_cxp_events.cpp`：枚举 3 张卡 → 每台相机注册事件回调 + 每秒打印统计快照 → 与 calib_with_HALCON 同时运行，花屏瞬间看哪个计数器跳变。
+
+**判定表**：
+| 跳变项 | 结论 |
+|--------|------|
+| `FailedBufferCount` | 驱动级缓冲损坏 |
+| `ResynchronizationCount` | CXP 链路重训练（线缆/供电/热） |
+| 卡温度 >85°C | H1 热故障 |
+| 无任何跳变 | 应用层问题，重新审视拷贝路径 |
+
+### 1.5 Pylon Viewer 长跑对照（关键盲区）
+
+用 Pylon Viewer 以 **100fps × 10 台连续跑 30 分钟**（与故障同条件），并**仔细检查画面底部几行**（截断帧的特征区域）：
+- Viewer 也坏 → 硬件/驱动问题，与我们的代码无关
+- Viewer 不坏 → 我们程序特有的问题（回到应用层排查）
+
+---
+
+## 二、原有配置对齐实验（保留作为后续手段）
 
 ### 2.1 导出 Pylon Viewer 的参考配置
 

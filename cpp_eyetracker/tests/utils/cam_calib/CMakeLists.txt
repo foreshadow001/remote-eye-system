@@ -26,6 +26,18 @@ target_link_libraries(calib_with_HALCON
         ${OpenCV_LIBS}
 )
 
+# [DBG] 帧级诊断版本 (坏帧落盘 + 缓冲指针跟踪)
+add_executable(calib_debug
+    calib_debug.cpp
+)
+
+target_link_libraries(calib_debug
+    PRIVATE
+        eyetracker::cfg
+        eyetracker::cam
+        ${OpenCV_LIBS}
+)
+
 message(STATUS "✅ calib_with_HALCON will be built")
 
 # ---- cam_calib / cam_calib_chain: 需要 HALCON ----
