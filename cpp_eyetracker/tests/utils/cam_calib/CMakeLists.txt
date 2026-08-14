@@ -50,6 +50,18 @@ target_link_libraries(calib_minimal
         ${OpenCV_LIBS}
 )
 
+# [Viewer] 与 Pylon Viewer 完全平行: 纯 Open, 无 BaslerCamera 封装, 无任何参数设置
+add_executable(calib_viewer
+    calib_viewer.cpp
+)
+
+target_link_libraries(calib_viewer
+    PRIVATE
+        eyetracker::cfg
+        eyetracker::cam
+        ${OpenCV_LIBS}
+)
+
 
 message(STATUS "✅ calib_with_HALCON will be built")
 
