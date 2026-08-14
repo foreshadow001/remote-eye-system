@@ -48,7 +48,7 @@ public:
     bool isMono() const { return isMono_; }
 
 private:
-    int maxNumBuffer_ = 150;  // default, overridden via config
+    int maxNumBuffer_ = 10;  // 实验A: 150 → 10 (CXP 流缓冲过大疑似导致缓冲复用/花屏)
     Pylon::PylonAutoInitTerm autoInit_;
     Pylon::CBaslerUniversalInstantCamera camera_;
     std::string serialNumber_;
