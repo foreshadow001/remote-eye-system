@@ -38,6 +38,18 @@ target_link_libraries(calib_dump
         ${OpenCV_LIBS}
 )
 
+# [Minimal] 不设置相机参数版 — 二进制定位触发参数 (对齐 Viewer 默认)
+add_executable(calib_minimal
+    calib_minimal.cpp
+)
+
+target_link_libraries(calib_minimal
+    PRIVATE
+        eyetracker::cfg
+        eyetracker::cam
+        ${OpenCV_LIBS}
+)
+
 
 message(STATUS "✅ calib_with_HALCON will be built")
 
