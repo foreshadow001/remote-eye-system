@@ -50,6 +50,8 @@ PROCESS_INFORMATION g_resolve_pi{};
 
 // ================== 手眼标定流水线 (h 键: 依次运行三个程序) ==================
 atomic<bool> g_pipeline_running{false};
+atomic<int> g_pipeline_step{0};                        // 当前步骤 1~3 (0 = 未运行)
+chrono::steady_clock::time_point g_pipeline_start;     // 流水线启动时刻 (UI 计时)
 
 // 运行同目录下的 exe 并等待结束, 返回退出码 (启动失败返回 -1)
 int runExeWait(const string& exe_name, const string& display) {
@@ -83,12 +85,20 @@ void runHandEyePipeline() {
         {"test_piper_hand_eye_calib.exe", "test_piper_hand_eye_calib"},
         {"save_piper_chain.exe", "save_piper_chain"},
     };
-    for (auto& s : steps) {
-        if (runExeWait(s.first, s.second) != 0) {
-            cerr << "[Pipeline] " << s.second << " failed. Stopping pipeline." << endl;
+    for (size_t i = 0; i < steps.size(); ++i) {
+        g_pipeline_step.store(static_cast<int>(i) + 1);
+        if (runExeWait(steps[i].first, steps[i].second) != 0) {
+            cerr << "[Pipeline] " << steps[i].second << " failed. Stopping pipeline." << endl;
             break;
         }
+        // 每个程序之间间隔几秒 (等待文件落盘/资源释放)
+        if (i + 1 < steps.size()) {
+            g_pipeline_step.store(0);   // 等待期间 UI 不显示步骤
+            cout << "[Pipeline] Waiting 3s before next step..." << endl;
+            this_thread::sleep_for(chrono::seconds(3));
+        }
     }
+    g_pipeline_step.store(0);
     cout << "[Pipeline] Done.\n" << endl;
     g_pipeline_running.store(false);
 }
@@ -137,6 +147,7 @@ string g_calib_save_dir;
 string g_mapping_file_upper;
 string g_mapping_file_lower;
 string g_handeye_output;   // 手眼标定输出 = cfg/arm_pose/{day_id}.yaml
+string g_cam_xml_dir;      // 相机标定 XML 加载目录 = cam_calib.yaml: calib_save_dir/{day_id}/output
 
 const string& currentMappingFile() {
     return (g_current_arm == "upper") ? g_mapping_file_upper : g_mapping_file_lower;
@@ -469,7 +480,13 @@ int main() {
     vector<string> camera_ids = rcfg["cam_indices"].as<vector<string>>();
     string day_id = rcfg["day_id"].as<string>();
     g_calib_save_dir = rcfg["calib_save_dir"].as<string>() + "/" + day_id;
-    g_handeye_output = (cfg_dir / "arm_pose" / (day_id + ".yaml")).string();   // test_piper_hand_eye_calib 的输出
+    g_handeye_output = "cfg/arm_pose/" + day_id + ".yaml";   // test_piper_hand_eye_calib 的输出 (显示用, 从 cfg 开始)
+
+    // 相机标定 XML 目录 (与 resolve_calib_board_pose.cpp 的计算一致)
+    {
+        Cfg cam_cfg((cfg_dir / "cam_calib.yaml").string());
+        g_cam_xml_dir = cam_cfg["calib"]["calib_save_dir"].as<string>() + "/" + day_id + "/output";
+    }
 
     double target_fps = rcfg["fps"].as<double>();
     double gain_val   = rcfg["gain"].as<double>();
@@ -486,6 +503,7 @@ int main() {
     cout << "Current arm: " << g_current_arm << "  [t] to switch" << endl;
     cout << "Save dir   : " << g_calib_save_dir << endl;
     cout << "Hand-eye out: " << g_handeye_output << endl;
+    cout << "Cam XML dir : " << g_cam_xml_dir << endl;
     cout << "Cameras    : " << camera_ids.size() << endl;
     for (size_t i = 0; i < camera_ids.size(); ++i)
         cout << "  " << i << ": SN=" << camera_ids[i] << endl;
@@ -550,6 +568,29 @@ int main() {
         // ===== 1. UI 渲染 =====
         if (need_ui_update) {
             cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
+            if (g_pipeline_running.load()) {
+                // 流水线运行中: 全屏状态文字, 不渲染采集 UI (降低 CPU)
+                int cx = g_win_w / 2, cy = g_win_h / 2;
+                auto put = [&](int y, const string& t, double s, cv::Scalar c) {
+                    int bl = 0;
+                    cv::Size sz = cv::getTextSize(t, cv::FONT_HERSHEY_SIMPLEX, s, 2, &bl);
+                    cv::putText(canvas, t, cv::Point(cx - sz.width / 2, y),
+                                cv::FONT_HERSHEY_SIMPLEX, s, c, 2, cv::LINE_AA);
+                };
+                put(cy - 80, "PIPELINE RUNNING...", 1.2, cv::Scalar(0, 215, 255));
+                int step = g_pipeline_step.load();
+                const char* names[] = {"", "resolve_calib_board_pose", "test_piper_hand_eye_calib", "save_piper_chain"};
+                if (step >= 1 && step <= 3) {
+                    char sb[128];
+                    snprintf(sb, sizeof(sb), "Step %d/3: %s", step, names[step]);
+                    put(cy - 20, sb, 0.8, cv::Scalar(220, 220, 220));
+                }
+                char et[64];
+                snprintf(et, sizeof(et), "Elapsed: %.1fs",
+                         chrono::duration<double>(current_time - g_pipeline_start).count());
+                put(cy + 30, et, 0.6, cv::Scalar(140, 140, 140));
+                put(g_win_h - 60, "[ESC/q] quit (pipeline continues in background)", 0.5, cv::Scalar(140, 140, 140));
+            } else {
             int sel = g_enlarged_cam.load();
             renderThumbnailGrid(canvas, sel);
             renderEnlargedView(canvas, sel);
@@ -578,7 +619,12 @@ int main() {
                         cv::Point(g_right_x + g_right_w - cnt_sz.width - 15, 35),
                         cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 215, 255), 2, cv::LINE_AA);
 
-            // Bottom-right: 输入输出目录 (右对齐, 位于 arm 指示上方)
+            // Bottom-right: 目录水印 (右对齐, 位于 arm 指示上方)
+            string io_xml = "XML: " + g_cam_xml_dir;
+            cv::Size xml_sz = cv::getTextSize(io_xml, cv::FONT_HERSHEY_SIMPLEX, 0.35, 1, 0);
+            cv::putText(canvas, io_xml,
+                        cv::Point(g_right_x + g_right_w - xml_sz.width - 15, g_win_h - 95),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(110, 110, 110), 1, cv::LINE_AA);
             string io_in = "In : " + g_calib_save_dir;
             cv::Size in_sz = cv::getTextSize(io_in, cv::FONT_HERSHEY_SIMPLEX, 0.35, 1, 0);
             cv::putText(canvas, io_in,
@@ -613,6 +659,7 @@ int main() {
                 : ("Arm: " + g_current_arm + "  |  Saving to: flange_pose_mapping_" + g_current_arm + ".txt");
             cv::putText(canvas, saving, cv::Point(hx, hy),
                         cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(110, 110, 110), 1, cv::LINE_AA);
+            }  // end if (g_pipeline_running)
 
             cv::imshow("Record Arm Data", canvas);
             last_ui_time = current_time;
@@ -631,6 +678,7 @@ int main() {
             }
             global_running = false;
         }
+        else if (g_pipeline_running.load()) { /* 流水线期间禁用按键 (仅 ESC/q 可用) */ }
         else if (key == 't' || key == 'T') {
             g_current_arm = (g_current_arm == "upper") ? "lower" : "upper";
             cout << "[Arm] Switched to: " << g_current_arm << endl;
@@ -665,13 +713,11 @@ int main() {
             }
         }
         else if (key == 'h' || key == 'H') {
-            // 依次运行 resolve → hand_eye → save_chain (后台线程, UI 不阻塞)
-            if (g_pipeline_running.load()) {
-                cout << "[Pipeline] Already running. Please wait." << endl;
-            } else {
-                g_pipeline_running.store(true);
-                thread(runHandEyePipeline).detach();
-            }
+            // 依次运行 resolve → hand_eye → save_chain (后台线程, UI 显示全屏状态)
+            g_pipeline_running.store(true);
+            g_pipeline_step.store(0);
+            g_pipeline_start = chrono::steady_clock::now();
+            thread(runHandEyePipeline).detach();
         }
         else if (key == 'v' || key == 'V') {
             // 启动 viz_piper_chain.py (脚本内已强制 TkAgg, 此处再设环境变量双保险)
