@@ -122,6 +122,7 @@ struct CameraContext {
     string sn;
     BaslerCamera cam{""};
     bool is_mono = true;
+    string status_msg = "Initializing";   // 相机初始化状态 (UI 空帧时显示)
 
     thread capture_thread;
     thread copy_thread;
@@ -340,7 +341,13 @@ void renderThumbnailGrid(cv::Mat& canvas, int selected_idx) {
                 int ox = (g_thumb_w - dw) / 2, oy = (g_thumb_h - dh) / 2;
                 resized.copyTo(cell(cv::Rect(ox, oy, dw, dh)));
             } else {
+                // 相机初始化中: 显示状态文字而不是黑屏
                 cell = cv::Mat::zeros(g_thumb_h, g_thumb_w, CV_8UC3);
+                int bl = 0;
+                cv::Size ts = cv::getTextSize(cam_ctxs[i]->status_msg, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &bl);
+                cv::putText(cell, cam_ctxs[i]->status_msg,
+                            cv::Point((g_thumb_w - ts.width) / 2, (g_thumb_h + ts.height) / 2),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
             }
 
             string label = cam_ctxs[i]->sn;
@@ -375,7 +382,16 @@ void renderEnlargedView(cv::Mat& canvas, int cam_idx) {
         local_raw = cam_ctxs[cam_idx]->latest_frame;
     }
 
-    if (local_raw.empty()) { canvas(right_roi) = cv::Scalar(0, 0, 0); return; }
+    if (local_raw.empty()) {
+        // 相机初始化中: 显示状态文字而不是黑屏
+        canvas(right_roi) = cv::Scalar(0, 0, 0);
+        int bl = 0;
+        cv::Size ts = cv::getTextSize(cam_ctxs[cam_idx]->status_msg, cv::FONT_HERSHEY_DUPLEX, 0.9, 2, &bl);
+        cv::putText(canvas, cam_ctxs[cam_idx]->status_msg,
+                    cv::Point(g_right_x + (g_right_w - ts.width) / 2, (g_win_h + ts.height) / 2),
+                    cv::FONT_HERSHEY_DUPLEX, 0.9, cv::Scalar(0, 215, 255), 2, cv::LINE_AA);
+        return;
+    }
 
     cv::Mat img;
     if (cam_ctxs[cam_idx]->is_mono) cv::cvtColor(local_raw, img, cv::COLOR_GRAY2RGB);
@@ -415,6 +431,7 @@ void copyWorker(shared_ptr<CameraContext> ctx) {
 void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma, double exp_time) {
     if (!ctx->cam.open(TriggerMode::Software)) {
         cerr << "[Error] Failed to open camera " << ctx->sn << endl;
+        ctx->status_msg = "OPEN FAILED";
         return;
     }
 
@@ -440,8 +457,10 @@ void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, doubl
 
     if (!ctx->cam.start()) {
         cerr << "[Error] Failed to start camera " << ctx->sn << endl;
+        ctx->status_msg = "START FAILED";
         return;
     }
+    ctx->status_msg = "STREAMING";
 
     while (ctx->running) this_thread::sleep_for(chrono::milliseconds(50));
     ctx->cam.close();

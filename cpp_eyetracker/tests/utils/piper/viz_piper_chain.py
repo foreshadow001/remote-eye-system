@@ -6,6 +6,7 @@ import yaml
 
 import matplotlib; matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from matplotlib.widgets import Button
 
 # ---------------------------------------------------------------------------
@@ -23,9 +24,10 @@ def draw_axes(ax, pos, quat, length=0.04, lw=2.5, alpha=1.0):
         ax.quiver(pos[0],pos[1],pos[2], R[0,i]*length,R[1,i]*length,R[2,i]*length,
                   color=c, linewidth=lw, arrow_length_ratio=0.25, alpha=alpha)
 
-def draw_text(ax, pos, text, color="white"):
+def draw_text(ax, pos, text, color="#2B2B2B"):
+    # 悬浮信息: 浅色圆角矩形 + 深色文字
     ax.text(pos[0],pos[1],pos[2],text,fontsize=9,color=color,
-            bbox=dict(boxstyle="round,pad=0.1",fc="black",ec="none",alpha=0.65))
+            bbox=dict(boxstyle="round,pad=0.15",fc="#FAFAF2",ec="#9E9E9E",lw=0.6,alpha=0.92))
 
 # ---------------------------------------------------------------------------
 def load(path):
@@ -167,7 +169,7 @@ class App:
         draw_axes(self.ax, bp, bq, self.AL*0.8, lw=2.5, alpha=0.9)
         draw_text(self.ax, bp, "  Board(GT)")
         self.ax.plot([cp[0],bp[0]],[cp[1],bp[1]],[cp[2],bp[2]],"red",lw=2)
-        mid = (cp+bp)/2; self.ax.text(mid[0],mid[1],mid[2],f"Δ{err_mm:.1f}mm",fontsize=8,color="red")
+        mid = (cp+bp)/2; draw_text(self.ax, mid, f"Δ{err_mm:.1f}mm", color="#C62828")
 
         pts = [np.zeros(3),ap,fp,cp,bp]; pts = np.array(pts)
         lo,hi = pts.min(0),pts.max(0); pad = max((hi-lo).max()*0.25,0.06)
@@ -179,36 +181,45 @@ class App:
         # 初始视角: 指向相机坐标系 z 轴负方向, x 轴向左, y 轴向下 (与 viz_calib_chain 一致)
         self.ax.view_init(elev=90, azim=90)
 
-        # sidebar
+        # sidebar (统计面板: 浅色圆角面板 + 深色标题栏 + 颜色区分误差)
         s = self.stats[self.arm]
-        rows = [
-            (f"=== {self.arm.upper()} ===", True),
-            (f"Frame: {idx:02d}  ({self.i+1}/{self.n})", False),
-            ("", False),
-            ("This frame:", True),
-            (f"  Δpos  {err_mm:7.2f} mm", False),
-            (f"  Δrot  {err_deg:7.2f} deg", False),
-            ("", False),
-            ("All frames:", True),
-            (f"  Valid {s['n_valid']}/{s['n_total']}", False),
-            ("  Pos (mm):", False),
-            (f"    mean {s['pos_mm'].mean():7.2f}", False),
-            (f"    med  {np.median(s['pos_mm']):7.2f}", False),
-            (f"    max  {s['pos_mm'].max():7.2f}", False),
-            (f"    std  {s['pos_mm'].std():7.2f}", False),
-            ("  Rot (deg):", False),
-            (f"    mean {s['rot_deg'].mean():7.2f}", False),
-            (f"    med  {np.median(s['rot_deg']):7.2f}", False),
-            (f"    max  {s['rot_deg'].max():7.2f}", False),
-            (f"    std  {s['rot_deg'].std():7.2f}", False),
-        ]
-        y = 0.96; dy = 0.046
-        for txt, bold in rows:
-            self.ax_side.text(0.02, y, txt, transform=self.ax_side.transAxes,
-                              fontsize=10, color="black", family="monospace",
+        self.ax_side.set_xlim(0, 1); self.ax_side.set_ylim(0, 1)
+        panel = mpatches.FancyBboxPatch((0, 0), 1, 1, transform=self.ax_side.transAxes,
+                                        boxstyle="round,pad=0.015,rounding_size=0.03",
+                                        fc="#F8F8F4", ec="#B0B0B0", lw=1.2, zorder=0)
+        self.ax_side.add_patch(panel)
+        hdr = mpatches.FancyBboxPatch((0.03, 0.905), 0.94, 0.08, transform=self.ax_side.transAxes,
+                                      boxstyle="round,pad=0.004,rounding_size=0.025",
+                                      fc="#37474F", ec="none", zorder=1)
+        self.ax_side.add_patch(hdr)
+        self.ax_side.text(0.5, 0.945, f"{self.arm.upper()}  |  Frame {idx:02d}  ({self.i+1}/{self.n})",
+                          transform=self.ax_side.transAxes, ha="center", va="center",
+                          fontsize=11, color="white", family="monospace", fontweight="bold")
+
+        GOOD_POS, GOOD_ROT = 10.0, 5.0   # 误差着色阈值 (mm / deg)
+        def row(y, txt, color="#2B2B2B", size=9.5, bold=False, x=0.07, align="left"):
+            self.ax_side.text(x, y, txt, transform=self.ax_side.transAxes,
+                              fontsize=size, color=color, family="monospace",
                               fontweight="bold" if bold else "normal",
-                              verticalalignment="top")
-            y -= dy
+                              ha=align, va="center")
+
+        y = 0.855
+        row(y, "THIS FRAME", color="#37474F", size=10, bold=True); y -= 0.052
+        row(y, f"dPos  {err_mm:6.2f} mm", color=("#2E7D32" if err_mm < GOOD_POS else "#C62828")); y -= 0.046
+        row(y, f"dRot  {err_deg:6.2f} deg", color=("#2E7D32" if err_deg < GOOD_ROT else "#C62828")); y -= 0.062
+        row(y, "ALL FRAMES", color="#37474F", size=10, bold=True); y -= 0.052
+        row(y, f"valid  {s['n_valid']:2d} / {s['n_total']:2d}"); y -= 0.048
+        row(y, "pos (mm)", size=9, color="#555555"); y -= 0.040
+        row(y, f"  mean {s['pos_mm'].mean():6.2f}"); y -= 0.038
+        row(y, f"  med  {np.median(s['pos_mm']):6.2f}"); y -= 0.038
+        row(y, f"  max  {s['pos_mm'].max():6.2f}"); y -= 0.038
+        row(y, f"  std  {s['pos_mm'].std():6.2f}"); y -= 0.050
+        row(y, "rot (deg)", size=9, color="#555555"); y -= 0.040
+        row(y, f"  mean {s['rot_deg'].mean():6.2f}"); y -= 0.038
+        row(y, f"  med  {np.median(s['rot_deg']):6.2f}"); y -= 0.038
+        row(y, f"  max  {s['rot_deg'].max():6.2f}"); y -= 0.038
+        row(y, f"  std  {s['rot_deg'].std():6.2f}"); y -= 0.058
+        row(y, "<-  ->  step frame", color="#888888", size=8.5, x=0.5, align="center")
 
         self.fig.canvas.draw_idle()
 
