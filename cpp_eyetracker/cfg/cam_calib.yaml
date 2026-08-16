@@ -23,6 +23,10 @@ calib:
 
   day_id: "D001"                      # 相机每天标定一次, 格式 D001 (与 calib_arm.yaml: record.day_id 一致)
 
+  # 内参标定模式 (calib_with_HALCON 'i' 键 + calib_cam_intrinsics.cpp)
+  participant_id: "P001"              # 参与者编号: 内参图片 = calib_save_dir/{participant_id}/pictures/{SN}/
+                                      # 该参与者所属 day_id 由 cfg/day_participant_map.json 映射
+
   # 可视化 (viz_calib_chain.py)
   viz_day_id: ""                      # 留空 → day_id
 

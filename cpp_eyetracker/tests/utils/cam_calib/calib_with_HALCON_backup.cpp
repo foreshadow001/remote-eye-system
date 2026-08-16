@@ -38,8 +38,6 @@ atomic<bool> global_running{true};
 bool g_is_master = false, g_enable_net_sync = false;
 string g_save_dir;  // calib_save_dir/{day_id}
 string g_xml_dir;   // 标定 XML 输出目录 = cam_calib.yaml: calib_save_dir/{input_day_id}/output
-atomic<bool> g_intr_mode{false};  // 内参标定模式 ('i' 切换; master 通过 MODE: 命令同步给 slave)
-string g_intr_root;               // 内参图片根目录 = calib_save_dir/{participant_id}/pictures
 int g_win_w=1600, g_win_h=800, g_left_w, g_right_x, g_right_w, g_thumb_w, g_thumb_h;
 atomic<int> g_enlarged_cam{-1};
 // UI 模式: CAPTURE = 正常采集界面; CALIBRATING = 标定期间全屏状态界面 (不渲染缩略图, 降低 CPU)
@@ -55,10 +53,8 @@ atomic<bool> g_fault_on_master{false};
 chrono::steady_clock::time_point g_fault_time, g_ready_time;
 atomic<int> g_capture_count{-1}, g_last_idx{-1}; int g_undo_count=0;
 #ifdef _WIN32
-PROCESS_INFORMATION g_halcon_pi{};       // calib_cam_chain 子进程 (外参模式 t 键传输完成后触发)
-PROCESS_INFORMATION g_intrinsics_pi{};   // calib_cam_intrinsics 子进程 (内参模式 t 键传输完成后触发)
+PROCESS_INFORMATION g_halcon_pi{};   // calib_cam_chain 子进程 (t 键传输完成后触发)
 #endif
-string g_calib_title="cam_calib_chain is running";   // CALIBRATING 界面副标题 (启动时设置)
 
 // recvLine leftover: catches data past \n when multiple lines arrive in one TCP segment
 thread_local string g_tcp_leftover;
@@ -78,31 +74,31 @@ bool sendExact(SOCKET s,const void* buf,size_t n){size_t sent=0;while(sent<n){in
 bool sendLine(SOCKET s,const string& m){string d=m+"\n";return sendExact(s,d.c_str(),d.length());}
 bool recvExact(SOCKET s,void* buf,size_t n){size_t got=0;while(got<n){int r=recv(s,(char*)buf+got,(int)(n-got),0);if(r<=0)return false;got+=r;}return true;}
 
-// ================== HALCON 标定子进程 ==================
+// ================== HALCON 标定链子进程 ==================
 #ifdef _WIN32
-// 通用: 启动同目录下的 HALCON 程序 (已在运行则跳过). 返回 true = 子进程正在运行
-bool launchChild(const string& exe_name,const string& display,PROCESS_INFORMATION& pi){
-    if (pi.hProcess) {
+// 启动同目录下的 cam_calib_chain.exe (已运行则跳过). 返回 true = 子进程正在运行
+bool launchHalconChain() {
+    if (g_halcon_pi.hProcess) {
         DWORD ec = 0;
-        if (GetExitCodeProcess(pi.hProcess, &ec) && ec == STILL_ACTIVE) {
-            cout << "[HALCON] " << display << " already running. Please wait." << endl;
+        if (GetExitCodeProcess(g_halcon_pi.hProcess, &ec) && ec == STILL_ACTIVE) {
+            cout << "[HALCON] cam_calib_chain already running. Please wait." << endl;
             return true;
         }
-        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-        ZeroMemory(&pi, sizeof(pi));
+        CloseHandle(g_halcon_pi.hProcess); CloseHandle(g_halcon_pi.hThread);
+        ZeroMemory(&g_halcon_pi, sizeof(g_halcon_pi));
     }
     char self_path[MAX_PATH];
     GetModuleFileNameA(NULL, self_path, MAX_PATH);
-    fs::path exe = fs::path(self_path).parent_path() / exe_name;
+    fs::path exe = fs::path(self_path).parent_path() / "cam_calib_chain.exe";
     if (!fs::exists(exe)) {
         cerr << "[HALCON] Not found: " << exe.string()
-             << " (需设置 HALCONROOT 并编译 " << display << ")" << endl;
+             << " (需设置 HALCONROOT 并编译 cam_calib_chain)" << endl;
         return false;
     }
     STARTUPINFOA si{}; si.cb = sizeof(si);
     if (CreateProcessA(exe.string().c_str(), NULL, NULL, NULL, FALSE, 0,
-                       NULL, NULL, &si, &pi)) {
-        cout << "[HALCON] Launched " << display << ".exe" << endl;
+                       NULL, NULL, &si, &g_halcon_pi)) {
+        cout << "[HALCON] Launched cam_calib_chain.exe" << endl;
         return true;
     } else {
         cerr << "[HALCON] Launch failed (error " << GetLastError() << "): "
@@ -110,11 +106,8 @@ bool launchChild(const string& exe_name,const string& display,PROCESS_INFORMATIO
         return false;
     }
 }
-bool launchHalconChain(){return launchChild("cam_calib_chain.exe","cam_calib_chain",g_halcon_pi);}
-bool launchIntrinsicsCalib(){return launchChild("calib_cam_intrinsics.exe","calib_cam_intrinsics",g_intrinsics_pi);}
 #else
 bool launchHalconChain() { cerr << "[HALCON] Not supported on this platform." << endl; return false; }
-bool launchIntrinsicsCalib() { cerr << "[HALCON] Not supported on this platform." << endl; return false; }
 #endif
 
 // ================== Camera ==================
@@ -143,17 +136,7 @@ void captureWorker(shared_ptr<CameraContext> ctx,double fps,double gain,double g
     if(!ctx->cam.start()){ctx->status_msg="START FAILED";return;}ctx->status_msg="STREAMING";while(ctx->running)this_thread::sleep_for(chrono::milliseconds(50));ctx->cam.close();}
 
 int getNextCounter(const string& dir){int mx=-1;if(!fs::exists(dir))return 0;for(auto& e:fs::directory_iterator(dir)){if(e.path().extension()==".jpg"){try{string s=e.path().stem().string();size_t u=s.find_last_of('_');if(u!=string::npos)mx=max(mx,stoi(s.substr(u+1)));}catch(...){}}}return mx+1;}
-// 扫描图片, 返回相对根目录的键 (不含扩展名). 外参模式: calib_cam_SN_NNN; 内参模式: SN/calib_cam_SN_NNN
-set<string> scanFiles(const string& root,bool nested){set<string> r;if(!fs::exists(root))return r;
-    if(!nested){for(auto& e:fs::directory_iterator(root)){if(e.path().extension()==".jpg"){string s=e.path().stem().string();if(s.rfind("calib_cam_",0)==0)r.insert(s);}}}
-    else{for(auto& e:fs::directory_iterator(root)){if(!e.is_directory())continue;string sn=e.path().filename().string();
-        for(auto& f:fs::directory_iterator(e.path())){if(f.path().extension()==".jpg"){string s=f.path().stem().string();if(s.rfind("calib_cam_",0)==0)r.insert(sn+"/"+s);}}}}
-    return r;}
-int countImages(const string& dir){int n=0;if(!fs::exists(dir))return 0;for(auto& e:fs::directory_iterator(dir))if(e.path().extension()==".jpg")n++;return n;}
-// 目录内索引最大的图片完整路径 (内参模式撤回用)
-string lastImageIn(const string& dir){string best;int mx=-1;if(!fs::exists(dir))return best;for(auto& e:fs::directory_iterator(dir)){if(e.path().extension()!=".jpg")continue;string s=e.path().stem().string();size_t u=s.find_last_of('_');if(u==string::npos)continue;try{int v=stoi(s.substr(u+1));if(v>mx){mx=v;best=e.path().string();}}catch(...){}}return best;}
-// 当前标定模式的图片根目录
-string picRoot(){return g_intr_mode.load()?g_intr_root:g_save_dir;}
+set<string> scanFiles(const string& dir){set<string> r;if(!fs::exists(dir))return r;for(auto& e:fs::directory_iterator(dir)){if(e.path().extension()==".jpg"){string s=e.path().stem().string();if(s.rfind("calib_cam_",0)==0)r.insert(s.substr(10));}}return r;}
 
 // ================== UI ==================
 void updateLayout(){g_left_w=g_win_h*2/5;g_right_x=g_left_w;g_right_w=g_win_w-g_left_w;g_thumb_w=g_left_w/2;g_thumb_h=g_win_h/5;}
@@ -192,8 +175,7 @@ void slaveCmdWorker(SOCKET s){
         else if(line.rfind("UNDO:",0)==0){int idx=stoi(line.substr(5));stringstream ss;ss<<setw(2)<<setfill('0')<<idx;
             cout<<"[Slave] UNDO index "<<ss.str()<<endl;
             if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir)){string st=e.path().stem().string();if(st.rfind("calib_cam_",0)==0&&st.length()>=2&&st.substr(st.length()-2)==ss.str())fs::remove(e.path());}g_last_idx.store(idx-1);if(g_capture_count>0)g_capture_count--;}
-        else if(line.rfind("MODE:",0)==0){string m=line.substr(5);g_intr_mode.store(m=="INTRINSIC");cout<<"[Slave] Calibration mode: "<<(g_intr_mode.load()?"INTRINSIC":"EXTRINSIC")<<endl;}
-        else if(line=="LIST_REQ"){cout<<"[Slave] LIST request"<<endl;stringstream fl;for(auto& f:scanFiles(picRoot(),g_intr_mode.load()))fl<<f<<",";sendLine(s,"LIST_RESP:"+fl.str());cout<<"[Slave] Sent file list"<<endl;}
+        else if(line=="LIST_REQ"){cout<<"[Slave] LIST request"<<endl;stringstream fl;for(auto& f:scanFiles(g_save_dir))fl<<f<<",";sendLine(s,"LIST_RESP:"+fl.str());cout<<"[Slave] Sent file list"<<endl;}
         else if(line=="CLEAR"){cout<<"[Slave] CLEAR \xe2\x80\x94 removing all calibration photos"<<endl;if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;g_last_idx=-1;sendLine(s,"CLEAR_DONE");cout<<"[Slave] Cleared."<<endl;}
         else if(line.rfind("XFER:",0)==0){string lst=line.substr(5);stringstream ss(lst);string tok;vector<string> files;while(getline(ss,tok,','))if(!tok.empty())files.push_back(tok);
             int total=(int)files.size(),cnt=0;size_t total_bytes=0;int data_port=g_ctrl_port+1;
@@ -201,10 +183,10 @@ void slaveCmdWorker(SOCKET s){
             SOCKET ds=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
             sockaddr_in dsa{};dsa.sin_family=AF_INET;dsa.sin_port=htons(data_port);inet_pton(AF_INET,g_master_ip.c_str(),&dsa.sin_addr);
             {int rtry=0;while(connect(ds,(sockaddr*)&dsa,sizeof(dsa))!=0){if(++rtry>30){cerr<<"[Slave] Data port connect timeout"<<endl;closesocket(ds);goto xfer_done_ctrl;}this_thread::sleep_for(chrono::milliseconds(200));}}
-            for(auto& f:files){string path=picRoot()+"/"+f+".jpg";   // 键含子目录 (内参模式), 保持文件夹结构
+            for(auto& f:files){size_t u=f.rfind('_');string sn=f.substr(0,u);int idx=stoi(f.substr(u+1));stringstream fn;fn<<setw(2)<<setfill('0')<<idx;string path=g_save_dir+"/calib_cam_"+sn+"_"+fn.str()+".jpg";
                 ifstream in(path,ios::binary|ios::ate);if(in){size_t sz=in.tellg();in.seekg(0);vector<char> data(sz);in.read(data.data(),sz);in.close();
                     uint32_t sz_be=htonl((uint32_t)sz);
-                    if(!sendExact(ds,&sz_be,4)||!sendExact(ds,data.data(),sz)){cerr<<"[Slave] sendExact FAILED for "<<f<<endl;break;}
+                    if(!sendExact(ds,&sz_be,4)||!sendExact(ds,data.data(),sz)){cerr<<"[Slave] sendExact FAILED for "<<sn<<"_"<<fn.str()<<endl;break;}
                     total_bytes+=sz;cnt++;}
                 else{cerr<<"[Slave] Cannot read "<<path<<endl;}}
             {uint32_t zero=0;sendExact(ds,&zero,4);}closesocket(ds);
@@ -229,8 +211,6 @@ int main(){
     string base_dir=c["calib_save_dir"].as<string>();
     string did=c["day_id"].as<string>();   // cam_calib.yaml 自带 (D001 系列, 每天标定一次)
     g_save_dir=base_dir+"/"+did+"/pictures"; fs::create_directories(g_save_dir);
-    string participant; try{participant=c["participant_id"].as<string>();}catch(...){participant="P001";}
-    g_intr_root=base_dir+"/"+participant+"/pictures";   // 内参模式图片根目录 (per-SN 子目录)
     // 标定 XML 输出目录 (cam_calib_chain 的输出, 与 calib_cam_chain.cpp 的计算一致)
     {
         string xdid=did; try{xdid=c["input_day_id"].as<string>();if(xdid.empty())xdid=did;}catch(...){}
@@ -250,7 +230,6 @@ int main(){
     cout<<"Test Xfer : "<<(test_xfer?"ON":"OFF")<<endl;
     cout<<"Save dir  : "<<g_save_dir<<endl;
     cout<<"XML dir   : "<<g_xml_dir<<endl;
-    cout<<"Intrinsic : "<<participant<<" -> "<<g_intr_root<<endl;
     if(test_xfer) cout<<"Recv dir  : "<<test_recv<<endl;
     cout<<"Cameras   : "<<sns.size()<<endl;
     for(size_t i=0;i<sns.size();++i)cout<<"  "<<i<<": SN="<<sns[i]<<endl;
@@ -306,7 +285,7 @@ int main(){
                 string resp; if(!recvLine(g_ctrl_sock,resp,5000)){cerr<<"[Error] No response from slave."<<endl;continue;}
                 if(resp.rfind("LIST_RESP:",0)!=0){xfer_status="LIST_REQ failed";continue;}
                 string lst=resp.substr(10);set<string> sf;stringstream ss(lst);string tok;while(getline(ss,tok,','))if(!tok.empty())sf.insert(tok);
-                set<string> lf=scanFiles(test_recv,false);vector<string> mis;for(auto& f:sf)if(!lf.count(f))mis.push_back(f);
+                set<string> lf=scanFiles(test_recv);vector<string> mis;for(auto& f:sf)if(!lf.count(f))mis.push_back(f);
                 if(mis.empty()){xfer_status="Already in sync.";xfer_done=true;continue;}
                 xfer_total=(int)mis.size();xfer_status="Transferring "+to_string(xfer_total)+" files...";
                 cout<<"\n[Transfer] "<<mis.size()<<" files missing. Starting transfer..."<<endl;
@@ -323,8 +302,8 @@ int main(){
                     if(file_idx>=(int)mis.size()){cerr<<"[XFER] Too many files!"<<endl;break;}
                     vector<char> buf(sz);if(!recvExact(ds,buf.data(),sz)){cerr<<"[XFER] recvExact FAILED at file "<<file_idx<<endl;break;}
                     xfer_bytes+=sz;xfer_cnt++;file_idx++;
-                    auto& f=mis[file_idx-1];
-                    string path=test_recv+"/"+f+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),sz);
+                    auto& f=mis[file_idx-1];size_t u=f.rfind('_');string sn=f.substr(0,u);int idx=stoi(f.substr(u+1));stringstream fn;fn<<setw(2)<<setfill('0')<<idx;
+                    string path=test_recv+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),sz);
                     auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();xfer_speed=dt>0?(xfer_bytes/1048576.0)/dt:0;
                     if(xfer_cnt%50==0||xfer_cnt==xfer_total)cout<<"[XFER] Progress: "<<xfer_cnt<<"/"<<xfer_total<<" ("<<(xfer_bytes/1048576.0)<<" MB, "<<xfer_speed<<" MB/s)"<<endl;}
                 closesocket(ds);closesocket(dl);
@@ -353,22 +332,11 @@ int main(){
         auto now=chrono::steady_clock::now();bool nu=(now-lui)>=uii;
         // UI
         if(nu){
-            if(g_ui_mode==UiMode::CALIBRATING){char et[64];snprintf(et,sizeof(et),"Elapsed: %.1fs",chrono::duration<double>(now-g_calib_start).count());renderStatusScreen("CALIBRATING...",g_calib_title,et,-1,false);}
+            if(g_ui_mode==UiMode::CALIBRATING){char et[64];snprintf(et,sizeof(et),"Elapsed: %.1fs",chrono::duration<double>(now-g_calib_start).count());renderStatusScreen("CALIBRATING...","cam_calib_chain is running",et,-1,false);}
             else{cv::Mat cv;if(g_fault_active.load()){cv=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);cv::putText(cv,"CAMERA FAULT",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,1.2,cv::Scalar(0,0,255),2);}
             else{cv=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);int sel=g_enlarged_cam.load();renderGrid(cv,sel);renderEnlarged(cv,sel);cv::line(cv,cv::Point(g_left_w,0),cv::Point(g_left_w,g_win_h),cv::Scalar(60,60,60),2);
-                // 左上: 相机 SN (如有放大) + 标定模式 (始终)
-                if(sel>=0&&sel<(int)cam_ctxs.size())cv::putText(cv,cam_ctxs[sel]->sn,cv::Point(g_right_x+10,35),cv::FONT_HERSHEY_SIMPLEX,0.8,cv::Scalar(0,215,255),2,cv::LINE_AA);
-                string mode_text=g_intr_mode.load()?"MODE: INTRINSIC":"MODE: EXTRINSIC";
-                cv::Scalar mode_color=g_intr_mode.load()?cv::Scalar(0,255,0):cv::Scalar(200,80,255);
-                cv::putText(cv,mode_text,cv::Point(g_right_x+10,62),cv::FONT_HERSHEY_SIMPLEX,0.5,mode_color,2,cv::LINE_AA);
-                // 右上: 图片数量 (内参模式 = 放大相机; 外参模式 = 全部)
-                string cnt=g_intr_mode.load()&&sel>=0&&sel<(int)cam_ctxs.size()?"Pictures: "+to_string(countImages(g_intr_root+"/"+cam_ctxs[sel]->sn)):"Captures: "+to_string(g_capture_count);
-                cv::Size csz=cv::getTextSize(cnt,cv::FONT_HERSHEY_SIMPLEX,0.8,2,0);
-                cv::putText(cv,cnt,cv::Point(g_right_x+g_right_w-csz.width-10,35),cv::FONT_HERSHEY_SIMPLEX,0.8,cv::Scalar(0,215,255),2,cv::LINE_AA);
-                string hints;
-                if(g_intr_mode.load())hints=g_enable_net_sync&&!g_is_master?"[SPACE] save enlarged  [z] undo  [c] clear  [ESC/q] quit":"[SPACE] save enlarged  [z] undo  [c] clear  [t] transfer  [i] extrinsics  [ESC/q] quit";
-                else hints=g_enable_net_sync&&!g_is_master?"[SPACE][z][c][t][ESC/q] disabled (Slave)":"[SPACE] capture  [z] undo  [c] clear  [t] transfer+calib  [i] intrinsics  [ESC/q] quit";
-                cv::putText(cv,hints,cv::Point(g_right_x+10,g_win_h-45),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(140,140,140),1,cv::LINE_AA);
+                string hints=g_enable_net_sync&&!g_is_master?"[SPACE][z][c][t][ESC/q] disabled (Slave)":"[SPACE] capture  [z] undo  [c] clear  [t] transfer+calib  [ESC/q] quit";cv::putText(cv,hints,cv::Point(g_right_x+10,g_win_h-45),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(140,140,140),1,cv::LINE_AA);
+                string cnt="Captures: "+to_string(g_capture_count);cv::putText(cv,cnt,cv::Point(g_right_x+g_right_w-200,35),cv::FONT_HERSHEY_SIMPLEX,0.8,cv::Scalar(0,215,255),2,cv::LINE_AA);
                 // Bottom-right: save dir + XML dir (右对齐)
                 string sdir="Save: "+g_save_dir;cv::Size ssz=cv::getTextSize(sdir,cv::FONT_HERSHEY_SIMPLEX,0.35,1,0);
                 cv::putText(cv,sdir,cv::Point(g_right_x+g_right_w-ssz.width-10,g_win_h-35),cv::FONT_HERSHEY_SIMPLEX,0.35,cv::Scalar(140,140,140),1,cv::LINE_AA);
@@ -377,17 +345,14 @@ int main(){
             cv::imshow("Calib Capture",cv);}
             lui=now;}
 #ifdef _WIN32
-        // HALCON 子进程退出检测 → 自动回到采集界面
-        if(g_ui_mode==UiMode::CALIBRATING){
-            PROCESS_INFORMATION* pi=nullptr; string disp;
-            if(g_halcon_pi.hProcess){pi=&g_halcon_pi;disp="cam_calib_chain";}
-            else if(g_intrinsics_pi.hProcess){pi=&g_intrinsics_pi;disp="calib_cam_intrinsics";}
-            if(pi){DWORD ec=0;
-                if(GetExitCodeProcess(pi->hProcess,&ec)&&ec!=STILL_ACTIVE){
-                    cout<<"[HALCON] "<<disp<<" finished (exit code "<<ec<<")."<<endl;
-                    CloseHandle(pi->hProcess);CloseHandle(pi->hThread);ZeroMemory(pi,sizeof(*pi));
-                    g_ui_mode=UiMode::CAPTURE;
-                }}
+        // 标定链退出检测 → 自动回到采集界面
+        if(g_ui_mode==UiMode::CALIBRATING&&g_halcon_pi.hProcess){
+            DWORD ec=0;
+            if(GetExitCodeProcess(g_halcon_pi.hProcess,&ec)&&ec!=STILL_ACTIVE){
+                cout<<"[HALCON] cam_calib_chain finished (exit code "<<ec<<")."<<endl;
+                CloseHandle(g_halcon_pi.hProcess);CloseHandle(g_halcon_pi.hThread);ZeroMemory(&g_halcon_pi,sizeof(g_halcon_pi));
+                g_ui_mode=UiMode::CAPTURE;
+            }
         }
 #endif
 
@@ -395,28 +360,7 @@ int main(){
         if(key==27||key=='q'){if(g_enable_net_sync&&g_is_master){sendLine(g_ctrl_sock,"SHUTDOWN");this_thread::sleep_for(chrono::milliseconds(200));}if(!g_enable_net_sync||g_is_master||g_fault_active.load())global_running=false;}
         else if(g_fault_active.load()){}
         else if(g_ui_mode==UiMode::CALIBRATING){}   // 标定期间忽略其他按键
-        else if(key=='i'||key=='I'){
-            if(g_is_master||!g_enable_net_sync){
-                g_intr_mode.store(!g_intr_mode.load());
-                if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,g_intr_mode.load()?"MODE:INTRINSIC":"MODE:EXTRINSIC");
-                cout<<"\n[Mode] "<<(g_intr_mode.load()?"INTRINSIC":"EXTRINSIC")<<" calibration mode"<<endl;
-            }
-        }
-        else if(key==' '){
-            if(g_intr_mode.load()){
-                // 内参模式: 只保存放大的相机 (master/slave 各自保存自己的相机, 到 pictures/{SN}/)
-                int ci=g_enlarged_cam.load();
-                if(ci<0||ci>=(int)cam_ctxs.size()){cout<<"[Intrinsics] No camera selected."<<endl;continue;}
-                auto& ctx=cam_ctxs[ci];string dir=g_intr_root+"/"+ctx->sn;fs::create_directories(dir);
-                int ctr=getNextCounter(dir);stringstream ss;ss<<setw(2)<<setfill('0')<<ctr;
-                cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}
-                if(snap.empty()){cout<<"[Intrinsics] No frame yet."<<endl;continue;}
-                cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);
-                string fn=dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg";cv::imwrite(fn,out);
-                cout<<"\n[Intrinsics] Saved "<<fn<<endl;
-            }
-            else if(g_enable_net_sync&&!g_is_master){/* 外参模式: slave 由 master PHOTO 命令驱动 */}
-            else{int ctr=getNextCounter(g_save_dir);stringstream ss;ss<<setw(2)<<setfill('0')<<ctr;if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"PHOTO:"+to_string(ctr));g_last_idx.store(ctr);g_capture_count++;
+        else if(key==' '){if(g_enable_net_sync&&!g_is_master){}else{int ctr=getNextCounter(g_save_dir);stringstream ss;ss<<setw(2)<<setfill('0')<<ctr;if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"PHOTO:"+to_string(ctr));g_last_idx.store(ctr);g_capture_count++;
             cout<<"\n[Photo] Capturing index "<<ctr<<endl;
             for(auto& ctx:cam_ctxs){cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}if(!snap.empty()){cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);string fn=g_save_dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg";cv::imwrite(fn,out);cout<<"  -> Saved "<<fn<<endl;}}}}
         else if((key=='t'||key=='T')&&g_is_master&&g_enable_net_sync){
@@ -424,11 +368,8 @@ int main(){
             renderStatusScreen("TRANSFERRING...","Requesting file list from slave","",-1,true);
             sendLine(g_ctrl_sock,"LIST_REQ");string resp;recvLine(g_ctrl_sock,resp,5000);
             if(resp.rfind("LIST_RESP:",0)!=0){renderStatusScreen("TRANSFER FAILED","No response from slave","",-1,true);this_thread::sleep_for(chrono::milliseconds(800));continue;}
-            string lst=resp.substr(10);set<string> sf;stringstream ss(lst);string tok;while(getline(ss,tok,','))if(!tok.empty())sf.insert(tok);set<string> lf=scanFiles(picRoot(),g_intr_mode.load());vector<string> mis;for(auto& f:sf)if(!lf.count(f))mis.push_back(f);
-            if(mis.empty()){cout<<"[Transfer] Already in sync."<<endl;
-                if(g_intr_mode.load()){renderStatusScreen("IN SYNC","No files missing","Starting intrinsics calibration...",-1,true);if(launchIntrinsicsCalib()){g_calib_title="calib_cam_intrinsics is running";g_ui_mode=UiMode::CALIBRATING;g_calib_start=chrono::steady_clock::now();}}
-                else{renderStatusScreen("IN SYNC","No files missing","Starting calibration...",-1,true);if(launchHalconChain()){g_calib_title="cam_calib_chain is running";g_ui_mode=UiMode::CALIBRATING;g_calib_start=chrono::steady_clock::now();}}
-                continue;}
+            string lst=resp.substr(10);set<string> sf;stringstream ss(lst);string tok;while(getline(ss,tok,','))if(!tok.empty())sf.insert(tok);set<string> lf=scanFiles(g_save_dir);vector<string> mis;for(auto& f:sf)if(!lf.count(f))mis.push_back(f);
+            if(mis.empty()){cout<<"[Transfer] Already in sync."<<endl;renderStatusScreen("IN SYNC","No files missing","Starting calibration...",-1,true);if(launchHalconChain()){g_ui_mode=UiMode::CALIBRATING;g_calib_start=chrono::steady_clock::now();}continue;}
             cout<<"\n[Transfer] "<<mis.size()<<" files missing. Starting transfer..."<<endl;string xfer="XFER:";for(auto& f:mis)xfer+=f+",";sendLine(g_ctrl_sock,xfer);
             SOCKET dl=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
             {int opt=1;setsockopt(dl,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
@@ -440,8 +381,8 @@ int main(){
                 size_t sz=ntohl(sz_be);if(sz==0)break;
                 if(fi>=(int)mis.size()){cerr<<"[XFER] Too many files!"<<endl;break;}
                 vector<char> buf(sz);if(!recvExact(ds,buf.data(),sz)){cerr<<"[XFER] recvExact data failed at file "<<fi<<endl;break;}
-                tb+=sz;rc++;fi++;auto& f=mis[fi-1];
-                string path=picRoot()+"/"+f+".jpg";fs::create_directories(fs::path(path).parent_path());ofstream out(path,ios::binary);out.write(buf.data(),sz);   // 键含子目录, 保持文件夹结构
+                tb+=sz;rc++;fi++;auto& f=mis[fi-1];size_t u=f.rfind('_');string sn=f.substr(0,u);int idx=stoi(f.substr(u+1));stringstream fn;fn<<setw(2)<<setfill('0')<<idx;
+                string path=g_save_dir+"/calib_cam_"+sn+"_"+fn.str()+".jpg";ofstream out(path,ios::binary);out.write(buf.data(),sz);
                 // 每 25 张或 200ms 刷新一次全屏传输进度
                 auto now2=chrono::steady_clock::now();
                 if(rc%25==0||now2-last_ui>chrono::milliseconds(200)){char p[96];snprintf(p,sizeof(p),"%d / %d files, %.1f MB",rc,(int)mis.size(),tb/1048576.0);renderStatusScreen("TRANSFERRING...",p,"",rc/(double)mis.size(),true);last_ui=now2;}}
@@ -450,40 +391,17 @@ int main(){
             auto dt=chrono::duration<double>(chrono::steady_clock::now()-t0).count();double spd=dt>0?(tb/1048576.0/dt):0;
             cout<<"[Transfer] "<<rc<<" files, "<<fixed<<setprecision(1)<<(tb/1048576.0)<<" MB, "<<dt<<"s, "<<spd<<" MB/s\n"<<endl;
             char p[128];snprintf(p,sizeof(p),"Done: %d files, %.1f MB, %.1fs, %.1f MB/s",rc,tb/1048576.0,dt,spd);
-            if(g_intr_mode.load()){
-                // 传输完成 → 启动内参重标定 (calib_cam_intrinsics.exe)
-                renderStatusScreen("TRANSFER COMPLETE",p,"Starting intrinsics calibration...",-1,true);
-                if(launchIntrinsicsCalib()){g_calib_title="calib_cam_intrinsics is running";g_ui_mode=UiMode::CALIBRATING;g_calib_start=chrono::steady_clock::now();}}
-            else{
-                // 传输完成 → 启动 HALCON 标定链 (标定期间全屏 CALIBRATING, 不渲染采集 UI)
-                renderStatusScreen("TRANSFER COMPLETE",p,"Starting calibration...",-1,true);
-                if(launchHalconChain()){g_calib_title="cam_calib_chain is running";g_ui_mode=UiMode::CALIBRATING;g_calib_start=chrono::steady_clock::now();}}}
-        else if((key=='z'||key=='Z')&&!g_fault_active.load()){
-            if(g_intr_mode.load()){
-                // 内参模式: 撤回放大相机的最后一张 (master/slave 各自本地)
-                int ci=g_enlarged_cam.load();
-                if(ci<0||ci>=(int)cam_ctxs.size()){cout<<"[Intrinsics] No camera selected."<<endl;continue;}
-                string dir=g_intr_root+"/"+cam_ctxs[ci]->sn;string del=lastImageIn(dir);
-                if(del.empty()){cout<<"[Intrinsics] No images to undo."<<endl;continue;}
-                fs::remove(del);cout<<"\n[Intrinsics] Undo: removed "<<del<<endl;
-            }
-            else{int li=g_last_idx.load();if(li<0){cout<<"[Undo] No previous capture to undo."<<endl;continue;}stringstream ss;ss<<setw(2)<<setfill('0')<<li;
+            renderStatusScreen("TRANSFER COMPLETE",p,"Starting calibration...",-1,true);
+            // 传输完成 → 启动 HALCON 标定链 (标定期间全屏 CALIBRATING, 不渲染采集 UI)
+            if(launchHalconChain()){g_ui_mode=UiMode::CALIBRATING;g_calib_start=chrono::steady_clock::now();}}
+        else if((key=='z'||key=='Z')&&!g_fault_active.load()){int li=g_last_idx.load();if(li<0){cout<<"[Undo] No previous capture to undo."<<endl;continue;}stringstream ss;ss<<setw(2)<<setfill('0')<<li;
             cout<<"\n[Undo] Deleting capture index "<<ss.str()<<endl;
             if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir)){string st=e.path().stem().string();if(st.rfind("calib_cam_",0)==0&&st.length()>=2&&st.substr(st.length()-2)==ss.str())fs::remove(e.path());}if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"UNDO:"+to_string(li));g_last_idx.store(li-1);g_undo_count++;if(g_capture_count>0)g_capture_count--;
-            cout<<"[Undo] Done.\n"<<endl;}}
-        else if(key=='c'||key=='C'){
-            if(g_intr_mode.load()){
-                // 内参模式: 清除放大相机的全部图片 (master/slave 各自本地)
-                int ci=g_enlarged_cam.load();
-                if(ci<0||ci>=(int)cam_ctxs.size()){cout<<"[Intrinsics] No camera selected."<<endl;continue;}
-                string dir=g_intr_root+"/"+cam_ctxs[ci]->sn;int n=countImages(dir);
-                if(fs::exists(dir))for(auto& e:fs::directory_iterator(dir))if(e.path().extension()==".jpg")fs::remove(e.path());
-                cout<<"\n[Intrinsics] Cleared "<<n<<" images from "<<dir<<endl;
-            }
-            else if(g_is_master&&g_enable_net_sync){
+            cout<<"[Undo] Done.\n"<<endl;}
+        else if((key=='c'||key=='C')&&g_is_master&&g_enable_net_sync){
             cout<<"\n[Clear] Removing local calibration photos..."<<endl;
             if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;sendLine(g_ctrl_sock,"CLEAR");string ack;recvLine(g_ctrl_sock,ack,2000);
-            cout<<"[Clear] Local photos removed.\n"<<endl;}}
+            cout<<"[Clear] Local photos removed.\n"<<endl;}
     }
 
     cout<<"[System] Shutting down..."<<endl;

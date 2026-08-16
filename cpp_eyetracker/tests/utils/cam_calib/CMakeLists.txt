@@ -66,4 +66,33 @@ else()
     )
 
     message(STATUS "✅ cam_calib_chain will be built")
+
+    add_executable(calib_cam_intrinsics
+        calib_cam_intrinsics.cpp
+    )
+
+    target_include_directories(calib_cam_intrinsics PUBLIC
+        "${HALCONROOT}/include"
+        "${HALCONROOT}/include/halconcpp"
+    )
+
+    target_link_directories(calib_cam_intrinsics PUBLIC
+        "${HALCONROOT}/lib/x64-win64"
+    )
+
+    target_link_libraries(calib_cam_intrinsics PUBLIC
+        halcon.lib
+        halconcpp.lib
+        eyetracker::cfg
+    )
+
+    add_custom_command(TARGET calib_cam_intrinsics POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${HALCONROOT}/bin/x64-win64/halcon.dll"
+            "${HALCONROOT}/bin/x64-win64/halconcpp.dll"
+            $<TARGET_FILE_DIR:calib_cam_intrinsics>
+        COMMENT "Copying HALCON DLLs to output..."
+    )
+
+    message(STATUS "✅ calib_cam_intrinsics will be built")
 endif()
