@@ -356,6 +356,10 @@ int main(){
             if(g_ui_mode==UiMode::CALIBRATING){char et[64];snprintf(et,sizeof(et),"Elapsed: %.1fs",chrono::duration<double>(now-g_calib_start).count());renderStatusScreen("CALIBRATING...",g_calib_title,et,-1,false);}
             else{cv::Mat cv;if(g_fault_active.load()){cv=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);cv::putText(cv,"CAMERA FAULT",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,1.2,cv::Scalar(0,0,255),2);}
             else{cv=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);int sel=g_enlarged_cam.load();renderGrid(cv,sel);renderEnlarged(cv,sel);cv::line(cv,cv::Point(g_left_w,0),cv::Point(g_left_w,g_win_h),cv::Scalar(60,60,60),2);
+                // 中心十字线 (enlarged 区域中心, 与 capture_with_LED 一致)
+                int cx=g_right_x+g_right_w/2,cy=g_win_h/2,cl=20;
+                cv::line(cv,cv::Point(cx-cl,cy),cv::Point(cx+cl,cy),cv::Scalar(100,100,100),1,cv::LINE_AA);
+                cv::line(cv,cv::Point(cx,cy-cl),cv::Point(cx,cy+cl),cv::Scalar(100,100,100),1,cv::LINE_AA);
                 // 左上: 相机 SN (如有放大) + 标定模式 (始终)
                 if(sel>=0&&sel<(int)cam_ctxs.size())cv::putText(cv,cam_ctxs[sel]->sn,cv::Point(g_right_x+10,35),cv::FONT_HERSHEY_SIMPLEX,0.8,cv::Scalar(0,215,255),2,cv::LINE_AA);
                 string mode_text=g_intr_mode.load()?"MODE: INTRINSIC":"MODE: EXTRINSIC";
