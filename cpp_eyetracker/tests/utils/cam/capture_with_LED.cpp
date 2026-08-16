@@ -132,6 +132,7 @@ atomic<bool> g_init_ok{false};     // Master→Slave: all connections ready
 atomic<bool> g_piper_busy{false};
 struct ArmTransform { Pt3 tool_t, tool_r, ccs_t, ccs_r; };
 ArmTransform g_xf_upper, g_xf_lower;
+string g_arm_pose_yml;   // 加载的 arm pose yaml (cfg/... 相对路径, UI 水印显示)
 vector<array<double,3>> g_targets_upper, g_targets_lower;
 string g_gaze_dir;
 struct ArmPose { double x,y,z, qx,qy,qz,qw, alpha,beta,gamma; bool valid=false; };
@@ -861,6 +862,7 @@ int main() {
         string day_id=findDayForParticipant(cfg_dir+"/day_participant_map.json",participant_id);
         string arm_pose_yml=cfg_dir+"/arm_pose/"+day_id+".yaml";
         if(!day_id.empty()&&fs::exists(arm_pose_yml)){
+            g_arm_pose_yml="cfg/arm_pose/"+day_id+".yaml";   // UI 水印用相对路径 (从 cfg 开始)
             Cfg cfg_pose(arm_pose_yml);
             for (auto& an:{"upper","lower"}) {
                 try{auto& a=cfg_pose["arms"][an];auto& tl=a["tool"];auto& cc=a["arm_in_ccs"];
@@ -1143,6 +1145,14 @@ int main() {
                             g_gaze_x.load(), g_gaze_y.load(), g_gaze_z.load());
                         cv::putText(canvas, pb, cv::Point(hx, hy), cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(0, 255, 200), 1, cv::LINE_AA);
                     }
+                }
+
+                // Bottom-right: arm pose 输入 (从 cfg 开始显示)
+                if (is_master_pc && !g_arm_pose_yml.empty()) {
+                    string ap = "Arm pose: " + g_arm_pose_yml;
+                    cv::Size apsz = cv::getTextSize(ap, cv::FONT_HERSHEY_SIMPLEX, 0.35, 1, 0);
+                    cv::putText(canvas, ap, cv::Point(g_right_x + g_right_w - apsz.width - 10, g_win_h - 30),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
                 }
 
                 // Crosshair at center of enlarged area
