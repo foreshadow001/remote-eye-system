@@ -61,6 +61,15 @@ All runtime settings come from `cpp_eyetracker/cfg/default.yaml`. The `Cfg` clas
 - `tests/utils/cam_calib/` — camera calibration executables (requires HALCON)
 - `tests/utils/glint_detection/` — glint detection tests
 
+## HALCON Pose Convention (rotation order)
+
+`calib_cam_chain` / `calib_cam_intrinsics` write camera poses to `{SN}_Data.xml` with `PoseTypeCode=0` (Rp+T), `OrderOfRotation=gba`, `ViewOfTransform=point`. The XML `<Rotation>` fields `Alpha/Beta/Gamma` follow HALCON's `create_pose` semantics:
+
+- **`gba` rotation matrix: `R = Rx(Alpha) · Ry(Beta) · Rz(Gamma)`** — Alpha rotates around X, Beta around Y, Gamma around Z. Read right-to-left in the fixed (reference) coordinate system: first around fixed z by Gamma, then old y by Beta, then old x by Alpha. Source: HALCON `create_pose` operator reference (`R('gba') = Rx(RotX) * Ry(RotY) * Rz(RotZ)`, RotX=alpha, RotY=beta, RotZ=gamma).
+- Pose transforms camera coordinates into the reference (center-camera) frame: `p_ref = R · p_cam + T`. Camera frame: x right, y down, z forward out of the lens.
+- C++ code does **no manual angle math** — all rebasing goes through HALCON (`PoseCompose`); raw gba values are exported to XML unchanged.
+- `viz_calib_chain.py` reimplements the convention. If axes look wrong in a new visualizer, check this formula first — a `Rz(α)·Ry(β)·Rz(γ)` implementation produces flipped Z and wrong X axes.
+
 ## Orphaned / Unused files
 
 These source files exist but are **not compiled by any CMakeLists** and will not be used again:
