@@ -282,6 +282,10 @@ int processArm(const string& arm, const string& img_dir, const string& out_dir,
                 first_img = img_dir + "/calib_cam_" + sns[ci] + "_" + ssf.str() + ".jpg";
                 if (fs::exists(first_img)) break;
             }
+            if (first_img.empty()) {
+                cout << "  No frame images for this camera, skipping." << endl;
+                continue;
+            }
             ReadImage(&ho_tmp, HTuple(first_img.c_str()));
             GetImageSize(ho_tmp, &hv_w, &hv_h);
 
@@ -436,6 +440,9 @@ int main(int argc, char* argv[]) {
 
     } catch (HException& ex) {
         cerr << "Halcon Error #" << ex.ErrorCode() << ": " << ex.ErrorMessage().TextA() << endl;
+        ret = 1;
+    } catch (const std::exception& e) {
+        cerr << "[Fatal] " << e.what() << endl;
         ret = 1;
     }
     return ret;

@@ -50,11 +50,14 @@ static map<int, Pose> loadBoardGT(const string& path) {
 }
 
 int main() {
-    auto yp = (fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()
-               / "cfg" / "piper.yaml").string();
-    Cfg cfg(yp);
-    string data_dir  = cfg["test_record_arm_data"]["calib_save_dir"].as<string>();
-    string board_dir = cfg["test_record_arm_data"]["calib_save_dir"].as<string>();
+    auto cfg_dir = fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path() / "cfg";
+    Cfg cfg((cfg_dir / "piper.yaml").string());
+    Cfg arm_cfg((cfg_dir / "calib_arm.yaml").string());
+    // 数据在 calib_save_dir/{day_id}/ 下 (day_id 与 test_record_arm_data/resolve 一致)
+    string day_id = arm_cfg["record"]["day_id"].as<string>();
+    string data_dir  = cfg["test_record_arm_data"]["calib_save_dir"].as<string>() + "/" + day_id;
+    string board_dir = data_dir;   // board_poses_*.txt 与 chain_viz_*.txt 均在此目录
+    cout << "Data dir: " << data_dir << endl;
 
     for (auto& arm_name : {"upper", "lower"}) {
         cout << "\n===== Arm: " << arm_name << " =====" << endl;

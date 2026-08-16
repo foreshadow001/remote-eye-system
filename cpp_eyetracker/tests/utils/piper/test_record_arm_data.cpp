@@ -50,7 +50,8 @@ PROCESS_INFORMATION g_resolve_pi{};
 
 // ================== 手眼标定流水线 (h 键: 依次运行三个程序) ==================
 atomic<bool> g_pipeline_running{false};
-atomic<int> g_pipeline_step{0};                        // 当前步骤 1~3 (0 = 未运行)
+atomic<int> g_pipeline_step{0};                        // 1~3 运行中; 0 等待/未运行; -1 失败; -2 完成
+string g_pipeline_fail_msg;                            // 失败信息 (UI 显示)
 chrono::steady_clock::time_point g_pipeline_start;     // 流水线启动时刻 (UI 计时)
 
 // 运行同目录下的 exe 并等待结束, 返回退出码 (启动失败返回 -1)
@@ -87,9 +88,13 @@ void runHandEyePipeline() {
     };
     for (size_t i = 0; i < steps.size(); ++i) {
         g_pipeline_step.store(static_cast<int>(i) + 1);
-        if (runExeWait(steps[i].first, steps[i].second) != 0) {
-            cerr << "[Pipeline] " << steps[i].second << " failed. Stopping pipeline." << endl;
-            break;
+        int ec = runExeWait(steps[i].first, steps[i].second);
+        if (ec != 0) {
+            g_pipeline_fail_msg = "Step " + to_string(i + 1) + "/" + to_string(steps.size())
+                                + ": " + steps[i].second + " (exit " + to_string(ec) + ")";
+            cerr << "[Pipeline] " << steps[i].second << " failed (exit " << ec << "). Stopping." << endl;
+            g_pipeline_step.store(-1);   // UI 显示失败画面 (保持 running=true, 按任意键返回)
+            return;
         }
         // 每个程序之间间隔几秒 (等待文件落盘/资源释放)
         if (i + 1 < steps.size()) {
@@ -98,9 +103,11 @@ void runHandEyePipeline() {
             this_thread::sleep_for(chrono::seconds(3));
         }
     }
-    g_pipeline_step.store(0);
+    g_pipeline_step.store(-2);   // UI 显示完成画面 3 秒后自动返回
     cout << "[Pipeline] Done.\n" << endl;
+    this_thread::sleep_for(chrono::seconds(3));
     g_pipeline_running.store(false);
+    g_pipeline_step.store(0);
 }
 
 // ================== TCP 通信 ==================
@@ -269,6 +276,9 @@ ArmPose queryFlangePose(const string& arm) {
 }
 
 // ================== UI 布局 ==================
+int countJpgs(const string& dir);   // 前向声明 (onMouse 使用, 定义在辅助函数区)
+string lastJpgIn(const string& dir);
+
 void updateLayout() {
     g_left_w = g_win_h * 2 / 5;
     g_right_x = g_left_w;
@@ -287,10 +297,13 @@ void onMouse(int event, int x, int y, int, void*) {
         if (idx >= 0 && idx < n) {
             int prev = g_enlarged_cam.load();
             if (prev != idx) {
-                // 切换到不同相机 → 退出标定模式
+                // 切换到不同相机 → 保持标定模式, 标定对象跟随切换
                 if (g_calib_mode) {
-                    g_calib_mode = false;
-                    cout << "[Calib Mode] OFF — camera switched." << endl;
+                    g_calib_cam_sn = cam_ctxs[idx]->sn;
+                    string calib_dir = g_calib_save_dir + "/" + g_current_arm + "/" + g_calib_cam_sn;
+                    fs::create_directories(calib_dir);
+                    cout << "[Calib Mode] Camera switched to " << g_calib_cam_sn
+                         << "  (existing: " << countJpgs(calib_dir) << ")" << endl;
                 }
                 g_enlarged_cam.store(idx);
             } else {
@@ -599,19 +612,31 @@ int main() {
                     cv::putText(canvas, t, cv::Point(cx - sz.width / 2, y),
                                 cv::FONT_HERSHEY_SIMPLEX, s, c, 2, cv::LINE_AA);
                 };
-                put(cy - 80, "PIPELINE RUNNING...", 1.2, cv::Scalar(0, 215, 255));
                 int step = g_pipeline_step.load();
                 const char* names[] = {"", "resolve_calib_board_pose", "test_piper_hand_eye_calib", "save_piper_chain"};
-                if (step >= 1 && step <= 3) {
-                    char sb[128];
-                    snprintf(sb, sizeof(sb), "Step %d/3: %s", step, names[step]);
-                    put(cy - 20, sb, 0.8, cv::Scalar(220, 220, 220));
+                if (step == -1) {
+                    // 失败: 保持显示直到按任意键返回
+                    put(cy - 80, "PIPELINE FAILED", 1.2, cv::Scalar(0, 0, 255));
+                    put(cy - 20, g_pipeline_fail_msg, 0.7, cv::Scalar(255, 255, 255));
+                    put(cy + 30, "Check console output for details", 0.5, cv::Scalar(140, 140, 140));
+                    put(g_win_h - 60, "[any key] return  [ESC/q] quit", 0.5, cv::Scalar(140, 140, 140));
+                } else if (step == -2) {
+                    // 完成: 显示 3 秒后自动返回
+                    put(cy - 40, "PIPELINE COMPLETE", 1.2, cv::Scalar(0, 255, 0));
+                    put(g_win_h - 60, "Returning to capture UI...", 0.5, cv::Scalar(140, 140, 140));
+                } else {
+                    put(cy - 80, "PIPELINE RUNNING...", 1.2, cv::Scalar(0, 215, 255));
+                    if (step >= 1 && step <= 3) {
+                        char sb[128];
+                        snprintf(sb, sizeof(sb), "Step %d/3: %s", step, names[step]);
+                        put(cy - 20, sb, 0.8, cv::Scalar(220, 220, 220));
+                    }
+                    char et[64];
+                    snprintf(et, sizeof(et), "Elapsed: %.1fs",
+                             chrono::duration<double>(current_time - g_pipeline_start).count());
+                    put(cy + 30, et, 0.6, cv::Scalar(140, 140, 140));
+                    put(g_win_h - 60, "[ESC/q] quit (pipeline continues in background)", 0.5, cv::Scalar(140, 140, 140));
                 }
-                char et[64];
-                snprintf(et, sizeof(et), "Elapsed: %.1fs",
-                         chrono::duration<double>(current_time - g_pipeline_start).count());
-                put(cy + 30, et, 0.6, cv::Scalar(140, 140, 140));
-                put(g_win_h - 60, "[ESC/q] quit (pipeline continues in background)", 0.5, cv::Scalar(140, 140, 140));
             } else {
             int sel = g_enlarged_cam.load();
             renderThumbnailGrid(canvas, sel);
@@ -702,7 +727,14 @@ int main() {
             }
             global_running = false;
         }
-        else if (g_pipeline_running.load()) { /* 流水线期间禁用按键 (仅 ESC/q 可用) */ }
+        else if (g_pipeline_running.load()) {
+            // 流水线期间禁用按键; 失败画面按任意键返回采集界面
+            if (g_pipeline_step.load() == -1) {
+                g_pipeline_running.store(false);
+                g_pipeline_step.store(0);
+                cout << "[Pipeline] Failure screen dismissed." << endl;
+            }
+        }
         else if (key == 't' || key == 'T') {
             g_current_arm = (g_current_arm == "upper") ? "lower" : "upper";
             cout << "[Arm] Switched to: " << g_current_arm << endl;

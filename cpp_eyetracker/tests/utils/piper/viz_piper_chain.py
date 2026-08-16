@@ -223,7 +223,14 @@ def main():
     if yaml_path is None: print("Cannot find piper.yaml"); sys.exit(1)
     with open(yaml_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-    data_dir = cfg["test_record_arm_data"]["calib_save_dir"]
+    # day_id 来自 calib_arm.yaml (与 save_piper_chain/test_record_arm_data 一致)
+    day_id = "D001"
+    arm_cfg_path = yaml_path.parent / "calib_arm.yaml"
+    if arm_cfg_path.exists():
+        with open(arm_cfg_path, encoding="utf-8") as f:
+            arm_cfg = yaml.safe_load(f)
+        day_id = arm_cfg["record"]["day_id"]
+    data_dir = Path(cfg["test_record_arm_data"]["calib_save_dir"]) / day_id
     app = App(data_dir)
     app.fig.canvas.mpl_connect("key_press_event", app.on_key)
     plt.show()
