@@ -7,7 +7,6 @@ import yaml
 import matplotlib; matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.widgets import Button
 
 # ---------------------------------------------------------------------------
 def quat_to_rot(qx, qy, qz, qw):
@@ -24,9 +23,12 @@ def draw_axes(ax, pos, quat, length=0.04, lw=2.5, alpha=1.0):
         ax.quiver(pos[0],pos[1],pos[2], R[0,i]*length,R[1,i]*length,R[2,i]*length,
                   color=c, linewidth=lw, arrow_length_ratio=0.25, alpha=alpha)
 
-def draw_text(ax, pos, text, color="#2B2B2B"):
-    # 悬浮信息: 浅色圆角矩形 + 深色文字
-    ax.text(pos[0],pos[1],pos[2],text,fontsize=9,color=color,
+def draw_text(ax, pos, text, color="#2B2B2B", offset=None):
+    # 悬浮信息: 浅色圆角矩形 + 深色文字 (offset: 世界坐标偏移, 避免与坐标轴/其他标签重叠)
+    p = np.array(pos, dtype=float)
+    if offset is not None:
+        p = p + np.array(offset, dtype=float)
+    ax.text(p[0],p[1],p[2],text,fontsize=9,color=color,
             bbox=dict(boxstyle="round,pad=0.15",fc="#FAFAF2",ec="#9E9E9E",lw=0.6,alpha=0.92))
 
 # ---------------------------------------------------------------------------
@@ -73,13 +75,21 @@ class App:
         self.ax_side.axis("off")
         plt.subplots_adjust(bottom=0.12)
 
-        # buttons
-        for i, name in enumerate(("upper","lower")):
-            axb = plt.axes([0.15 + i*0.14, 0.02, 0.12, 0.04])
-            btn = Button(axb, name.upper(), color="0.2", hovercolor="0.5")
-            btn.label.set_color("white")
-            btn.on_clicked(self.make_switch(name))
-            setattr(self, f"btn_{name}", btn)
+        # 圆角按钮 (UPPER / LOWER)
+        self.btn_patches = {}
+        for i, name in enumerate(("upper", "lower")):
+            axb = plt.axes([0.15 + i * 0.16, 0.015, 0.13, 0.045])
+            axb.axis("off")
+            axb.set_xlim(0, 1); axb.set_ylim(0, 1)
+            patch = mpatches.FancyBboxPatch((0, 0), 1, 1, transform=axb.transAxes,
+                                            boxstyle="round,pad=0.02,rounding_size=0.25",
+                                            fc="#37474F", ec="none")
+            axb.add_patch(patch)
+            lab = axb.text(0.5, 0.5, name.upper(), transform=axb.transAxes,
+                           ha="center", va="center", fontsize=10, color="white",
+                           family="monospace", fontweight="bold")
+            self.btn_patches[name] = (patch, lab, axb)
+        self.fig.canvas.mpl_connect("button_press_event", self.on_btn_click)
 
         # pre-load both arms + print stats
         for arm in ("upper","lower"):
@@ -126,20 +136,23 @@ class App:
                   f"max={s['rot_deg'].max():.2f} std={s['rot_deg'].std():.2f}")
         print("="*60 + "\n  ← → keys to step. Close window to exit.\n")
 
-    def make_switch(self, name):
-        def handler(event):
-            if name != self.arm:
+    def on_btn_click(self, event):
+        for name, (_, _, axb) in self.btn_patches.items():
+            if event.inaxes == axb and name != self.arm:
                 self.switch_arm(name)
-        return handler
+                return
+
+    def _update_btn_colors(self):
+        for name, (patch, lab, _) in self.btn_patches.items():
+            active = (name == self.arm)
+            patch.set_facecolor("#00838F" if active else "#37474F")
+            lab.set_color("white" if active else "#AFAFAF")
 
     def switch_arm(self, arm):
         self.arm = arm
         self.n = len(self.frames[arm])
         self.i = 0
-        for an in ("upper","lower"):
-            btn = getattr(self, f"btn_{an}")
-            btn.color = "0.4" if an==arm else "0.2"
-            btn.label.set_color("lime" if an==arm else "white")
+        self._update_btn_colors()
         self.update()
         self.fig.canvas.draw_idle()
 
@@ -154,22 +167,33 @@ class App:
         R_err = quat_to_rot(*cq).T @ quat_to_rot(*bq)
         tr = np.trace(R_err); err_deg = math.acos(max(-1,min(1,(tr-1)/2)))*180/math.pi
 
-        # 3D axes
+        # 3D axes (悬浮框与坐标轴保持一定距离)
         draw_axes(self.ax, np.zeros(3), (0,0,0,1), self.AL, lw=2.5, alpha=0.9)
-        draw_text(self.ax, np.zeros(3), "  Cam")
+        draw_text(self.ax, np.zeros(3), "Cam", offset=(0.022, 0.016, 0.004))
         draw_axes(self.ax, ap, aq, self.AL, lw=2.5, alpha=0.8)
-        draw_text(self.ax, ap, "  Arm")
+        draw_text(self.ax, ap, "Arm", offset=(0.022, 0.016, 0.004))
         self.ax.plot([0,ap[0]],[0,ap[1]],[0,ap[2]],"gray",lw=0.6,ls="--")
         draw_axes(self.ax, fp, fq, self.AL*0.8, lw=2, alpha=0.8)
-        draw_text(self.ax, fp, f"  Flange [{idx:02d}]")
+        draw_text(self.ax, fp, f"Flange [{idx:02d}]", offset=(0.018, -0.020, 0.004))
         self.ax.plot([ap[0],fp[0]],[ap[1],fp[1]],[ap[2],fp[2]],"cyan",lw=0.6,ls="--")
         draw_axes(self.ax, cp, cq, self.AL*0.8, lw=2, alpha=0.85)
-        draw_text(self.ax, cp, "  Calib(est)")
         self.ax.plot([fp[0],cp[0]],[fp[1],cp[1]],[fp[2],cp[2]],"orange",lw=0.6,ls="--")
         draw_axes(self.ax, bp, bq, self.AL*0.8, lw=2.5, alpha=0.9)
-        draw_text(self.ax, bp, "  Board(GT)")
         self.ax.plot([cp[0],bp[0]],[cp[1],bp[1]],[cp[2],bp[2]],"red",lw=2)
-        mid = (cp+bp)/2; draw_text(self.ax, mid, f"Δ{err_mm:.1f}mm", color="#C62828")
+
+        # Calib(est)/Board(GT)/Δ 三个悬浮框沿 cp→bp 的垂直方向错开, 避免重叠
+        d = bp - cp
+        dn = float(np.linalg.norm(d))
+        u = d/dn if dn > 1e-9 else np.array([1.0, 0.0, 0.0])
+        nrm = np.cross(u, np.array([0.0, 0.0, 1.0]))
+        if np.linalg.norm(nrm) < 1e-9:
+            nrm = np.array([0.0, 1.0, 0.0])
+        nrm = nrm / np.linalg.norm(nrm)
+        s = 0.032   # 分离间距 (m)
+        draw_text(self.ax, cp, "Calib(est)", offset=-nrm * s)
+        draw_text(self.ax, bp, "Board(GT)", offset=nrm * s)
+        mid = (cp + bp) / 2
+        draw_text(self.ax, mid, f"Δ{err_mm:.1f}mm", color="#C62828", offset=nrm * s * 2.4)
 
         pts = [np.zeros(3),ap,fp,cp,bp]; pts = np.array(pts)
         lo,hi = pts.min(0),pts.max(0); pad = max((hi-lo).max()*0.25,0.06)
@@ -181,7 +205,7 @@ class App:
         # 初始视角: 指向相机坐标系 z 轴负方向, x 轴向左, y 轴向下 (与 viz_calib_chain 一致)
         self.ax.view_init(elev=90, azim=90)
 
-        # sidebar (统计面板: 浅色圆角面板 + 深色标题栏 + 颜色区分误差)
+        # sidebar (统计面板: 圆角面板 + 深色标题栏 + 两列对齐 + 分隔线)
         s = self.stats[self.arm]
         self.ax_side.set_xlim(0, 1); self.ax_side.set_ylim(0, 1)
         panel = mpatches.FancyBboxPatch((0, 0), 1, 1, transform=self.ax_side.transAxes,
@@ -197,29 +221,46 @@ class App:
                           fontsize=11, color="white", family="monospace", fontweight="bold")
 
         GOOD_POS, GOOD_ROT = 10.0, 5.0   # 误差着色阈值 (mm / deg)
-        def row(y, txt, color="#2B2B2B", size=9.5, bold=False, x=0.07, align="left"):
-            self.ax_side.text(x, y, txt, transform=self.ax_side.transAxes,
-                              fontsize=size, color=color, family="monospace",
-                              fontweight="bold" if bold else "normal",
-                              ha=align, va="center")
+        def hdr_txt(y, txt):
+            self.ax_side.text(0.07, y, txt, transform=self.ax_side.transAxes,
+                              fontsize=10, color="#37474F", family="monospace",
+                              fontweight="bold", ha="left", va="center")
+        def pair(y, label, value, vc="#2B2B2B"):
+            self.ax_side.text(0.07, y, label, transform=self.ax_side.transAxes,
+                              fontsize=9.5, color="#2B2B2B", family="monospace",
+                              ha="left", va="center")
+            self.ax_side.text(0.93, y, value, transform=self.ax_side.transAxes,
+                              fontsize=9.5, color=vc, family="monospace",
+                              fontweight="bold", ha="right", va="center")
+        def sub(y, txt):
+            self.ax_side.text(0.07, y, txt, transform=self.ax_side.transAxes,
+                              fontsize=9, color="#555555", family="monospace",
+                              ha="left", va="center")
+        def sep(y):
+            self.ax_side.plot([0.07, 0.93], [y, y], transform=self.ax_side.transAxes,
+                              color="#D0D0D0", lw=0.8, zorder=2)
 
         y = 0.855
-        row(y, "THIS FRAME", color="#37474F", size=10, bold=True); y -= 0.052
-        row(y, f"dPos  {err_mm:6.2f} mm", color=("#2E7D32" if err_mm < GOOD_POS else "#C62828")); y -= 0.046
-        row(y, f"dRot  {err_deg:6.2f} deg", color=("#2E7D32" if err_deg < GOOD_ROT else "#C62828")); y -= 0.062
-        row(y, "ALL FRAMES", color="#37474F", size=10, bold=True); y -= 0.052
-        row(y, f"valid  {s['n_valid']:2d} / {s['n_total']:2d}"); y -= 0.048
-        row(y, "pos (mm)", size=9, color="#555555"); y -= 0.040
-        row(y, f"  mean {s['pos_mm'].mean():6.2f}"); y -= 0.038
-        row(y, f"  med  {np.median(s['pos_mm']):6.2f}"); y -= 0.038
-        row(y, f"  max  {s['pos_mm'].max():6.2f}"); y -= 0.038
-        row(y, f"  std  {s['pos_mm'].std():6.2f}"); y -= 0.050
-        row(y, "rot (deg)", size=9, color="#555555"); y -= 0.040
-        row(y, f"  mean {s['rot_deg'].mean():6.2f}"); y -= 0.038
-        row(y, f"  med  {np.median(s['rot_deg']):6.2f}"); y -= 0.038
-        row(y, f"  max  {s['rot_deg'].max():6.2f}"); y -= 0.038
-        row(y, f"  std  {s['rot_deg'].std():6.2f}"); y -= 0.058
-        row(y, "<-  ->  step frame", color="#888888", size=8.5, x=0.5, align="center")
+        hdr_txt(y, "THIS FRAME"); y -= 0.055
+        pair(y, "dPos", f"{err_mm:6.2f} mm", "#2E7D32" if err_mm < GOOD_POS else "#C62828"); y -= 0.052
+        pair(y, "dRot", f"{err_deg:6.2f} deg", "#2E7D32" if err_deg < GOOD_ROT else "#C62828"); y -= 0.062
+        sep(y + 0.031)
+        hdr_txt(y, "ALL FRAMES"); y -= 0.055
+        pair(y, "valid", f"{s['n_valid']:2d} / {s['n_total']:2d}"); y -= 0.050
+        sub(y, "pos (mm)"); y -= 0.042
+        pair(y, "mean", f"{s['pos_mm'].mean():6.2f}"); y -= 0.038
+        pair(y, "med", f"{np.median(s['pos_mm']):6.2f}"); y -= 0.038
+        pair(y, "max", f"{s['pos_mm'].max():6.2f}"); y -= 0.038
+        pair(y, "std", f"{s['pos_mm'].std():6.2f}"); y -= 0.048
+        sub(y, "rot (deg)"); y -= 0.042
+        pair(y, "mean", f"{s['rot_deg'].mean():6.2f}"); y -= 0.038
+        pair(y, "med", f"{np.median(s['rot_deg']):6.2f}"); y -= 0.038
+        pair(y, "max", f"{s['rot_deg'].max():6.2f}"); y -= 0.038
+        pair(y, "std", f"{s['rot_deg'].std():6.2f}"); y -= 0.056
+        sep(y + 0.028)
+        self.ax_side.text(0.5, y, "<-  ->  step frame", transform=self.ax_side.transAxes,
+                          fontsize=8.5, color="#888888", family="monospace",
+                          ha="center", va="center")
 
         self.fig.canvas.draw_idle()
 
