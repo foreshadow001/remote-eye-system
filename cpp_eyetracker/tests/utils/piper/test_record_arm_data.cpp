@@ -135,9 +135,8 @@ vector<shared_ptr<CameraContext>> cam_ctxs;
 atomic<int> g_enlarged_cam{-1};
 int g_last_capture_index = -1;
 string g_last_capture_arm;
-bool g_calib_mode = false;      // 内参标定模式
+bool g_calib_mode = false;      // 内参标定模式 ('i' 切换)
 string g_calib_cam_sn;          // 标定模式下的相机 SN
-int g_calib_counter = 0;        // 标定模式计数器
 
 // UI layout
 int g_win_w = 1224, g_win_h = 1024;
@@ -291,7 +290,6 @@ void onMouse(int event, int x, int y, int, void*) {
                 // 切换到不同相机 → 退出标定模式
                 if (g_calib_mode) {
                     g_calib_mode = false;
-                    g_calib_counter = 0;
                     cout << "[Calib Mode] OFF — camera switched." << endl;
                 }
                 g_enlarged_cam.store(idx);
@@ -454,6 +452,30 @@ int getNextCalibCounter(const string& save_dir) {
     return max_counter + 1;
 }
 
+// 统计目录内 jpg 数量 (计数器显示用)
+int countJpgs(const string& dir) {
+    int n = 0;
+    if (!fs::exists(dir)) return 0;
+    for (auto& e : fs::directory_iterator(dir))
+        if (e.path().extension() == ".jpg") n++;
+    return n;
+}
+
+// 目录内索引最大的 jpg 完整路径 (撤回用)
+string lastJpgIn(const string& dir) {
+    string best; int mx = -1;
+    if (!fs::exists(dir)) return best;
+    for (auto& e : fs::directory_iterator(dir)) {
+        if (e.path().extension() != ".jpg") continue;
+        string s = e.path().stem().string();
+        size_t u = s.find_last_of('_');
+        if (u == string::npos) continue;
+        try { int v = stoi(s.substr(u + 1)); if (v > mx) { mx = v; best = e.path().string(); } }
+        catch (...) {}
+    }
+    return best;
+}
+
 // ================== 主函数 ==================
 int main() {
     cout << "=== [TEST] Record Arm Data (Camera + Flange Pose) ===" << endl;
@@ -611,8 +633,10 @@ int main() {
             cv::putText(canvas, mode_text, cv::Point(g_right_x + 10, 62),
                         cv::FONT_HERSHEY_SIMPLEX, 0.5, mode_color, 2, cv::LINE_AA);
 
-            // Top-right: capture count
-            int capture_count = g_calib_mode ? g_calib_counter : (g_last_capture_index + 1);
+            // Top-right: 直接统计图片数量 (两种模式均以磁盘为准)
+            int capture_count = g_calib_mode
+                ? countJpgs(g_calib_save_dir + "/" + g_current_arm + "/" + g_calib_cam_sn)
+                : countJpgs(g_calib_save_dir);
             string cnt = "Captures: " + to_string(capture_count);
             cv::Size cnt_sz = cv::getTextSize(cnt, cv::FONT_HERSHEY_SIMPLEX, 0.8, 2, 0);
             cv::putText(canvas, cnt,
@@ -649,8 +673,8 @@ int main() {
             // Bottom-left hints
             int hx = g_right_x + 10, hy = g_win_h - 45;
             string hints = g_calib_mode
-                ? "[a] exit  [space] capture  [z] undo  Camera: " + g_calib_cam_sn
-                : "[t] switch  [space] capture  [z] undo  [a] calib  [r] resolve  [h] pipeline  [v] viz  [c] clear  [q] quit";
+                ? "[i] exit  [space] capture  [z] undo  Camera: " + g_calib_cam_sn
+                : "[t] switch  [space] capture  [z] undo  [i] calib  [r] resolve  [h] pipeline  [v] viz  [c] clear  [q] quit";
             cv::putText(canvas, hints, cv::Point(hx, hy),
                         cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
             hy += 18;
@@ -735,16 +759,11 @@ int main() {
         }
         else if (key == 'z' || key == 'Z') {
             if (g_calib_mode) {
-                if (g_calib_counter <= 0) {
-                    cout << "[Undo] No calib photos to undo." << endl;
-                } else {
-                    g_calib_counter--;
-                    stringstream ss; ss << setw(2) << setfill('0') << g_calib_counter;
-                    string calib_dir = g_calib_save_dir + "/" + g_current_arm + "/" + g_calib_cam_sn;
-                    string fn = calib_dir + "/calib_" + ss.str() + ".jpg";
-                    if (fs::exists(fn)) { fs::remove(fn); cout << "[Undo] Removed " << fn << endl; }
-                    else { cout << "[Undo] File not found: " << fn << endl; }
-                }
+                // 撤回索引最大的一张 (以磁盘为准)
+                string calib_dir = g_calib_save_dir + "/" + g_current_arm + "/" + g_calib_cam_sn;
+                string del = lastJpgIn(calib_dir);
+                if (del.empty()) { cout << "[Undo] No calib photos to undo." << endl; }
+                else { fs::remove(del); cout << "[Undo] Removed " << del << endl; }
             } else if (g_last_capture_index < 0) {
                 cout << "[Undo] No previous capture to undo." << endl;
             } else {
@@ -777,7 +796,7 @@ int main() {
                 cout << "[Undo] Done.\n" << endl;
             }
         }
-        else if (key == 'a' && !g_calib_mode) {
+        else if (key == 'i' && !g_calib_mode) {
             int cam_idx = g_enlarged_cam.load();
             if (cam_idx < 0 || cam_idx >= (int)cam_ctxs.size()) {
                 cout << "[Calib] No camera selected. Click a thumbnail first." << endl;
@@ -786,17 +805,16 @@ int main() {
                 g_calib_cam_sn = cam_ctxs[cam_idx]->sn;
                 string calib_dir = g_calib_save_dir + "/" + g_current_arm + "/" + g_calib_cam_sn;
                 fs::create_directories(calib_dir);
-                g_calib_counter = getNextCalibCounter(calib_dir);
                 cout << "\n[Calib Mode] ON — Camera: " << g_calib_cam_sn
                      << "  Arm: " << g_current_arm
-                     << "  Starting at: " << setfill('0') << setw(2) << g_calib_counter
-                     << "  (a=exit, space=capture, z=undo)" << endl;
+                     << "  Existing: " << countJpgs(calib_dir)
+                     << "  (i=exit, space=capture, z=undo)" << endl;
             }
         }
-        else if (key == 'a' && g_calib_mode) {
+        else if (key == 'i' && g_calib_mode) {
             g_calib_mode = false;
-            cout << "[Calib Mode] OFF — " << g_calib_counter << " photos captured for "
-                 << g_calib_cam_sn << endl;
+            cout << "[Calib Mode] OFF — " << countJpgs(g_calib_save_dir + "/" + g_current_arm + "/" + g_calib_cam_sn)
+                 << " photos captured for " << g_calib_cam_sn << endl;
         }
         else if (key == 'c') {
             cout << "\n[Clear] Removing all photos and mapping files..." << endl;
@@ -821,16 +839,16 @@ int main() {
                     cerr << "[Clear] Error: " << e.what() << endl;
                 }
             }
-            g_calib_counter = 0;
             g_last_capture_index = -1;
             cout << "[Clear] Removed " << removed << " files. Counters reset.\n" << endl;
         }
         else if (key == ' ') {
             if (g_calib_mode) {
-                // 内参标定模式: 保存到 save_dir/<arm>/<SN>/calib_<NN>.jpg
+                // 内参标定模式: 保存到 save_dir/<arm>/<SN>/calib_<NN>.jpg (索引由文件夹扫描决定)
                 string calib_dir = g_calib_save_dir + "/" + g_current_arm + "/" + g_calib_cam_sn;
                 fs::create_directories(calib_dir);
-                stringstream ss; ss << setw(2) << setfill('0') << g_calib_counter;
+                int counter = getNextCalibCounter(calib_dir);
+                stringstream ss; ss << setw(2) << setfill('0') << counter;
                 int cam_idx = -1;
                 for (int i = 0; i < (int)cam_ctxs.size(); ++i)
                     if (cam_ctxs[i]->sn == g_calib_cam_sn) { cam_idx = i; break; }
@@ -846,7 +864,6 @@ int main() {
                         string fn = calib_dir + "/calib_" + ss.str() + ".jpg";
                         cv::imwrite(fn, out_img);
                         cout << "  [Calib " << ss.str() << "] -> " << fn << endl;
-                        g_calib_counter++;
                     }
                 }
             } else {
