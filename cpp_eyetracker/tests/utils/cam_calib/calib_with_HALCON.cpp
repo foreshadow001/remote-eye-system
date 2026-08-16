@@ -40,6 +40,7 @@ string g_save_dir;  // calib_save_dir/{day_id}
 string g_xml_dir;   // 标定 XML 输出目录 = cam_calib.yaml: calib_save_dir/{input_day_id}/output
 atomic<bool> g_intr_mode{false};  // 内参标定模式 ('i' 切换; master 通过 MODE: 命令同步给 slave)
 string g_intr_root;               // 内参图片根目录 = calib_save_dir/{participant_id}/pictures
+string g_intr_xml_dir;            // 内参标定 XML 输出目录 = calib_save_dir/{participant_id}/output
 int g_win_w=1600, g_win_h=800, g_left_w, g_right_x, g_right_w, g_thumb_w, g_thumb_h;
 atomic<int> g_enlarged_cam{-1};
 // UI 模式: CAPTURE = 正常采集界面; CALIBRATING = 标定期间全屏状态界面 (不渲染缩略图, 降低 CPU)
@@ -112,9 +113,23 @@ bool launchChild(const string& exe_name,const string& display,PROCESS_INFORMATIO
 }
 bool launchHalconChain(){return launchChild("cam_calib_chain.exe","cam_calib_chain",g_halcon_pi);}
 bool launchIntrinsicsCalib(){return launchChild("calib_cam_intrinsics.exe","calib_cam_intrinsics",g_intrinsics_pi);}
+// 启动 viz_calib_chain.py 可视化 (参数 = 目录 ID: day_id 或 participant_id)
+void launchViz(const string& viz_id){
+    fs::path script=fs::path(__FILE__).parent_path()/"viz_calib_chain.py";
+    string cmd="python \""+script.string()+"\" "+viz_id;
+    STARTUPINFOA si{};si.cb=sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if(CreateProcessA(NULL,cmd.data(),NULL,NULL,FALSE,0,NULL,NULL,&si,&pi)){
+        CloseHandle(pi.hProcess);CloseHandle(pi.hThread);
+        cout<<"[Viz] Launched viz_calib_chain.py ("<<viz_id<<")"<<endl;
+    }else{
+        cerr<<"[Viz] Launch failed (error "<<GetLastError()<<"): "<<cmd<<endl;
+    }
+}
 #else
 bool launchHalconChain() { cerr << "[HALCON] Not supported on this platform." << endl; return false; }
 bool launchIntrinsicsCalib() { cerr << "[HALCON] Not supported on this platform." << endl; return false; }
+void launchViz(const string&) { cerr << "[Viz] Not supported on this platform." << endl; }
 #endif
 
 // ================== Camera ==================
@@ -231,6 +246,7 @@ int main(){
     g_save_dir=base_dir+"/"+did+"/pictures"; fs::create_directories(g_save_dir);
     string participant; try{participant=c["participant_id"].as<string>();}catch(...){participant="P001";}
     g_intr_root=base_dir+"/"+participant+"/pictures";   // 内参模式图片根目录 (per-SN 子目录)
+    g_intr_xml_dir=base_dir+"/"+participant+"/output";  // 内参标定 XML 输出目录
     // 标定 XML 输出目录 (cam_calib_chain 的输出, 与 calib_cam_chain.cpp 的计算一致)
     {
         string xdid=did; try{xdid=c["input_day_id"].as<string>();if(xdid.empty())xdid=did;}catch(...){}
@@ -251,6 +267,7 @@ int main(){
     cout<<"Save dir  : "<<g_save_dir<<endl;
     cout<<"XML dir   : "<<g_xml_dir<<endl;
     cout<<"Intrinsic : "<<participant<<" -> "<<g_intr_root<<endl;
+    cout<<"Intr XML  : "<<g_intr_xml_dir<<endl;
     if(test_xfer) cout<<"Recv dir  : "<<test_recv<<endl;
     cout<<"Cameras   : "<<sns.size()<<endl;
     for(size_t i=0;i<sns.size();++i)cout<<"  "<<i<<": SN="<<sns[i]<<endl;
@@ -370,13 +387,13 @@ int main(){
                 cv::Size csz=cv::getTextSize(cnt,cv::FONT_HERSHEY_SIMPLEX,0.8,2,0);
                 cv::putText(cv,cnt,cv::Point(g_right_x+g_right_w-csz.width-10,35),cv::FONT_HERSHEY_SIMPLEX,0.8,cv::Scalar(0,215,255),2,cv::LINE_AA);
                 string hints;
-                if(g_intr_mode.load())hints=g_enable_net_sync&&!g_is_master?"[SPACE] save enlarged  [z] undo  [c] clear  [ESC/q] quit":"[SPACE] save enlarged  [z] undo  [c] clear  [t] transfer  [i] extrinsics  [ESC/q] quit";
-                else hints=g_enable_net_sync&&!g_is_master?"[SPACE][z][c][t][ESC/q] disabled (Slave)":"[SPACE] capture  [z] undo  [c] clear  [t] transfer+calib  [i] intrinsics  [ESC/q] quit";
+                if(g_intr_mode.load())hints=g_enable_net_sync&&!g_is_master?"[SPACE] save enlarged  [z] undo  [c] clear  [ESC/q] quit":"[SPACE] save enlarged  [z] undo  [c] clear  [t] transfer  [v] viz  [i] extrinsics  [ESC/q] quit";
+                else hints=g_enable_net_sync&&!g_is_master?"[SPACE][z][c][t][ESC/q] disabled (Slave)":"[SPACE] capture  [z] undo  [c] clear  [t] transfer+calib  [v] viz  [i] intrinsics  [ESC/q] quit";
                 cv::putText(cv,hints,cv::Point(g_right_x+10,g_win_h-45),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(140,140,140),1,cv::LINE_AA);
-                // Bottom-right: save dir + XML dir (右对齐)
-                string sdir="Save: "+g_save_dir;cv::Size ssz=cv::getTextSize(sdir,cv::FONT_HERSHEY_SIMPLEX,0.35,1,0);
+                // Bottom-right: save dir + XML dir (右对齐; 内参模式显示 participant 目录)
+                string sdir=g_intr_mode.load()?"Save: "+g_intr_root:"Save: "+g_save_dir;cv::Size ssz=cv::getTextSize(sdir,cv::FONT_HERSHEY_SIMPLEX,0.35,1,0);
                 cv::putText(cv,sdir,cv::Point(g_right_x+g_right_w-ssz.width-10,g_win_h-35),cv::FONT_HERSHEY_SIMPLEX,0.35,cv::Scalar(140,140,140),1,cv::LINE_AA);
-                string xdir="XML : "+g_xml_dir;cv::Size xsz=cv::getTextSize(xdir,cv::FONT_HERSHEY_SIMPLEX,0.35,1,0);
+                string xdir=g_intr_mode.load()?"XML : "+g_intr_xml_dir:"XML : "+g_xml_dir;cv::Size xsz=cv::getTextSize(xdir,cv::FONT_HERSHEY_SIMPLEX,0.35,1,0);
                 cv::putText(cv,xdir,cv::Point(g_right_x+g_right_w-xsz.width-10,g_win_h-20),cv::FONT_HERSHEY_SIMPLEX,0.35,cv::Scalar(140,140,140),1,cv::LINE_AA);}
             cv::imshow("Calib Capture",cv);}
             lui=now;}
@@ -404,6 +421,13 @@ int main(){
                 g_intr_mode.store(!g_intr_mode.load());
                 if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,g_intr_mode.load()?"MODE:INTRINSIC":"MODE:EXTRINSIC");
                 cout<<"\n[Mode] "<<(g_intr_mode.load()?"INTRINSIC":"EXTRINSIC")<<" calibration mode"<<endl;
+            }
+        }
+        else if(key=='v'||key=='V'){
+            if(g_is_master||!g_enable_net_sync){
+                // 外参模式可视化 day 结果, 内参模式可视化 participant 结果
+                string viz_id=g_intr_mode.load()?fs::path(g_intr_root).parent_path().filename().string():fs::path(g_xml_dir).parent_path().filename().string();
+                launchViz(viz_id);
             }
         }
         else if(key==' '){

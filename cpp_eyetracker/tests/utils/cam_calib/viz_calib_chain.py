@@ -9,6 +9,7 @@ Each camera is shown with its XYZ axes and position label.
 Config:
   - cam_calib.yaml:   calib_save_dir, viz_day_id, center_cam
                      (day_id is the fallback if viz_day_id is empty)
+  - optional argv[1]:  directory ID override (day_id or participant_id)
 """
 
 import numpy as np
@@ -153,8 +154,10 @@ def main():
     base_dir  = calib.get("calib_save_dir", "D:/calib_images")
     center_sn = calib.get("center_cam", "")
     # day_id 由 cam_calib.yaml 自带 (D001 系列), viz_day_id 留空时回退到它
+    # 命令行参数可覆盖 (calib_with_HALCON 按 v 传入 day_id / participant_id):
+    #   python viz_calib_chain.py D001
     base_did  = calib.get("day_id", "D001")
-    viz_did   = calib.get("viz_day_id", "") or base_did
+    viz_did   = sys.argv[1] if len(sys.argv) > 1 else (calib.get("viz_day_id", "") or base_did)
 
     # Locate XML files
     xml_dir = os.path.join(base_dir, viz_did, "output")
