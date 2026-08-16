@@ -10,3 +10,7 @@ cpp_eyetracker/build/
 /.claude/
 
 cpp_eyetracker/log/
+
+# python cache
+__pycache__/
+*.py[cod]

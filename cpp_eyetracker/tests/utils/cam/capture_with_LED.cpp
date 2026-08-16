@@ -33,6 +33,7 @@
 #include "cam/basler.hpp"
 #include "cfg/config.hpp"
 #include "piper/piper.hpp"
+#include <yaml-cpp/yaml.h>
 
 namespace fs = std::filesystem;
 using namespace std;
@@ -769,6 +770,21 @@ void writeReport(const string& timestr, int rec_num, int total_frames, bool hw_t
 }
 
 // ================== main ==================
+// participant_id → day_id (cfg/day_participant_map.json; JSON 是 YAML 子集)
+string findDayForParticipant(const string& json_path, const string& participant) {
+    try {
+        YAML::Node root = YAML::LoadFile(json_path);
+        for (YAML::const_iterator it = root.begin(); it != root.end(); ++it) {
+            string day = it->first.as<string>();
+            for (size_t i = 0; i < it->second.size(); ++i)
+                if (it->second[i].as<string>() == participant) return day;
+        }
+    } catch (const std::exception& e) {
+        cerr << "[Piper] Failed to parse " << json_path << ": " << e.what() << endl;
+    }
+    return "";
+}
+
 int main() {
     _putenv("HDF5_USE_FILE_LOCKING=FALSE");
     // 安装时间戳输出 (所有 cout/cerr 行自动加 [YYYY-MM-DD HH:MM:SS] 前缀)
@@ -841,12 +857,22 @@ int main() {
         try{gaze_port=cfg_piper["network"]["gaze_port"].as<int>();}catch(...){gaze_port=49302;}
         g_gaze_dir="cfg/gaze_target/"+participant_id;
         auto readPt3=[](const CfgNode& n)->Pt3{return{n[0].as<double>(),n[1].as<double>(),n[2].as<double>()};};
-        for (auto& an:{"upper","lower"}) {
-            try{auto& a=cfg_piper["arms"][an];auto& tl=a["tool"];auto& cc=a["arm_in_ccs"];
-                auto& xf=(an==string("upper"))?g_xf_upper:g_xf_lower;
-                xf.tool_t=readPt3(tl["translation"]);xf.tool_r=readPt3(tl["rotation_zxz"]);
-                xf.ccs_t=readPt3(cc["translation"]);xf.ccs_r=readPt3(cc["rotation_zxz"]);}
-            catch(...){cerr<<"[Piper] WARN: cannot load "<<an<<" transform"<<endl;}
+        // 位姿从 cfg/arm_pose/{day_id}.yaml 加载 (day_id 由 participant_id 经 day_participant_map.json 映射, 不再是 piper.yaml)
+        string day_id=findDayForParticipant(cfg_dir+"/day_participant_map.json",participant_id);
+        string arm_pose_yml=cfg_dir+"/arm_pose/"+day_id+".yaml";
+        if(!day_id.empty()&&fs::exists(arm_pose_yml)){
+            Cfg cfg_pose(arm_pose_yml);
+            for (auto& an:{"upper","lower"}) {
+                try{auto& a=cfg_pose["arms"][an];auto& tl=a["tool"];auto& cc=a["arm_in_ccs"];
+                    auto& xf=(an==string("upper"))?g_xf_upper:g_xf_lower;
+                    xf.tool_t=readPt3(tl["translation"]);xf.tool_r=readPt3(tl["rotation_zxz"]);
+                    xf.ccs_t=readPt3(cc["translation"]);xf.ccs_r=readPt3(cc["rotation_zxz"]);}
+                catch(...){cerr<<"[Piper] WARN: cannot load "<<an<<" transform from "<<arm_pose_yml<<endl;}
+            }
+            cout<<"[Piper] Arm transforms loaded from "<<arm_pose_yml<<" (day "<<day_id<<")"<<endl;
+        }else{
+            cerr<<"[Piper] WARN: no arm_pose yaml for participant "<<participant_id
+                <<" — check cfg/day_participant_map.json. Transforms NOT loaded."<<endl;
         }
         auto loadTgts=[&](const string& path)->vector<array<double,3>>{
             vector<array<double,3>> out; ifstream in(path); string line;
