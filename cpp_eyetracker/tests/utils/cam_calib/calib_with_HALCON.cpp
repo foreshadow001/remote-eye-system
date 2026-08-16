@@ -200,6 +200,20 @@ void renderStatusScreen(const string& title,const string& sub1,const string& sub
     if(poll)cv::waitKey(1);
 }
 
+// 内参模式: 保存放大的相机到 pictures/{SN}/ (返回 false = 无选中/无帧)
+bool saveIntrinsicsFrame(){
+    int ci=g_enlarged_cam.load();
+    if(ci<0||ci>=(int)cam_ctxs.size()){cout<<"[Intrinsics] No camera selected."<<endl;return false;}
+    auto& ctx=cam_ctxs[ci];string dir=g_intr_root+"/"+ctx->sn;fs::create_directories(dir);
+    int ctr=getNextCounter(dir);stringstream ss;ss<<setw(2)<<setfill('0')<<ctr;
+    cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}
+    if(snap.empty()){cout<<"[Intrinsics] No frame yet."<<endl;return false;}
+    cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);
+    string fn=dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg";cv::imwrite(fn,out);
+    cout<<"\n[Intrinsics] Saved "<<fn<<endl;
+    return true;
+}
+
 // ================== TCP: Slave command handler (runs in dedicated thread) ==================
 void slaveCmdWorker(SOCKET s){
     while(global_running){
@@ -211,6 +225,9 @@ void slaveCmdWorker(SOCKET s){
             cout<<"[Slave] UNDO index "<<ss.str()<<endl;
             if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir)){string st=e.path().stem().string();if(st.rfind("calib_cam_",0)==0&&st.length()>=2&&st.substr(st.length()-2)==ss.str())fs::remove(e.path());}g_last_idx.store(idx-1);if(g_capture_count>0)g_capture_count--;}
         else if(line.rfind("MODE:",0)==0){string m=line.substr(5);g_intr_mode.store(m=="INTRINSIC");cout<<"[Slave] Calibration mode: "<<(g_intr_mode.load()?"INTRINSIC":"EXTRINSIC")<<endl;}
+        else if(line=="IPHOTO"){cout<<"[Slave] IPHOTO request from master"<<endl;
+            if(g_intr_mode.load()&&saveIntrinsicsFrame())sendLine(s,"IPHOTO_OK");
+            else sendLine(s,"IPHOTO_NOSEL");}
         else if(line=="LIST_REQ"){cout<<"[Slave] LIST request"<<endl;stringstream fl;for(auto& f:scanFiles(picRoot(),g_intr_mode.load()))fl<<f<<",";sendLine(s,"LIST_RESP:"+fl.str());cout<<"[Slave] Sent file list"<<endl;}
         else if(line=="CLEAR"){cout<<"[Slave] CLEAR \xe2\x80\x94 removing all calibration photos"<<endl;if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;g_last_idx=-1;sendLine(s,"CLEAR_DONE");cout<<"[Slave] Cleared."<<endl;}
         else if(line.rfind("XFER:",0)==0){string lst=line.substr(5);stringstream ss(lst);string tok;vector<string> files;while(getline(ss,tok,','))if(!tok.empty())files.push_back(tok);
@@ -390,7 +407,7 @@ int main(){
                 cv::Size csz=cv::getTextSize(cnt,cv::FONT_HERSHEY_SIMPLEX,0.8,2,0);
                 cv::putText(cv,cnt,cv::Point(g_right_x+g_right_w-csz.width-10,35),cv::FONT_HERSHEY_SIMPLEX,0.8,cv::Scalar(0,215,255),2,cv::LINE_AA);
                 string hints;
-                if(g_intr_mode.load())hints=g_enable_net_sync&&!g_is_master?"[SPACE] save enlarged  [z] undo  [c] clear  [ESC/q] quit":"[SPACE] save enlarged  [z] undo  [c] clear  [t] transfer  [v] viz  [i] extrinsics  [ESC/q] quit";
+                if(g_intr_mode.load())hints=g_enable_net_sync&&!g_is_master?"[click] select camera (master SPACE to save)  [ESC/q] quit":"[SPACE] save enlarged (none sel. -> slave)  [z] undo  [c] clear  [t] transfer  [v] viz  [i] extrinsics  [ESC/q] quit";
                 else hints=g_enable_net_sync&&!g_is_master?"[SPACE][z][c][t][ESC/q] disabled (Slave)":"[SPACE] capture  [z] undo  [c] clear  [t] transfer+calib  [v] viz  [i] intrinsics  [ESC/q] quit";
                 cv::putText(cv,hints,cv::Point(g_right_x+10,g_win_h-45),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(140,140,140),1,cv::LINE_AA);
                 // Bottom-right: save dir + XML dir (右对齐; 内参模式显示 participant 目录)
@@ -435,16 +452,15 @@ int main(){
         }
         else if(key==' '){
             if(g_intr_mode.load()){
-                // 内参模式: 只保存放大的相机 (master/slave 各自保存自己的相机, 到 pictures/{SN}/)
-                int ci=g_enlarged_cam.load();
-                if(ci<0||ci>=(int)cam_ctxs.size()){cout<<"[Intrinsics] No camera selected."<<endl;continue;}
-                auto& ctx=cam_ctxs[ci];string dir=g_intr_root+"/"+ctx->sn;fs::create_directories(dir);
-                int ctr=getNextCounter(dir);stringstream ss;ss<<setw(2)<<setfill('0')<<ctr;
-                cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}
-                if(snap.empty()){cout<<"[Intrinsics] No frame yet."<<endl;continue;}
-                cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);
-                string fn=dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg";cv::imwrite(fn,out);
-                cout<<"\n[Intrinsics] Saved "<<fn<<endl;
+                if(g_enable_net_sync&&!g_is_master){/* slave 内参模式: 按键禁用, 只负责选中相机 */}
+                else if(g_enlarged_cam.load()<0&&g_enable_net_sync&&g_is_master){
+                    // master 未选中相机 → 命令 slave 对其选中相机拍照保存
+                    sendLine(g_ctrl_sock,"IPHOTO");string resp;recvLine(g_ctrl_sock,resp,3000);
+                    if(resp=="IPHOTO_OK")cout<<"\n[Intrinsics] Slave saved its selected camera."<<endl;
+                    else if(resp=="IPHOTO_NOSEL")cout<<"[Intrinsics] Slave has no camera selected."<<endl;
+                    else cout<<"[Intrinsics] No response from slave."<<endl;
+                }
+                else{saveIntrinsicsFrame();}   // 保存本机放大相机的画面
             }
             else if(g_enable_net_sync&&!g_is_master){/* 外参模式: slave 由 master PHOTO 命令驱动 */}
             else{int ctr=getNextCounter(g_save_dir);stringstream ss;ss<<setw(2)<<setfill('0')<<ctr;if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"PHOTO:"+to_string(ctr));g_last_idx.store(ctr);g_capture_count++;
@@ -491,13 +507,14 @@ int main(){
                 if(launchHalconChain()){g_calib_title="cam_calib_chain is running";g_ui_mode=UiMode::CALIBRATING;g_calib_start=chrono::steady_clock::now();}}}
         else if((key=='z'||key=='Z')&&!g_fault_active.load()){
             if(g_intr_mode.load()){
-                // 内参模式: 撤回放大相机的最后一张 (master/slave 各自本地)
-                int ci=g_enlarged_cam.load();
+                // 内参模式: 撤回放大相机的最后一张 (slave 按键禁用, 只负责选中)
+                if(g_enable_net_sync&&!g_is_master){}
+                else{int ci=g_enlarged_cam.load();
                 if(ci<0||ci>=(int)cam_ctxs.size()){cout<<"[Intrinsics] No camera selected."<<endl;continue;}
                 string dir=g_intr_root+"/"+cam_ctxs[ci]->sn;string del=lastImageIn(dir);
                 if(del.empty()){cout<<"[Intrinsics] No images to undo."<<endl;continue;}
                 fs::remove(del);
-                cout<<"\n[Intrinsics] Undo: removed "<<del<<endl;
+                cout<<"\n[Intrinsics] Undo: removed "<<del<<endl;}
             }
             else{int li=g_last_idx.load();if(li<0){cout<<"[Undo] No previous capture to undo."<<endl;continue;}stringstream ss;ss<<setw(2)<<setfill('0')<<li;
             cout<<"\n[Undo] Deleting capture index "<<ss.str()<<endl;
@@ -505,12 +522,13 @@ int main(){
             cout<<"[Undo] Done.\n"<<endl;}}
         else if(key=='c'||key=='C'){
             if(g_intr_mode.load()){
-                // 内参模式: 清除放大相机的全部图片 (master/slave 各自本地)
-                int ci=g_enlarged_cam.load();
+                // 内参模式: 清除放大相机的全部图片 (slave 按键禁用, 只负责选中)
+                if(g_enable_net_sync&&!g_is_master){}
+                else{int ci=g_enlarged_cam.load();
                 if(ci<0||ci>=(int)cam_ctxs.size()){cout<<"[Intrinsics] No camera selected."<<endl;continue;}
                 string dir=g_intr_root+"/"+cam_ctxs[ci]->sn;int n=countImages(dir);
                 if(fs::exists(dir))for(auto& e:fs::directory_iterator(dir))if(e.path().extension()==".jpg")fs::remove(e.path());
-                cout<<"\n[Intrinsics] Cleared "<<n<<" images from "<<dir<<endl;
+                cout<<"\n[Intrinsics] Cleared "<<n<<" images from "<<dir<<endl;}
             }
             else if(g_is_master&&g_enable_net_sync){
             cout<<"\n[Clear] Removing local calibration photos..."<<endl;
