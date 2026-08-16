@@ -133,6 +133,7 @@ atomic<bool> g_piper_busy{false};
 struct ArmTransform { Pt3 tool_t, tool_r, ccs_t, ccs_r; };
 ArmTransform g_xf_upper, g_xf_lower;
 string g_arm_pose_yml;   // 加载的 arm pose yaml (cfg/... 相对路径, UI 水印显示)
+string g_participant_id; // participant_id (UI 水印显示)
 vector<array<double,3>> g_targets_upper, g_targets_lower;
 string g_gaze_dir;
 struct ArmPose { double x,y,z, qx,qy,qz,qw, alpha,beta,gamma; bool valid=false; };
@@ -804,6 +805,7 @@ int main() {
     Pylon::PylonInitialize();
     g_participant_roots=cap["participant_root"].as<vector<string>>();
     string participant_id; try{participant_id=cap["participant_id"].as<string>();}catch(...){participant_id="P001";}
+    g_participant_id=participant_id;
     for(auto& r:g_participant_roots) r+="/"+participant_id;
     g_sentry_root=g_participant_roots[0];
     try{g_hdf5_chunk_capacity=cap["hdf5_chunk_frame_capacity"].as<int>();}catch(...){}
@@ -1147,11 +1149,15 @@ int main() {
                     }
                 }
 
-                // Bottom-right: arm pose 输入 (从 cfg 开始显示)
+                // Bottom-right 水印: participant + arm pose (位于状态行上方, 右对齐)
+                string wm = "Participant: " + g_participant_id;
+                cv::Size wsz = cv::getTextSize(wm, cv::FONT_HERSHEY_SIMPLEX, 0.35, 1, 0);
+                cv::putText(canvas, wm, cv::Point(g_right_x + g_right_w - wsz.width - 10, g_win_h - 95),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
                 if (is_master_pc && !g_arm_pose_yml.empty()) {
                     string ap = "Arm pose: " + g_arm_pose_yml;
                     cv::Size apsz = cv::getTextSize(ap, cv::FONT_HERSHEY_SIMPLEX, 0.35, 1, 0);
-                    cv::putText(canvas, ap, cv::Point(g_right_x + g_right_w - apsz.width - 10, g_win_h - 30),
+                    cv::putText(canvas, ap, cv::Point(g_right_x + g_right_w - apsz.width - 10, g_win_h - 75),
                                 cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
                 }
 
