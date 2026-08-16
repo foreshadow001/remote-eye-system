@@ -1208,10 +1208,7 @@ int main() {
                     cout<<"[Piper] Moving to next target..."<<endl;
                     arm_thread=thread([&](){
                         ArmResult ar = moveArmToTarget();
-                        if(ar==ArmResult::ARM_OK){
-                            int& idx=(g_arm=="upper")?g_upper_idx:g_lower_idx;
-                            idx++; updatePiperSentry();
-                        } else if(ar==ArmResult::ARM_EXHAUSTED){
+                        if(ar==ArmResult::ARM_EXHAUSTED){
                             g_show_exhausted = true;
                         } else {
                             logException("ERROR","piper","arm move failed");
@@ -1398,7 +1395,6 @@ int main() {
               cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
             ArmResult ar = moveArmToTarget();
             if(ar==ArmResult::ARM_OK){
-                int& idx=(g_arm=="upper")?g_upper_idx:g_lower_idx; idx++; updatePiperSentry();
                 this_thread::sleep_for(chrono::milliseconds(200));g_recording_enabled=true;
                 cout<<"[s] Session started. SPACE to record."<<endl;
             } else if(ar==ArmResult::ARM_EXHAUSTED){
@@ -1455,6 +1451,11 @@ int main() {
         }
 
         if((trigger_start||net_cmd_record.exchange(false))&&!is_recording&&!is_dumping){
+            if(is_master_pc&&trigger_start){
+                // 录制开始: 当前目标指令已被使用, 此时才推进 sentry (按 t/b 放弃时不推进)
+                int& idx=(g_arm=="upper")?g_upper_idx:g_lower_idx;
+                idx++; updatePiperSentry();
+            }
             current_record_timestr=shared_record_timestr;
             record_start_time=global_record_start_time;
             is_recording=true; cout<<"[Info] Recording in progress..."<<endl;
