@@ -92,22 +92,30 @@ def parse_camera_xml(xml_path):
 
 def euler_gba_to_matrix(alpha_deg, beta_deg, gamma_deg):
     """
-    HALCON 'gba' rotation: R = Rz(alpha) * Ry(beta) * Rz(gamma), angles in degrees.
-    Returns 3x3 rotation matrix.
+    HALCON 'gba' rotation (PoseTypeCode=0, OrderOfRotation='gba'):
+      R = Rx(alpha) * Ry(beta) * Rz(gamma)
+    官方文档 (create_pose): R('gba') = Rx(RotX) * Ry(RotY) * Rz(RotZ),
+    其中 RotX=alpha (绕 X), RotY=beta (绕 Y), RotZ=gamma (绕 Z).
+    从右往左读: 先绕固定坐标系 z 轴转 gamma, 再绕旧 y 轴转 beta, 最后绕旧 x 轴转 alpha.
+    Angles in degrees. Returns 3x3 rotation matrix.
     """
     a = np.radians(alpha_deg)
     b = np.radians(beta_deg)
     g = np.radians(gamma_deg)
 
-    def Rz(t):
+    def Rx(t):
         c, s = np.cos(t), np.sin(t)
-        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
 
     def Ry(t):
         c, s = np.cos(t), np.sin(t)
         return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
 
-    return Rz(a) @ Ry(b) @ Rz(g)
+    def Rz(t):
+        c, s = np.cos(t), np.sin(t)
+        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+    return Rx(a) @ Ry(b) @ Rz(g)
 
 
 # ==================== Visualization ====================
@@ -320,7 +328,7 @@ def main():
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
     ax.set_zlabel('Z (m)')
-    ax.set_title(f'Camera Extrinsics — {len(cameras)} cameras in "{center_cam["sn"]}" frame\n{viz_did}\nClick a camera to see XYZ + intrinsics', fontsize=12)
+    ax.set_title(f'Camera Extrinsics — {len(cameras)} cameras in "{center_cam["sn"]}" frame\nXML: {xml_dir}\nClick a camera to see XYZ + intrinsics', fontsize=12)
 
     mid = np.mean(all_positions, axis=0)
     rng = max(np.max(np.ptp(all_positions, axis=0)) * 0.6, 0.5)
