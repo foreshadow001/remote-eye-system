@@ -115,6 +115,8 @@ bool launchHalconChain(){return launchChild("cam_calib_chain.exe","cam_calib_cha
 bool launchIntrinsicsCalib(){return launchChild("calib_cam_intrinsics.exe","calib_cam_intrinsics",g_intrinsics_pi);}
 // 启动 viz_calib_chain.py 可视化 (参数 = 目录 ID: day_id 或 participant_id)
 void launchViz(const string& viz_id){
+    // 本机默认 Qt 后端不可用, 强制 TkAgg (与 DEV_GUIDE 一致: $env:MPLBACKEND="TkAgg"), 子进程继承
+    SetEnvironmentVariableA("MPLBACKEND","TkAgg");
     fs::path script=fs::path(__FILE__).parent_path()/"viz_calib_chain.py";
     string cmd="python \""+script.string()+"\" "+viz_id;
     STARTUPINFOA si{};si.cb=sizeof(si);

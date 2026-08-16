@@ -10,7 +10,11 @@ Config:
   - cam_calib.yaml:   calib_save_dir, viz_day_id, center_cam
                      (day_id is the fallback if viz_day_id is empty)
   - optional argv[1]:  directory ID override (day_id or participant_id)
+  - MPLBACKEND:        forced to TkAgg (default Qt backend unavailable on this machine)
 """
+
+import os
+os.environ.setdefault("MPLBACKEND", "TkAgg")  # 本机默认 Qt 后端不可用, 强制 TkAgg (与 DEV_GUIDE 一致)
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -18,7 +22,6 @@ from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import xml.etree.ElementTree as ET
 import yaml
-import os
 import sys
 import glob
 import re
