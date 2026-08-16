@@ -1416,7 +1416,18 @@ int main() {
                 if(g_upper_done&&g_lower_done) cout<<"[SPACE] Both arms DONE. Press [c] to clear sentry."<<endl;
             }
         }
-        else if(is_master_pc&&(key=='b'||key=='B')&&!g_piper_busy){zeroArm(g_arm);}
+        else if(is_master_pc&&(key=='b'||key=='B')&&!g_piper_busy){
+            g_recording_enabled=false;               // 回零后需按 s 才能录制
+            g_show_exhausted=false;
+            g_led_state=LedState::WAITING;           // 立刻进入 WAITING 状态
+            { cv::Mat loading=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
+              cv::putText(loading,"Zeroing arm...",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,200,255),2);
+              drawLedIndicator(loading);
+              cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
+            zeroArm(g_arm);
+            g_led_state=LedState::PIPER_INIT;        // 回零完成 → INIT (按 s 开始录制)
+            cout<<"[Piper] "<<g_arm<<" zeroed. Press [s] to start session."<<endl;
+        }
         else if(is_master_pc&&(key=='c'||key=='C')&&!g_piper_busy){
             // Clear only current arm's piper sentry
             if(g_arm=="upper"){g_upper_idx=0;g_upper_done=false;}
