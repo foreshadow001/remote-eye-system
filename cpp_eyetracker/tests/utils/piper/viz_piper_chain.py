@@ -7,6 +7,7 @@ import yaml
 import matplotlib; matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from mpl_toolkits.mplot3d import proj3d
 
 # ---------------------------------------------------------------------------
 def quat_to_rot(qx, qy, qz, qw):
@@ -23,13 +24,12 @@ def draw_axes(ax, pos, quat, length=0.04, lw=2.5, alpha=1.0):
         ax.quiver(pos[0],pos[1],pos[2], R[0,i]*length,R[1,i]*length,R[2,i]*length,
                   color=c, linewidth=lw, arrow_length_ratio=0.25, alpha=alpha)
 
-def draw_text(ax, pos, text, color="#2B2B2B", offset=None):
-    # 悬浮信息: 浅色圆角矩形 + 深色文字 (offset: 世界坐标偏移, 避免与坐标轴/其他标签重叠)
-    p = np.array(pos, dtype=float)
-    if offset is not None:
-        p = p + np.array(offset, dtype=float)
-    ax.text(p[0],p[1],p[2],text,fontsize=9,color=color,
-            bbox=dict(boxstyle="round,pad=0.15",fc="#FAFAF2",ec="#9E9E9E",lw=0.6,alpha=0.92))
+def draw_text(ax, pos, text, color="#2B2B2B", dx=14, dy=0):
+    # 悬浮信息: 投影到屏幕后按像素偏移锚定 (dx/dy: 显示像素),
+    # 锚点(坐标系原点)始终位于方框外, 且各标签可用 dy 上下错开
+    x2, y2, _ = proj3d.proj_transform(pos[0], pos[1], pos[2], ax.get_proj())
+    ax.text2D(x2 + dx, y2 + dy, text, fontsize=9, color=color,
+              bbox=dict(boxstyle="round,pad=0.15",fc="#FAFAF2",ec="#9E9E9E",lw=0.6,alpha=0.92))
 
 # ---------------------------------------------------------------------------
 def load(path):
@@ -81,9 +81,11 @@ class App:
             axb = plt.axes([0.15 + i * 0.16, 0.015, 0.13, 0.045])
             axb.axis("off")
             axb.set_xlim(0, 1); axb.set_ylim(0, 1)
+            # 圆角矩形按钮: pad=0 保证圆弧不被裁剪
             patch = mpatches.FancyBboxPatch((0, 0), 1, 1, transform=axb.transAxes,
-                                            boxstyle="round,pad=0.02,rounding_size=0.25",
+                                            boxstyle="round,pad=0,rounding_size=0.35",
                                             fc="#37474F", ec="none")
+            patch.set_clip_on(False)
             axb.add_patch(patch)
             lab = axb.text(0.5, 0.5, name.upper(), transform=axb.transAxes,
                            ha="center", va="center", fontsize=10, color="white",
@@ -167,33 +169,25 @@ class App:
         R_err = quat_to_rot(*cq).T @ quat_to_rot(*bq)
         tr = np.trace(R_err); err_deg = math.acos(max(-1,min(1,(tr-1)/2)))*180/math.pi
 
-        # 3D axes (悬浮框与坐标轴保持一定距离)
+        # 3D axes (悬浮框屏幕锚定: 锚点在框外, 标签间按像素上下错开)
         draw_axes(self.ax, np.zeros(3), (0,0,0,1), self.AL, lw=2.5, alpha=0.9)
-        draw_text(self.ax, np.zeros(3), "Cam", offset=(0.022, 0.016, 0.004))
+        draw_text(self.ax, np.zeros(3), "Cam", dx=16, dy=20)
         draw_axes(self.ax, ap, aq, self.AL, lw=2.5, alpha=0.8)
-        draw_text(self.ax, ap, "Arm", offset=(0.022, 0.016, 0.004))
+        draw_text(self.ax, ap, "Arm", dx=16, dy=20)
         self.ax.plot([0,ap[0]],[0,ap[1]],[0,ap[2]],"gray",lw=0.6,ls="--")
         draw_axes(self.ax, fp, fq, self.AL*0.8, lw=2, alpha=0.8)
-        draw_text(self.ax, fp, f"Flange [{idx:02d}]", offset=(0.018, -0.020, 0.004))
+        draw_text(self.ax, fp, f"Flange [{idx:02d}]", dx=16, dy=-30)
         self.ax.plot([ap[0],fp[0]],[ap[1],fp[1]],[ap[2],fp[2]],"cyan",lw=0.6,ls="--")
         draw_axes(self.ax, cp, cq, self.AL*0.8, lw=2, alpha=0.85)
         self.ax.plot([fp[0],cp[0]],[fp[1],cp[1]],[fp[2],cp[2]],"orange",lw=0.6,ls="--")
         draw_axes(self.ax, bp, bq, self.AL*0.8, lw=2.5, alpha=0.9)
         self.ax.plot([cp[0],bp[0]],[cp[1],bp[1]],[cp[2],bp[2]],"red",lw=2)
 
-        # Calib(est)/Board(GT)/Δ 三个悬浮框沿 cp→bp 的垂直方向错开, 避免重叠
-        d = bp - cp
-        dn = float(np.linalg.norm(d))
-        u = d/dn if dn > 1e-9 else np.array([1.0, 0.0, 0.0])
-        nrm = np.cross(u, np.array([0.0, 0.0, 1.0]))
-        if np.linalg.norm(nrm) < 1e-9:
-            nrm = np.array([0.0, 1.0, 0.0])
-        nrm = nrm / np.linalg.norm(nrm)
-        s = 0.032   # 分离间距 (m)
-        draw_text(self.ax, cp, "Calib(est)", offset=-nrm * s)
-        draw_text(self.ax, bp, "Board(GT)", offset=nrm * s)
+        # Calib(est)/Board(GT)/Δ 三框上下分开: 分别投影到 cp / bp / 中点, 像素级错开
+        draw_text(self.ax, cp, "Calib(est)", dx=16, dy=34)
+        draw_text(self.ax, bp, "Board(GT)", dx=16, dy=2)
         mid = (cp + bp) / 2
-        draw_text(self.ax, mid, f"Δ{err_mm:.1f}mm", color="#C62828", offset=nrm * s * 2.4)
+        draw_text(self.ax, mid, f"Δ{err_mm:.1f}mm", color="#C62828", dx=16, dy=-30)
 
         pts = [np.zeros(3),ap,fp,cp,bp]; pts = np.array(pts)
         lo,hi = pts.min(0),pts.max(0); pad = max((hi-lo).max()*0.25,0.06)
@@ -221,8 +215,14 @@ class App:
                           fontsize=11, color="white", family="monospace", fontweight="bold")
 
         GOOD_POS, GOOD_ROT = 10.0, 5.0   # 误差着色阈值 (mm / deg)
-        def hdr_txt(y, txt):
-            self.ax_side.text(0.07, y, txt, transform=self.ax_side.transAxes,
+        def hdr_txt(y, txt, ac="#00838F"):
+            # 节标题: 左侧彩色圆角强调条 + 深灰加粗文字
+            bar = mpatches.FancyBboxPatch((0.055, y - 0.014), 0.010, 0.028,
+                                          transform=self.ax_side.transAxes,
+                                          boxstyle="round,pad=0,rounding_size=0.5",
+                                          fc=ac, ec="none", zorder=2)
+            self.ax_side.add_patch(bar)
+            self.ax_side.text(0.085, y, txt, transform=self.ax_side.transAxes,
                               fontsize=10, color="#37474F", family="monospace",
                               fontweight="bold", ha="left", va="center")
         def pair(y, label, value, vc="#2B2B2B"):
@@ -239,14 +239,25 @@ class App:
         def sep(y):
             self.ax_side.plot([0.07, 0.93], [y, y], transform=self.ax_side.transAxes,
                               color="#D0D0D0", lw=0.8, zorder=2)
+        def frac_bar(y, frac):
+            self.ax_side.add_patch(mpatches.FancyBboxPatch((0.07, y), 0.86, 0.014,
+                                  transform=self.ax_side.transAxes,
+                                  boxstyle="round,pad=0,rounding_size=0.5",
+                                  fc="#E4E4DE", ec="none", zorder=2))
+            if frac > 0:
+                self.ax_side.add_patch(mpatches.FancyBboxPatch((0.07, y), 0.86 * min(frac, 1.0), 0.014,
+                                      transform=self.ax_side.transAxes,
+                                      boxstyle="round,pad=0,rounding_size=0.5",
+                                      fc="#00838F", ec="none", zorder=3))
 
         y = 0.855
-        hdr_txt(y, "THIS FRAME"); y -= 0.055
+        hdr_txt(y, "THIS FRAME", "#00838F"); y -= 0.055
         pair(y, "dPos", f"{err_mm:6.2f} mm", "#2E7D32" if err_mm < GOOD_POS else "#C62828"); y -= 0.052
         pair(y, "dRot", f"{err_deg:6.2f} deg", "#2E7D32" if err_deg < GOOD_ROT else "#C62828"); y -= 0.062
         sep(y + 0.031)
-        hdr_txt(y, "ALL FRAMES"); y -= 0.055
-        pair(y, "valid", f"{s['n_valid']:2d} / {s['n_total']:2d}"); y -= 0.050
+        hdr_txt(y, "ALL FRAMES", "#E65100"); y -= 0.055
+        pair(y, "valid", f"{s['n_valid']:2d} / {s['n_total']:2d}"); y -= 0.042
+        frac_bar(y + 0.021, s['n_valid'] / s['n_total'] if s['n_total'] else 0.0); y -= 0.042
         sub(y, "pos (mm)"); y -= 0.042
         pair(y, "mean", f"{s['pos_mm'].mean():6.2f}"); y -= 0.038
         pair(y, "med", f"{np.median(s['pos_mm']):6.2f}"); y -= 0.038
