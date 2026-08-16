@@ -88,7 +88,12 @@ class App:
     def load_arm_data(self, arm):
         path = self.data_dir / f"chain_viz_{arm}.txt"
         if not path.exists():
+            # chain 文件缺失 (save_piper_chain 尚未运行): 填默认值, 避免后续 KeyError
+            print(f"[Warn] {path} not found — run save_piper_chain first.")
             self.frames[arm] = []
+            self.arm_ccs[arm] = None
+            self.stats[arm] = dict(n_valid=0, n_total=0,
+                                   pos_mm=np.array([0]), rot_deg=np.array([0]))
             return
         ccs, all_f = load(path)
         self.arm_ccs[arm] = ccs
