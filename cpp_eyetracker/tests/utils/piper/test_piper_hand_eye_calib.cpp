@@ -92,6 +92,10 @@ void writeArmPoseYaml(const fs::path& path, const Cfg& piper_cfg,
         out << "    arm_in_ccs:\n";
         out << "      translation: [" << r.ccs[0] << ", " << r.ccs[1] << ", " << r.ccs[2] << "]\n";
         out << "      rotation_zxz: [" << r.ccs[3] << ", " << r.ccs[4] << ", " << r.ccs[5] << "]\n";
+        // board_in_flange: 标定结果 (save_piper_chain 计算 calib board 位姿所需)
+        out << "    board_in_flange:\n";
+        out << "      translation: [" << r.cb[0] << ", " << r.cb[1] << ", " << r.cb[2] << "]\n";
+        out << "      rotation_zxz: [" << r.cb[3] << ", " << r.cb[4] << ", " << r.cb[5] << "]\n";
     }
     out.close();
     cout << "[ArmPose] Written: " << path.string() << endl;

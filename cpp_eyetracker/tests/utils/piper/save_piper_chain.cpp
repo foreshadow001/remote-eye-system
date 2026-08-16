@@ -1,5 +1,5 @@
 // 保存坐标系转换链中间量，供 viz_piper_chain.py 可视化
-// 使用 piper.yaml 中 calib_board_in_flange 和 calib_arm_in_ccs 的 init_value
+// 使用 cfg/arm_pose/{day_id}.yaml (手眼标定结果) 的 arm_in_ccs + board_in_flange
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -51,42 +51,38 @@ static map<int, Pose> loadBoardGT(const string& path) {
 
 int main() {
     auto cfg_dir = fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path() / "cfg";
-    Cfg cfg((cfg_dir / "piper.yaml").string());
     Cfg arm_cfg((cfg_dir / "calib_arm.yaml").string());
     // 数据在 calib_save_dir/{day_id}/ 下 (day_id 与 test_record_arm_data/resolve 一致)
     string day_id = arm_cfg["record"]["day_id"].as<string>();
-    string data_dir  = cfg["test_record_arm_data"]["calib_save_dir"].as<string>() + "/" + day_id;
+    string data_dir  = arm_cfg["record"]["calib_save_dir"].as<string>() + "/" + day_id;
     string board_dir = data_dir;   // board_poses_*.txt 与 chain_viz_*.txt 均在此目录
     cout << "Data dir: " << data_dir << endl;
+
+    // 手眼标定结果 (test_piper_hand_eye_calib 的输出, 不是 piper.yaml)
+    fs::path arm_pose_path = cfg_dir / "arm_pose" / (day_id + ".yaml");
+    if (!fs::exists(arm_pose_path)) {
+        cerr << "[Fatal] Not found: " << arm_pose_path.string()
+             << " — run test_piper_hand_eye_calib first." << endl;
+        return 1;
+    }
+    Cfg arm_pose(arm_pose_path.string());
+    cout << "Arm pose : " << arm_pose_path.string() << endl;
 
     for (auto& arm_name : {"upper", "lower"}) {
         cout << "\n===== Arm: " << arm_name << " =====" << endl;
 
-        // arm_in_ccs: 根据配置读取标定前/后; calib_board_in_flange: init_value (固定)
-        bool use_calib = false;
-        try { use_calib = cfg["resolve_calib_board_pose"]["use_calibrated_arm_in_ccs"].as<bool>(); }
-        catch (...) {}
+        // arm_in_ccs + board_in_flange: 手眼标定结果
         Pt3 cb_t{0,0,0}, cb_r{0,0,0}, ccs_t{0,0,0}, ccs_r{0,0,0};
         try {
-            auto& a = cfg["arms"][arm_name];
-            if (use_calib) {
-                auto& cb = a["board_in_flange"];
-                cb_t = readPt3(cb["translation"]);
-                cb_r = readPt3(cb["rotation_zxz"]);
-            } else {
-                auto& cb = a["calib_board_in_flange"];
-                cb_t = readPt3(cb["translation"]["init_value"]);
-                cb_r = readPt3(cb["rotation_zxz"]["init_value"]);
-            }
-            if (use_calib) {
-                ccs_t = readPt3(a["arm_in_ccs"]["translation"]);
-                ccs_r = readPt3(a["arm_in_ccs"]["rotation_zxz"]);
-            } else {
-                ccs_t = readPt3(a["calib_arm_in_ccs"]["translation"]["init_value"]);
-                ccs_r = readPt3(a["calib_arm_in_ccs"]["rotation_zxz"]["init_value"]);
-            }
-            cout << "  arm_in_ccs: " << (use_calib ? "calibrated" : "init_value") << endl;
-        } catch (...) { cout << "Not configured, skipping." << endl; continue; }
+            auto& a = arm_pose["arms"][arm_name];
+            auto& cb = a["board_in_flange"];
+            cb_t = readPt3(cb["translation"]);
+            cb_r = readPt3(cb["rotation_zxz"]);
+            auto& ccs = a["arm_in_ccs"];
+            ccs_t = readPt3(ccs["translation"]);
+            ccs_r = readPt3(ccs["rotation_zxz"]);
+            cout << "  arm_in_ccs + board_in_flange: calibrated" << endl;
+        } catch (...) { cout << "Not calibrated, skipping." << endl; continue; }
 
         Pose arm_in_ccs = {{ccs_t.x, ccs_t.y, ccs_t.z},
                             zxzToQuat(ccs_r.x, ccs_r.y, ccs_r.z)};

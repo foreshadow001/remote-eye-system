@@ -176,7 +176,8 @@ class App:
         self.ax.set_zlim(mid[2]-r,mid[2]+r)
         self.ax.set_xlabel("X (m)"); self.ax.set_ylabel("Y (m)"); self.ax.set_zlabel("Z (m)")
         self.ax.set_title(f"[{self.arm.upper()}] Frame {idx:02d}  ({self.i+1}/{self.n})",fontsize=13)
-        self.ax.view_init(elev=-90, azim=-90)
+        # 初始视角: 指向相机坐标系 z 轴负方向, x 轴向左, y 轴向下 (与 viz_calib_chain 一致)
+        self.ax.view_init(elev=90, azim=90)
 
         # sidebar
         s = self.stats[self.arm]
