@@ -2,13 +2,13 @@
 """
 viz_calib_chain.py — 3D visualization of multi-camera calibration extrinsics.
 
-Reads CameraData XML files from calib_save_dir/{viz_participant_id}/output/
+Reads CameraData XML files from calib_save_dir/{viz_day_id}/output/
 and plots all camera poses in the center_cam coordinate system.
 Each camera is shown with its XYZ axes and position label.
 
 Config:
-  - cam_calib.yaml:   calib_save_dir, viz_participant_id, center_cam
-  - capture.yaml:     participant_id (fallback if viz_participant_id empty)
+  - cam_calib.yaml:   calib_save_dir, viz_day_id, center_cam
+                     (day_id is the fallback if viz_day_id is empty)
 """
 
 import numpy as np
@@ -152,12 +152,12 @@ def main():
     calib = calib_cfg.get("calib", {})
     base_dir  = calib.get("calib_save_dir", "D:/calib_images")
     center_sn = calib.get("center_cam", "")
-    # participant_id 由 cam_calib.yaml 自带 (P001 / D001 系列), viz_participant_id 留空时回退到它
-    base_pid  = calib.get("participant_id", "P001")
-    viz_pid   = calib.get("viz_participant_id", "") or base_pid
+    # day_id 由 cam_calib.yaml 自带 (D001 系列), viz_day_id 留空时回退到它
+    base_did  = calib.get("day_id", "D001")
+    viz_did   = calib.get("viz_day_id", "") or base_did
 
     # Locate XML files
-    xml_dir = os.path.join(base_dir, viz_pid, "output")
+    xml_dir = os.path.join(base_dir, viz_did, "output")
     if not os.path.isdir(xml_dir):
         print(f"[ERROR] Output directory not found: {xml_dir}")
         sys.exit(1)
@@ -293,7 +293,7 @@ def main():
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
     ax.set_zlabel('Z (m)')
-    ax.set_title(f'Camera Extrinsics — {len(cameras)} cameras in "{center_cam["sn"]}" frame\n{viz_pid}\nClick a camera to see XYZ', fontsize=12)
+    ax.set_title(f'Camera Extrinsics — {len(cameras)} cameras in "{center_cam["sn"]}" frame\n{viz_did}\nClick a camera to see XYZ', fontsize=12)
 
     mid = np.mean(all_positions, axis=0)
     rng = max(np.max(np.ptp(all_positions, axis=0)) * 0.6, 0.5)

@@ -36,8 +36,8 @@ using namespace gazeestimation;
 // ================== Globals ==================
 atomic<bool> global_running{true};
 bool g_is_master = false, g_enable_net_sync = false;
-string g_save_dir;  // calib_save_dir/{participant_id}
-string g_xml_dir;   // 标定 XML 输出目录 = cam_calib.yaml: calib_save_dir/{input_participant_id}/output
+string g_save_dir;  // calib_save_dir/{day_id}
+string g_xml_dir;   // 标定 XML 输出目录 = cam_calib.yaml: calib_save_dir/{input_day_id}/output
 int g_win_w=1600, g_win_h=800, g_left_w, g_right_x, g_right_w, g_thumb_w, g_thumb_h;
 atomic<int> g_enlarged_cam{-1};
 SOCKET g_ctrl_sock = INVALID_SOCKET;  // TCP control channel (text commands)
@@ -85,7 +85,7 @@ void launchHalconChain() {
     }
     char self_path[MAX_PATH];
     GetModuleFileNameA(NULL, self_path, MAX_PATH);
-    fs::path exe = fs::path(self_path).parent_path() / "calib_cam_chain.exe";
+    fs::path exe = fs::path(self_path).parent_path() / "cam_calib_chain.exe";
     if (!fs::exists(exe)) {
         cerr << "[HALCON] Not found: " << exe.string()
              << " (需设置 HALCONROOT 并编译 cam_calib_chain)" << endl;
@@ -189,15 +189,15 @@ int main(){
     g_ctrl_port=c["port"].as<int>(); g_enable_net_sync=c["enable_net_sync"].as<bool>();
     vector<string> sns=c["cam_indices"].as<vector<string>>();
     string base_dir=c["calib_save_dir"].as<string>();
-    string pid=c["participant_id"].as<string>();   // cam_calib.yaml 自带 (P001 / D001 系列)
-    g_save_dir=base_dir+"/"+pid+"/pictures"; fs::create_directories(g_save_dir);
-    // 标定 XML 输出目录 (calib_cam_chain 的输出, 与 calib_cam_chain.cpp 的计算一致)
+    string did=c["day_id"].as<string>();   // cam_calib.yaml 自带 (D001 系列, 每天标定一次)
+    g_save_dir=base_dir+"/"+did+"/pictures"; fs::create_directories(g_save_dir);
+    // 标定 XML 输出目录 (cam_calib_chain 的输出, 与 calib_cam_chain.cpp 的计算一致)
     {
-        string xpid=pid; try{xpid=c["input_participant_id"].as<string>();if(xpid.empty())xpid=pid;}catch(...){}
-        g_xml_dir=base_dir+"/"+xpid+"/output";
+        string xdid=did; try{xdid=c["input_day_id"].as<string>();if(xdid.empty())xdid=did;}catch(...){}
+        g_xml_dir=base_dir+"/"+xdid+"/output";
     }
     bool test_xfer=false; try{test_xfer=c["test_transfer"].as<bool>();}catch(...){}
-    string test_recv; try{test_recv=c["test_transfer_recv_dir"].as<string>();test_recv+="/"+pid+"/pictures";}catch(...){test_recv="D:/calib_transfer_test/"+pid+"/pictures";}
+    string test_recv; try{test_recv=c["test_transfer_recv_dir"].as<string>();test_recv+="/"+did+"/pictures";}catch(...){test_recv="D:/calib_transfer_test/"+did+"/pictures";}
     if(test_xfer) fs::create_directories(test_recv);
     double fps=c["fps"].as<double>(),gain=c["gain"].as<double>(),gamma=c["gamma"].as<double>(),exp=c["exposure_time"].as<double>(),me=c["calib_mono_exp_ext"].as<double>();
     int data_port=g_ctrl_port+1;
@@ -328,7 +328,7 @@ int main(){
         else if(key==' '){if(g_enable_net_sync&&!g_is_master){}else{int ctr=getNextCounter(g_save_dir);stringstream ss;ss<<setw(2)<<setfill('0')<<ctr;if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"PHOTO:"+to_string(ctr));g_last_idx.store(ctr);g_capture_count++;
             cout<<"\n[Photo] Capturing index "<<ctr<<endl;
             for(auto& ctx:cam_ctxs){cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}if(!snap.empty()){cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);string fn=g_save_dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg";cv::imwrite(fn,out);cout<<"  -> Saved "<<fn<<endl;}}}}
-        else if((key=='t'||key=='T')&&g_is_master&&g_enable_net_sync){sendLine(g_ctrl_sock,"LIST_REQ");string resp;recvLine(g_ctrl_sock,resp,5000);if(resp.rfind("LIST_RESP:",0)!=0)continue;string lst=resp.substr(10);set<string> sf;stringstream ss(lst);string tok;while(getline(ss,tok,','))if(!tok.empty())sf.insert(tok);set<string> lf=scanFiles(g_save_dir);vector<string> mis;for(auto& f:sf)if(!lf.count(f))mis.push_back(f);if(mis.empty()){cout<<"[Transfer] Already in sync.\n"<<endl;continue;}
+        else if((key=='t'||key=='T')&&g_is_master&&g_enable_net_sync){sendLine(g_ctrl_sock,"LIST_REQ");string resp;recvLine(g_ctrl_sock,resp,5000);if(resp.rfind("LIST_RESP:",0)!=0)continue;string lst=resp.substr(10);set<string> sf;stringstream ss(lst);string tok;while(getline(ss,tok,','))if(!tok.empty())sf.insert(tok);set<string> lf=scanFiles(g_save_dir);vector<string> mis;for(auto& f:sf)if(!lf.count(f))mis.push_back(f);if(mis.empty()){cout<<"[Transfer] Already in sync."<<endl;launchHalconChain();continue;}
             cout<<"\n[Transfer] "<<mis.size()<<" files missing. Starting transfer..."<<endl;string xfer="XFER:";for(auto& f:mis)xfer+=f+",";sendLine(g_ctrl_sock,xfer);
             SOCKET dl=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
             {int opt=1;setsockopt(dl,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));

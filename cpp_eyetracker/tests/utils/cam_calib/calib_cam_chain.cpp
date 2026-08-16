@@ -123,23 +123,23 @@ void action()
     namespace fs = std::filesystem;
     fs::path cfg_dir = fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path() / "cfg";
     Cfg cfg((cfg_dir / "cam_calib.yaml").string()); auto& calib = cfg["calib"];
-    string base_pid = calib["participant_id"].as<string>();   // cam_calib.yaml 自带 (P001 / D001 系列)
+    string base_did = calib["day_id"].as<string>();   // cam_calib.yaml 自带 (D001 系列, 每天标定一次)
 
-    // input_participant_id: 优先使用 cam_calib.yaml 配置，空则 fallback 到 participant_id
-    string pid;
-    try { pid = calib["input_participant_id"].as<string>(); } catch(...) { pid = ""; }
-    if (pid.empty()) pid = base_pid;
+    // input_day_id: 优先使用 cam_calib.yaml 配置，空则 fallback 到 day_id
+    string did;
+    try { did = calib["input_day_id"].as<string>(); } catch(...) { did = ""; }
+    if (did.empty()) did = base_did;
 
     string base_dir = calib["calib_save_dir"].as<string>();
 
     // input_dir: 优先使用配置值，空则自动计算
     string input_dir, output_dir;
     try { input_dir = calib["input_dir"].as<string>(); } catch(...) { input_dir = ""; }
-    if (input_dir.empty()) input_dir = base_dir + "/" + pid + "/pictures";
+    if (input_dir.empty()) input_dir = base_dir + "/" + did + "/pictures";
 
     // output_dir: 优先使用配置值，空则自动计算
     try { output_dir = calib["output_dir"].as<string>(); } catch(...) { output_dir = ""; }
-    if (output_dir.empty()) output_dir = base_dir + "/" + pid + "/output";
+    if (output_dir.empty()) output_dir = base_dir + "/" + did + "/output";
 
     filesystem::create_directories(output_dir);
 

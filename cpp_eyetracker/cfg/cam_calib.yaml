@@ -19,19 +19,18 @@ calib:
   port: 49200                       # TCP 控制 + 文件传输端口
   enable_net_sync: true
 
-  calib_save_dir: "D:/calib_images"    # 总目录, 完整路径 = calib_save_dir/{participant_id}
+  calib_save_dir: "D:/calib_images"    # 总目录, 完整路径 = calib_save_dir/{day_id}
 
-  participant_id: "P000"              # 本标定集 ID (P001 / D001 等), 不再从 capture.yaml 读取
-                                      # 标定可能承担 P001 和 D001 系列, 按需修改
+  day_id: "D001"                      # 相机每天标定一次, 格式 D001 (与 calib_arm.yaml: record.day_id 一致)
 
   # 可视化 (viz_calib_chain.py)
-  viz_participant_id: ""              # 留空 → participant_id
+  viz_day_id: ""                      # 留空 → day_id
 
   # --- 标定算法参数 (calib_cam_chain.cpp) ---
-  # 输入/输出目录 (空字符串 = 自动根据 calib_save_dir/{input_participant_id} 计算)
-  input_participant_id: ""            # 留空 → participant_id
-  input_dir: ""                       # 留空 → calib_save_dir/{input_participant_id}/pictures
-  output_dir: ""                      # 留空 → calib_save_dir/{input_participant_id}/output
+  # 输入/输出目录 (空字符串 = 自动根据 calib_save_dir/{input_day_id} 计算)
+  input_day_id: ""                    # 留空 → day_id
+  input_dir: ""                       # 留空 → calib_save_dir/{input_day_id}/pictures
+  output_dir: ""                      # 留空 → calib_save_dir/{input_day_id}/output
   calib_plane: "C:/hitsz/apps/MVTec/multiple_cameras/calib/HG-180.cpd"
   focus: 0.016                       # m
   pixel_size_x: 2.74e-6              # m
