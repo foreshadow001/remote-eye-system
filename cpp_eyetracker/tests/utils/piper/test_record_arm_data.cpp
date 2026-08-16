@@ -48,6 +48,51 @@ atomic<bool> global_running{true};
 // ================== Resolve 子进程 (r 键触发) ==================
 PROCESS_INFORMATION g_resolve_pi{};
 
+// ================== 手眼标定流水线 (h 键: 依次运行三个程序) ==================
+atomic<bool> g_pipeline_running{false};
+
+// 运行同目录下的 exe 并等待结束, 返回退出码 (启动失败返回 -1)
+int runExeWait(const string& exe_name, const string& display) {
+    char self_path[MAX_PATH];
+    GetModuleFileNameA(NULL, self_path, MAX_PATH);
+    fs::path exe = fs::path(self_path).parent_path() / exe_name;
+    if (!fs::exists(exe)) {
+        cerr << "[Pipeline] Not found: " << exe.string() << endl;
+        return -1;
+    }
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessA(exe.string().c_str(), NULL, NULL, NULL, FALSE, 0,
+                        NULL, NULL, &si, &pi)) {
+        cerr << "[Pipeline] Launch failed (error " << GetLastError() << "): " << exe.string() << endl;
+        return -1;
+    }
+    cout << "[Pipeline] Running " << display << " ..." << endl;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD ec = 0; GetExitCodeProcess(pi.hProcess, &ec);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    cout << "[Pipeline] " << display << " finished (exit code " << ec << ")" << endl;
+    return static_cast<int>(ec);
+}
+
+// 后台线程: resolve_calib_board_pose → test_piper_hand_eye_calib → save_piper_chain
+void runHandEyePipeline() {
+    cout << "\n[Pipeline] Hand-eye pipeline started (resolve -> hand_eye -> save_chain)..." << endl;
+    vector<pair<string,string>> steps = {
+        {"resolve_calib_board_pose.exe", "resolve_calib_board_pose"},
+        {"test_piper_hand_eye_calib.exe", "test_piper_hand_eye_calib"},
+        {"save_piper_chain.exe", "save_piper_chain"},
+    };
+    for (auto& s : steps) {
+        if (runExeWait(s.first, s.second) != 0) {
+            cerr << "[Pipeline] " << s.second << " failed. Stopping pipeline." << endl;
+            break;
+        }
+    }
+    cout << "[Pipeline] Done.\n" << endl;
+    g_pipeline_running.store(false);
+}
+
 // ================== TCP 通信 ==================
 SOCKET g_arm_sock = INVALID_SOCKET;
 string g_ubuntu_ip;
@@ -91,6 +136,7 @@ int g_thumb_w = 0, g_thumb_h = 0;
 string g_calib_save_dir;
 string g_mapping_file_upper;
 string g_mapping_file_lower;
+string g_handeye_output;   // 手眼标定输出 = cfg/arm_pose/{day_id}.yaml
 
 const string& currentMappingFile() {
     return (g_current_arm == "upper") ? g_mapping_file_upper : g_mapping_file_lower;
@@ -423,6 +469,7 @@ int main() {
     vector<string> camera_ids = rcfg["cam_indices"].as<vector<string>>();
     string day_id = rcfg["day_id"].as<string>();
     g_calib_save_dir = rcfg["calib_save_dir"].as<string>() + "/" + day_id;
+    g_handeye_output = (cfg_dir / "arm_pose" / (day_id + ".yaml")).string();   // test_piper_hand_eye_calib 的输出
 
     double target_fps = rcfg["fps"].as<double>();
     double gain_val   = rcfg["gain"].as<double>();
@@ -438,6 +485,7 @@ int main() {
     cout << "Ubuntu IP : " << g_ubuntu_ip << ":" << g_arm_port << endl;
     cout << "Current arm: " << g_current_arm << "  [t] to switch" << endl;
     cout << "Save dir   : " << g_calib_save_dir << endl;
+    cout << "Hand-eye out: " << g_handeye_output << endl;
     cout << "Cameras    : " << camera_ids.size() << endl;
     for (size_t i = 0; i < camera_ids.size(); ++i)
         cout << "  " << i << ": SN=" << camera_ids[i] << endl;
@@ -491,6 +539,8 @@ int main() {
     cout << "  SPACE - Capture photo + flange pose" << endl;
     cout << "  t     - Switch arm (upper/lower), current: " << g_current_arm << endl;
     cout << "  r     - Launch resolve_calib_board_pose.exe" << endl;
+    cout << "  h     - Hand-eye pipeline (resolve -> hand_eye -> save_chain)" << endl;
+    cout << "  v     - Launch viz_piper_chain.py" << endl;
     cout << "  Q/ESC - Quit\n" << endl;
 
     while (global_running) {
@@ -528,6 +578,18 @@ int main() {
                         cv::Point(g_right_x + g_right_w - cnt_sz.width - 15, 35),
                         cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 215, 255), 2, cv::LINE_AA);
 
+            // Bottom-right: 输入输出目录 (右对齐, 位于 arm 指示上方)
+            string io_in = "In : " + g_calib_save_dir;
+            cv::Size in_sz = cv::getTextSize(io_in, cv::FONT_HERSHEY_SIMPLEX, 0.35, 1, 0);
+            cv::putText(canvas, io_in,
+                        cv::Point(g_right_x + g_right_w - in_sz.width - 15, g_win_h - 75),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(110, 110, 110), 1, cv::LINE_AA);
+            string io_out = "Out: " + g_handeye_output;
+            cv::Size out_sz = cv::getTextSize(io_out, cv::FONT_HERSHEY_SIMPLEX, 0.35, 1, 0);
+            cv::putText(canvas, io_out,
+                        cv::Point(g_right_x + g_right_w - out_sz.width - 15, g_win_h - 55),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(110, 110, 110), 1, cv::LINE_AA);
+
             // Bottom-right: arm indicator
             string arm_label = (g_current_arm == "upper") ? "UPPER" : "LOWER";
             cv::Scalar arm_color = (g_current_arm == "upper")
@@ -542,7 +604,7 @@ int main() {
             int hx = g_right_x + 10, hy = g_win_h - 45;
             string hints = g_calib_mode
                 ? "[a] exit  [space] capture  [z] undo  Camera: " + g_calib_cam_sn
-                : "[t] switch  [space] capture  [z] undo  [a] calib  [r] resolve  [c] clear  [q] quit";
+                : "[t] switch  [space] capture  [z] undo  [a] calib  [r] resolve  [h] pipeline  [v] viz  [c] clear  [q] quit";
             cv::putText(canvas, hints, cv::Point(hx, hy),
                         cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
             hy += 18;
@@ -600,6 +662,29 @@ int main() {
                              << exe.string() << endl;
                     }
                 }
+            }
+        }
+        else if (key == 'h' || key == 'H') {
+            // 依次运行 resolve → hand_eye → save_chain (后台线程, UI 不阻塞)
+            if (g_pipeline_running.load()) {
+                cout << "[Pipeline] Already running. Please wait." << endl;
+            } else {
+                g_pipeline_running.store(true);
+                thread(runHandEyePipeline).detach();
+            }
+        }
+        else if (key == 'v' || key == 'V') {
+            // 启动 viz_piper_chain.py (脚本内已强制 TkAgg, 此处再设环境变量双保险)
+            SetEnvironmentVariableA("MPLBACKEND", "TkAgg");
+            fs::path script = fs::path(__FILE__).parent_path() / "viz_piper_chain.py";
+            string cmd = "python \"" + script.string() + "\"";
+            STARTUPINFOA si{}; si.cb = sizeof(si);
+            PROCESS_INFORMATION pi{};
+            if (CreateProcessA(NULL, cmd.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+                CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+                cout << "[Viz] Launched viz_piper_chain.py" << endl;
+            } else {
+                cerr << "[Viz] Launch failed (error " << GetLastError() << "): " << cmd << endl;
             }
         }
         else if (key == 'z' || key == 'Z') {
