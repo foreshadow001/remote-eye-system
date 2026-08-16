@@ -1440,8 +1440,16 @@ int main() {
             string new_arm=(g_arm=="upper")?"lower":"upper";
             bool nd=(new_arm=="upper")?g_upper_done:g_lower_done;
             if(nd){cout<<"[t] "<<new_arm<<" already done."<<endl;goto next_iter;}
+            g_recording_enabled=false;               // 切换后需按 s 才能录制
+            g_show_exhausted=false;
+            g_led_state=LedState::WAITING;           // 立刻进入 WAITING 状态
+            { cv::Mat loading=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
+              cv::putText(loading,"Zeroing arm...",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,200,255),2);
+              drawLedIndicator(loading);
+              cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
             zeroArm(g_arm);
-            g_arm=new_arm; g_recording_enabled=false; g_show_exhausted=false;
+            g_arm=new_arm;
+            g_led_state=LedState::PIPER_INIT;        // 回零完成 → INIT (按 s 开始录制)
             syncPiperToSlave();
             cout<<"[t] Switched to "<<g_arm<<" (press 's' to start session)"<<endl;
         }
