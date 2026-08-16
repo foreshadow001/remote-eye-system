@@ -24,6 +24,7 @@
 #include <fstream>
 #include <sstream>
 #include <set>
+#include <map>
 #include <system_error>
 
 #include "cam/basler.hpp"
@@ -169,6 +170,15 @@ set<string> scanFiles(const string& root,bool nested){set<string> r;if(!fs::exis
 int countImages(const string& dir){int n=0;if(!fs::exists(dir))return 0;for(auto& e:fs::directory_iterator(dir))if(e.path().extension()==".jpg")n++;return n;}
 // 目录内索引最大的图片完整路径 (内参模式撤回用)
 string lastImageIn(const string& dir){string best;int mx=-1;if(!fs::exists(dir))return best;for(auto& e:fs::directory_iterator(dir)){if(e.path().extension()!=".jpg")continue;string s=e.path().stem().string();size_t u=s.find_last_of('_');if(u==string::npos)continue;try{int v=stoi(s.substr(u+1));if(v>mx){mx=v;best=e.path().string();}}catch(...){}}return best;}
+// 内参模式每相机计数 (与外参 g_capture_count 独立, 切换模式互不影响; 首次访问时懒加载自磁盘)
+map<string,int> g_intr_counts;
+int intrCount(const string& sn){
+    auto it=g_intr_counts.find(sn);
+    if(it!=g_intr_counts.end())return it->second;
+    int n=countImages(g_intr_root+"/"+sn);
+    g_intr_counts[sn]=n;
+    return n;
+}
 // 当前标定模式的图片根目录
 string picRoot(){return g_intr_mode.load()?g_intr_root:g_save_dir;}
 
@@ -385,7 +395,7 @@ int main(){
                 cv::Scalar mode_color=g_intr_mode.load()?cv::Scalar(0,255,0):cv::Scalar(200,80,255);
                 cv::putText(cv,mode_text,cv::Point(g_right_x+10,62),cv::FONT_HERSHEY_SIMPLEX,0.5,mode_color,2,cv::LINE_AA);
                 // 右上: 图片数量 (内参模式 = 放大相机; 外参模式 = 全部)
-                string cnt=g_intr_mode.load()&&sel>=0&&sel<(int)cam_ctxs.size()?"Pictures: "+to_string(countImages(g_intr_root+"/"+cam_ctxs[sel]->sn)):"Captures: "+to_string(g_capture_count);
+                string cnt=g_intr_mode.load()&&sel>=0&&sel<(int)cam_ctxs.size()?"Pictures: "+to_string(intrCount(cam_ctxs[sel]->sn)):"Captures: "+to_string(g_capture_count);
                 cv::Size csz=cv::getTextSize(cnt,cv::FONT_HERSHEY_SIMPLEX,0.8,2,0);
                 cv::putText(cv,cnt,cv::Point(g_right_x+g_right_w-csz.width-10,35),cv::FONT_HERSHEY_SIMPLEX,0.8,cv::Scalar(0,215,255),2,cv::LINE_AA);
                 string hints;
@@ -443,6 +453,7 @@ int main(){
                 if(snap.empty()){cout<<"[Intrinsics] No frame yet."<<endl;continue;}
                 cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);
                 string fn=dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg";cv::imwrite(fn,out);
+                g_intr_counts[ctx->sn]=ctr+1;
                 cout<<"\n[Intrinsics] Saved "<<fn<<endl;
             }
             else if(g_enable_net_sync&&!g_is_master){/* 外参模式: slave 由 master PHOTO 命令驱动 */}
@@ -495,7 +506,8 @@ int main(){
                 if(ci<0||ci>=(int)cam_ctxs.size()){cout<<"[Intrinsics] No camera selected."<<endl;continue;}
                 string dir=g_intr_root+"/"+cam_ctxs[ci]->sn;string del=lastImageIn(dir);
                 if(del.empty()){cout<<"[Intrinsics] No images to undo."<<endl;continue;}
-                fs::remove(del);cout<<"\n[Intrinsics] Undo: removed "<<del<<endl;
+                fs::remove(del);if(g_intr_counts[cam_ctxs[ci]->sn]>0)g_intr_counts[cam_ctxs[ci]->sn]--;
+                cout<<"\n[Intrinsics] Undo: removed "<<del<<endl;
             }
             else{int li=g_last_idx.load();if(li<0){cout<<"[Undo] No previous capture to undo."<<endl;continue;}stringstream ss;ss<<setw(2)<<setfill('0')<<li;
             cout<<"\n[Undo] Deleting capture index "<<ss.str()<<endl;
@@ -508,6 +520,7 @@ int main(){
                 if(ci<0||ci>=(int)cam_ctxs.size()){cout<<"[Intrinsics] No camera selected."<<endl;continue;}
                 string dir=g_intr_root+"/"+cam_ctxs[ci]->sn;int n=countImages(dir);
                 if(fs::exists(dir))for(auto& e:fs::directory_iterator(dir))if(e.path().extension()==".jpg")fs::remove(e.path());
+                g_intr_counts[cam_ctxs[ci]->sn]=0;
                 cout<<"\n[Intrinsics] Cleared "<<n<<" images from "<<dir<<endl;
             }
             else if(g_is_master&&g_enable_net_sync){

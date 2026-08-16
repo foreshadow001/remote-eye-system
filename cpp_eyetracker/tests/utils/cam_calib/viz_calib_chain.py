@@ -54,6 +54,19 @@ def parse_camera_xml(xml_path):
         raw = ip_node.find('RawData')
         if raw is not None and raw.text:
             data['internal_raw'] = raw.text.strip()
+            # "area_scan_division focus kappa sx sy cx cy width height"
+            toks = data['internal_raw'].split()
+            if len(toks) >= 9:
+                vals = [float(t) for t in toks[1:]]
+                data['model']   = toks[0]
+                data['focus']   = vals[0]  # m
+                data['kappa']   = vals[1]
+                data['sx']      = vals[2]  # m
+                data['sy']      = vals[3]  # m
+                data['cx']      = vals[4]  # px
+                data['cy']      = vals[5]  # px
+                data['width']   = vals[6]  # px
+                data['height']  = vals[7]  # px
 
     # External params
     ep_node = root.find('.//ExternalParameters')
@@ -225,7 +238,8 @@ def main():
     ax.scatter(*origin, c='k', marker='o', s=60, zorder=5)
     # Register for picking
     center_line_ref = ax.plot([0, wsize], [0, 0], [0, 0], c='r', lw=2.5, picker=8)[0]
-    artist_to_cam[id(center_line_ref)] = {'sn': center_cam['sn'], 'tx': 0.0, 'ty': 0.0, 'tz': 0.0, 'is_center': True}
+    center_cam['is_center'] = True
+    artist_to_cam[id(center_line_ref)] = center_cam
     draw_camera_fov(ax, (0, 0, 0), np.eye(3), cam_size=wsize * 0.3, fov_len=wsize * 0.5)
 
     # Initial view: from -Z direction, X-left, Y-down
@@ -240,7 +254,7 @@ def main():
         R = euler_gba_to_matrix(c['alpha'], c['beta'], c['gamma'])
         cam_lines = draw_camera_axes(ax, pos, R, size=axis_size, pick_radius=8)
         for line in cam_lines:
-            artist_to_cam[id(line)] = {'sn': c['sn'], 'tx': c['tx'], 'ty': c['ty'], 'tz': c['tz'], 'is_center': False}
+            artist_to_cam[id(line)] = c   # 完整 camera dict (含内参)
         draw_camera_fov(ax, pos, R, cam_size=axis_size * 0.5, fov_len=axis_size * 0.8)
 
     # Floating annotation (initially off-screen)
@@ -273,6 +287,13 @@ def main():
         else:
             text = f"{cam['sn']}\nx={cam['tx']:.4f}  y={cam['ty']:.4f}  z={cam['tz']:.4f} m"
 
+        # 内参 (焦距/像元/主点/分辨率)
+        if 'focus' in cam:
+            text += (f"\nf={cam['focus']*1000:.2f} mm  sx={cam['sx']*1e6:.2f} um  sy={cam['sy']*1e6:.2f} um"
+                     f"\nprincipal point=({cam['cx']:.1f}, {cam['cy']:.1f}) px  {cam['width']:.0f}x{cam['height']:.0f}")
+        else:
+            text += "\nintrinsics: N/A"
+
         annot.set_text(text)
         annot.set_visible(True)
         # Position annotation in upper-left corner of the axes
@@ -299,7 +320,7 @@ def main():
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
     ax.set_zlabel('Z (m)')
-    ax.set_title(f'Camera Extrinsics — {len(cameras)} cameras in "{center_cam["sn"]}" frame\n{viz_did}\nClick a camera to see XYZ', fontsize=12)
+    ax.set_title(f'Camera Extrinsics — {len(cameras)} cameras in "{center_cam["sn"]}" frame\n{viz_did}\nClick a camera to see XYZ + intrinsics', fontsize=12)
 
     mid = np.mean(all_positions, axis=0)
     rng = max(np.max(np.ptp(all_positions, axis=0)) * 0.6, 0.5)
@@ -318,7 +339,7 @@ def main():
 
     # Keyboard shortcuts
     print("\nKeyboard / mouse:")
-    print("  Click camera axes → show XYZ")
+    print("  Click camera axes → show XYZ + intrinsics")
     print("  Click empty space  → hide label")
     print("  t / f / s          → top / front / side view")
     print("  r                  → reset view")

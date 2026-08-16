@@ -51,7 +51,7 @@ calib:
   calib_mono_exp_ext: 1.0
   window_width: 1600
   window_height: 800
-  ui_fps: 20.0
+  ui_fps: 5.0
 
   # 传输测试 (跳过相机初始化)
   test_transfer: false              # true = 跳过主循环, 直接测试 TCP 传输速度
