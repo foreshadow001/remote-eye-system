@@ -36,7 +36,7 @@ capture:
   record_time: 1.0
   margin_frames_ratio: 0.05
   max_num_buffer: 30
-  ui_fps: 20.0
+  ui_fps: 5.0
   window_width: 1600
   window_height: 800
   enable_offset: false

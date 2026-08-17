@@ -156,28 +156,41 @@ void sendLedCmd(HANDLE h, const string& cmd) {
         cerr << "[M5Stack] Write failed." << endl;
 }
 
-// 状态 → LED 图案 (与 plan/m5stack_atom_matrix.md 映射表一致)
-void sendLedStatePattern(LedState s) {
-    string cmd;
+extern string g_arm;   // 当前机械臂 ("upper"/"lower"), 定义在下方 Piper arm state 区
+
+// 状态 → LED 图案命令 (与 plan/m5stack_atom_matrix.md 映射表一致)
+string ledPatternCmd(LedState s) {
     switch (s) {
-        case LedState::PIPER_INIT: cmd = "MODE ALL 0000ff"; break;      // 25 全亮蓝
-        case LedState::READY:      cmd = "MODE BREATH 00ff00"; break;   // 绿十字呼吸
-        case LedState::CAPTURING:  cmd = "MODE BREATH 00ff00"; break;   // 绿十字呼吸
-        case LedState::WAITING:    cmd = "MODE ALL ff8000"; break;      // 25 全亮橙
-        case LedState::EXHAUSTED:  cmd = "MODE ALL ff0000"; break;      // 25 全亮红
-        case LedState::OVER:       cmd = "MODE FLOW"; break;            // 横向彩流
-        default: return;
+        case LedState::PIPER_INIT: return "MODE ALL 0000ff";      // 25 全亮蓝
+        case LedState::READY:      return "MODE BREATH 00ff00";   // 绿十字呼吸
+        case LedState::CAPTURING:  return "MODE BREATH 00ff00";   // 绿十字呼吸
+        case LedState::WAITING:    return "MODE ALL ff8000";      // 25 全亮橙
+        case LedState::EXHAUSTED:  return "MODE ALL ff0000";      // 25 全亮红
+        case LedState::OVER:       return "MODE FLOW";            // 横向彩流
+        default: return "";
     }
-    cout << "[M5Stack] State -> " << cmd << endl;
-    sendLedCmd(g_led_upper, cmd);
-    sendLedCmd(g_led_lower, cmd);
 }
 
-// 设置 LED 状态 (状态变化时向两块 M5Stack 发送对应图案)
+// 每臂各自的 M5Stack LED 状态 (两块设备独立显示各自机械臂的状态)
+LedState g_led_state_upper = LedState::PIPER_INIT;
+LedState g_led_state_lower = LedState::PIPER_INIT;
+
+void sendLedPatternTo(HANDLE h, LedState s) {
+    string cmd = ledPatternCmd(s);
+    if (cmd.empty()) return;
+    sendLedCmd(h, cmd);
+}
+
+// 设置全局状态 (UI 指示器), 只更新"当前臂"对应的设备
 void setLedState(LedState s) {
-    if (g_led_state != s) {
-        g_led_state = s;
-        sendLedStatePattern(s);
+    if (g_led_state == s) return;
+    g_led_state = s;
+    LedState& arm_st = (g_arm == "upper") ? g_led_state_upper : g_led_state_lower;
+    HANDLE arm_dev = (g_arm == "upper") ? g_led_upper : g_led_lower;
+    if (arm_st != s) {
+        arm_st = s;
+        cout << "[M5Stack] " << g_arm << " -> " << ledPatternCmd(s) << endl;
+        sendLedPatternTo(arm_dev, s);
     }
 }
 
@@ -984,7 +997,9 @@ int main() {
             try{led_baud=cfg_led["serial"]["baud_rate"].as<int>();}catch(...){}
             openLedSerial(g_led_upper, led_upper, led_baud);
             openLedSerial(g_led_lower, led_lower, led_baud);
-            sendLedStatePattern(g_led_state);   // 初始状态同步
+            // 初始状态同步: 两块设备各自 INIT
+            sendLedPatternTo(g_led_upper, LedState::PIPER_INIT);
+            sendLedPatternTo(g_led_lower, LedState::PIPER_INIT);
         } catch (...) {
             cerr<<"[M5Stack] cfg/M5Stack.yaml load failed — LED disabled."<<endl;
         }
@@ -1588,8 +1603,16 @@ int main() {
               drawLedIndicator(loading);
               cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
             zeroArm(g_arm);
+            // 原来的机械臂 → INIT (其设备回到 INIT 图案)
+            if (g_arm == "upper") {
+                g_led_state_upper = LedState::PIPER_INIT;
+                sendLedPatternTo(g_led_upper, LedState::PIPER_INIT);
+            } else {
+                g_led_state_lower = LedState::PIPER_INIT;
+                sendLedPatternTo(g_led_lower, LedState::PIPER_INIT);
+            }
             g_arm=new_arm;
-            setLedState(LedState::PIPER_INIT);       // 回零完成 → INIT (按 s 开始录制)
+            setLedState(LedState::PIPER_INIT);       // 新臂 → INIT (按 s 开始录制)
             syncPiperToSlave();
             cout<<"[t] Switched to "<<g_arm<<" (press 's' to start session)"<<endl;
         }
