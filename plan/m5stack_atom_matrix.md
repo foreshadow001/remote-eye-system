@@ -1,7 +1,8 @@
 # M5Stack Atom Matrix (5×5 RGB LED) 串口灯光控制 — 官方文档核实报告
 
 > 状态: ✅ 已核实 (2026-08-17)。固件 API 用法已按 M5Atom 库当前源码验证并修正。
-> 相关文件: `cpp_eyetracker/tests/utils/M5Stack/` (test_m5stack.cpp + M5Stack.ino) + `cpp_eyetracker/cfg/M5Stack.yaml`
+> 相关文件: `cpp_eyetracker/tests/utils/M5Stack/` (test_m5stack.cpp, CMake 构建) + `cpp_eyetracker/utils/M5Stack/M5Stack.ino` (Arduino 固件) + `cpp_eyetracker/cfg/M5Stack.yaml`
+> ⚠️ 固件与 C++ 程序必须分目录: Arduino IDE 会编译草图文件夹内的**所有** .cpp/.h 文件, 若 ino 与 test_m5stack.cpp 同目录, Arduino 会尝试编译 opencv 头文件而报错。
 
 ## 一、硬件事实 (官方文档)
 
@@ -62,7 +63,20 @@ PC 端 (test_m5stack.cpp): Win32 `CreateFileA("\\\\.\\COMx")` + DCB 8N1 + 超时
 2. BRIGHT 钳制改为 0..100 (对齐库内部钳制; 文档建议 ≤60)
 3. 注释注明依赖: M5Atom 库 (含 issue #5 修复的版本, 即库管理器当前版)
 
-## 五、已知限制 / 后续事项
+## 五、烧录步骤 (Arduino IDE)
+
+1. **库**: Library Manager 搜索 `M5Atom` → 安装 "M5Atom by M5Stack" (依赖 FastLED 自动安装)
+2. **板卡包**: Boards Manager 搜索 `M5Stack` → 安装 "M5Stack by M5Stack" (esp32 分支)
+3. **板卡选择**: Tools → Board → M5Stack → Atom Matrix
+4. **打开工程**: File → Open → `cpp_eyetracker/utils/M5Stack/M5Stack.ino`
+   (Arduino 要求文件夹名 = .ino 文件名, 当前 `M5Stack/M5Stack.ino` 已满足)
+5. **上传**: 选择 COM 口 → Upload (失败可按住复位键重试)
+
+> **为什么 ino 必须单独放 utils/M5Stack**: Arduino IDE 会把草图文件夹内所有 .cpp/.h 当作草图源码编译。
+> 若与 test_m5stack.cpp (依赖 opencv/Pylon 等) 同目录, Arduino 会报 `opencv2/opencv.hpp not found`。
+> 因此固件 (utils/M5Stack) 与 Windows 控制程序 (tests/utils/M5Stack, CMake 构建) 分目录存放。
+
+## 六、已知限制 / 后续事项
 
 - M5Atom 库已 deprecated (官方推荐 M5Unified + M5GFX) — 当前固件继续用 M5Atom (API 已验证, 库管理器可装); 未来迁移 M5Unified 时协议不变, 仅改 LED 写入层
 - 亮度 >60 不建议长时间使用 (面板散热)
