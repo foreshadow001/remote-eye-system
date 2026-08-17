@@ -162,7 +162,7 @@ extern string g_arm;   // 当前机械臂 ("upper"/"lower"), 定义在下方 Pip
 string ledPatternCmd(LedState s) {
     switch (s) {
         case LedState::PIPER_INIT: return "MODE ALL 0000ff";      // 25 全亮蓝
-        case LedState::READY:      return "MODE BREATH 00ff00";   // 绿十字呼吸
+        case LedState::READY:      return "MODE ALL 00ff00";      // 25 全绿常亮
         case LedState::CAPTURING:  return "MODE BREATH 00ff00";   // 绿十字呼吸
         case LedState::WAITING:    return "MODE ALL ff8000";      // 25 全亮橙
         case LedState::EXHAUSTED:  return "MODE ALL ff0000";      // 25 全亮红
@@ -214,6 +214,14 @@ double g_click_window = 0.5;              // READY 等待 SPACE 的最大时长 
 int g_num_targets_per_arm = 0;            // 每臂成功录制数上限 (0 = 不限制)
 bool g_show_over = false;                 // 当前臂的 OVER 显示标志 (随切换加载)
 atomic<int64_t> g_ready_since_us{0};      // READY 起始时刻 (us since epoch, 跨线程)
+
+// ================== Capture delay (CAPTURING → 延迟录制) ==================
+double g_capture_delay = 0.5;              // SPACE 后延迟录制的秒数 (capture.yaml)
+atomic<bool> g_delay_pending{false};       // delay 等待中 (LED 显示 CAPTURING)
+atomic<int64_t> g_delay_start_us{0};       // delay 起点
+atomic<int64_t> g_delay_deadline_us{0};    // delay 终点
+atomic<bool> g_trigger_pending{false};     // delay 结束 → 待触发录制
+double g_last_delay_s = 0.0;               // 最近一次实际 delay 时长 (日志)
 
 int64_t nowUs() {
     return chrono::duration_cast<chrono::microseconds>(
@@ -809,11 +817,11 @@ void writeReport(const string& timestr, int rec_num, int total_frames, bool hw_t
 
     // Per-Camera Metrics
     g_session_log << "### Per-Camera Metrics\n\n";
-    g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | Rec2RAM(s) |"
+    g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | Rec2RAM(s) | Delay(s) |"
                   << " ArmStage(s) | M-HDF5(s) | S-HDF5(s) |\n";
-    g_session_log << "|---|-----|------|-------|------|-----|-------|---------|------------|"
+    g_session_log << "|---|-----|------|-------|------|-----|-------|---------|------------|----------|"
                   << "------------|-----------|-----------|\n";
-    g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列峰值/总帧数 | 首帧触发延迟 | RAM写完-理论完成 |"
+    g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列峰值/总帧数 | 首帧触发延迟 | RAM写完-理论完成 | SPACE→触发延迟 |"
                   << " 并行阶段墙钟 | Master HDF5写入 | Slave HDF5写入 |\n";
 
     double theoretical_s = total_frames / 200.0;
@@ -841,6 +849,7 @@ void writeReport(const string& timestr, int rec_num, int total_frames, bool hw_t
                       << ctx->max_queue_size.load() << "/" << total_frames << " | "
                       << fixed << setprecision(1) << lat_ms << " | "
                       << fixed << setprecision(3) << ctx->recover2ram_s << " | "
+                      << fixed << setprecision(3) << g_last_delay_s << " | "
                       << g_arm_stage_s << " | " << show_mhdf5 << " | " << show_shdf5 << " |\n";
     }
 
@@ -849,6 +858,7 @@ void writeReport(const string& timestr, int rec_num, int total_frames, bool hw_t
     g_session_log << "| Metric | Value | Note |\n";
     g_session_log << "|--------|-------|------|\n";
     g_session_log << "| ARM stage | " << fixed << setprecision(2) << g_arm_stage_s << " s | Par. wall clock (arm || HDF5) |\n";
+    g_session_log << "| Delay | " << fixed << setprecision(3) << g_last_delay_s << " s | SPACE→录制触发 (受试者聚焦十字中心) |\n";
     g_session_log << "| Master HDF5 write | " << g_master_hdf5_s << " s | WaitForMultipleObjects |\n";
     g_session_log << "| Slave HDF5 write | " << g_slave_hdf5_s << " s | WaitForMultipleObjects (via TCP) |\n";
     double max_hdf5 = max(g_master_hdf5_s, g_slave_hdf5_s);
@@ -917,6 +927,7 @@ int main() {
     try{g_enable_auto_move=cap["enable_auto_move"].as<bool>();}catch(...){}
     try{g_click_window=cap["click_window"].as<double>();}catch(...){}
     try{g_num_targets_per_arm=cap["num_targets_per_arm"].as<int>();}catch(...){}
+    try{g_capture_delay=cap["capture_delay"].as<double>();}catch(...){}
     double target_fps=cap["fps"].as<double>(), gain=cap["gain"].as<double>();
     double gammav=cap["gamma"].as<double>(), exp_time=cap["exposure_time"].as<double>();
     g_win_w=cap["window_width"].as<int>(); g_win_h=cap["window_height"].as<int>();
@@ -952,6 +963,7 @@ int main() {
     if(g_enable_auto_move) cout<<" (click window "<<g_click_window<<"s)";
     cout<<endl;
     cout<<"Targets per arm  : "<<(g_num_targets_per_arm>0?to_string(g_num_targets_per_arm):"unlimited")<<endl;
+    cout<<"Capture Delay    : "<<g_capture_delay<<"s"<<endl;
     cout<<"----------------------------------\n"<<endl;
 
     // ---- Piper config (Master only) ----
@@ -1198,6 +1210,8 @@ int main() {
                 setLedState(LedState::EXHAUSTED);
             } else if (is_dumping) {
                 setLedState(LedState::WAITING);
+            } else if (g_delay_pending.load()) {
+                setLedState(LedState::CAPTURING);
             } else if (is_recording) {
                 setLedState(LedState::CAPTURING);
             } else if (g_recording_enabled) {
@@ -1272,7 +1286,8 @@ int main() {
                 // Watermark hints (bottom-left of right panel)
                 int hx = g_right_x + 10, hy = g_win_h - 60;
                 string hints;
-                if (is_recording) hints = "[REC] Recording in progress...";
+                if (g_delay_pending.load()) hints = "[DELAY] Focus on the cross...";
+                else if (is_recording) hints = "[REC] Recording in progress...";
                 else if (is_dumping) hints = "[DUMP] Writing to disk...";
                 else if (g_syncing.load()) hints = "Syncing sentry - please wait...";
                 else if (enable_net_sync && !is_master_pc) hints = "[s][space] disabled (Slave) | Waiting for Master...";
@@ -1555,6 +1570,17 @@ int main() {
             }
         }
 
+        // ---- Capture delay: 等待期结束 → 真正开始录制 ----
+        if (g_delay_pending.load() && nowUs() >= g_delay_deadline_us.load()) {
+            g_delay_pending.store(false);
+            g_last_delay_s = (nowUs() - g_delay_start_us.load()) / 1e6;
+            instantTrigger();
+            g_trigger_pending.store(true);
+            if(enable_net_sync&&g_cmd_sock!=INVALID_SOCKET) sendLineRaw(g_cmd_sock,"TRIGGER");
+            logException("INFO","delay",to_string(g_last_delay_s)+"s");
+            cout<<"[Delay] "<<g_last_delay_s<<"s elapsed - recording started."<<endl;
+        }
+
         // ---- Key handling ----
         char key=(char)cv::waitKey(1); bool trigger_start=false;
         if(g_syncing.load()){}
@@ -1567,6 +1593,7 @@ int main() {
                 global_running=false;
             }else{if(g_fault_active.load())global_running=false;}
         }else if(g_fault_active.load()){}
+        else if(g_delay_pending.load()){/* delay 等待期间仅 ESC/q 可用 */}
         // ---- Master-only keys ----
         else if(is_master_pc&&key=='s'&&!is_recording&&!is_dumping&&!g_piper_busy&&!g_show_over){
             bool all_streaming=true;
@@ -1589,11 +1616,20 @@ int main() {
                 cout<<"[s] "<<g_arm<<" exhausted. Press t or c."<<endl;
             } else { cout<<"[s] Arm ERROR."<<endl; }
         }
-        else if(is_master_pc&&key==' '&&!is_recording&&!is_dumping&&!g_piper_busy){
+        else if(is_master_pc&&key==' '&&!is_recording&&!is_dumping&&!g_piper_busy&&!g_delay_pending){
             if(g_recording_enabled){
-                instantTrigger(); trigger_start=true;
-                if(enable_net_sync&&g_cmd_sock!=INVALID_SOCKET) sendLineRaw(g_cmd_sock,"TRIGGER");
-                cout<<"[Recording] Started."<<endl;
+                if(g_capture_delay>0.0){
+                    // 进入 CAPTURING, 延迟 capture_delay 后再真正录制 (受试者聚焦十字中心)
+                    setLedState(LedState::CAPTURING);
+                    g_delay_start_us.store(nowUs());
+                    g_delay_deadline_us.store(g_delay_start_us.load()+(int64_t)(g_capture_delay*1e6));
+                    g_delay_pending.store(true);
+                    cout<<"[Delay] Capturing - waiting "<<g_capture_delay<<"s before recording..."<<endl;
+                }else{
+                    instantTrigger(); trigger_start=true;
+                    if(enable_net_sync&&g_cmd_sock!=INVALID_SOCKET) sendLineRaw(g_cmd_sock,"TRIGGER");
+                    cout<<"[Recording] Started."<<endl;
+                }
             } else {
                 cout<<"[SPACE] Recording not enabled. Press [s] first."<<endl;
                 if(g_upper_done&&g_lower_done) cout<<"[SPACE] Both arms DONE. Press [c] to clear sentry."<<endl;
@@ -1655,8 +1691,9 @@ int main() {
             cout<<"[t] Switched to "<<g_arm<<" (press 's' to start session)"<<endl;
         }
 
-        if((trigger_start||net_cmd_record.exchange(false))&&!is_recording&&!is_dumping){
-            if(is_master_pc&&trigger_start){
+        bool trig_fired = trigger_start || g_trigger_pending.exchange(false);
+        if((trig_fired||net_cmd_record.exchange(false))&&!is_recording&&!is_dumping){
+            if(is_master_pc&&trig_fired){
                 // 录制开始: 当前目标指令已被使用, 此时才推进 sentry (按 t/b 放弃时不推进)
                 int& idx=(g_arm=="upper")?g_upper_idx:g_lower_idx;
                 idx++; updatePiperSentry();

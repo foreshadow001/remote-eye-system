@@ -73,7 +73,7 @@ struct LedPattern { string name; bool breath; bool flow; array<int,3> rgb; strin
 //   PIPER_INIT=蓝 READY=绿 CAPTURING=绿 WAITING=橙 EXHAUSTED=红 OVER=横向彩流
 vector<LedPattern> g_states = {
     {"PIPER_INIT", false, false, {  0,  0,255}, "all 25 blue"},
-    {"READY",      true,  false, {  0,255,  0}, "green breathing cross"},
+    {"READY",      false, false, {  0,255,  0}, "all 25 green steady"},
     {"CAPTURING",  true,  false, {  0,255,  0}, "green breathing cross"},
     {"WAITING",    false, false, {255,128,  0}, "all 25 orange"},
     {"EXHAUSTED",  false, false, {255,  0,  0}, "all 25 red"},

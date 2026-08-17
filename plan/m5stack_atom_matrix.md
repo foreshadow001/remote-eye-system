@@ -63,7 +63,7 @@ FastLED.setBrightness(Brightness);
 | 状态 | 图案 | 颜色 (RGB) | 指令 |
 |------|------|-----------|------|
 | PIPER_INIT | 25 全亮 | **蓝 0000ff** | `MODE ALL 0000ff` |
-| READY | **十字呼吸** | 绿 00ff00 | `MODE BREATH 00ff00` |
+| READY | **25 全绿常亮** | 绿 00ff00 | `MODE ALL 00ff00` |
 | CAPTURING | **十字呼吸** | 绿 00ff00 | `MODE BREATH 00ff00` |
 | WAITING | 25 全亮 | **橙 ff8000** (与绿区分度大) | `MODE ALL ff8000` |
 | EXHAUSTED | 25 全亮 | **红 ff0000** | `MODE ALL ff0000` |
