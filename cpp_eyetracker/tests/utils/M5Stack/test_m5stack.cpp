@@ -114,13 +114,18 @@ void sendNextState() {
     // 更新 5x5 预览
     for (int i = 0; i < 25; ++i) g_grid[i] = {0, 0, 0};
     if (st.flow) {
-        // 彩流静态快照: 每列一个色相 (与固件列偏移 72° 一致)
+        // 斜向彩流静态快照: 每条反对角线 (x+y) 一个色相, 偏移 40° (与固件一致)
         for (int i = 0; i < 25; ++i) {
-            int r, g, b; hsvToRgb((i % 5) * 72.0, 1.0, 1.0, r, g, b);
+            int x = i % 5, y = i / 5;
+            int r, g, b; hsvToRgb(((x + y) * 40) % 360, 1.0, 1.0, r, g, b);
             g_grid[i] = {r, g, b};
         }
     } else if (st.breath) {
-        for (int j = 0; j < 9; ++j) g_grid[CROSS_IDX[j]] = st.rgb;
+        // 外臂+中心 = 呼吸色, 内 3x3 小十字 (7,11,13,17) = 白 (与固件一致)
+        for (int j = 0; j < 9; ++j) {
+            int i = CROSS_IDX[j];
+            g_grid[i] = (i == 7 || i == 11 || i == 13 || i == 17) ? array<int,3>{255, 255, 255} : st.rgb;
+        }
     } else {
         for (int i = 0; i < 25; ++i) g_grid[i] = st.rgb;
     }
