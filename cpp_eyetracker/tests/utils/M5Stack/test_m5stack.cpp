@@ -11,8 +11,6 @@
 #include <filesystem>
 #include <vector>
 #include <array>
-#include <random>
-#include <cmath>
 #include <cctype>
 #include <cstdint>
 
@@ -68,33 +66,37 @@ bool sendSerial(const string& cmd) {
     return true;
 }
 
-// ================== 颜色 ==================
-void hsvToRgb(double h, double s, double v, int& r, int& g, int& b) {
-    double c = v * s;
-    double x = c * (1 - fabs(fmod(h / 60.0, 2) - 1));
-    double m = v - c;
-    double rp = 0, gp = 0, bp = 0;
-    if (h < 60) { rp = c; gp = x; }
-    else if (h < 120) { rp = x; gp = c; }
-    else if (h < 180) { gp = c; bp = x; }
-    else if (h < 240) { gp = x; bp = c; }
-    else if (h < 300) { rp = x; bp = c; }
-    else { rp = c; bp = x; }
-    r = (int)((rp + m) * 255); g = (int)((gp + m) * 255); b = (int)((bp + m) * 255);
-}
+// ================== 状态灯 (capture_with_LED 的 LedState) ==================
+struct LedPattern { string name; bool breath; array<int,3> rgb; string desc; };
+// 颜色与 capture_with_LED.cpp 的 drawLedIndicator 一致:
+//   PIPER_INIT=红 READY=绿 CAPTURING=绿 WAITING=黄 EXHAUSTED=蓝 OVER=品红
+vector<LedPattern> g_states = {
+    {"PIPER_INIT", false, {255,  0,  0}, "all 25 red"},
+    {"READY",      true,  {  0,255,  0}, "green breathing cross"},
+    {"CAPTURING",  true,  {  0,255,  0}, "green breathing cross"},
+    {"WAITING",    false, {255,255,  0}, "all 25 yellow"},
+    {"EXHAUSTED",  false, {  0,  0,255}, "all 25 blue"},
+    {"OVER",       false, {255,  0,255}, "all 25 magenta"},
+};
+int g_state_idx = -1;   // -1 = 尚未发送
 
-// 随机 HSV → 鲜艳颜色 (随机 RGB 会偏灰)
-void sendRandom() {
-    random_device rd; mt19937 gen(rd());
-    uniform_real_distribution<double> dh(0.0, 360.0);
-    string cmd = "PIX";
+// 十字 = 中心行 (10..14) + 中心列 (2,7,17,22), 共 9 颗
+const int CROSS_IDX[9] = {2, 7, 10, 11, 12, 13, 14, 17, 22};
+bool isCross(int i) { for (int j = 0; j < 9; ++j) if (CROSS_IDX[j] == i) return true; return false; }
+
+// 按 s 循环发送状态图案 (READY/CAPTURING = 绿色十字呼吸灯, 其余 = 25 颗全亮)
+void sendNextState() {
+    g_state_idx = (g_state_idx + 1) % (int)g_states.size();
+    auto& st = g_states[g_state_idx];
+    char hexbuf[8];
+    snprintf(hexbuf, sizeof(hexbuf), "%02x%02x%02x", st.rgb[0], st.rgb[1], st.rgb[2]);
+    string cmd = st.breath ? ("MODE BREATH " + string(hexbuf)) : ("MODE ALL " + string(hexbuf));
+    g_status = sendSerial(cmd) ? ("State: " + st.name + " — " + st.desc) : "Send failed.";
+    // 更新 5x5 预览
     for (int i = 0; i < 25; ++i) {
-        int r, g, b; hsvToRgb(dh(gen), 1.0, 1.0, r, g, b);
-        g_grid[i] = {r, g, b};
-        char hexbuf[8]; snprintf(hexbuf, sizeof(hexbuf), " %02x%02x%02x", r, g, b);
-        cmd += hexbuf;
+        if (st.breath && !isCross(i)) g_grid[i] = {0, 0, 0};
+        else g_grid[i] = st.rgb;
     }
-    g_status = sendSerial(cmd) ? "Sent 25 random colors." : "Send failed.";
 }
 
 // ================== UI ==================
@@ -115,7 +117,7 @@ void render(cv::Mat& canvas) {
     cv::putText(canvas, "Device : " + dev, cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2); ty += 30;
     string port = (g_serial != INVALID_HANDLE_VALUE) ? g_open_port : "(closed)";
     cv::putText(canvas, "Port   : " + port, cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2); ty += 40;
-    cv::putText(canvas, "[t] switch  [s] random  [ESC/q] quit", cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(140, 140, 140), 1, cv::LINE_AA); ty += 30;
+    cv::putText(canvas, "[t] switch  [s] state  [ESC/q] quit", cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(140, 140, 140), 1, cv::LINE_AA); ty += 30;
     cv::putText(canvas, g_status, cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 255, 0), 1, cv::LINE_AA);
 }
 
@@ -144,7 +146,7 @@ int main() {
             if (tryOpenSerial(next_port, baud)) { g_cur_dev = next; g_status = "Connected to " + g_open_port; }
             else g_status = "Cannot open " + next_port + " (keeping " + g_open_port + ")";
         }
-        else if (key == 's' || key == 'S') { sendRandom(); }
+        else if (key == 's' || key == 'S') { sendNextState(); }
     }
     closeSerial();
     cv::destroyAllWindows();

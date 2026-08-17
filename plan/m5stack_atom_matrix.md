@@ -50,10 +50,25 @@ FastLED.setBrightness(Brightness);
 
 | 指令 | 说明 |
 |------|------|
-| `PIX <rrggbb> ×25` | 设置 25 像素 (行优先, 索引 0..24) |
-| `ALL <rrggbb>` | 全部同色 |
-| `CLEAR` | 熄灭 |
+| `PIX <rrggbb> ×25` | 静态: 设置 25 像素 (行优先, 索引 0..24) |
+| `ALL <rrggbb>` | 静态: 全部同色 |
+| `MODE ALL <rrggbb>` | 静态: 25 颗全亮 (状态灯) |
+| `MODE BREATH <rrggbb>` | 动画: 十字呼吸灯 (中心行+列 9 颗, 正弦亮度 25ms/帧, 固件自主运行) |
+| `CLEAR` | 熄灭 (退出动画) |
 | `BRIGHT <0-100>` | 全局亮度 (库钳制上限 100) |
+
+### capture_with_LED 状态 → LED 图案映射 (test_m5stack 按 s 循环发送)
+
+| 状态 | 图案 | 颜色 (RGB) | 指令 |
+|------|------|-----------|------|
+| PIPER_INIT | 25 全亮 | 红 ff0000 | `MODE ALL ff0000` |
+| READY | **十字呼吸** | 绿 00ff00 | `MODE BREATH 00ff00` |
+| CAPTURING | **十字呼吸** | 绿 00ff00 | `MODE BREATH 00ff00` |
+| WAITING | 25 全亮 | 黄 ffff00 | `MODE ALL ffff00` |
+| EXHAUSTED | 25 全亮 | 蓝 0000ff | `MODE ALL 0000ff` |
+| OVER | 25 全亮 | 品红 ff00ff | `MODE ALL ff00ff` |
+
+(颜色与 capture_with_LED.cpp 的 drawLedIndicator BGR 值换算一致; 后续集成时按此表在 capture_with_LED 中发送)
 
 PC 端 (test_m5stack.cpp): Win32 `CreateFileA("\\\\.\\COMx")` + DCB 8N1 + 超时; `t` 切换 upper/lower COM 口, `s` 发送随机 HSV 颜色; 5×5 网格 UI 预览。
 
