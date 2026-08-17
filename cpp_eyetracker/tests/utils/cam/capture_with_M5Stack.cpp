@@ -1539,6 +1539,10 @@ int main() {
     // ---- Cleanup ----
     cout<<"[System] Shutting down..."<<endl;
     for(auto& ctx:cam_ctxs){ctx->running=false;ctx->copy_cv.notify_all();}
+    // 退出前熄灭两个 M5Stack
+    sendLedCmd(g_led_upper,"CLEAR");
+    sendLedCmd(g_led_lower,"CLEAR");
+    this_thread::sleep_for(chrono::milliseconds(50));   // 等待串口写出
     if(g_led_upper!=INVALID_HANDLE_VALUE){CloseHandle(g_led_upper);g_led_upper=INVALID_HANDLE_VALUE;}
     if(g_led_lower!=INVALID_HANDLE_VALUE){CloseHandle(g_led_lower);g_led_lower=INVALID_HANDLE_VALUE;}
     if(g_piper_sock!=INVALID_SOCKET) closesocket(g_piper_sock);

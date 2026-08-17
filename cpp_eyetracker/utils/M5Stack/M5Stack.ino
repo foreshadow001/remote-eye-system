@@ -6,7 +6,7 @@
 //   PIX <rrggbb> <rrggbb> ... (25 个, 行优先索引 0..24)  — 静态: 设置 25 个像素
 //   ALL <rrggbb>                                         — 静态: 全部同色
 //   MODE ALL <rrggbb>                                    — 静态: 25 个全亮 (状态灯)
-//   MODE BREATH <rrggbb>                                 — 动画: 十字呼吸灯 (外臂+中心=呼吸色, 内3x3小十字=白)
+//   MODE BREATH <rrggbb>                                 — 动画: 十字呼吸灯 (外臂+中心=白, 内3x3小十字=呼吸色)
 //   MODE FLOW                                            — 动画: 45° 斜向彩色流转 (每条反对角线一个色相)
 //   CLEAR                                                — 熄灭 (退出动画)
 //   BRIGHT <0-100>                                       — 全局亮度 (库内部钳制上限 100, 建议 <=60)
@@ -25,7 +25,7 @@ uint32_t g_breath_color = 0x00FF00;
 uint16_t g_phase = 0;               // 动画相位 (度)
 
 // 十字 = 中心行 (10..14) + 中心列 (2,7,17,22), 共 9 颗 (亮度相同)
-// 配色: 外臂+中心 = 呼吸色; 内 3x3 小十字 (7,11,13,17) = 白色
+// 配色: 外臂+中心 (2,10,12,14,22) = 白色; 内 3x3 小十字 (7,11,13,17) = 呼吸色
 const uint8_t CROSS_IDX[9] = {2, 7, 10, 11, 12, 13, 14, 17, 22};
 
 bool isCross(uint8_t i) {
@@ -33,8 +33,8 @@ bool isCross(uint8_t i) {
     return false;
 }
 
-bool isWhiteInner(uint8_t i) {
-    return (i == 7 || i == 11 || i == 13 || i == 17);
+bool isWhitePx(uint8_t i) {
+    return (i == 2 || i == 10 || i == 12 || i == 14 || i == 22);
 }
 
 void applyPixels() {
@@ -130,12 +130,12 @@ void loop() {
     }
     if (g_mode == 1) {
         // 十字呼吸动画: 9 颗亮度相同, 正弦波动最低约 1/4 (63.75..255)
-        // 外臂+中心 = 呼吸色, 内 3x3 小十字 = 白色, 全部随呼吸亮度缩放
+        // 外臂+中心 = 白色, 内 3x3 小十字 = 呼吸色, 全部随呼吸亮度缩放
         g_phase = (g_phase + 6) % 360;
         uint8_t b = (uint8_t)(159.375 + 95.625 * sin(g_phase * PI / 180.0));
         for (int i = 0; i < NUM_LEDS; i++) {
             if (!isCross(i)) { M5.dis.drawpix(i, CRGB(0, 0, 0)); continue; }
-            uint32_t col = isWhiteInner(i) ? 0xFFFFFF : g_breath_color;
+            uint32_t col = isWhitePx(i) ? 0xFFFFFF : g_breath_color;
             uint8_t r = (uint8_t)((uint16_t)((col >> 16) & 0xFF) * b / 255);
             uint8_t g = (uint8_t)((uint16_t)((col >> 8) & 0xFF) * b / 255);
             uint8_t bl = (uint8_t)((uint16_t)(col & 0xFF) * b / 255);
