@@ -81,10 +81,8 @@ vector<LedPattern> g_states = {
 };
 int g_state_idx = -1;   // -1 = 尚未发送
 
-// 十字 = 中心行 (10..14) + 中心列 (2,7,17,22), 共 9 颗
-// 权重: 中心 1.0 / 邻位 0.7 / 外缘 0.4 (越中心越亮, 与固件一致), ×255 定点
+// 十字 = 中心行 (10..14) + 中心列 (2,7,17,22), 共 9 颗 (亮度相同, 与固件一致)
 const int CROSS_IDX[9] = {2, 7, 10, 11, 12, 13, 14, 17, 22};
-const int CROSS_W[9]   = {102, 179, 102, 179, 255, 179, 102, 179, 102};
 
 void hsvToRgb(double h, double s, double v, int& r, int& g, int& b) {
     double c = v * s;
@@ -122,8 +120,7 @@ void sendNextState() {
             g_grid[i] = {r, g, b};
         }
     } else if (st.breath) {
-        for (int j = 0; j < 9; ++j)
-            g_grid[CROSS_IDX[j]] = {st.rgb[0] * CROSS_W[j] / 255, st.rgb[1] * CROSS_W[j] / 255, st.rgb[2] * CROSS_W[j] / 255};
+        for (int j = 0; j < 9; ++j) g_grid[CROSS_IDX[j]] = st.rgb;
     } else {
         for (int i = 0; i < 25; ++i) g_grid[i] = st.rgb;
     }

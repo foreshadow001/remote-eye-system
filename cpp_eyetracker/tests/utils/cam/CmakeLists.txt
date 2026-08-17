@@ -136,3 +136,23 @@ target_include_directories(capture_with_LED
 )
 
 message(STATUS "capture_with_LED will be built")
+
+# ---- capture_with_M5Stack (capture_with_LED + M5Stack 状态灯) ----
+add_executable(capture_with_M5Stack
+    capture_with_M5Stack.cpp
+)
+
+target_link_libraries(capture_with_M5Stack
+    PRIVATE
+        eyetracker::piper
+        eyetracker::cfg
+        eyetracker::cam
+        ${HDF5_CXX_LIBRARIES}
+)
+
+target_include_directories(capture_with_M5Stack
+    PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+)
+
+message(STATUS "capture_with_M5Stack will be built")

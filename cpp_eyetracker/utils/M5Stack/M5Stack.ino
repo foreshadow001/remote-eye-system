@@ -24,15 +24,12 @@ uint8_t  g_mode = 0;                // 0 = 静态, 1 = 十字呼吸动画, 2 = �
 uint32_t g_breath_color = 0x00FF00;
 uint16_t g_phase = 0;               // 动画相位 (度)
 
-// 十字 = 中心行 (10..14) + 中心列 (2,7,17,22), 共 9 颗
-// 权重: 中心 1.0 / 邻位 0.7 / 外缘 0.4 (越中心越亮), ×255 定点
+// 十字 = 中心行 (10..14) + 中心列 (2,7,17,22), 共 9 颗 (亮度相同)
 const uint8_t CROSS_IDX[9] = {2, 7, 10, 11, 12, 13, 14, 17, 22};
-const uint8_t CROSS_W[9]   = {102, 179, 102, 179, 255, 179, 102, 179, 102};
 
-// 返回像素 i 的十字权重 (0 = 不在十字上)
-uint8_t crossWeight(uint8_t i) {
-    for (uint8_t j = 0; j < 9; j++) if (CROSS_IDX[j] == i) return CROSS_W[j];
-    return 0;
+bool isCross(uint8_t i) {
+    for (uint8_t j = 0; j < 9; j++) if (CROSS_IDX[j] == i) return true;
+    return false;
 }
 
 void applyPixels() {
@@ -127,17 +124,15 @@ void loop() {
         }
     }
     if (g_mode == 1) {
-        // 十字呼吸动画: 亮度正弦波动, 最低约 50% (127.5..255), 越中心越亮 (权重缩放)
+        // 十字呼吸动画: 9 颗亮度相同, 正弦波动最低约 1/4 (63.75..255)
         g_phase = (g_phase + 6) % 360;
-        uint8_t b = (uint8_t)(191.25 + 63.75 * sin(g_phase * PI / 180.0));
+        uint8_t b = (uint8_t)(159.375 + 95.625 * sin(g_phase * PI / 180.0));
+        uint8_t r = (uint8_t)((uint16_t)((g_breath_color >> 16) & 0xFF) * b / 255);
+        uint8_t g = (uint8_t)((uint16_t)((g_breath_color >> 8) & 0xFF) * b / 255);
+        uint8_t bl = (uint8_t)((uint16_t)(g_breath_color & 0xFF) * b / 255);
         for (int i = 0; i < NUM_LEDS; i++) {
-            uint8_t w = crossWeight(i);
-            if (w == 0) { M5.dis.drawpix(i, CRGB(0, 0, 0)); continue; }
-            uint8_t bb = (uint8_t)((uint16_t)b * w / 255);
-            uint8_t r = (uint8_t)((uint16_t)((g_breath_color >> 16) & 0xFF) * bb / 255);
-            uint8_t g = (uint8_t)((uint16_t)((g_breath_color >> 8) & 0xFF) * bb / 255);
-            uint8_t bl = (uint8_t)((uint16_t)(g_breath_color & 0xFF) * bb / 255);
-            M5.dis.drawpix(i, CRGB(r, g, bl));
+            if (isCross(i)) M5.dis.drawpix(i, CRGB(r, g, bl));
+            else M5.dis.drawpix(i, CRGB(0, 0, 0));
         }
         delay(25);
     } else if (g_mode == 2) {
