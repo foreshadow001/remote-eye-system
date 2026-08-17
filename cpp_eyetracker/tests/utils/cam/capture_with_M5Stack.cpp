@@ -181,6 +181,13 @@ void sendLedPatternTo(HANDLE h, LedState s) {
     sendLedCmd(h, cmd);
 }
 
+// 每臂成功录制数 / OVER 标志 (运行期独立计数, 跨切换保持, 重启归零)
+int g_recorded_upper = 0, g_recorded_lower = 0;
+bool g_over_upper = false, g_over_lower = false;
+
+int& recordedOf() { return (g_arm == "upper") ? g_recorded_upper : g_recorded_lower; }
+bool& overOf()    { return (g_arm == "upper") ? g_over_upper : g_over_lower; }
+
 // 设置全局状态 (UI 指示器), 只更新"当前臂"对应的设备
 void setLedState(LedState s) {
     if (g_led_state == s) return;
@@ -213,19 +220,8 @@ int64_t nowUs() {
         chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-extern int g_chunk_idx;   // HDF5 已写入 chunk 数 (sentry 落盘, 定义在下方)
-
-int g_chunk_base_upper = 0, g_chunk_base_lower = 0;   // 臂会话开始时的 chunk_idx 基线
-
-int& chunkBaseOf() { return (g_arm == "upper") ? g_chunk_base_upper : g_chunk_base_lower; }
-
-// OVER 判断: 当前臂已写入的 chunk 数 (HDF5 sentry 反映真实写入量) 达到 num_targets_per_arm
-// +1 = 当前 dump 即将写入的 chunk; 检查点在 dump 入口 (提前移动机械臂之前), 重启后成立
-bool armOver() {
-    if (g_num_targets_per_arm <= 0) return false;
-    int written = g_chunk_idx - chunkBaseOf() + 1;
-    return written >= g_num_targets_per_arm;
-}
+// OVER 判断 (初版): 每次程序运行, 两臂从零开始独立计数, 不与任何 sentry 比较
+// (h5 sentry 无法区分机械臂, piper sentry 包含跳过目标, 均不作为判据)
 atomic<bool> g_init_ok{false};     // Master→Slave: all connections ready
 atomic<bool> g_piper_busy{false};
 struct ArmTransform { Pt3 tool_t, tool_r, ccs_t, ccs_r; };
@@ -1179,10 +1175,6 @@ int main() {
         }
     }
     cout<<"[HDF5] Ready."<<endl;
-    // OVER 基线: 臂会话开始时的已写入 chunk 数 (sentry 握手之后才准确)
-    g_chunk_base_upper = g_chunk_idx;
-    g_chunk_base_lower = g_chunk_idx;
-    g_show_over = armOver();
     if(is_master_pc)cout<<"[s] Start session  [SPACE] Record  [b] Re-zero  [c] Clear piper sentry  [t] Switch arm  [ESC/q] Quit\n";
     else cout<<"Waiting for Master... [ESC/q] to quit.\n";
 
@@ -1226,7 +1218,7 @@ int main() {
                 string msg = arm_name + " OVER";
                 cv::putText(canvas, msg, cv::Point(g_win_w/4, g_win_h/2-40), cv::FONT_HERSHEY_DUPLEX, 1.2, cv::Scalar(255,0,255), 2);
                 char buf[64];
-                snprintf(buf,sizeof(buf),"%d / %d chunks written", g_chunk_idx - chunkBaseOf(), g_num_targets_per_arm);
+                snprintf(buf,sizeof(buf),"%d / %d targets recorded", recordedOf(), g_num_targets_per_arm);
                 cv::putText(canvas,buf,cv::Point(g_win_w/4,g_win_h/2+10),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(255,255,255),1);
                 string hints = "Press 'b' to reset or 't' to switch arm | 'q' to quit";
                 cv::putText(canvas,hints,cv::Point(g_win_w/4,g_win_h/2+50),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,255),1);
@@ -1258,6 +1250,24 @@ int main() {
 
                 // LED state indicator (Master, top-left of canvas)
                 if (is_master_pc) drawLedIndicator(canvas);
+
+                // 右上角 (LED 指示下方): HDF5 chunk/offset + 每臂本次写入进度 (各占一行)
+                {
+                    string quota = (g_num_targets_per_arm > 0) ? to_string(g_num_targets_per_arm) : "-";
+                    char lb[96]; int bl = 0;
+                    snprintf(lb, sizeof(lb), "chunk: %d   offset: %d", g_chunk_idx, g_frame_offset.load());
+                    cv::Size wsz = cv::getTextSize(lb, cv::FONT_HERSHEY_SIMPLEX, 0.5, 2, &bl);
+                    cv::putText(canvas, lb, cv::Point(g_win_w - wsz.width - 15, 60),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 215, 255), 2, cv::LINE_AA);
+                    snprintf(lb, sizeof(lb), "UPPER: %d/%s", g_recorded_upper, quota.c_str());
+                    wsz = cv::getTextSize(lb, cv::FONT_HERSHEY_SIMPLEX, 0.5, 2, &bl);
+                    cv::putText(canvas, lb, cv::Point(g_win_w - wsz.width - 15, 84),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 200), 2, cv::LINE_AA);
+                    snprintf(lb, sizeof(lb), "LOWER: %d/%s", g_recorded_lower, quota.c_str());
+                    wsz = cv::getTextSize(lb, cv::FONT_HERSHEY_SIMPLEX, 0.5, 2, &bl);
+                    cv::putText(canvas, lb, cv::Point(g_win_w - wsz.width - 15, 108),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 200), 2, cv::LINE_AA);
+                }
 
                 // Watermark hints (bottom-left of right panel)
                 int hx = g_right_x + 10, hy = g_win_h - 60;
@@ -1319,13 +1329,19 @@ int main() {
             if (all_done) {
                 g_consecutive_faults=0; is_recording=false; is_dumping=true; g_recording_number++;
                 if(is_master_pc) setLedState(LedState::WAITING);  // update before loading screens
-                // OVER 检查: 当前臂已写入 chunk 数 (HDF5 sentry) 达到 num_targets_per_arm
+                // OVER 检查: 本臂成功录制计数达到 num_targets_per_arm (运行期独立计数)
                 // → 在提前移动机械臂之前进入 OVER
-                if (is_master_pc && armOver()) {
-                    g_show_over = true;
-                    g_recording_enabled = false;
-                    cout << "[Piper] " << g_arm << " written " << (g_chunk_idx - chunkBaseOf() + 1)
-                         << "/" << g_num_targets_per_arm << " — OVER." << endl;
+                if (is_master_pc && g_num_targets_per_arm > 0) {
+                    recordedOf()++;
+                    cout << "[Piper] " << g_arm << " recorded " << recordedOf()
+                         << "/" << g_num_targets_per_arm << endl;
+                    if (recordedOf() >= g_num_targets_per_arm) {
+                        overOf() = true;
+                        g_show_over = true;
+                        g_recording_enabled = false;
+                        cout << "[Piper] " << g_arm << " reached " << g_num_targets_per_arm
+                             << " recordings — OVER." << endl;
+                    }
                 }
                 auto t0=chrono::steady_clock::now();
 
@@ -1592,15 +1608,8 @@ int main() {
               drawLedIndicator(loading);
               cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
             zeroArm(g_arm);
-            if (g_show_over) {
-                // OVER 退出: 回零 + 重置本臂 piper sentry + 会话基线 → INIT
-                if (g_arm=="upper"){g_upper_idx=0;g_upper_done=false;}
-                else{g_lower_idx=0;g_lower_done=false;}
-                updatePiperSentry(); syncPiperToSlave();
-                chunkBaseOf() = g_chunk_idx;
-                cout<<"[Piper] "<<g_arm<<" sentry reset (OVER exit)."<<endl;
-            }
-            g_show_over=false;
+            // 回零 = 重置本臂 OVER 标志与录制计数 (运行期独立计数)
+            overOf()=false; recordedOf()=0; g_show_over=false;
             setLedState(LedState::PIPER_INIT);       // 回零完成 → INIT (按 s 开始录制)
             cout<<"[Piper] "<<g_arm<<" zeroed. Press [s] to start session."<<endl;
         }
@@ -1609,7 +1618,7 @@ int main() {
             if(g_arm=="upper"){g_upper_idx=0;g_upper_done=false;}
             else{g_lower_idx=0;g_lower_done=false;}
             g_show_exhausted=false;
-            chunkBaseOf() = g_chunk_idx;   // 重置会话基线
+            overOf()=false; recordedOf()=0;
             g_recording_enabled=false; updatePiperSentry();
             syncPiperToSlave();
             cout<<"[Piper] "<<g_arm<<" sentry cleared."<<endl;
@@ -1635,9 +1644,8 @@ int main() {
                 sendLedPatternTo(g_led_lower, LedState::PIPER_INIT);
             }
             g_arm=new_arm;
-            chunkBaseOf() = g_chunk_idx;   // 新臂会话基线 = 当前已写入 chunk 数
-            // 加载新臂的 OVER 状态 (HDF5 sentry 推导, 切多少次都保持)
-            g_show_over = armOver();
+            // 加载新臂的 OVER 状态 (每臂独立标志, 切多少次都保持)
+            g_show_over = overOf();
             if (g_show_over) {
                 setLedState(LedState::OVER);         // 新臂已 OVER → 彩流
             } else {
