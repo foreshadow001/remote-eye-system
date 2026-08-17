@@ -187,6 +187,19 @@ string g_arm = "upper";
 int g_upper_idx = 0, g_lower_idx = 0;
 bool g_upper_done = false, g_lower_done = false;
 bool g_recording_enabled = false;
+
+// ================== AutoMove / OVER (capture.yaml) ==================
+bool g_enable_auto_move = false;          // READY 超时自动跳过
+double g_click_window = 0.5;              // READY 等待 SPACE 的最大时长 (s)
+int g_num_targets_per_arm = 0;            // 每臂成功录制数上限 (0 = 不限制)
+int g_arm_recorded = 0;                   // 当前臂成功录制数
+bool g_show_over = false;                 // OVER 状态
+atomic<int64_t> g_ready_since_us{0};      // READY 起始时刻 (us since epoch, 跨线程)
+
+int64_t nowUs() {
+    return chrono::duration_cast<chrono::microseconds>(
+        chrono::steady_clock::now().time_since_epoch()).count();
+}
 atomic<bool> g_init_ok{false};     // Master→Slave: all connections ready
 atomic<bool> g_piper_busy{false};
 struct ArmTransform { Pt3 tool_t, tool_r, ccs_t, ccs_r; };
@@ -481,6 +494,7 @@ ArmResult moveArmToTarget() {
             g_gaze_x = g_tool_ccs_pos.x; g_gaze_y = g_tool_ccs_pos.y; g_gaze_z = g_tool_ccs_pos.z;
             g_gaze_ready = true; g_gaze_need_send = true;
             g_piper_busy = false;
+            g_ready_since_us.store(nowUs());   // AutoMove: READY 计时起点
             return ArmResult::ARM_OK;
         }
         if (resp.rfind("ERROR:",0) == 0) {
@@ -877,6 +891,10 @@ int main() {
     bool enable_offset=true, enable_intersection=true, enable_net_sync=true;
     try{enable_offset=cap["enable_offset"].as<bool>();enable_intersection=cap["enable_intersection"].as<bool>();
         enable_net_sync=cap["enable_net_sync"].as<bool>();}catch(...){}
+    // AutoMove / OVER 配置
+    try{g_enable_auto_move=cap["enable_auto_move"].as<bool>();}catch(...){}
+    try{g_click_window=cap["click_window"].as<double>();}catch(...){}
+    try{g_num_targets_per_arm=cap["num_targets_per_arm"].as<int>();}catch(...){}
     double target_fps=cap["fps"].as<double>(), gain=cap["gain"].as<double>();
     double gammav=cap["gamma"].as<double>(), exp_time=cap["exposure_time"].as<double>();
     g_win_w=cap["window_width"].as<int>(); g_win_h=cap["window_height"].as<int>();
@@ -908,6 +926,10 @@ int main() {
     cout<<"SW Offset Init   : "<<(enable_offset?"ON":"OFF")<<endl;
     cout<<"Intersection Crop: "<<(enable_intersection?"ON":"OFF")<<endl;
     cout<<"Net Sync         : "<<(enable_net_sync?"ON":"OFF (Local Mode)")<<endl;
+    cout<<"Auto Move        : "<<(g_enable_auto_move?"ON":"OFF");
+    if(g_enable_auto_move) cout<<" (click window "<<g_click_window<<"s)";
+    cout<<endl;
+    cout<<"Targets per arm  : "<<(g_num_targets_per_arm>0?to_string(g_num_targets_per_arm):"unlimited")<<endl;
     cout<<"----------------------------------\n"<<endl;
 
     // ---- Piper config (Master only) ----
@@ -1146,8 +1168,9 @@ int main() {
 
         // ===== LED state update (Master only; 状态变化时同步到 M5Stack) =====
         if (is_master_pc) {
-            if (g_show_exhausted) {
-                // TODO: OVER state when both arms done (reserved)
+            if (g_show_over) {
+                setLedState(LedState::OVER);
+            } else if (g_show_exhausted) {
                 setLedState(LedState::EXHAUSTED);
             } else if (is_dumping) {
                 setLedState(LedState::WAITING);
@@ -1164,6 +1187,19 @@ int main() {
         if (need_ui_update && !is_dumping) {
             if (g_fault_active.load()) {
                 showFaultOverlay(g_faulty_cam.load(), g_use_hw_trigger);
+            } else if (g_show_over) {
+                // OVER UI — 当前臂成功录制数达到 num_targets_per_arm
+                cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
+                string arm_name = g_arm; for(auto& c:arm_name) c=toupper(c);
+                string msg = arm_name + " OVER";
+                cv::putText(canvas, msg, cv::Point(g_win_w/4, g_win_h/2-40), cv::FONT_HERSHEY_DUPLEX, 1.2, cv::Scalar(255,0,255), 2);
+                char buf[64];
+                snprintf(buf,sizeof(buf),"%d / %d targets recorded", g_arm_recorded, g_num_targets_per_arm);
+                cv::putText(canvas,buf,cv::Point(g_win_w/4,g_win_h/2+10),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(255,255,255),1);
+                string hints = "Press 'c' to clear or 't' to switch arm | 'q' to quit";
+                cv::putText(canvas,hints,cv::Point(g_win_w/4,g_win_h/2+50),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,255),1);
+                if(is_master_pc) drawLedIndicator(canvas);
+                cv::imshow("Multi-Cam Preview", canvas);
             } else if (g_show_exhausted) {
                 // EXHAUSTED UI — no camera rendering
                 cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
@@ -1251,6 +1287,18 @@ int main() {
             if (all_done) {
                 g_consecutive_faults=0; is_recording=false; is_dumping=true; g_recording_number++;
                 if(is_master_pc) setLedState(LedState::WAITING);  // update before loading screens
+                // OVER 检查: 成功录制计数达到 num_targets_per_arm → 在提前移动机械臂之前进入 OVER
+                if (is_master_pc && g_num_targets_per_arm > 0) {
+                    g_arm_recorded++;
+                    cout << "[Piper] " << g_arm << " recorded " << g_arm_recorded
+                         << "/" << g_num_targets_per_arm << endl;
+                    if (g_arm_recorded >= g_num_targets_per_arm) {
+                        g_show_over = true;
+                        g_recording_enabled = false;
+                        cout << "[Piper] " << g_arm << " reached " << g_num_targets_per_arm
+                             << " recordings — OVER." << endl;
+                    }
+                }
                 auto t0=chrono::steady_clock::now();
 
                 // Save old gaze (recording #N position) before arm overwrites it
@@ -1275,9 +1323,9 @@ int main() {
                     g_show_exhausted = true;
                     cout<<"[Piper] "<<g_arm<<" targets exhausted (pre-check). Skipping ARM."<<endl;
                 }
-                // Master: start arm thread (parallel with HDF5)
+                // Master: start arm thread (parallel with HDF5); OVER 时不移动
                 thread arm_thread;
-                if (is_master_pc && !g_show_exhausted) {
+                if (is_master_pc && !g_show_exhausted && !g_show_over) {
                     cout<<"[Piper] Moving to next target..."<<endl;
                     arm_thread=thread([&](){
                         ArmResult ar = moveArmToTarget();
@@ -1441,6 +1489,28 @@ int main() {
                 is_dumping=false;while(cv::waitKey(1)>=0);last_ui_time=chrono::steady_clock::now();
         }}
 
+        // ---- AutoMove: READY 超时未按 SPACE → 跳过本次 capture+dump, 直接移动机械臂 ----
+        if (is_master_pc && g_enable_auto_move && g_recording_enabled
+            && !is_recording && !is_dumping && !g_piper_busy
+            && !g_show_exhausted && !g_show_over) {
+            auto ready_tp = chrono::steady_clock::time_point(chrono::microseconds(g_ready_since_us.load()));
+            double waited = chrono::duration<double>(chrono::steady_clock::now() - ready_tp).count();
+            if (waited > g_click_window) {
+                cout << "[AutoMove] No SPACE within " << fixed << setprecision(1) << g_click_window
+                     << "s — skipping this capture, moving " << g_arm << " to next target..." << endl;
+                int& idx = (g_arm=="upper") ? g_upper_idx : g_lower_idx;
+                idx++; updatePiperSentry();          // 目标被跳过 (不录制, 仍消耗)
+                ArmResult ar = moveArmToTarget();
+                if (ar == ArmResult::ARM_OK) {
+                    cout << "[AutoMove] " << g_arm << " at next target. Waiting for SPACE..." << endl;
+                } else if (ar == ArmResult::ARM_EXHAUSTED) {
+                    g_show_exhausted = true;
+                } else {
+                    cout << "[AutoMove] Arm ERROR." << endl;
+                }
+            }
+        }
+
         // ---- Key handling ----
         char key=(char)cv::waitKey(1); bool trigger_start=false;
         if(g_syncing.load()){}
@@ -1454,7 +1524,7 @@ int main() {
             }else{if(g_fault_active.load())global_running=false;}
         }else if(g_fault_active.load()){}
         // ---- Master-only keys ----
-        else if(is_master_pc&&key=='s'&&!is_recording&&!is_dumping&&!g_piper_busy){
+        else if(is_master_pc&&key=='s'&&!is_recording&&!is_dumping&&!g_piper_busy&&!g_show_over){
             bool all_streaming=true;
             for(auto& ctx:cam_ctxs) if(ctx->status.load()!=CamStatus::STREAMING){all_streaming=false;break;}
             if(!all_streaming){cout<<"[s] Waiting for cameras to be STREAMING..."<<endl;goto next_iter;}
@@ -1501,7 +1571,8 @@ int main() {
             // Clear only current arm's piper sentry
             if(g_arm=="upper"){g_upper_idx=0;g_upper_done=false;}
             else{g_lower_idx=0;g_lower_done=false;}
-            g_show_exhausted=false; g_recording_enabled=false; updatePiperSentry();
+            g_show_exhausted=false; g_show_over=false; g_arm_recorded=0;
+            g_recording_enabled=false; updatePiperSentry();
             syncPiperToSlave();
             cout<<"[Piper] "<<g_arm<<" sentry cleared."<<endl;
         }
@@ -1510,7 +1581,7 @@ int main() {
             bool nd=(new_arm=="upper")?g_upper_done:g_lower_done;
             if(nd){cout<<"[t] "<<new_arm<<" already done."<<endl;goto next_iter;}
             g_recording_enabled=false;               // 切换后需按 s 才能录制
-            g_show_exhausted=false;
+            g_show_exhausted=false; g_show_over=false; g_arm_recorded=0;
             setLedState(LedState::WAITING);          // 立刻进入 WAITING 状态
             { cv::Mat loading=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
               cv::putText(loading,"Zeroing arm...",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,200,255),2);
