@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <vector>
 #include <array>
+#include <cmath>
 #include <cctype>
 #include <cstdint>
 
@@ -67,35 +68,64 @@ bool sendSerial(const string& cmd) {
 }
 
 // ================== 状态灯 (capture_with_LED 的 LedState) ==================
-struct LedPattern { string name; bool breath; array<int,3> rgb; string desc; };
+struct LedPattern { string name; bool breath; bool flow; array<int,3> rgb; string desc; };
 // 颜色与 capture_with_LED.cpp 的 drawLedIndicator 一致:
-//   PIPER_INIT=红 READY=绿 CAPTURING=绿 WAITING=黄 EXHAUSTED=蓝 OVER=品红
+//   PIPER_INIT=蓝 READY=绿 CAPTURING=绿 WAITING=橙 EXHAUSTED=红 OVER=横向彩流
 vector<LedPattern> g_states = {
-    {"PIPER_INIT", false, {255,  0,  0}, "all 25 red"},
-    {"READY",      true,  {  0,255,  0}, "green breathing cross"},
-    {"CAPTURING",  true,  {  0,255,  0}, "green breathing cross"},
-    {"WAITING",    false, {255,255,  0}, "all 25 yellow"},
-    {"EXHAUSTED",  false, {  0,  0,255}, "all 25 blue"},
-    {"OVER",       false, {255,  0,255}, "all 25 magenta"},
+    {"PIPER_INIT", false, false, {  0,  0,255}, "all 25 blue"},
+    {"READY",      true,  false, {  0,255,  0}, "green breathing cross"},
+    {"CAPTURING",  true,  false, {  0,255,  0}, "green breathing cross"},
+    {"WAITING",    false, false, {255,128,  0}, "all 25 orange"},
+    {"EXHAUSTED",  false, false, {255,  0,  0}, "all 25 red"},
+    {"OVER",       false, true,  {255,  0,255}, "horizontal rainbow flow"},
 };
 int g_state_idx = -1;   // -1 = 尚未发送
 
 // 十字 = 中心行 (10..14) + 中心列 (2,7,17,22), 共 9 颗
+// 权重: 中心 1.0 / 邻位 0.7 / 外缘 0.4 (越中心越亮, 与固件一致), ×255 定点
 const int CROSS_IDX[9] = {2, 7, 10, 11, 12, 13, 14, 17, 22};
-bool isCross(int i) { for (int j = 0; j < 9; ++j) if (CROSS_IDX[j] == i) return true; return false; }
+const int CROSS_W[9]   = {102, 179, 102, 179, 255, 179, 102, 179, 102};
 
-// 按 s 循环发送状态图案 (READY/CAPTURING = 绿色十字呼吸灯, 其余 = 25 颗全亮)
+void hsvToRgb(double h, double s, double v, int& r, int& g, int& b) {
+    double c = v * s;
+    double x = c * (1 - fabs(fmod(h / 60.0, 2) - 1));
+    double m = v - c;
+    double rp = 0, gp = 0, bp = 0;
+    if (h < 60) { rp = c; gp = x; }
+    else if (h < 120) { rp = x; gp = c; }
+    else if (h < 180) { gp = c; bp = x; }
+    else if (h < 240) { gp = x; bp = c; }
+    else if (h < 300) { rp = x; bp = c; }
+    else { rp = c; bp = x; }
+    r = (int)((rp + m) * 255); g = (int)((gp + m) * 255); b = (int)((bp + m) * 255);
+}
+
+// 按 s 循环发送状态图案 (READY/CAPTURING = 十字呼吸, OVER = 横向彩流, 其余 = 25 颗全亮)
 void sendNextState() {
     g_state_idx = (g_state_idx + 1) % (int)g_states.size();
     auto& st = g_states[g_state_idx];
-    char hexbuf[8];
-    snprintf(hexbuf, sizeof(hexbuf), "%02x%02x%02x", st.rgb[0], st.rgb[1], st.rgb[2]);
-    string cmd = st.breath ? ("MODE BREATH " + string(hexbuf)) : ("MODE ALL " + string(hexbuf));
+    string cmd;
+    if (st.flow) {
+        cmd = "MODE FLOW";
+    } else {
+        char hexbuf[8];
+        snprintf(hexbuf, sizeof(hexbuf), "%02x%02x%02x", st.rgb[0], st.rgb[1], st.rgb[2]);
+        cmd = st.breath ? ("MODE BREATH " + string(hexbuf)) : ("MODE ALL " + string(hexbuf));
+    }
     g_status = sendSerial(cmd) ? ("State: " + st.name + " — " + st.desc) : "Send failed.";
     // 更新 5x5 预览
-    for (int i = 0; i < 25; ++i) {
-        if (st.breath && !isCross(i)) g_grid[i] = {0, 0, 0};
-        else g_grid[i] = st.rgb;
+    for (int i = 0; i < 25; ++i) g_grid[i] = {0, 0, 0};
+    if (st.flow) {
+        // 彩流静态快照: 每列一个色相 (与固件列偏移 72° 一致)
+        for (int i = 0; i < 25; ++i) {
+            int r, g, b; hsvToRgb((i % 5) * 72.0, 1.0, 1.0, r, g, b);
+            g_grid[i] = {r, g, b};
+        }
+    } else if (st.breath) {
+        for (int j = 0; j < 9; ++j)
+            g_grid[CROSS_IDX[j]] = {st.rgb[0] * CROSS_W[j] / 255, st.rgb[1] * CROSS_W[j] / 255, st.rgb[2] * CROSS_W[j] / 255};
+    } else {
+        for (int i = 0; i < 25; ++i) g_grid[i] = st.rgb;
     }
 }
 

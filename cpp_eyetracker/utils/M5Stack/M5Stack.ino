@@ -7,6 +7,7 @@
 //   ALL <rrggbb>                                         — 静态: 全部同色
 //   MODE ALL <rrggbb>                                    — 静态: 25 个全亮 (状态灯)
 //   MODE BREATH <rrggbb>                                 — 动画: 十字呼吸灯 (中心行+列, 9 颗)
+//   MODE FLOW                                            — 动画: 横向彩色流转 (每列不同色相, 彩虹循环)
 //   CLEAR                                                — 熄灭 (退出动画)
 //   BRIGHT <0-100>                                       — 全局亮度 (库内部钳制上限 100, 建议 <=60)
 //
@@ -19,16 +20,19 @@
 #define NUM_LEDS 25
 
 uint32_t g_pixels[NUM_LEDS];        // 0xRRGGBB 存储 (静态模式), 发送时显式拆分为 CRGB
-uint8_t  g_mode = 0;                // 0 = 静态, 1 = 十字呼吸动画
+uint8_t  g_mode = 0;                // 0 = 静态, 1 = 十字呼吸动画, 2 = 横向彩流动画
 uint32_t g_breath_color = 0x00FF00;
-uint16_t g_phase = 0;               // 呼吸相位 (度)
+uint16_t g_phase = 0;               // 动画相位 (度)
 
 // 十字 = 中心行 (10..14) + 中心列 (2,7,17,22), 共 9 颗
+// 权重: 中心 1.0 / 邻位 0.7 / 外缘 0.4 (越中心越亮), ×255 定点
 const uint8_t CROSS_IDX[9] = {2, 7, 10, 11, 12, 13, 14, 17, 22};
+const uint8_t CROSS_W[9]   = {102, 179, 102, 179, 255, 179, 102, 179, 102};
 
-bool isCross(uint8_t i) {
-    for (uint8_t j = 0; j < 9; j++) if (CROSS_IDX[j] == i) return true;
-    return false;
+// 返回像素 i 的十字权重 (0 = 不在十字上)
+uint8_t crossWeight(uint8_t i) {
+    for (uint8_t j = 0; j < 9; j++) if (CROSS_IDX[j] == i) return CROSS_W[j];
+    return 0;
 }
 
 void applyPixels() {
@@ -66,6 +70,9 @@ void handleLine(const String& line) {
         tok.trim();
         g_mode = 1;
         g_breath_color = parseHex(tok);
+        g_phase = 0;
+    } else if (cmd == "MODE FLOW") {
+        g_mode = 2;
         g_phase = 0;
     } else if (cmd == "CLEAR") {
         g_mode = 0;
@@ -120,17 +127,28 @@ void loop() {
         }
     }
     if (g_mode == 1) {
-        // 十字呼吸动画: 亮度正弦波动 (颜色缩放, 不调 FastLED 亮度避免与库钳制冲突)
+        // 十字呼吸动画: 亮度正弦波动, 最低约 50% (127.5..255), 越中心越亮 (权重缩放)
         g_phase = (g_phase + 6) % 360;
-        uint8_t b = (uint8_t)(127.5 + 127.5 * sin(g_phase * PI / 180.0));
-        uint8_t r = (uint8_t)(((g_breath_color >> 16) & 0xFF) * b / 255);
-        uint8_t g = (uint8_t)(((g_breath_color >> 8) & 0xFF) * b / 255);
-        uint8_t bl = (uint8_t)((g_breath_color & 0xFF) * b / 255);
+        uint8_t b = (uint8_t)(191.25 + 63.75 * sin(g_phase * PI / 180.0));
         for (int i = 0; i < NUM_LEDS; i++) {
-            if (isCross(i)) M5.dis.drawpix(i, CRGB(r, g, bl));
-            else M5.dis.drawpix(i, CRGB(0, 0, 0));
+            uint8_t w = crossWeight(i);
+            if (w == 0) { M5.dis.drawpix(i, CRGB(0, 0, 0)); continue; }
+            uint8_t bb = (uint8_t)((uint16_t)b * w / 255);
+            uint8_t r = (uint8_t)((uint16_t)((g_breath_color >> 16) & 0xFF) * bb / 255);
+            uint8_t g = (uint8_t)((uint16_t)((g_breath_color >> 8) & 0xFF) * bb / 255);
+            uint8_t bl = (uint8_t)((uint16_t)(g_breath_color & 0xFF) * bb / 255);
+            M5.dis.drawpix(i, CRGB(r, g, bl));
         }
         delay(25);
+    } else if (g_mode == 2) {
+        // 横向彩色流转: 每列色相 = 相位 + 列偏移 (72°), 随时间向右流动
+        g_phase = (g_phase + 8) % 360;
+        for (int x = 0; x < 5; x++) {
+            uint16_t hue = (g_phase + x * 72) % 360;
+            CRGB c = CRGB(CHSV(hue, 255, 255));   // FastLED HSV→RGB
+            for (int y = 0; y < 5; y++) M5.dis.drawpix(x + y * 5, c);
+        }
+        delay(30);
     } else {
         delay(1);
     }

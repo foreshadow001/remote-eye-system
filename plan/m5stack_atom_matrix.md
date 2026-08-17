@@ -54,6 +54,7 @@ FastLED.setBrightness(Brightness);
 | `ALL <rrggbb>` | 静态: 全部同色 |
 | `MODE ALL <rrggbb>` | 静态: 25 颗全亮 (状态灯) |
 | `MODE BREATH <rrggbb>` | 动画: 十字呼吸灯 (中心行+列 9 颗, 正弦亮度 25ms/帧, 固件自主运行) |
+| `MODE FLOW` | 动画: 横向彩色流转 (每列色相 = 相位 + 列偏移 72°, 30ms/帧, 固件自主运行) |
 | `CLEAR` | 熄灭 (退出动画) |
 | `BRIGHT <0-100>` | 全局亮度 (库钳制上限 100) |
 
@@ -61,14 +62,21 @@ FastLED.setBrightness(Brightness);
 
 | 状态 | 图案 | 颜色 (RGB) | 指令 |
 |------|------|-----------|------|
-| PIPER_INIT | 25 全亮 | 红 ff0000 | `MODE ALL ff0000` |
+| PIPER_INIT | 25 全亮 | **蓝 0000ff** | `MODE ALL 0000ff` |
 | READY | **十字呼吸** | 绿 00ff00 | `MODE BREATH 00ff00` |
 | CAPTURING | **十字呼吸** | 绿 00ff00 | `MODE BREATH 00ff00` |
-| WAITING | 25 全亮 | 黄 ffff00 | `MODE ALL ffff00` |
-| EXHAUSTED | 25 全亮 | 蓝 0000ff | `MODE ALL 0000ff` |
-| OVER | 25 全亮 | 品红 ff00ff | `MODE ALL ff00ff` |
+| WAITING | 25 全亮 | **橙 ff8000** (与绿区分度大) | `MODE ALL ff8000` |
+| EXHAUSTED | 25 全亮 | **红 ff0000** | `MODE ALL ff0000` |
+| OVER | **横向彩色流转** | 彩虹 (每列偏移 72°) | `MODE FLOW` |
 
-(颜色与 capture_with_LED.cpp 的 drawLedIndicator BGR 值换算一致; 后续集成时按此表在 capture_with_LED 中发送)
+(颜色与 capture_with_LED.cpp 的 drawLedIndicator 同步一致; 后续集成时按此表在 capture_with_LED 中发送)
+
+### 呼吸十字规格 (MODE BREATH)
+
+- 十字 9 颗: 中心行 (10..14) + 中心列 (2,7,17,22)
+- 亮度 = 正弦呼吸, **最低 ~50% (127.5..255)**, 25ms/帧
+- **越中心越亮** (权重 ×255): 中心 255 / 邻位 179 / 外缘 102 (1.0 / 0.7 / 0.4)
+- 固件与 PC 预览使用同一套权重表
 
 PC 端 (test_m5stack.cpp): Win32 `CreateFileA("\\\\.\\COMx")` + DCB 8N1 + 超时; `t` 切换 upper/lower COM 口, `s` 发送随机 HSV 颜色; 5×5 网格 UI 预览。
 
