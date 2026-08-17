@@ -1412,7 +1412,7 @@ int main() {
                 if(g_upper_done&&g_lower_done) cout<<"[SPACE] Both arms DONE. Press [c] to clear sentry."<<endl;
             }
         }
-        else if(is_master_pc&&(key=='b'||key=='B')&&!g_piper_busy){
+        else if(is_master_pc&&(key=='b'||key=='B')&&!g_piper_busy&&!is_recording&&!is_dumping){
             g_recording_enabled=false;               // 回零后需按 s 才能录制
             g_show_exhausted=false;
             g_led_state=LedState::WAITING;           // 立刻进入 WAITING 状态
@@ -1424,7 +1424,7 @@ int main() {
             g_led_state=LedState::PIPER_INIT;        // 回零完成 → INIT (按 s 开始录制)
             cout<<"[Piper] "<<g_arm<<" zeroed. Press [s] to start session."<<endl;
         }
-        else if(is_master_pc&&(key=='c'||key=='C')&&!g_piper_busy){
+        else if(is_master_pc&&(key=='c'||key=='C')&&!g_piper_busy&&!is_recording&&!is_dumping){
             // Clear only current arm's piper sentry
             if(g_arm=="upper"){g_upper_idx=0;g_upper_done=false;}
             else{g_lower_idx=0;g_lower_done=false;}
@@ -1432,7 +1432,7 @@ int main() {
             syncPiperToSlave();
             cout<<"[Piper] "<<g_arm<<" sentry cleared."<<endl;
         }
-        else if(is_master_pc&&(key=='t'||key=='T')&&!g_piper_busy){
+        else if(is_master_pc&&(key=='t'||key=='T')&&!g_piper_busy&&!is_recording&&!is_dumping){
             string new_arm=(g_arm=="upper")?"lower":"upper";
             bool nd=(new_arm=="upper")?g_upper_done:g_lower_done;
             if(nd){cout<<"[t] "<<new_arm<<" already done."<<endl;goto next_iter;}
@@ -1456,6 +1456,8 @@ int main() {
                 int& idx=(g_arm=="upper")?g_upper_idx:g_lower_idx;
                 idx++; updatePiperSentry();
             }
+            // 吞掉快速连按/自动重复的残留按键 (此时它们已无效), 防止 READY 下 SPACE 二次触发
+            while(cv::waitKey(1)>=0){}
             current_record_timestr=shared_record_timestr;
             record_start_time=global_record_start_time;
             is_recording=true; cout<<"[Info] Recording in progress..."<<endl;
