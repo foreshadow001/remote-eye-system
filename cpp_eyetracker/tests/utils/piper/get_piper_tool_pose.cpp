@@ -54,7 +54,7 @@ struct ToolResult {
 ToolResult g_upper_res, g_lower_res;
 
 // ================== TCP ==================
-bool recvLine(SOCKET sock, string& line, int timeout_ms = 3000) {
+bool recvLine(SOCKET sock, string& line, int timeout_ms = 10000) {
 #ifdef _WIN32
     DWORD to = timeout_ms;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
@@ -100,44 +100,53 @@ bool parsePoseResponse(const string& resp, string& arm, Pose& flange,
     return true;
 }
 
-// 连接 + READY/ACK 握手 (带重试, 参照 test_record_arm_data)
+// 连接 + READY/ACK 握手 (与 test_record_arm_data::connectToArmServer 完全一致:
+// 无限重试, 500ms 间隔, 握手超时 10s — Ubuntu 端可能后启动/被其他客户端占用)
 bool connectArm() {
-    if (g_sock != INVALID_SOCKET) { closesocket(g_sock); g_sock = INVALID_SOCKET; }
-    for (int retry = 0; retry < 3; ++retry) {
+    int retry = 0;
+    while (true) {
+        if (g_sock != INVALID_SOCKET) { closesocket(g_sock); g_sock = INVALID_SOCKET; }
         g_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (g_sock == INVALID_SOCKET) return false;
         sockaddr_in server{};
         server.sin_family = AF_INET;
         server.sin_port = htons(g_port);
         inet_pton(AF_INET, g_ubuntu_ip.c_str(), &server.sin_addr);
-        if (connect(g_sock, (sockaddr*)&server, sizeof(server)) != 0) {
+        if (connect(g_sock, (sockaddr*)&server, sizeof(server)) == 0) {
+            sendLine(g_sock, "READY");
+            string hl;
+            if (recvLine(g_sock, hl, 10000) && hl == "ACK") {
+                g_status = "Connected";
+                cout << "[Arm] Handshake OK." << endl;
+                return true;
+            }
+            cerr << "[Arm] Handshake fail: " << (hl.empty() ? "no response" : hl) << endl;
             closesocket(g_sock); g_sock = INVALID_SOCKET;
-            this_thread::sleep_for(chrono::milliseconds(500));
-            continue;
+        } else {
+            closesocket(g_sock); g_sock = INVALID_SOCKET;
         }
-        sendLine(g_sock, "READY");
-        string hl;
-        if (recvLine(g_sock, hl, 3000) && hl == "ACK") {
-            g_status = "Connected";
-            return true;
-        }
-        closesocket(g_sock); g_sock = INVALID_SOCKET;
+        if (++retry % 10 == 1)
+            cerr << "[Arm] Connect retry #" << retry << " (" << g_ubuntu_ip << ":" << g_port << ")..." << endl;
         this_thread::sleep_for(chrono::milliseconds(500));
     }
-    g_status = "Connect failed";
-    return false;
 }
 
 // ================== 查询 ==================
 void queryTool() {
-    if (g_sock == INVALID_SOCKET && !connectArm()) return;
     if (!sendLine(g_sock, "GET_POSE:" + g_current_arm)) {
-        g_status = "Send failed - reconnecting...";
-        if (!connectArm()) return;
+        cerr << "[Arm] Send failed - reconnecting..." << endl;
+        connectArm();
         if (!sendLine(g_sock, "GET_POSE:" + g_current_arm)) { g_status = "Send failed"; return; }
     }
     string resp;
-    if (!recvLine(g_sock, resp, 3000)) { g_status = "Query timeout"; return; }
+    if (!recvLine(g_sock, resp, 10000)) {
+        cerr << "[Arm] Query timeout - reconnecting..." << endl;
+        connectArm();
+        if (!sendLine(g_sock, "GET_POSE:" + g_current_arm) || !recvLine(g_sock, resp, 10000)) {
+            g_status = "Query failed";
+            return;
+        }
+    }
 
     string arm; Pose flange; double a, b, g;
     if (!parsePoseResponse(resp, arm, flange, a, b, g)) {
@@ -242,6 +251,10 @@ int main() {
         return 1;
     }
     cout << "Keys   : [g] query tool pose  [t] switch arm  [q] quit\n" << endl;
+
+    // 启动即连接 (参照 test_record_arm_data: 无限重试握手, 连不上则阻塞等待)
+    cout << "[Arm] Connecting to " << g_ubuntu_ip << ":" << g_port << " ... " << flush;
+    connectArm();
 
     drawUI();
 
