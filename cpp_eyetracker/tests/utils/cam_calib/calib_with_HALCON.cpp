@@ -221,9 +221,9 @@ void slaveCmdWorker(SOCKET s){
         if(line.rfind("PHOTO:",0)==0){int idx=stoi(line.substr(6));stringstream ss;ss<<setw(2)<<setfill('0')<<idx;g_last_idx.store(idx);g_capture_count++;
             cout<<"[Slave] PHOTO "<<idx<<endl;
             for(auto& ctx:cam_ctxs){cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}if(!snap.empty()){cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);string fn=g_save_dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg";cv::imwrite(fn,out);cout<<"  -> Saved "<<fn<<endl;}}}
-        else if(line.rfind("UNDO:",0)==0){int idx=stoi(line.substr(5));stringstream ss;ss<<setw(2)<<setfill('0')<<idx;
-            cout<<"[Slave] UNDO index "<<ss.str()<<endl;
-            if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir)){string st=e.path().stem().string();if(st.rfind("calib_cam_",0)==0&&st.length()>=2&&st.substr(st.length()-2)==ss.str())fs::remove(e.path());}g_last_idx.store(idx-1);if(g_capture_count>0)g_capture_count--;}
+        else if(line.rfind("UNDO:",0)==0){int idx=stoi(line.substr(5));
+            cout<<"[Slave] UNDO index "<<idx<<" (counter rollback, files kept for overwrite)"<<endl;
+            g_last_idx.store(idx-1);if(g_capture_count>0)g_capture_count--;}
         else if(line.rfind("MODE:",0)==0){string m=line.substr(5);g_intr_mode.store(m=="INTRINSIC");cout<<"[Slave] Calibration mode: "<<(g_intr_mode.load()?"INTRINSIC":"EXTRINSIC")<<endl;}
         else if(line=="IPHOTO"){cout<<"[Slave] IPHOTO request from master"<<endl;
             if(g_intr_mode.load()&&saveIntrinsicsFrame())sendLine(s,"IPHOTO_OK");
@@ -384,7 +384,8 @@ int main(){
     // ---- UI ----
     cv::namedWindow("Calib Capture",cv::WINDOW_NORMAL);cv::resizeWindow("Calib Capture",g_win_w,g_win_h);updateLayout();cv::setMouseCallback("Calib Capture",onMouse);
     auto uii=chrono::milliseconds((int)(1000.0/uif));auto lui=chrono::steady_clock::now()-uii;
-    g_capture_count=getNextCounter(g_save_dir);cout<<"[System] Existing captures: "<<g_capture_count<<endl;g_ready_time=chrono::steady_clock::now();
+    g_capture_count=getNextCounter(g_save_dir);g_last_idx.store(g_capture_count-1);   // 内存计数器 (z 回退, 下次拍摄覆盖)
+    cout<<"[System] Existing captures: "<<g_capture_count<<endl;g_ready_time=chrono::steady_clock::now();
 
     while(global_running){
         auto now=chrono::steady_clock::now();bool nu=(now-lui)>=uii;
@@ -463,7 +464,7 @@ int main(){
                 else{saveIntrinsicsFrame();}   // 保存本机放大相机的画面
             }
             else if(g_enable_net_sync&&!g_is_master){/* 外参模式: slave 由 master PHOTO 命令驱动 */}
-            else{int ctr=getNextCounter(g_save_dir);stringstream ss;ss<<setw(2)<<setfill('0')<<ctr;if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"PHOTO:"+to_string(ctr));g_last_idx.store(ctr);g_capture_count++;
+            else{int ctr=g_last_idx.load()+1;stringstream ss;ss<<setw(2)<<setfill('0')<<ctr;if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"PHOTO:"+to_string(ctr));g_last_idx.store(ctr);g_capture_count++;
             cout<<"\n[Photo] Capturing index "<<ctr<<endl;
             for(auto& ctx:cam_ctxs){cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}if(!snap.empty()){cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);string fn=g_save_dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg";cv::imwrite(fn,out);cout<<"  -> Saved "<<fn<<endl;}}}}
         else if((key=='t'||key=='T')&&g_is_master&&g_enable_net_sync){
@@ -516,9 +517,10 @@ int main(){
                 fs::remove(del);
                 cout<<"\n[Intrinsics] Undo: removed "<<del<<endl;}
             }
-            else{int li=g_last_idx.load();if(li<0){cout<<"[Undo] No previous capture to undo."<<endl;continue;}stringstream ss;ss<<setw(2)<<setfill('0')<<li;
-            cout<<"\n[Undo] Deleting capture index "<<ss.str()<<endl;
-            if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir)){string st=e.path().stem().string();if(st.rfind("calib_cam_",0)==0&&st.length()>=2&&st.substr(st.length()-2)==ss.str())fs::remove(e.path());}if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"UNDO:"+to_string(li));g_last_idx.store(li-1);g_undo_count++;if(g_capture_count>0)g_capture_count--;
+            else{int li=g_last_idx.load();if(li<0){cout<<"[Undo] No previous capture to undo."<<endl;continue;}
+            cout<<"\n[Undo] Rolling back index "<<li<<" (next capture will overwrite)"<<endl;
+            g_last_idx.store(li-1);g_undo_count++;if(g_capture_count>0)g_capture_count--;
+            if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"UNDO:"+to_string(li));   // slave 同步计数器回退
             cout<<"[Undo] Done.\n"<<endl;}}
         else if(key=='c'||key=='C'){
             if(g_intr_mode.load()){
