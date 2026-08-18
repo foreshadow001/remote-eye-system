@@ -78,8 +78,8 @@ arms:
 # Network config (must match Ubuntu net.yaml)
 network:
   ubuntu_ip: "192.168.10.4"
-  port: 49300                # windows_end_monitor.py
-  ctrl_port: 49301           # piper_windows_ctrl_server.py
+  port: 49300                # [废弃] windows_end_monitor.py — 已由 ctrl_port 取代
+  ctrl_port: 49301           # piper_windows_ctrl_server.py (全部机械臂程序使用此端口)
   gaze_port: 49302           # gaze forwarding Master->Slave
   cmd_port: 49303            # TRIGGER/EXIT Master->Slave
 

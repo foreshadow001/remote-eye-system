@@ -210,7 +210,7 @@ int main() {
     auto pp = (fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()/"cfg"/"piper.yaml").string();
     Cfg cfg(pp);
     g_ubuntu_ip = cfg["network"]["ubuntu_ip"].as<string>();
-    g_port      = cfg["network"]["port"].as<int>();
+    g_port      = cfg["network"]["ctrl_port"].as<int>();   // piper_windows_ctrl_server.py (49301)
 
     cout << "=== Piper Arm Pose ===" << endl;
     cout << "Server: " << g_ubuntu_ip << ":" << g_port << endl;

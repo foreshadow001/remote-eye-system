@@ -103,7 +103,7 @@ int main() {
     PiperToCam p2c(yp);
     Cfg cfg(yp);
     g_ip = cfg["network"]["ubuntu_ip"].as<string>();
-    g_port = cfg["network"]["port"].as<int>();
+    g_port = cfg["network"]["ctrl_port"].as<int>();   // piper_windows_ctrl_server.py (49301)
 
     cout << "=== Piper Flange -> Tool in CCS ===" << endl;
     cout << "Server: " << g_ip << ":" << g_port << endl;
