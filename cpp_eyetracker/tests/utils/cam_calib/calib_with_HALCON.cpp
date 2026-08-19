@@ -534,7 +534,7 @@ int main(){
             }
             else if(g_is_master&&g_enable_net_sync){
             cout<<"\n[Clear] Removing local calibration photos..."<<endl;
-            if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;sendLine(g_ctrl_sock,"CLEAR");string ack;recvLine(g_ctrl_sock,ack,2000);
+            if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;g_last_idx.store(-1);sendLine(g_ctrl_sock,"CLEAR");string ack;recvLine(g_ctrl_sock,ack,2000);
             cout<<"[Clear] Local photos removed.\n"<<endl;}}
     }
 
