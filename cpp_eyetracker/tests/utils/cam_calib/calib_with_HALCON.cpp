@@ -55,7 +55,7 @@ string g_master_ip;                  // Slave needs this to connect to data port
 atomic<bool> g_fault_active{false}; atomic<int> g_faulty_cam{-1};
 atomic<bool> g_fault_on_master{false};
 chrono::steady_clock::time_point g_fault_time, g_ready_time;
-atomic<int> g_capture_count{-1}, g_last_idx{-1}; int g_undo_count=0;
+atomic<int> g_capture_count{-1}; int g_undo_count=0;   // 逻辑拍摄数 = 下一张后缀 (z 回退递减, 下次拍摄覆盖)
 #ifdef _WIN32
 PROCESS_INFORMATION g_halcon_pi{};       // calib_cam_chain 子进程 (外参模式 t 键传输完成后触发)
 PROCESS_INFORMATION g_intrinsics_pi{};   // calib_cam_intrinsics 子进程 (内参模式 t 键传输完成后触发)
@@ -218,18 +218,19 @@ bool saveIntrinsicsFrame(){
 void slaveCmdWorker(SOCKET s){
     while(global_running){
         string line; if(!recvLine(s,line,500)) continue;
-        if(line.rfind("PHOTO:",0)==0){int idx=stoi(line.substr(6));stringstream ss;ss<<setw(2)<<setfill('0')<<idx;g_last_idx.store(idx);g_capture_count++;
+        if(line.rfind("PHOTO:",0)==0){int idx=stoi(line.substr(6));stringstream ss;ss<<setw(2)<<setfill('0')<<idx;g_capture_count.store(idx+1);   // 覆盖式: 对齐 master 计数 (文件名必须与 master 一致)
             cout<<"[Slave] PHOTO "<<idx<<endl;
             for(auto& ctx:cam_ctxs){cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}if(!snap.empty()){cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);string fn=g_save_dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg";cv::imwrite(fn,out);cout<<"  -> Saved "<<fn<<endl;}}}
         else if(line.rfind("UNDO:",0)==0){int idx=stoi(line.substr(5));
             cout<<"[Slave] UNDO index "<<idx<<" (counter rollback, files kept for overwrite)"<<endl;
-            g_last_idx.store(idx-1);if(g_capture_count>0)g_capture_count--;}
+            g_capture_count.store(idx);   // 覆盖式: 对齐 master 回退后的计数
+            }
         else if(line.rfind("MODE:",0)==0){string m=line.substr(5);g_intr_mode.store(m=="INTRINSIC");cout<<"[Slave] Calibration mode: "<<(g_intr_mode.load()?"INTRINSIC":"EXTRINSIC")<<endl;}
         else if(line=="IPHOTO"){cout<<"[Slave] IPHOTO request from master"<<endl;
             if(g_intr_mode.load()&&saveIntrinsicsFrame())sendLine(s,"IPHOTO_OK");
             else sendLine(s,"IPHOTO_NOSEL");}
         else if(line=="LIST_REQ"){cout<<"[Slave] LIST request"<<endl;stringstream fl;for(auto& f:scanFiles(picRoot(),g_intr_mode.load()))fl<<f<<",";sendLine(s,"LIST_RESP:"+fl.str());cout<<"[Slave] Sent file list"<<endl;}
-        else if(line=="CLEAR"){cout<<"[Slave] CLEAR \xe2\x80\x94 removing all calibration photos"<<endl;if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;g_last_idx=-1;sendLine(s,"CLEAR_DONE");cout<<"[Slave] Cleared."<<endl;}
+        else if(line=="CLEAR"){cout<<"[Slave] CLEAR \xe2\x80\x94 removing all calibration photos"<<endl;if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;sendLine(s,"CLEAR_DONE");cout<<"[Slave] Cleared."<<endl;}
         else if(line.rfind("XFER:",0)==0){string lst=line.substr(5);stringstream ss(lst);string tok;vector<string> files;while(getline(ss,tok,','))if(!tok.empty())files.push_back(tok);
             int total=(int)files.size(),cnt=0;size_t total_bytes=0;int data_port=g_ctrl_port+1;
             cout<<"[Slave] Transfer started — "<<total<<" files via data port "<<data_port<<endl;
@@ -384,7 +385,7 @@ int main(){
     // ---- UI ----
     cv::namedWindow("Calib Capture",cv::WINDOW_NORMAL);cv::resizeWindow("Calib Capture",g_win_w,g_win_h);updateLayout();cv::setMouseCallback("Calib Capture",onMouse);
     auto uii=chrono::milliseconds((int)(1000.0/uif));auto lui=chrono::steady_clock::now()-uii;
-    g_capture_count=getNextCounter(g_save_dir);g_last_idx.store(g_capture_count-1);   // 内存计数器 (z 回退, 下次拍摄覆盖)
+    g_capture_count=getNextCounter(g_save_dir);   // 启动时: 计数 = 最大后缀 + 1 = 下一张后缀
     cout<<"[System] Existing captures: "<<g_capture_count<<endl;g_ready_time=chrono::steady_clock::now();
 
     while(global_running){
@@ -464,7 +465,7 @@ int main(){
                 else{saveIntrinsicsFrame();}   // 保存本机放大相机的画面
             }
             else if(g_enable_net_sync&&!g_is_master){/* 外参模式: slave 由 master PHOTO 命令驱动 */}
-            else{int ctr=g_last_idx.load()+1;stringstream ss;ss<<setw(2)<<setfill('0')<<ctr;if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"PHOTO:"+to_string(ctr));g_last_idx.store(ctr);g_capture_count++;
+            else{int ctr=g_capture_count.load();stringstream ss;ss<<setw(2)<<setfill('0')<<ctr;if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"PHOTO:"+to_string(ctr));g_capture_count++;
             cout<<"\n[Photo] Capturing index "<<ctr<<endl;
             for(auto& ctx:cam_ctxs){cv::Mat snap;{lock_guard<mutex> lk(ctx->frame_mtx);snap=ctx->latest_frame.clone();}if(!snap.empty()){cv::Mat out;if(ctx->is_mono)out=snap.clone();else cv::cvtColor(snap,out,cv::COLOR_BayerRG2RGB);string fn=g_save_dir+"/calib_cam_"+ctx->sn+"_"+ss.str()+".jpg";cv::imwrite(fn,out);cout<<"  -> Saved "<<fn<<endl;}}}}
         else if((key=='t'||key=='T')&&g_is_master&&g_enable_net_sync){
@@ -517,9 +518,9 @@ int main(){
                 fs::remove(del);
                 cout<<"\n[Intrinsics] Undo: removed "<<del<<endl;}
             }
-            else{int li=g_last_idx.load();if(li<0){cout<<"[Undo] No previous capture to undo."<<endl;continue;}
+            else{int li=g_capture_count.load()-1;if(li<0){cout<<"[Undo] No previous capture to undo."<<endl;continue;}
             cout<<"\n[Undo] Rolling back index "<<li<<" (next capture will overwrite)"<<endl;
-            g_last_idx.store(li-1);g_undo_count++;if(g_capture_count>0)g_capture_count--;
+            g_capture_count--;g_undo_count++;
             if(g_enable_net_sync&&g_is_master)sendLine(g_ctrl_sock,"UNDO:"+to_string(li));   // slave 同步计数器回退
             cout<<"[Undo] Done.\n"<<endl;}}
         else if(key=='c'||key=='C'){
@@ -534,7 +535,7 @@ int main(){
             }
             else if(g_is_master&&g_enable_net_sync){
             cout<<"\n[Clear] Removing local calibration photos..."<<endl;
-            if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;g_last_idx.store(-1);sendLine(g_ctrl_sock,"CLEAR");string ack;recvLine(g_ctrl_sock,ack,2000);
+            if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;sendLine(g_ctrl_sock,"CLEAR");string ack;recvLine(g_ctrl_sock,ack,2000);
             cout<<"[Clear] Local photos removed.\n"<<endl;}}
     }
 
