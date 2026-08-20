@@ -11,6 +11,7 @@ add_executable(get_piper_pose
 
 target_link_libraries(get_piper_pose
     PRIVATE
+        eyetracker::piper
         eyetracker::cfg
         ${OpenCV_LIBS}
 )
@@ -26,32 +27,7 @@ target_link_libraries(test_record_arm_data
         ${OpenCV_LIBS}
 )
 
-add_executable(test_piper_to_cam
-    test_piper_to_cam.cpp
-)
-
-target_link_libraries(test_piper_to_cam
-    PRIVATE
-        eyetracker::piper
-        eyetracker::cfg
-        ${OpenCV_LIBS}
-)
-
 message(STATUS "get_piper_pose will be built")
-
-# ---- get_piper_tool_pose: 末端工具位姿查询 (arm_pose/{day_id}.yaml + GET_POSE) ----
-add_executable(get_piper_tool_pose
-    get_piper_tool_pose.cpp
-)
-
-target_link_libraries(get_piper_tool_pose
-    PRIVATE
-        eyetracker::piper
-        eyetracker::cfg
-        ${OpenCV_LIBS}
-)
-
-message(STATUS "get_piper_tool_pose will be built")
 
 add_executable(test_piper_ctrl
     test_piper_ctrl.cpp
@@ -66,7 +42,6 @@ target_link_libraries(test_piper_ctrl
 
 message(STATUS "test_piper_ctrl will be built")
 message(STATUS "test_record_arm_data will be built")
-message(STATUS "test_piper_to_cam will be built")
 
 add_executable(save_piper_chain
     save_piper_chain.cpp

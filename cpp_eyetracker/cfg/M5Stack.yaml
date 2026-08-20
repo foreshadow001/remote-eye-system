@@ -1,7 +1,7 @@
 # M5Stack Atom Matrix (5x5 RGB LED) 串口控制
 # 由 tests/utils/M5Stack/test_m5stack.cpp 读取; 固件 = tests/utils/M5Stack/M5Stack.ino
 ports:
-  upper: "COM5"
+  upper: "COM6"
   lower: "COM4"
 
 serial:

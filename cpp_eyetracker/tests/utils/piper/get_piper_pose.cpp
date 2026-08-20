@@ -1,5 +1,6 @@
 // ================== get_piper_pose ==================
 // 实时获取 Piper 机械臂 flange 位姿 (XYZ + 四元数 + Z-X-Z'' 欧拉角)
+// + locating tool 在 CCS 中的位置 (变换从 piper.yaml 读取, 计算同 capture_with_M5Stack)
 // 用法: t 切换 upper/lower, g 打印位姿, q 退出
 // =================================================================
 #ifdef _WIN32
@@ -31,6 +32,7 @@
 #include <iomanip>
 
 #include "cfg/config.hpp"
+#include "piper/piper.hpp"
 
 using namespace std;
 
@@ -49,6 +51,12 @@ string g_current_arm = "upper";
 string g_status = "Disconnected";
 string g_ubuntu_ip;
 int g_port = 0;
+
+// locating tool 在法兰盘坐标系中的位姿 + 臂基座在 CCS 中的位姿 (piper.yaml)
+struct ArmXf {
+    Pt3 loc_t, loc_r, ccs_t, ccs_r;
+};
+ArmXf g_xf_upper, g_xf_lower;
 
 // ================== TCP ==================
 
@@ -143,10 +151,10 @@ void tcpWorker() {
 
 void drawUI() {
     cv::namedWindow("Piper Arm Pose", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Piper Arm Pose", 640, 400);
+    cv::resizeWindow("Piper Arm Pose", 640, 480);
 
     while (g_running) {
-        cv::Mat canvas = cv::Mat::zeros(400, 640, CV_8UC3);
+        cv::Mat canvas = cv::Mat::zeros(480, 640, CV_8UC3);
         int y = 30;
         auto put = [&](const string& s, cv::Scalar c = {255,255,255}) {
             cv::putText(canvas, s, {20,y}, cv::FONT_HERSHEY_SIMPLEX, 0.55, c, 1, cv::LINE_AA);
@@ -179,7 +187,21 @@ void drawUI() {
             put(b, {0,255,0});
         } else { put("No pose data"); }
 
-        y = 370;
+        // Locating tool in CCS (变换同 capture_with_M5Stack: flange -> tool -> CCS)
+        cv::putText(canvas, "--- " + dn + " LOCATING TOOL (CCS) ---", {20,y},
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, {200,200,200}, 1, cv::LINE_AA);
+        y += 28;
+        if (p.valid) {
+            const auto& xf = (g_current_arm=="upper") ? g_xf_upper : g_xf_lower;
+            Pose lt_ccs = armToolToCamPose(Pose{{p.x,p.y,p.z},{p.qx,p.qy,p.qz,p.qw}},
+                                           xf.loc_t, xf.loc_r, xf.ccs_t, xf.ccs_r);
+            char b[128];
+            snprintf(b,sizeof(b),"XYZ (m):      [%.4f, %.4f, %.4f]",
+                     lt_ccs.pos.x, lt_ccs.pos.y, lt_ccs.pos.z);
+            put(b, {0,255,0});
+        } else { put("No pose data"); }
+
+        y = 450;
         cv::putText(canvas, "[t] Switch arm   [g] Print pose   [q/ESC] Quit",
                     {20,y}, cv::FONT_HERSHEY_SIMPLEX, 0.45, {150,150,150}, 1);
 
@@ -196,7 +218,12 @@ void drawUI() {
                 cout << "XYZ (m):       ["<<pp.x<<", "<<pp.y<<", "<<pp.z<<"]"<<endl;
                 cout << "Quat (wxyz):   ["<<pp.qw<<", "<<pp.qx<<", "<<pp.qy<<", "<<pp.qz<<"]"<<endl;
                 cout << fixed << setprecision(2);
-                cout << "Euler ZXZ'' (deg): ["<<pp.alpha<<", "<<pp.beta<<", "<<pp.gamma<<"]\n"<<endl;
+                cout << "Euler ZXZ'' (deg): ["<<pp.alpha<<", "<<pp.beta<<", "<<pp.gamma<<"]"<<endl;
+                const auto& xf = (g_current_arm=="upper") ? g_xf_upper : g_xf_lower;
+                Pose lt_ccs = armToolToCamPose(Pose{{pp.x,pp.y,pp.z},{pp.qx,pp.qy,pp.qz,pp.qw}},
+                                               xf.loc_t, xf.loc_r, xf.ccs_t, xf.ccs_r);
+                cout << fixed << setprecision(4);
+                cout << "Locating tool CCS (m): ["<<lt_ccs.pos.x<<", "<<lt_ccs.pos.y<<", "<<lt_ccs.pos.z<<"]\n"<<endl;
             } else { cout << "No pose data\n" << endl; }
         }
     }
@@ -211,6 +238,25 @@ int main() {
     Cfg cfg(pp);
     g_ubuntu_ip = cfg["network"]["ubuntu_ip"].as<string>();
     g_port      = cfg["network"]["ctrl_port"].as<int>();   // piper_windows_ctrl_server.py (49301)
+
+    // locating tool + arm_in_ccs 变换 (与 capture_with_M5Stack 同源: piper.yaml)
+    auto readPt3 = [](const CfgNode& n) -> Pt3 {
+        return {n[0].as<double>(), n[1].as<double>(), n[2].as<double>()};
+    };
+    for (auto& an : {"upper", "lower"}) {
+        try {
+            auto& a  = cfg["arms"][an];
+            auto& lt = a["locating_tool"];
+            auto& cc = a["arm_in_ccs"];
+            auto& xf = (an == string("upper")) ? g_xf_upper : g_xf_lower;
+            xf.loc_t = readPt3(lt["translation"]);
+            xf.loc_r = readPt3(lt["rotation_zxz"]);
+            xf.ccs_t = readPt3(cc["translation"]);
+            xf.ccs_r = readPt3(cc["rotation_zxz"]);
+        } catch (const exception& e) {
+            cerr << "[Pose] WARN: cannot load " << an << " transforms: " << e.what() << endl;
+        }
+    }
 
     cout << "=== Piper Arm Pose ===" << endl;
     cout << "Server: " << g_ubuntu_ip << ":" << g_port << endl;
