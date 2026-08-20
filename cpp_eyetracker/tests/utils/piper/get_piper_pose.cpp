@@ -2,7 +2,9 @@
 // 实时获取 Piper 机械臂 flange 位姿 (XYZ + 四元数 + Z-X-Z'' 欧拉角)
 // + flange / locating tool 在 CCS 中的位置 (arm_in_ccs 从 arm_pose yaml 读取,
 //   locating tool 偏移从 piper.yaml 读取, 计算同 capture_with_M5Stack)
-// 用法: t 切换 upper/lower, g 打印位姿, q 退出
+// + r 进入 IR 发射器位置记录模式: SPACE 记录 locating tool CCS, ENTER 切换左右中,
+//   三个全部记录后统一写入 cfg/IR/{calib_arm.yaml: day_id}.txt (三行: 左/右/中)
+// 用法: t 切换 upper/lower, g 打印位姿, r IR 记录, q 退出
 // =================================================================
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -23,6 +25,7 @@
 #include <opencv2/opencv.hpp>
 #include <filesystem>
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -58,6 +61,24 @@ struct ArmXf {
     Pt3 loc_t, loc_r, ccs_t, ccs_r;
 };
 ArmXf g_xf_upper, g_xf_lower;
+
+// IR 发射器位置记录模式: r 进入, SPACE 记录 locating tool CCS, ENTER 切换左右中
+bool g_ir_mode = false;
+int  g_ir_slot = 0;                    // 0=left 1=right 2=center
+Pt3  g_ir_val[3];
+bool g_ir_rec[3] = {false, false, false};
+string g_ir_path;                      // cfg/IR/{day_id}.txt
+static const char* kIrSlotName[3] = {"LEFT", "RIGHT", "CENTER"};
+
+void writeIrFile() {
+    std::filesystem::create_directories(std::filesystem::path(g_ir_path).parent_path());
+    ofstream out(g_ir_path);
+    for (int i = 0; i < 3; ++i)
+        out << fixed << setprecision(4)
+            << g_ir_val[i].x << "," << g_ir_val[i].y << "," << g_ir_val[i].z << "\n";
+    out.close();
+    cout << "[IR] Written " << g_ir_path << " (LEFT/RIGHT/CENTER)" << endl;
+}
 
 // ================== TCP ==================
 
@@ -216,14 +237,72 @@ void drawUI() {
             put(b, {0,255,0});
         } else { put("No pose data"); }
 
+        // IR 记录模式状态 (r 进入/取消; SPACE 记录, ENTER 切换左右中)
+        if (g_ir_mode) {
+            cv::putText(canvas, "--- IR RECORDER (" + g_ir_path + ") ---", {20,y},
+                        cv::FONT_HERSHEY_SIMPLEX, 0.45, {0,200,255}, 1, cv::LINE_AA);
+            y += 24;
+            for (int i = 0; i < 3; ++i) {
+                char b[160];
+                if (g_ir_rec[i])
+                    snprintf(b,sizeof(b),"%s: [%.4f, %.4f, %.4f]", kIrSlotName[i],
+                             g_ir_val[i].x, g_ir_val[i].y, g_ir_val[i].z);
+                else
+                    snprintf(b,sizeof(b),"%s: [--]", kIrSlotName[i]);
+                cv::Scalar c = (i == g_ir_slot) ? cv::Scalar(0,255,255)          // 当前槽高亮
+                             : (g_ir_rec[i] ? cv::Scalar(0,255,0) : cv::Scalar(120,120,120));
+                cv::putText(canvas, b, {40,y}, cv::FONT_HERSHEY_SIMPLEX, 0.5, c, 1, cv::LINE_AA);
+                y += 22;
+            }
+        }
+
         y = 450;
-        cv::putText(canvas, "[t] Switch arm   [g] Print pose   [q/ESC] Quit",
+        cv::putText(canvas, "[t] Switch arm   [g] Print pose   [r] IR record   [q/ESC] Quit",
                     {20,y}, cv::FONT_HERSHEY_SIMPLEX, 0.45, {150,150,150}, 1);
 
         cv::imshow("Piper Arm Pose", canvas);
         char key = (char)cv::waitKey(50);
         if (key=='q'||key==27) g_running = false;
         else if (key=='t'||key=='T') g_current_arm = (g_current_arm=="upper")?"lower":"upper";
+        else if (key=='r'||key=='R') {
+            if (g_ir_mode) {
+                g_ir_mode = false;
+                cout << "[IR] Recording mode cancelled (nothing written)." << endl;
+            } else {
+                g_ir_mode = true;
+                g_ir_slot = 0;
+                for (int i = 0; i < 3; ++i) g_ir_rec[i] = false;
+                cout << "[IR] Recording mode ON. Slot: LEFT."
+                     << " SPACE=record  ENTER=switch  r=cancel" << endl;
+            }
+        }
+        else if (key==13) {   // ENTER: 切换左/右/中
+            if (g_ir_mode) {
+                g_ir_slot = (g_ir_slot + 1) % 3;
+                cout << "[IR] Slot: " << kIrSlotName[g_ir_slot] << endl;
+            }
+        }
+        else if (key==' ') {
+            if (g_ir_mode) {
+                if (!p.valid) {
+                    cout << "[IR] No pose data — cannot record." << endl;
+                } else {
+                    const auto& xf = (g_current_arm=="upper") ? g_xf_upper : g_xf_lower;
+                    Pose lt_ccs = armToolToCamPose(Pose{{p.x,p.y,p.z},{p.qx,p.qy,p.qz,p.qw}},
+                                                   xf.loc_t, xf.loc_r, xf.ccs_t, xf.ccs_r);
+                    g_ir_val[g_ir_slot] = lt_ccs.pos;
+                    g_ir_rec[g_ir_slot] = true;
+                    cout << fixed << setprecision(4);
+                    cout << "[IR] " << kIrSlotName[g_ir_slot] << " recorded: ["
+                         << lt_ccs.pos.x << ", " << lt_ccs.pos.y << ", " << lt_ccs.pos.z << "]" << endl;
+                    if (g_ir_rec[0] && g_ir_rec[1] && g_ir_rec[2]) {
+                        writeIrFile();          // 三个全部记录后统一写入
+                        g_ir_mode = false;
+                        cout << "[IR] Recording mode OFF." << endl;
+                    }
+                }
+            }
+        }
         else if (key=='g'||key=='G') {
             lock_guard<mutex> lk(g_pose_mtx);
             const auto& pp = (g_current_arm=="upper")?g_upper_pose:g_lower_pose;
@@ -313,9 +392,19 @@ int main() {
              << " — check cfg/day_participant_map.json. Transforms NOT loaded." << endl;
     }
 
+    // IR 记录输出路径: cfg/IR/{day_id}.txt (day_id 来自 calib_arm.yaml)
+    try {
+        Cfg arm_cfg(cfg_dir + "/calib_arm.yaml");
+        string day_id = arm_cfg["record"]["day_id"].as<string>();
+        g_ir_path = cfg_dir + "/IR/" + day_id + ".txt";
+    } catch (const exception& e) {
+        cerr << "[IR] WARN: cannot read calib_arm.yaml: " << e.what()
+             << " — IR recording disabled." << endl;
+    }
+
     cout << "=== Piper Arm Pose ===" << endl;
     cout << "Server: " << g_ubuntu_ip << ":" << g_port << endl;
-    cout << "[t] switch arm  [g] print  [q] quit\n" << endl;
+    cout << "[t] switch arm  [g] print  [r] IR record  [q] quit\n" << endl;
 
     thread t(tcpWorker);
     drawUI();

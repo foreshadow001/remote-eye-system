@@ -13,6 +13,7 @@
 # =================================================================
 
 import argparse
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -250,13 +251,16 @@ def main():
     ap.add_argument("--edge", type=float, default=0.025, help="gen box inset (m)")
     ap.add_argument("--max-dist", type=float, default=0.2,
                     help="max adjacent target distance after reorder (m)")
-    ap.add_argument("--seed", type=int, default=123, help="RNG seed")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="RNG seed (default: random, printed for reproducibility)")
     ap.add_argument("--arms", nargs="+", default=["upper", "lower"],
                     help="arms to generate (default: upper lower)")
     ap.add_argument("--no-viz", action="store_true", help="skip visualization")
     args = ap.parse_args()
 
     args.participant = args.participant or default_participant()
+    if args.seed is None:
+        args.seed = random.randrange(1 << 32)
     rng = np.random.default_rng(args.seed)
     print(f"=== gen_gaze_target: participant={args.participant} num={args.num} "
           f"edge={args.edge} max_dist={args.max_dist} seed={args.seed} arms={args.arms}")
