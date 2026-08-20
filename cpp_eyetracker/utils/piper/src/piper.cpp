@@ -102,7 +102,10 @@ Pose composePoses(const Pose& base, const Pose& offset) {
 Pose armToolToCamPose(const Pose& flange,
                       const Pt3& tool_trans, const Pt3& tool_rot_zxz_deg,
                       const Pt3& arm_trans,   const Pt3& arm_rot_zxz_deg) {
-    Pose tool_in_arm = computeToolPose(flange, tool_trans, tool_rot_zxz_deg);
+    // 工具偏移语义与手眼标定完全一致: 先旋转 Z-X-Z'', 再平移
+    // (平移在法兰盘坐标系的轴上, 不被 R_offset 预旋转) —
+    // 见 test_piper_hand_eye_calib.cpp / save_piper_chain.cpp 的残差模型
+    Pose tool_in_arm = computeToolPoseTransFirst(flange, tool_trans, tool_rot_zxz_deg);
     Quat arm_q = zxzToQuat(arm_rot_zxz_deg.x, arm_rot_zxz_deg.y, arm_rot_zxz_deg.z);
     Pose arm_in_ccs{arm_trans, arm_q};
     return composePoses(arm_in_ccs, tool_in_arm);
