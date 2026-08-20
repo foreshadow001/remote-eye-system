@@ -7,7 +7,7 @@ arms:
       rotation_zxz: [0.0, 0.0, 0.0]      # 度, 内旋 Z-X-Z''
     locating_tool:                          # 定位工具 在法兰盘坐标系中的位姿
       translation: [-0.15, 0.0, 0.051]      # 米 (法兰盘坐标系)
-      rotation_zxz: [-90.0, 0.0, 0.0]       # 度, 内旋 Z-X-Z''
+      rotation_zxz: [0.0, 0.0, 0.0]         # 度, 内旋 Z-X-Z''
     arm_in_ccs:
       translation: [-0.0091, 0.0224, -0.1684]
       rotation_zxz: [0.0948, 89.4077, 86.6415]
@@ -47,7 +47,7 @@ arms:
       rotation_zxz: [0.0, 0.0, 0.0]
     locating_tool:                          # 定位工具 在法兰盘坐标系中的位姿
       translation: [-0.15, 0.0, 0.051]      # 米 (法兰盘坐标系)
-      rotation_zxz: [-90.0, 0.0, 0.0]       # 度, 内旋 Z-X-Z''
+      rotation_zxz: [0.0, 0.0, 0.0]         # 度, 内旋 Z-X-Z''
     arm_in_ccs:
       translation: [-0.0106, 0.6283, -0.1682]
       rotation_zxz: [0.9223, 90.0716, 86.3688]
