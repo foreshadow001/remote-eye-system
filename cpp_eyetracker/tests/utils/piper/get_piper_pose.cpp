@@ -1,6 +1,7 @@
 // ================== get_piper_pose ==================
 // 实时获取 Piper 机械臂 flange 位姿 (XYZ + 四元数 + Z-X-Z'' 欧拉角)
-// + locating tool 在 CCS 中的位置 (变换从 piper.yaml 读取, 计算同 capture_with_M5Stack)
+// + flange / locating tool 在 CCS 中的位置 (arm_in_ccs 从 arm_pose yaml 读取,
+//   locating tool 偏移从 piper.yaml 读取, 计算同 capture_with_M5Stack)
 // 用法: t 切换 upper/lower, g 打印位姿, q 退出
 // =================================================================
 #ifdef _WIN32
@@ -187,6 +188,20 @@ void drawUI() {
             put(b, {0,255,0});
         } else { put("No pose data"); }
 
+        // Flange in CCS (arm_in_ccs 变换; 零工具偏移复用 armToolToCamPose)
+        cv::putText(canvas, "--- " + dn + " FLANGE (CCS) ---", {20,y},
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, {200,200,200}, 1, cv::LINE_AA);
+        y += 28;
+        if (p.valid) {
+            const auto& xf = (g_current_arm=="upper") ? g_xf_upper : g_xf_lower;
+            Pose fl_ccs = armToolToCamPose(Pose{{p.x,p.y,p.z},{p.qx,p.qy,p.qz,p.qw}},
+                                           {0,0,0}, {0,0,0}, xf.ccs_t, xf.ccs_r);
+            char b[128];
+            snprintf(b,sizeof(b),"XYZ (m):      [%.4f, %.4f, %.4f]",
+                     fl_ccs.pos.x, fl_ccs.pos.y, fl_ccs.pos.z);
+            put(b, {0,255,0});
+        } else { put("No pose data"); }
+
         // Locating tool in CCS (变换同 capture_with_M5Stack: flange -> tool -> CCS)
         cv::putText(canvas, "--- " + dn + " LOCATING TOOL (CCS) ---", {20,y},
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, {200,200,200}, 1, cv::LINE_AA);
@@ -220,6 +235,9 @@ void drawUI() {
                 cout << fixed << setprecision(2);
                 cout << "Euler ZXZ'' (deg): ["<<pp.alpha<<", "<<pp.beta<<", "<<pp.gamma<<"]"<<endl;
                 const auto& xf = (g_current_arm=="upper") ? g_xf_upper : g_xf_lower;
+                Pose fl_ccs = armToolToCamPose(Pose{{pp.x,pp.y,pp.z},{pp.qx,pp.qy,pp.qz,pp.qw}},
+                                               {0,0,0}, {0,0,0}, xf.ccs_t, xf.ccs_r);
+                cout << "Flange CCS (m):  ["<<fl_ccs.pos.x<<", "<<fl_ccs.pos.y<<", "<<fl_ccs.pos.z<<"]"<<endl;
                 Pose lt_ccs = armToolToCamPose(Pose{{pp.x,pp.y,pp.z},{pp.qx,pp.qy,pp.qz,pp.qw}},
                                                xf.loc_t, xf.loc_r, xf.ccs_t, xf.ccs_r);
                 cout << fixed << setprecision(4);
