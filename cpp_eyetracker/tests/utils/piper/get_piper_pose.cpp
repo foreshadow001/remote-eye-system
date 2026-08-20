@@ -2,8 +2,8 @@
 // 实时获取 Piper 机械臂 flange 位姿 (XYZ + 四元数 + Z-X-Z'' 欧拉角)
 // + flange / locating tool 在 CCS 中的位置 (arm_in_ccs 从 arm_pose yaml 读取,
 //   locating tool 偏移从 piper.yaml 读取, 计算同 capture_with_M5Stack)
-// + r 进入 IR 发射器位置记录模式: SPACE 记录 locating tool CCS, ENTER 切换左右中,
-//   三个全部记录后统一写入 cfg/IR/{calib_arm.yaml: day_id}.txt (三行: 左/右/中)
+// + r 进入 IR 发射器位置记录模式: SPACE 记录/覆盖 locating tool CCS, ENTER 切换左右中,
+//   s 保存 (三个全部记录后) 到 cfg/IR/{calib_arm.yaml: day_id}.txt (三行: 左/右/中)
 // 用法: t 切换 upper/lower, g 打印位姿, r IR 记录, q 退出
 // =================================================================
 #ifdef _WIN32
@@ -67,7 +67,8 @@ bool g_ir_mode = false;
 int  g_ir_slot = 0;                    // 0=left 1=right 2=center
 Pt3  g_ir_val[3];
 bool g_ir_rec[3] = {false, false, false};
-string g_ir_path;                      // cfg/IR/{day_id}.txt
+string g_ir_path;                      // cfg/IR/{day_id}.txt (绝对路径, 写入用)
+string g_ir_path_disp;                 // UI 水印: 从 cfg 开始的相对路径
 static const char* kIrSlotName[3] = {"LEFT", "RIGHT", "CENTER"};
 
 void writeIrFile() {
@@ -237,9 +238,9 @@ void drawUI() {
             put(b, {0,255,0});
         } else { put("No pose data"); }
 
-        // IR 记录模式状态 (r 进入/取消; SPACE 记录, ENTER 切换左右中)
+        // IR 记录模式状态 (r 进入/退出; SPACE 记录/覆盖, ENTER 切换, s 保存)
         if (g_ir_mode) {
-            cv::putText(canvas, "--- IR RECORDER (" + g_ir_path + ") ---", {20,y},
+            cv::putText(canvas, "--- IR RECORDER (" + g_ir_path_disp + ") ---", {20,y},
                         cv::FONT_HERSHEY_SIMPLEX, 0.45, {0,200,255}, 1, cv::LINE_AA);
             y += 24;
             for (int i = 0; i < 3; ++i) {
@@ -254,6 +255,9 @@ void drawUI() {
                 cv::putText(canvas, b, {40,y}, cv::FONT_HERSHEY_SIMPLEX, 0.5, c, 1, cv::LINE_AA);
                 y += 22;
             }
+            cv::putText(canvas, "[SPACE] record/overwrite   [ENTER] switch   [s] save   [r] exit",
+                        {20,y}, cv::FONT_HERSHEY_SIMPLEX, 0.4, {150,150,150}, 1, cv::LINE_AA);
+            y += 18;
         }
 
         y = 450;
@@ -267,13 +271,19 @@ void drawUI() {
         else if (key=='r'||key=='R') {
             if (g_ir_mode) {
                 g_ir_mode = false;
-                cout << "[IR] Recording mode cancelled (nothing written)." << endl;
+                cout << "[IR] Recording mode OFF." << endl;
             } else {
                 g_ir_mode = true;
                 g_ir_slot = 0;
                 for (int i = 0; i < 3; ++i) g_ir_rec[i] = false;
                 cout << "[IR] Recording mode ON. Slot: LEFT."
-                     << " SPACE=record  ENTER=switch  r=cancel" << endl;
+                     << " SPACE=record  ENTER=switch  s=save  r=exit" << endl;
+            }
+        }
+        else if (key=='s'||key=='S') {
+            if (g_ir_mode) {
+                if (g_ir_rec[0] && g_ir_rec[1] && g_ir_rec[2]) writeIrFile();
+                else cout << "[IR] Not all three recorded yet — cannot save." << endl;
             }
         }
         else if (key==13) {   // ENTER: 切换左/右/中
@@ -295,11 +305,6 @@ void drawUI() {
                     cout << fixed << setprecision(4);
                     cout << "[IR] " << kIrSlotName[g_ir_slot] << " recorded: ["
                          << lt_ccs.pos.x << ", " << lt_ccs.pos.y << ", " << lt_ccs.pos.z << "]" << endl;
-                    if (g_ir_rec[0] && g_ir_rec[1] && g_ir_rec[2]) {
-                        writeIrFile();          // 三个全部记录后统一写入
-                        g_ir_mode = false;
-                        cout << "[IR] Recording mode OFF." << endl;
-                    }
                 }
             }
         }
@@ -397,6 +402,7 @@ int main() {
         Cfg arm_cfg(cfg_dir + "/calib_arm.yaml");
         string day_id = arm_cfg["record"]["day_id"].as<string>();
         g_ir_path = cfg_dir + "/IR/" + day_id + ".txt";
+        g_ir_path_disp = "cfg/IR/" + day_id + ".txt";   // UI 从 cfg 开始显示
     } catch (const exception& e) {
         cerr << "[IR] WARN: cannot read calib_arm.yaml: " << e.what()
              << " — IR recording disabled." << endl;
