@@ -229,6 +229,21 @@ void drawUI() {
     }
 }
 
+// 由 participant_id 经 day_participant_map.json 映射到 day_id (与 capture_with_M5Stack 一致)
+string findDayForParticipant(const string& json_path, const string& participant) {
+    try {
+        YAML::Node root = YAML::LoadFile(json_path);
+        for (YAML::const_iterator it = root.begin(); it != root.end(); ++it) {
+            string day = it->first.as<string>();
+            for (size_t i = 0; i < it->second.size(); ++i)
+                if (it->second[i].as<string>() == participant) return day;
+        }
+    } catch (const std::exception& e) {
+        cerr << "[Pose] Failed to parse " << json_path << ": " << e.what() << endl;
+    }
+    return "";
+}
+
 int main() {
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
@@ -239,23 +254,45 @@ int main() {
     g_ubuntu_ip = cfg["network"]["ubuntu_ip"].as<string>();
     g_port      = cfg["network"]["ctrl_port"].as<int>();   // piper_windows_ctrl_server.py (49301)
 
-    // locating tool + arm_in_ccs 变换 (与 capture_with_M5Stack 同源: piper.yaml)
+    string cfg_dir = (fs::path(pp).parent_path()).string();
     auto readPt3 = [](const CfgNode& n) -> Pt3 {
         return {n[0].as<double>(), n[1].as<double>(), n[2].as<double>()};
     };
+
+    // locating tool 偏移: piper.yaml (法兰盘坐标系)
     for (auto& an : {"upper", "lower"}) {
         try {
-            auto& a  = cfg["arms"][an];
-            auto& lt = a["locating_tool"];
-            auto& cc = a["arm_in_ccs"];
+            auto& lt = cfg["arms"][an]["locating_tool"];
             auto& xf = (an == string("upper")) ? g_xf_upper : g_xf_lower;
             xf.loc_t = readPt3(lt["translation"]);
             xf.loc_r = readPt3(lt["rotation_zxz"]);
-            xf.ccs_t = readPt3(cc["translation"]);
-            xf.ccs_r = readPt3(cc["rotation_zxz"]);
         } catch (const exception& e) {
-            cerr << "[Pose] WARN: cannot load " << an << " transforms: " << e.what() << endl;
+            cerr << "[Pose] WARN: cannot load " << an << " locating_tool: " << e.what() << endl;
         }
+    }
+
+    // arm pose (arm_in_ccs): 与 capture_with_M5Stack 读取方式一致 —
+    // participant_id (capture.yaml) -> day_id (day_participant_map.json) -> cfg/arm_pose/{day_id}.yaml
+    Cfg cfg_capture(cfg_dir + "/capture.yaml");
+    string participant_id = cfg_capture["capture"]["participant_id"].as<string>();
+    string day_id = findDayForParticipant(cfg_dir + "/day_participant_map.json", participant_id);
+    string arm_pose_yml = cfg_dir + "/arm_pose/" + day_id + ".yaml";
+    if (!day_id.empty() && fs::exists(arm_pose_yml)) {
+        Cfg cfg_pose(arm_pose_yml);
+        for (auto& an : {"upper", "lower"}) {
+            try {
+                auto& cc = cfg_pose["arms"][an]["arm_in_ccs"];
+                auto& xf = (an == string("upper")) ? g_xf_upper : g_xf_lower;
+                xf.ccs_t = readPt3(cc["translation"]);
+                xf.ccs_r = readPt3(cc["rotation_zxz"]);
+            } catch (...) {
+                cerr << "[Pose] WARN: cannot load " << an << " transform from " << arm_pose_yml << endl;
+            }
+        }
+        cout << "[Pose] Arm transforms loaded from " << arm_pose_yml << " (day " << day_id << ")" << endl;
+    } else {
+        cerr << "[Pose] WARN: no arm_pose yaml for participant " << participant_id
+             << " — check cfg/day_participant_map.json. Transforms NOT loaded." << endl;
     }
 
     cout << "=== Piper Arm Pose ===" << endl;
