@@ -33,8 +33,8 @@ capture:
   exposure_time: 4000.0
   cam_width: 2448
   cam_height: 2048
-  record_time: 1.0
-  capture_delay: 0.5                # CAPTURING 后延迟录制 (s), 让受试者聚焦十字中心
+  record_time: 0.5
+  capture_delay: 1.0                # CAPTURING 后延迟录制 (s), 让受试者聚焦十字中心
   margin_frames_ratio: 0.05
   max_num_buffer: 30
   ui_fps: 5.0

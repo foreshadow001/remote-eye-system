@@ -288,6 +288,7 @@ chrono::steady_clock::time_point g_ready_time, g_fault_time;
 int g_chunk_idx = 0; atomic<int> g_frame_offset{0};
 vector<string> g_participant_roots; string g_sentry_root;
 int g_hdf5_chunk_capacity = 2000;
+int g_cam_w = 0, g_cam_h = 0;          // 相机分辨率 (main 加载, precreateHdf5Files 用)
 int g_sentry_mismatch_count = 0, g_consecutive_faults = 0;
 atomic<bool> g_syncing{false};
 string g_session_log_path; int g_recording_number = 0; ofstream g_session_log;
@@ -679,6 +680,40 @@ void renderThumbnailGrid(cv::Mat& canvas, int selected_idx, bool is_recording,
         else{canvas(roi)=cv::Scalar(0,0,0);}
     }
 }
+// ================== i 键: 提前创建 HDF5 文件 (chunk 0..24) ==================
+// 任一相机目录下已存在 .h5 → 不执行 (防止误删已录制数据)
+int precreateHdf5Files() {
+    // 检查: 任何相机在路径下有 h5 → 拒绝
+    for (auto& ctx : cam_ctxs)
+        for (auto& e : fs::directory_iterator(ctx->hdf5_dir))
+            if (e.path().extension() == ".h5") {
+                cout << "[HDF5] Found existing " << e.path().filename().string()
+                     << " in " << ctx->hdf5_dir << " — pre-create skipped." << endl;
+                return 0;
+            }
+    int cam_w = g_cam_w, cam_h = g_cam_h;
+    int created = 0;
+    for (auto& ctx : cam_ctxs)
+        for (int ci = 0; ci < 25; ++ci) {
+            stringstream pss; pss << ctx->hdf5_dir << "/" << setw(4) << setfill('0') << ci << ".h5";
+            if (fs::exists(pss.str())) continue;   // 已检查过整体为空, 此处防御
+            try {
+                H5::H5File f(pss.str(), H5F_ACC_TRUNC);
+                hsize_t rd[3] = {(hsize_t)g_hdf5_chunk_capacity, (hsize_t)cam_h, (hsize_t)cam_w};
+                f.createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd));
+                hsize_t gd[2] = {(hsize_t)g_hdf5_chunk_capacity, 3};
+                f.createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd));
+                hsize_t vd[1] = {(hsize_t)g_hdf5_chunk_capacity};
+                f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd));
+                created++;
+            } catch (const H5::Exception& e) {
+                logException("ERROR", "hdf5:precreate", e.getCDetailMsg());
+                return created;
+            }
+        }
+    return created;
+}
+
 void renderEnlargedView(cv::Mat& canvas, int cam_idx, bool is_recording,
                         const chrono::steady_clock::time_point& record_start_time, int total_record_frames) {
     cv::Rect right_roi(g_right_x,0,g_right_w,g_win_h);if(cam_idx<0||cam_idx>=(int)cam_ctxs.size()){canvas(right_roi)=cv::Scalar(0,0,0);return;}
@@ -933,6 +968,7 @@ int main() {
     g_win_w=cap["window_width"].as<int>(); g_win_h=cap["window_height"].as<int>();
     double record_time=cap["record_time"].as<double>();
     int cam_w=cap["cam_width"].as<int>(), cam_h=cap["cam_height"].as<int>();
+    g_cam_w=cam_w; g_cam_h=cam_h;
     int core_frames=(int)ceil(target_fps*record_time);
     double margin_ratio=cap["margin_frames_ratio"].as<double>();
     int margin_frames=(int)ceil(core_frames*margin_ratio);
@@ -1658,6 +1694,12 @@ int main() {
             g_recording_enabled=false; updatePiperSentry();
             syncPiperToSlave();
             cout<<"[Piper] "<<g_arm<<" sentry cleared."<<endl;
+        }
+        else if(is_master_pc&&(key=='i'||key=='I')&&!g_piper_busy&&!is_recording&&!is_dumping){
+            // 提前为每个相机创建 25 个 h5 (chunk 0000..0024); 任一相机已有 h5 → 不执行
+            int created = precreateHdf5Files();
+            cout<<"[HDF5] Pre-create: "<<created<<" files "
+                <<(created?"(0000-0024 per camera)":"— existing h5 found, skipped")<<endl;
         }
         else if(is_master_pc&&(key=='t'||key=='T')&&!g_piper_busy&&!is_recording&&!is_dumping){
             string new_arm=(g_arm=="upper")?"lower":"upper";

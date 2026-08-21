@@ -28,7 +28,7 @@ record:                               # 从 piper.yaml test_record_arm_data 节�
 
 # 手眼标定 (test_piper_hand_eye_calib.cpp, 从 piper.yaml 搬迁)
 hand_eye_calib:
-  rotation_weight: 1.0            # 旋转残差权重 (<1 = 位置优先)
+  rotation_weight: 0.1            # 旋转残差权重 (<1 = 位置优先)
   upper:
     - 40772278
     - 40777498
