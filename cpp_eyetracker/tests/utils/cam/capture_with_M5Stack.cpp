@@ -288,7 +288,18 @@ chrono::steady_clock::time_point g_ready_time, g_fault_time;
 int g_chunk_idx = 0; atomic<int> g_frame_offset{0};
 vector<string> g_participant_roots; string g_sentry_root;
 int g_hdf5_chunk_capacity = 2000;
-int g_cam_w = 0, g_cam_h = 0;          // 相机分辨率 (main 加载, precreateHdf5Files 用)
+int g_cam_w = 0, g_cam_h = 0;          // 相机分辨率 (main 加载, precreateSerial 用)
+
+// ================== i 键: 预创建 HDF5 (双机握手 + 串行创建 + 进度 UI) ==================
+atomic<bool> g_precreating{false};      // 创建状态: 全屏进度 UI, 屏蔽所有按键
+atomic<int>  g_pre_phase{0};            // 1=握手检查 2=创建中
+atomic<int>  g_pre_total{0}, g_pre_done{0};
+atomic<bool> g_pre_local_done{false};   // 本机创建完成
+atomic<bool> g_pre_peer_clear{false};   // master: slave 检查通过 (无 h5)
+atomic<bool> g_pre_peer_reject{false};  // master: slave 已有 h5 → 放弃
+atomic<bool> g_pre_peer_done{false};    // master: slave 创建完成
+thread g_pre_thread;                    // 本机创建线程 (cleanup 时 join)
+chrono::steady_clock::time_point g_pre_t0;   // 握手阶段起始 (超时保护)
 int g_sentry_mismatch_count = 0, g_consecutive_faults = 0;
 atomic<bool> g_syncing{false};
 string g_session_log_path; int g_recording_number = 0; ofstream g_session_log;
@@ -680,38 +691,46 @@ void renderThumbnailGrid(cv::Mat& canvas, int selected_idx, bool is_recording,
         else{canvas(roi)=cv::Scalar(0,0,0);}
     }
 }
-// ================== i 键: 提前创建 HDF5 文件 (chunk 0..24) ==================
-// 任一相机目录下已存在 .h5 → 不执行 (防止误删已录制数据)
-int precreateHdf5Files() {
-    // 检查: 任何相机在路径下有 h5 → 拒绝
-    for (auto& ctx : cam_ctxs)
-        for (auto& e : fs::directory_iterator(ctx->hdf5_dir))
-            if (e.path().extension() == ".h5") {
-                cout << "[HDF5] Found existing " << e.path().filename().string()
-                     << " in " << ctx->hdf5_dir << " — pre-create skipped." << endl;
-                return 0;
-            }
-    int cam_w = g_cam_w, cam_h = g_cam_h;
+// ================== i 键: 预创建 HDF5 (检查/创建, 由创建线程调用) ==================
+// 任一相机目录下已存在 .h5 → true (双机握手时双方各自检查)
+bool anyLocalH5() {
+    for (auto& ctx : cam_ctxs) {
+        if (!fs::exists(ctx->hdf5_dir)) continue;
+        try {
+            for (auto& e : fs::directory_iterator(ctx->hdf5_dir))
+                if (e.path().extension() == ".h5") return true;
+        } catch (...) {}   // 目录不可访问等异常 → 视为无 h5, 由后续创建失败暴露
+    }
+    return false;
+}
+
+// 串行创建 25×N 个 h5 (H5 文件必须逐个创建, 不可并行); 进度写入 g_pre_done/g_pre_total
+void precreateSerial() {
     int created = 0;
+    g_pre_total = (int)cam_ctxs.size() * 25;
+    g_pre_done = 0;
     for (auto& ctx : cam_ctxs)
         for (int ci = 0; ci < 25; ++ci) {
             stringstream pss; pss << ctx->hdf5_dir << "/" << setw(4) << setfill('0') << ci << ".h5";
-            if (fs::exists(pss.str())) continue;   // 已检查过整体为空, 此处防御
-            try {
-                H5::H5File f(pss.str(), H5F_ACC_TRUNC);
-                hsize_t rd[3] = {(hsize_t)g_hdf5_chunk_capacity, (hsize_t)cam_h, (hsize_t)cam_w};
-                f.createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd));
-                hsize_t gd[2] = {(hsize_t)g_hdf5_chunk_capacity, 3};
-                f.createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd));
-                hsize_t vd[1] = {(hsize_t)g_hdf5_chunk_capacity};
-                f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd));
-                created++;
-            } catch (const H5::Exception& e) {
-                logException("ERROR", "hdf5:precreate", e.getCDetailMsg());
-                return created;
+            if (!fs::exists(pss.str())) {   // 双端预检保证为空, 此处仅防御
+                try {
+                    H5::H5File f(pss.str(), H5F_ACC_TRUNC);
+                    hsize_t rd[3] = {(hsize_t)g_hdf5_chunk_capacity, (hsize_t)g_cam_h, (hsize_t)g_cam_w};
+                    f.createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd));
+                    hsize_t gd[2] = {(hsize_t)g_hdf5_chunk_capacity, 3};
+                    f.createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd));
+                    hsize_t vd[1] = {(hsize_t)g_hdf5_chunk_capacity};
+                    f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd));
+                    created++;
+                } catch (const H5::Exception& e) {
+                    logException("ERROR", "hdf5:precreate", e.getCDetailMsg());
+                } catch (...) {
+                    logException("ERROR", "hdf5:precreate", "unknown exception");
+                }
             }
+            g_pre_done++;
         }
-    return created;
+    cout << "[HDF5] Pre-create: " << created << " files created." << endl;
 }
 
 void renderEnlargedView(cv::Mat& canvas, int cam_idx, bool is_recording,
@@ -775,6 +794,9 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
                 if(st==2){cerr<<"[Cmd] Slave disconnected - re-accepting."<<endl;break;}  // 真断连 → 重新 accept
                 if(st==1)continue;  // 500ms 轮询超时
                 if(line.rfind("HDF5_DONE:",0)==0){g_slave_hdf5_done=true;g_slave_hdf5_s=atof(line.c_str()+10);cout<<"[Cmd] Slave HDF5 done ("<<g_slave_hdf5_s<<"s)."<<endl;}
+                else if(line=="PRECHECK_CLEAR"){g_pre_peer_clear=true;cout<<"[Cmd] Slave pre-check clear (no h5)."<<endl;}
+                else if(line=="PRECHECK_BLOCKED"){g_pre_peer_reject=true;cout<<"[Cmd] Slave has existing h5 — pre-create aborted."<<endl;}
+                else if(line=="PRECREATE_DONE"){g_pre_peer_done=true;cout<<"[Cmd] Slave pre-create done."<<endl;}
                 else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){
                     if(line.length()<=7) continue;
                     char hf=line[6]; int fi=stoi(line.substr(7));
@@ -818,6 +840,15 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
                     bool& cd=(g_arm=="upper")?g_upper_done:g_lower_done; g_show_exhausted=cd;
                 }
                 else if(line=="GAZE_DONE"){g_gaze_done=true;cout<<"[Cmd] Received GAZE_DONE from Master."<<endl;}
+                else if(line=="PRECHECK_REQ"){   // master 请求预检 → 回复本机是否有 h5
+                    bool has=anyLocalH5();
+                    sendLineRaw(g_cmd_sock,has?"PRECHECK_BLOCKED":"PRECHECK_CLEAR");
+                    cout<<"[Cmd] PRECHECK_REQ -> "<<(has?"BLOCKED":"CLEAR")<<endl;}
+                else if(line=="PRECREATE_BEGIN"){   // master 令开始创建 → 独立线程, 完成后回报
+                    g_pre_phase=2;g_precreating=true;g_pre_local_done=false;
+                    if(g_pre_thread.joinable())g_pre_thread.join();
+                    g_pre_thread=thread([]{precreateSerial();g_pre_local_done=true;sendLineRaw(g_cmd_sock,"PRECREATE_DONE");});
+                    cout<<"[Cmd] Pre-create started on slave."<<endl;}
                 else if(line=="TRIGGER"){instantTrigger();net_cmd_record=true;}
                 else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){
                     if(line.length()<=7) continue;
@@ -1617,6 +1648,54 @@ int main() {
             cout<<"[Delay] "<<g_last_delay_s<<"s elapsed - recording started."<<endl;
         }
 
+        // ---- HDF5 预创建状态 (i 键): 状态机 + 全屏进度, 屏蔽所有按键 ----
+        if(g_precreating.load()){
+            if(g_pre_phase==1){
+                // 握手阶段: 等待 slave 预检回复 (15s 超时保护, 防止断连卡死)
+                if(g_pre_peer_reject.load()||
+                   chrono::duration<double>(chrono::steady_clock::now()-g_pre_t0).count()>15.0){
+                    g_precreating=false;
+                    cout<<(g_pre_peer_reject.load()?"[HDF5] Slave has existing h5 — aborted."
+                                                   :"[HDF5] Slave pre-check timeout — aborted.")<<endl;
+                }else if(g_pre_peer_clear.load()){
+                    // 双端均无 h5 → 下令双方同时开始创建
+                    g_pre_peer_done=false;g_pre_local_done=false;
+                    sendLineRaw(g_cmd_sock,"PRECREATE_BEGIN");
+                    if(g_pre_thread.joinable())g_pre_thread.join();
+                    g_pre_thread=thread([]{precreateSerial();g_pre_local_done=true;});
+                    g_pre_phase=2;
+                    cout<<"[HDF5] Pre-create started on master + slave."<<endl;
+                }
+            }else if(g_pre_phase==2){
+                // 创建阶段: 本机完成 + (如有) slave 完成 → 握手退出
+                bool peer_ok=(!enable_net_sync)||g_pre_peer_done.load();
+                if(g_pre_local_done.load()&&peer_ok){
+                    g_precreating=false;
+                    cout<<"[HDF5] Pre-create complete on both hosts."<<endl;
+                }
+            }
+            if(g_precreating.load()){
+                cv::Mat pc=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
+                string ph=(g_pre_phase==1)?string("Checking slave cameras..."):
+                    (g_pre_local_done.load()?string("Waiting for slave to finish..."):string("Creating HDF5 files (serial)..."));
+                cv::putText(pc,"PRE-CREATING HDF5 FILES",cv::Point(g_win_w/4,g_win_h/2-70),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,200,255),2);
+                cv::putText(pc,ph,cv::Point(g_win_w/4,g_win_h/2-20),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(255,255,255),1);
+                int tot=g_pre_total.load(),dn=g_pre_done.load();
+                if(tot>0){
+                    int bw=g_win_w/2,bx=(g_win_w-bw)/2,by=g_win_h/2+20;
+                    cv::rectangle(pc,cv::Rect(bx,by,bw,30),cv::Scalar(80,80,80),1);
+                    int pw=(int)(bw*(double)dn/tot);
+                    if(pw>0)cv::rectangle(pc,cv::Rect(bx,by,pw,30),cv::Scalar(0,255,0),-1);
+                    char pb[64];snprintf(pb,sizeof(pb),"%d / %d files",dn,tot);
+                    cv::putText(pc,pb,cv::Point(bx+bw/2-60,by+21),cv::FONT_HERSHEY_SIMPLEX,0.55,cv::Scalar(255,255,255),1);
+                }
+                cv::putText(pc,"Do not press any key - this may take a while",cv::Point(g_win_w/4,g_win_h/2+90),cv::FONT_HERSHEY_SIMPLEX,0.5,cv::Scalar(150,150,150),1);
+                cv::imshow("Multi-Cam Preview",pc);
+                while(cv::waitKey(1)>=0){}   // 创建期间吞掉所有按键 (含 ESC, 中断会产生残缺 h5)
+                goto next_iter;
+            }
+        }
+
         // ---- Key handling ----
         char key=(char)cv::waitKey(1); bool trigger_start=false;
         if(g_syncing.load()){}
@@ -1695,11 +1774,21 @@ int main() {
             syncPiperToSlave();
             cout<<"[Piper] "<<g_arm<<" sentry cleared."<<endl;
         }
-        else if(is_master_pc&&(key=='i'||key=='I')&&!g_piper_busy&&!is_recording&&!is_dumping){
-            // 提前为每个相机创建 25 个 h5 (chunk 0000..0024); 任一相机已有 h5 → 不执行
-            int created = precreateHdf5Files();
-            cout<<"[HDF5] Pre-create: "<<created<<" files "
-                <<(created?"(0000-0024 per camera)":"— existing h5 found, skipped")<<endl;
+        else if(is_master_pc&&(key=='i'||key=='I')&&!g_piper_busy&&!is_recording&&!is_dumping&&!g_precreating.load()){
+            // 提前创建 25×N 个 h5: 双机握手预检 → 各自串行创建 → 握手退出
+            if(anyLocalH5()){cout<<"[HDF5] Existing h5 on master — pre-create skipped."<<endl;}
+            else if(!enable_net_sync){
+                // 单机模式: 直接创建 (无握手)
+                g_pre_phase=2;g_precreating=true;g_pre_local_done=false;
+                if(g_pre_thread.joinable())g_pre_thread.join();
+                g_pre_thread=thread([]{precreateSerial();g_pre_local_done=true;});
+            }else{
+                // 双机模式: 先握手检查 slave (master 本机已确认无 h5)
+                g_pre_peer_clear=false;g_pre_peer_reject=false;
+                g_precreating=true;g_pre_phase=1;g_pre_t0=chrono::steady_clock::now();
+                sendLineRaw(g_cmd_sock,"PRECHECK_REQ");
+                cout<<"[HDF5] Master clear. Pre-checking slave..."<<endl;
+            }
         }
         else if(is_master_pc&&(key=='t'||key=='T')&&!g_piper_busy&&!is_recording&&!is_dumping){
             string new_arm=(g_arm=="upper")?"lower":"upper";
@@ -1751,6 +1840,7 @@ int main() {
 
     // ---- Cleanup ----
     cout<<"[System] Shutting down..."<<endl;
+    if(g_pre_thread.joinable())g_pre_thread.join();   // HDF5 预创建线程
     for(auto& ctx:cam_ctxs){ctx->running=false;ctx->copy_cv.notify_all();}
     // 退出前熄灭两个 M5Stack
     sendLedCmd(g_led_upper,"CLEAR");
