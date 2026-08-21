@@ -6,7 +6,7 @@
 //   PIX <rrggbb> <rrggbb> ... (25 个, 行优先索引 0..24)  — 静态: 设置 25 个像素
 //   ALL <rrggbb>                                         — 静态: 全部同色
 //   MODE ALL <rrggbb>                                    — 静态: 25 个全亮 (状态灯)
-//   MODE BREATH <rrggbb>                                 — 动画: 十字呼吸灯 (外臂+中心=白, 内3x3小十字=呼吸色)
+//   MODE BREATH <rrggbb>                                 — 动画: 25 颗全亮呼吸灯 (正弦亮度, 最低约 1/4)
 //   MODE FLOW                                            — 动画: 45° 斜向彩色流转 (每条反对角线一个色相)
 //   CLEAR                                                — 熄灭 (退出动画)
 //   BRIGHT <0-100>                                       — 全局亮度 (库内部钳制上限 100, 建议 <=60)
@@ -129,18 +129,14 @@ void loop() {
         }
     }
     if (g_mode == 1) {
-        // 十字呼吸动画: 9 颗亮度相同, 正弦波动最低约 1/4 (63.75..255)
-        // 外臂+中心 = 白色, 内 3x3 小十字 = 呼吸色, 全部随呼吸亮度缩放
+        // 全矩阵呼吸动画: 25 颗同色, 正弦波动最低约 1/4 (63.75..255)
         g_phase = (g_phase + 6) % 360;
         uint8_t b = (uint8_t)(159.375 + 95.625 * sin(g_phase * PI / 180.0));
-        for (int i = 0; i < NUM_LEDS; i++) {
-            if (!isCross(i)) { M5.dis.drawpix(i, CRGB(0, 0, 0)); continue; }
-            uint32_t col = isWhitePx(i) ? 0xFFFFFF : g_breath_color;
-            uint8_t r = (uint8_t)((uint16_t)((col >> 16) & 0xFF) * b / 255);
-            uint8_t g = (uint8_t)((uint16_t)((col >> 8) & 0xFF) * b / 255);
-            uint8_t bl = (uint8_t)((uint16_t)(col & 0xFF) * b / 255);
-            M5.dis.drawpix(i, CRGB(r, g, bl));
-        }
+        uint32_t col = g_breath_color;
+        uint8_t r = (uint8_t)((uint16_t)((col >> 16) & 0xFF) * b / 255);
+        uint8_t g = (uint8_t)((uint16_t)((col >> 8) & 0xFF) * b / 255);
+        uint8_t bl = (uint8_t)((uint16_t)(col & 0xFF) * b / 255);
+        for (int i = 0; i < NUM_LEDS; i++) M5.dis.drawpix(i, CRGB(r, g, bl));
         delay(25);
     } else if (g_mode == 2) {
         // 45° 斜向彩色流转: 每条反对角线 (x+y 相同) 一个色相, 9 条线 × 40°

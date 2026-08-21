@@ -158,8 +158,7 @@ void sendLedCmd(HANDLE h, const string& cmd) {
 
 extern string g_arm;   // 当前机械臂 ("upper"/"lower"), 定义在下方 Piper arm state 区
 
-// 状态 → LED 图案命令 (固件无全绿呼吸/十字常亮模式, 由主机侧组合实现:
-// READY = MODE ALL + 主循环 BRIGHT 呼吸; CAPTURING = PIX 静态绿白十字)
+// 状态 → LED 图案命令 (每次切换仅一条指令; 呼吸动画由固件 MODE BREATH 实现)
 string pixCrossCmd() {
     // 十字: 外臂+中心 (2,10,12,14,22) = 白; 内 3x3 小十字 (7,11,13,17) = 绿; 其余黑
     string px[25]; for (auto& v : px) v = "000000";
@@ -170,7 +169,7 @@ string pixCrossCmd() {
 string ledPatternCmd(LedState s) {
     switch (s) {
         case LedState::PIPER_INIT: return "MODE ALL 0000ff";      // 25 全亮蓝
-        case LedState::READY:      return "MODE ALL 00ff00";      // 25 全绿 (主循环 BRIGHT 呼吸)
+        case LedState::READY:      return "MODE BREATH 00ff00";   // 25 全绿呼吸 (固件动画)
         case LedState::CAPTURING:  return pixCrossCmd();          // 绿白十字常亮
         case LedState::WAITING:    return "MODE ALL ff8000";      // 25 全亮橙
         case LedState::EXHAUSTED:  return "MODE ALL ff0000";      // 25 全亮红
@@ -186,23 +185,7 @@ LedState g_led_state_lower = LedState::PIPER_INIT;
 void sendLedPatternTo(HANDLE h, LedState s) {
     string cmd = ledPatternCmd(s);
     if (cmd.empty()) return;
-    sendLedCmd(h, "BRIGHT 20");   // 切换图案前恢复默认亮度 (退出 READY 呼吸后残留低亮度)
     sendLedCmd(h, cmd);
-}
-
-// READY 全绿呼吸: 主循环高频调用 (内部节流 ~8Hz), 对处于 READY 的设备发送 BRIGHT 正弦亮度
-// (固件无全矩阵呼吸模式, 用全局亮度动画实现; 周期 3s, 5..40, 上限遵守 <=60 建议)
-chrono::steady_clock::time_point g_led_breath_t0 = chrono::steady_clock::now();
-chrono::steady_clock::time_point g_led_breath_last;
-void tickLedBreath() {
-    auto now = chrono::steady_clock::now();
-    if (now - g_led_breath_last < chrono::milliseconds(125)) return;   // 节流 ~8Hz
-    g_led_breath_last = now;
-    double t = chrono::duration<double>(now - g_led_breath_t0).count();
-    int b = 5 + (int)(35.0 * (0.5 + 0.5 * sin(2.0 * 3.14159265 * t / 3.0)));
-    char buf[16]; snprintf(buf, sizeof(buf), "BRIGHT %d", b);
-    if (g_led_state_upper == LedState::READY) sendLedCmd(g_led_upper, buf);
-    if (g_led_state_lower == LedState::READY) sendLedCmd(g_led_lower, buf);
 }
 
 // 每臂成功录制数 / OVER 标志 (运行期独立计数, 跨切换保持, 重启归零)
@@ -1310,7 +1293,6 @@ int main() {
             } else {
                 setLedState(LedState::PIPER_INIT);
             }
-            tickLedBreath();   // READY 全绿呼吸 (每循环迭代一次, ~ui_fps)
         }
 
         // ===== UI render (from hdf5_multi_process.cpp) =====
