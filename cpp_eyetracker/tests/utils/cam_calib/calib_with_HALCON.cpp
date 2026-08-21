@@ -243,6 +243,7 @@ void slaveCmdWorker(SOCKET s){
                 if(!d.is_directory())continue;
                 for(auto& e:fs::directory_iterator(d.path()))if(e.path().extension()==".jpg")fs::remove(e.path());}
             sendLine(s,"ICLEAR_DONE");cout<<"[Slave] All intrinsics photos cleared."<<endl;}
+        else if(line=="LIST_REQ"){cout<<"[Slave] LIST request"<<endl;stringstream fl;for(auto& f:scanFiles(picRoot(),g_intr_mode.load()))fl<<f<<",";sendLine(s,"LIST_RESP:"+fl.str());cout<<"[Slave] Sent file list ("<<scanFiles(picRoot(),g_intr_mode.load()).size()<<" files)"<<endl;}
         else if(line=="CLEAR"){cout<<"[Slave] CLEAR \xe2\x80\x94 removing all calibration photos"<<endl;if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;sendLine(s,"CLEAR_DONE");cout<<"[Slave] Cleared."<<endl;}
         else if(line.rfind("XFER:",0)==0){string lst=line.substr(5);stringstream ss(lst);string tok;vector<string> files;while(getline(ss,tok,','))if(!tok.empty())files.push_back(tok);
             int total=(int)files.size(),cnt=0;size_t total_bytes=0;int data_port=g_ctrl_port+1;
