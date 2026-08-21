@@ -38,3 +38,10 @@ cmake --build build --config Release
 $env:MPLBACKEND = "TkAgg"
 python cpp_eyetracker\tests\utils\cam_calib\viz_calib_chain.py
 ```
+
+# Close Defender
+```Powershell
+Add-MpPreference -ExclusionPath "D:\capture"
+Add-MpPreference -ExclusionPath "E:\capture"
+Add-MpPreference -ExclusionProcess "hdf5_multi_process_child.exe"
+```
