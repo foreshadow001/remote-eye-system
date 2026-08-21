@@ -111,8 +111,8 @@ void drawLedIndicator(cv::Mat& canvas) {
     cv::Scalar color; string text;
     switch (g_led_state) {
         case LedState::PIPER_INIT: color={255,0,0};   text="PIPER INIT"; break;  // BGR: RGB 蓝 0000ff
-        case LedState::READY:      color={0,255,0};   text="READY"; break;
-        case LedState::CAPTURING:  color={0,255,0};   text="CAPTURING"; break;
+        case LedState::READY:      color={0,255,0};   text="READY (breath)"; break;   // 绿十字呼吸
+        case LedState::CAPTURING:  color={0,255,0};   text="CAPTURING"; break;       // 25 全绿常亮
         case LedState::WAITING:    color={0,128,255}; text="WAITING"; break;    // BGR: RGB 橙 ff8000
         case LedState::EXHAUSTED:  color={0,0,255};   text="EXHAUSTED"; break;  // BGR: RGB 红 ff0000
         case LedState::OVER:       color={255,0,255}; text="OVER"; break;
@@ -162,8 +162,8 @@ extern string g_arm;   // 当前机械臂 ("upper"/"lower"), 定义在下方 Pip
 string ledPatternCmd(LedState s) {
     switch (s) {
         case LedState::PIPER_INIT: return "MODE ALL 0000ff";      // 25 全亮蓝
-        case LedState::READY:      return "MODE ALL 00ff00";      // 25 全绿常亮
-        case LedState::CAPTURING:  return "MODE BREATH 00ff00";   // 绿十字呼吸
+        case LedState::READY:      return "MODE BREATH 00ff00";   // 绿十字呼吸
+        case LedState::CAPTURING:  return "MODE ALL 00ff00";      // 25 全绿常亮
         case LedState::WAITING:    return "MODE ALL ff8000";      // 25 全亮橙
         case LedState::EXHAUSTED:  return "MODE ALL ff0000";      // 25 全亮红
         case LedState::OVER:       return "MODE FLOW";            // 横向彩流
