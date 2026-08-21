@@ -81,6 +81,7 @@ void handleLine(const String& line) {
         for (int i = 0; i < NUM_LEDS; i++) g_pixels[i] = 0;
         applyPixels();
     } else if (cmd.startsWith("PIX ")) {
+        g_mode = 0;   // 退出动画模式 (BREATH/FLOW 循环会每帧覆盖静态像素)
         String payload = cmd.substring(4);
         int idx = 0;
         int pos = 0;
