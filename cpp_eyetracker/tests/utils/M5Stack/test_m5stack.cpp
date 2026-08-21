@@ -67,17 +67,17 @@ bool sendSerial(const string& cmd) {
     return true;
 }
 
-// ================== 状态灯 (capture_with_LED 的 LedState) ==================
-struct LedPattern { string name; bool breath; bool flow; array<int,3> rgb; string desc; };
-// 颜色与 capture_with_LED.cpp 的 drawLedIndicator 一致:
-//   PIPER_INIT=蓝 READY=绿 CAPTURING=绿 WAITING=橙 EXHAUSTED=红 OVER=横向彩流
+// ================== 状态灯 (capture_with_M5Stack 的 LedState) ==================
+// kind: ALL = 25 颗全亮;  ALLBREATH = 25 颗全亮 + 主机 BRIGHT 呼吸;
+//       CROSS = 绿白十字常亮 (PIX);  BREATH = 十字呼吸 (固件模式);  FLOW = 斜向彩流
+struct LedPattern { string name; string kind; array<int,3> rgb; string desc; };
 vector<LedPattern> g_states = {
-    {"PIPER_INIT", false, false, {  0,  0,255}, "all 25 blue"},
-    {"READY",      false, false, {  0,255,  0}, "all 25 green steady"},
-    {"CAPTURING",  true,  false, {  0,255,  0}, "green breathing cross"},
-    {"WAITING",    false, false, {255,128,  0}, "all 25 orange"},
-    {"EXHAUSTED",  false, false, {255,  0,  0}, "all 25 red"},
-    {"OVER",       false, true,  {255,  0,255}, "horizontal rainbow flow"},
+    {"PIPER_INIT", "ALL",       {  0,  0,255}, "all 25 blue"},
+    {"READY",      "ALLBREATH", {  0,255,  0}, "all 25 green breathing"},
+    {"CAPTURING",  "CROSS",     {  0,255,  0}, "green-white steady cross"},
+    {"WAITING",    "ALL",       {255,128,  0}, "all 25 orange"},
+    {"EXHAUSTED",  "ALL",       {255,  0,  0}, "all 25 red"},
+    {"OVER",       "FLOW",      {255,  0,255}, "diagonal rainbow flow"},
 };
 int g_state_idx = -1;   // -1 = 尚未发送
 
@@ -98,30 +98,43 @@ void hsvToRgb(double h, double s, double v, int& r, int& g, int& b) {
     r = (int)((rp + m) * 255); g = (int)((gp + m) * 255); b = (int)((bp + m) * 255);
 }
 
-// 按 s 循环发送状态图案 (READY/CAPTURING = 十字呼吸, OVER = 横向彩流, 其余 = 25 颗全亮)
+// 十字 PIX 命令: 外臂+中心 (2,10,12,14,22) = 白, 内 3x3 小十字 (7,11,13,17) = rgb, 其余黑
+string pixCrossCmd(const array<int,3>& rgb) {
+    char hexbuf[8];
+    snprintf(hexbuf, sizeof(hexbuf), "%02x%02x%02x", rgb[0], rgb[1], rgb[2]);
+    string px[25]; for (auto& v : px) v = "000000";
+    for (int i : {7, 11, 13, 17}) px[i] = hexbuf;
+    for (int i : {2, 10, 12, 14, 22}) px[i] = "ffffff";
+    string cmd = "PIX"; for (auto& v : px) cmd += " " + v; return cmd;
+}
+
+bool g_breathing = false;   // ALLBREATH 状态下主循环持续发送 BRIGHT
+
+// 按 s 循环发送状态图案
 void sendNextState() {
     g_state_idx = (g_state_idx + 1) % (int)g_states.size();
     auto& st = g_states[g_state_idx];
-    string cmd;
-    if (st.flow) {
-        cmd = "MODE FLOW";
-    } else {
-        char hexbuf[8];
-        snprintf(hexbuf, sizeof(hexbuf), "%02x%02x%02x", st.rgb[0], st.rgb[1], st.rgb[2]);
-        cmd = st.breath ? ("MODE BREATH " + string(hexbuf)) : ("MODE ALL " + string(hexbuf));
-    }
-    g_status = sendSerial(cmd) ? ("State: " + st.name + " — " + st.desc) : "Send failed.";
+    sendSerial("BRIGHT 20");   // 切换前恢复默认亮度 (退出呼吸后残留低亮度)
+    bool ok = false;
+    char hexbuf[8];
+    snprintf(hexbuf, sizeof(hexbuf), "%02x%02x%02x", st.rgb[0], st.rgb[1], st.rgb[2]);
+    g_breathing = (st.kind == "ALLBREATH");
+    if (st.kind == "FLOW") ok = sendSerial("MODE FLOW");
+    else if (st.kind == "BREATH") ok = sendSerial(string("MODE BREATH ") + hexbuf);
+    else if (st.kind == "CROSS") ok = sendSerial(pixCrossCmd(st.rgb));
+    else ok = sendSerial(string("MODE ALL ") + hexbuf);   // ALL / ALLBREATH (后者由主循环呼吸)
+    g_status = ok ? ("State: " + st.name + " — " + st.desc) : "Send failed.";
     // 更新 5x5 预览
     for (int i = 0; i < 25; ++i) g_grid[i] = {0, 0, 0};
-    if (st.flow) {
+    if (st.kind == "FLOW") {
         // 斜向彩流静态快照: 每条反对角线 (x+y) 一个色相, 偏移 40° (与固件一致)
         for (int i = 0; i < 25; ++i) {
             int x = i % 5, y = i / 5;
             int r, g, b; hsvToRgb(((x + y) * 40) % 360, 1.0, 1.0, r, g, b);
             g_grid[i] = {r, g, b};
         }
-    } else if (st.breath) {
-        // 外臂+中心 (2,10,12,14,22) = 白, 内 3x3 小十字 = 呼吸色 (与固件一致)
+    } else if (st.kind == "CROSS" || st.kind == "BREATH") {
+        // 外臂+中心 = 白, 内 3x3 小十字 = rgb (与固件/PIX 一致)
         for (int j = 0; j < 9; ++j) {
             int i = CROSS_IDX[j];
             g_grid[i] = (i == 2 || i == 10 || i == 12 || i == 14 || i == 22) ? array<int,3>{255, 255, 255} : st.rgb;
@@ -168,7 +181,15 @@ int main() {
 
     cv::namedWindow("M5Stack LED Control", cv::WINDOW_NORMAL);
     cv::resizeWindow("M5Stack LED Control", 760, 420);
+    auto breath_t0 = chrono::steady_clock::now();
     while (true) {
+        // ALLBREATH 状态: 主机驱动全局亮度呼吸 (周期 3s, 5..40)
+        if (g_breathing) {
+            double t = chrono::duration<double>(chrono::steady_clock::now() - breath_t0).count();
+            int b = 5 + (int)(35.0 * (0.5 + 0.5 * sin(2.0 * 3.14159265 * t / 3.0)));
+            char buf[16]; snprintf(buf, sizeof(buf), "BRIGHT %d", b);
+            sendSerial(buf);
+        }
         cv::Mat canvas; render(canvas); cv::imshow("M5Stack LED Control", canvas);
         char key = (char)cv::waitKey(30);
         if (key == 27 || key == 'q') break;
