@@ -317,7 +317,8 @@ double g_slave_hdf5_s = 0;     // Slave HDF5 write (hdf5 phase in par)
 double g_wait_slave_hdf5_s = 0; // Wait for Slave HDF5_DONE
 double g_gaze_forward_s = 0;    // GAZE forward + GAZE_DONE
 double g_sentry_sync_s = 0;     // Sentry handshake
-double g_recording_end_to_end_s = 0; // Total from SPACE to SPACE-ready
+double g_recording_end_to_end_s = 0; // Total from SPACE to SPACE-ready (delay + record + arm&h5 + sync)
+atomic<int64_t> g_e2e_start_us{0};   // SPACE 按下时刻 (End-to-end 起点; slave 由 TRIGGER 兜底)
 atomic<int> g_exc_fatal{0}, g_exc_error{0}, g_exc_warn{0}, g_exc_info{0};
 int64_t g_peer_first_block_id = -1;
 atomic<int> g_enlarged_cam{-1};
@@ -732,12 +733,15 @@ void precreateSerial() {
                 try {
                     H5::H5File f(pss.str(), H5F_ACC_TRUNC);
                     H5::DSetCreatPropList pl = allocEarlyPl();
-                    hsize_t rd[3] = {(hsize_t)g_hdf5_chunk_capacity, (hsize_t)g_cam_h, (hsize_t)g_cam_w};
-                    f.createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd), pl);
+                    // 顺序关键: 小数据集必须先创建 (文件布局在 raw_image 之前) —
+                    // 否则首写 gaze/valid (位于 10GB raw 区之后) 越过 NTFS 有效数据长度,
+                    // close 时触发整个空洞的同步零填充 (~115ms/GB, 首录尖峰根因)
                     hsize_t gd[2] = {(hsize_t)g_hdf5_chunk_capacity, 3};
                     f.createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd), pl);
                     hsize_t vd[1] = {(hsize_t)g_hdf5_chunk_capacity};
                     f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd), pl);
+                    hsize_t rd[3] = {(hsize_t)g_hdf5_chunk_capacity, (hsize_t)g_cam_h, (hsize_t)g_cam_w};
+                    f.createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd), pl);
                     created++;
                 } catch (const H5::Exception& e) {
                     logException("ERROR", "hdf5:precreate", e.getCDetailMsg());
@@ -949,7 +953,7 @@ void writeReport(const string& timestr, int rec_num, int total_frames, bool hw_t
     g_session_log << "| Wait Slave HDF5_DONE | " << g_wait_slave_hdf5_s << " s | Master idle wait for Slave |\n";
     g_session_log << "| GAZE forward | " << g_gaze_forward_s << " s | GAZE tx + GAZE_ACK + GAZE_DONE |\n";
     g_session_log << "| Sentry sync | " << g_sentry_sync_s << " s | TCP handshake port+300 |\n";
-    g_session_log << "| End-to-end | " << g_recording_end_to_end_s << " s | SPACE→SPACE-ready |\n";
+    g_session_log << "| End-to-end | " << g_recording_end_to_end_s << " s | SPACE→SPACE-ready (delay+record+arm&h5+sync) |\n";
     int ef=g_exc_fatal.load(), ee=g_exc_error.load(), ew=g_exc_warn.load(), ei=g_exc_info.load();
     auto b=[](int v){return v>0?"**"+to_string(v)+"**":to_string(v);};
     g_session_log << "| exceptions_fatal | "<<b(ef)<<" | FATAL count |\n";
@@ -1480,16 +1484,17 @@ int main() {
                     });
                 }
 
-                // Step 0: Pre-create HDF5 files
+                // Step 0: Pre-create HDF5 files (小数据集先创建 — 布局须在 raw_image 前, 见 precreateSerial 注释)
                 for (auto& ctx:cam_ctxs){ctx->dump_start_time=chrono::steady_clock::now();
                     stringstream pss;pss<<ctx->hdf5_dir<<"/"<<setw(4)<<setfill('0')<<g_chunk_idx<<".h5";
                     if(!fs::exists(pss.str())){try{H5::H5File f(pss.str(),H5F_ACC_TRUNC);
-                        hsize_t rd[3]={(hsize_t)g_hdf5_chunk_capacity,(hsize_t)cam_h,(hsize_t)cam_w};
-                        f.createDataSet("raw_image",H5::PredType::NATIVE_UINT8,H5::DataSpace(3,rd));
+                        H5::DSetCreatPropList pl=allocEarlyPl();
                         hsize_t gd[2]={(hsize_t)g_hdf5_chunk_capacity,3};
-                        f.createDataSet("gaze_target",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,gd));
+                        f.createDataSet("gaze_target",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,gd),pl);
                         hsize_t vd[1]={(hsize_t)g_hdf5_chunk_capacity};
-                        f.createDataSet("valid",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,vd));}
+                        f.createDataSet("valid",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,vd),pl);
+                        hsize_t rd[3]={(hsize_t)g_hdf5_chunk_capacity,(hsize_t)cam_h,(hsize_t)cam_w};
+                        f.createDataSet("raw_image",H5::PredType::NATIVE_UINT8,H5::DataSpace(3,rd),pl);}
                         catch(const H5::Exception& e){logException("ERROR","hdf5:precreate",e.getCDetailMsg());}}}
                 auto t_pre=chrono::steady_clock::now();
 
@@ -1615,11 +1620,14 @@ int main() {
                 auto d_sync=chrono::duration<double>(t_sync_done-t_arm_done).count();
                 auto d_sentry=chrono::duration<double>(t_sentry1-t_sentry0).count();
                 auto d_total=chrono::duration<double>(t_sentry1-t0).count();
+                // End-to-end = SPACE → SPACE-ready: capture_delay + 录制(含margin) + arm&h5 + sync/sentry
+                auto e2e_start=chrono::steady_clock::time_point(chrono::microseconds(g_e2e_start_us.load()));
+                g_recording_end_to_end_s = chrono::duration<double>(t_sentry1-e2e_start).count();
+                g_e2e_start_us.store(0);
                 // Store for report
                 g_arm_stage_s = d_par;
                 if(is_master_pc) g_master_hdf5_s = d_wait; else g_slave_hdf5_s = d_wait;
                 g_sentry_sync_s = d_sentry;
-                g_recording_end_to_end_s = d_total;
                 double d_sync_total = d_sync; // keep for console output
                 cout<<"[Timing] par="<<fixed<<setprecision(2)<<d_par
                     <<"s (pre="<<d_pre<<" launch="<<d_launch
@@ -1751,6 +1759,7 @@ int main() {
         }
         else if(is_master_pc&&key==' '&&!is_recording&&!is_dumping&&!g_piper_busy&&!g_delay_pending){
             if(g_recording_enabled){
+                g_e2e_start_us.store(nowUs());   // End-to-end 起点: SPACE 按下时刻
                 if(g_capture_delay>0.0){
                     // 进入 CAPTURING, 延迟 capture_delay 后再真正录制 (受试者聚焦十字中心)
                     setLedState(LedState::CAPTURING);
@@ -1851,6 +1860,8 @@ int main() {
             while(cv::waitKey(1)>=0){}
             current_record_timestr=shared_record_timestr;
             record_start_time=global_record_start_time;
+            // End-to-end 起点兜底 (slave TRIGGER / 未走 SPACE 路径): 触发时刻
+            if(g_e2e_start_us.load()==0) g_e2e_start_us.store(nowUs());
             is_recording=true; cout<<"[Info] Recording in progress..."<<endl;
         }
         next_iter:;
