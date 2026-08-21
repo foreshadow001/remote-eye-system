@@ -101,7 +101,8 @@ static void render(cv::Mat& canvas) {
             cv::Mat cell;
             if (g_cams[i].loaded) {
                 cv::Mat bgr;
-                try { cv::cvtColor(g_cams[i].raw, bgr, cv::COLOR_BayerRG2BGR); }
+                // 彩色相机实际排列为 BayerBG (按 RG 解读会 R/B 互换: 黄→蓝)
+                try { cv::cvtColor(g_cams[i].raw, bgr, cv::COLOR_BayerBG2BGR); }
                 catch (...) { cv::cvtColor(g_cams[i].raw, bgr, cv::COLOR_GRAY2BGR); }
                 double sc = min((double)g_thumb_w / bgr.cols, (double)g_thumb_h / bgr.rows);
                 int dw = (int)(bgr.cols * sc), dh = (int)(bgr.rows * sc);
@@ -130,7 +131,7 @@ static void render(cv::Mat& canvas) {
     cv::Rect right(g_right_x, 0, g_right_w, g_win_h);
     if (g_enlarged >= 0 && g_enlarged < n && g_cams[g_enlarged].loaded) {
         cv::Mat bgr;
-        try { cv::cvtColor(g_cams[g_enlarged].raw, bgr, cv::COLOR_BayerRG2BGR); }
+        try { cv::cvtColor(g_cams[g_enlarged].raw, bgr, cv::COLOR_BayerBG2BGR); }   // BayerBG (见缩略图处注释)
         catch (...) { cv::cvtColor(g_cams[g_enlarged].raw, bgr, cv::COLOR_GRAY2BGR); }
         double sc = min((double)g_right_w / bgr.cols, (double)g_win_h / bgr.rows);
         int dw = (int)(bgr.cols * sc), dh = (int)(bgr.rows * sc);
