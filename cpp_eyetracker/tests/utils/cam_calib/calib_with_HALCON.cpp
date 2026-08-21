@@ -229,7 +229,20 @@ void slaveCmdWorker(SOCKET s){
         else if(line=="IPHOTO"){cout<<"[Slave] IPHOTO request from master"<<endl;
             if(g_intr_mode.load()&&saveIntrinsicsFrame())sendLine(s,"IPHOTO_OK");
             else sendLine(s,"IPHOTO_NOSEL");}
-        else if(line=="LIST_REQ"){cout<<"[Slave] LIST request"<<endl;stringstream fl;for(auto& f:scanFiles(picRoot(),g_intr_mode.load()))fl<<f<<",";sendLine(s,"LIST_RESP:"+fl.str());cout<<"[Slave] Sent file list"<<endl;}
+        else if(line=="IUNDO"){cout<<"[Slave] IUNDO request from master"<<endl;
+            // 撤回 slave 选中相机的最后一张 (无选中/无图 → NOSEL)
+            if(!g_intr_mode.load()){sendLine(s,"IUNDO_NOSEL");continue;}
+            int ci=g_enlarged_cam.load();
+            if(ci<0||ci>=(int)cam_ctxs.size()){sendLine(s,"IUNDO_NOSEL");continue;}
+            string del=lastImageIn(g_intr_root+"/"+cam_ctxs[ci]->sn);
+            if(del.empty()){sendLine(s,"IUNDO_NOSEL");continue;}
+            fs::remove(del);cout<<"  -> Removed "<<del<<endl;sendLine(s,"IUNDO_OK");}
+        else if(line=="ICLEAR"){cout<<"[Slave] ICLEAR — removing ALL intrinsics photos"<<endl;
+            // 清空 slave 全部相机的内参图片 (master c 键触发, 双端全清)
+            if(fs::exists(g_intr_root))for(auto& d:fs::directory_iterator(g_intr_root)){
+                if(!d.is_directory())continue;
+                for(auto& e:fs::directory_iterator(d.path()))if(e.path().extension()==".jpg")fs::remove(e.path());}
+            sendLine(s,"ICLEAR_DONE");cout<<"[Slave] All intrinsics photos cleared."<<endl;}
         else if(line=="CLEAR"){cout<<"[Slave] CLEAR \xe2\x80\x94 removing all calibration photos"<<endl;if(fs::exists(g_save_dir))for(auto& e:fs::directory_iterator(g_save_dir))if(e.path().extension()==".jpg")fs::remove(e.path());g_capture_count=0;sendLine(s,"CLEAR_DONE");cout<<"[Slave] Cleared."<<endl;}
         else if(line.rfind("XFER:",0)==0){string lst=line.substr(5);stringstream ss(lst);string tok;vector<string> files;while(getline(ss,tok,','))if(!tok.empty())files.push_back(tok);
             int total=(int)files.size(),cnt=0;size_t total_bytes=0;int data_port=g_ctrl_port+1;
@@ -509,8 +522,14 @@ int main(){
                 if(launchHalconChain()){g_calib_title="cam_calib_chain is running";g_ui_mode=UiMode::CALIBRATING;g_calib_start=chrono::steady_clock::now();}}}
         else if((key=='z'||key=='Z')&&!g_fault_active.load()){
             if(g_intr_mode.load()){
-                // 内参模式: 撤回放大相机的最后一张 (slave 按键禁用, 只负责选中)
-                if(g_enable_net_sync&&!g_is_master){}
+                if(g_enable_net_sync&&!g_is_master){}   // slave 按键禁用
+                else if(g_enlarged_cam.load()<0&&g_enable_net_sync&&g_is_master){
+                    // master 未选中 → 命令 slave 撤回其选中相机的最后一张
+                    sendLine(g_ctrl_sock,"IUNDO");string resp;recvLine(g_ctrl_sock,resp,3000);
+                    if(resp=="IUNDO_OK")cout<<"\n[Intrinsics] Slave undid its selected camera."<<endl;
+                    else if(resp=="IUNDO_NOSEL")cout<<"[Intrinsics] Slave: no camera selected / no images."<<endl;
+                    else cout<<"[Intrinsics] No response from slave."<<endl;
+                }
                 else{int ci=g_enlarged_cam.load();
                 if(ci<0||ci>=(int)cam_ctxs.size()){cout<<"[Intrinsics] No camera selected."<<endl;continue;}
                 string dir=g_intr_root+"/"+cam_ctxs[ci]->sn;string del=lastImageIn(dir);
@@ -525,8 +544,17 @@ int main(){
             cout<<"[Undo] Done.\n"<<endl;}}
         else if(key=='c'||key=='C'){
             if(g_intr_mode.load()){
-                // 内参模式: 清除放大相机的全部图片 (slave 按键禁用, 只负责选中)
-                if(g_enable_net_sync&&!g_is_master){}
+                if(g_enable_net_sync&&!g_is_master){}   // slave 按键禁用
+                else if(g_enlarged_cam.load()<0&&g_enable_net_sync&&g_is_master){
+                    // master 未选中 → 清空 master + slave 全部相机的内参照片
+                    cout<<"\n[Intrinsics] Clearing ALL cameras on master and slave..."<<endl;
+                    if(fs::exists(g_intr_root))for(auto& d:fs::directory_iterator(g_intr_root)){
+                        if(!d.is_directory())continue;
+                        for(auto& e:fs::directory_iterator(d.path()))if(e.path().extension()==".jpg")fs::remove(e.path());}
+                    sendLine(g_ctrl_sock,"ICLEAR");string resp;recvLine(g_ctrl_sock,resp,5000);
+                    cout<<(resp=="ICLEAR_DONE"?"[Intrinsics] Slave cleared.":"[Intrinsics] Slave no response ("+resp+").")<<endl;
+                    cout<<"[Intrinsics] All intrinsics photos cleared."<<endl;
+                }
                 else{int ci=g_enlarged_cam.load();
                 if(ci<0||ci>=(int)cam_ctxs.size()){cout<<"[Intrinsics] No camera selected."<<endl;continue;}
                 string dir=g_intr_root+"/"+cam_ctxs[ci]->sn;int n=countImages(dir);
