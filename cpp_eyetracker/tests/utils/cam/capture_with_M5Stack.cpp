@@ -711,6 +711,15 @@ bool anyLocalH5() {
     return false;
 }
 
+// 数据集创建属性: 创建时即分配全部存储空间 (文件扩展到满尺寸),
+// 且不写填充值 (避免逐字节清零 9.7GB; 未写区域由 valid 数据集标记)
+H5::DSetCreatPropList allocEarlyPl() {
+    H5::DSetCreatPropList pl;
+    pl.setAllocTime(H5D_ALLOC_TIME_EARLY);
+    pl.setFillTime(H5D_FILL_TIME_NEVER);
+    return pl;
+}
+
 // 串行创建 25×N 个 h5 (H5 文件必须逐个创建, 不可并行); 进度写入 g_pre_done/g_pre_total
 void precreateSerial() {
     int created = 0;
@@ -722,12 +731,13 @@ void precreateSerial() {
             if (!fs::exists(pss.str())) {   // 双端预检保证为空, 此处仅防御
                 try {
                     H5::H5File f(pss.str(), H5F_ACC_TRUNC);
+                    H5::DSetCreatPropList pl = allocEarlyPl();
                     hsize_t rd[3] = {(hsize_t)g_hdf5_chunk_capacity, (hsize_t)g_cam_h, (hsize_t)g_cam_w};
-                    f.createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd));
+                    f.createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd), pl);
                     hsize_t gd[2] = {(hsize_t)g_hdf5_chunk_capacity, 3};
-                    f.createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd));
+                    f.createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd), pl);
                     hsize_t vd[1] = {(hsize_t)g_hdf5_chunk_capacity};
-                    f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd));
+                    f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd), pl);
                     created++;
                 } catch (const H5::Exception& e) {
                     logException("ERROR", "hdf5:precreate", e.getCDetailMsg());
@@ -1674,8 +1684,9 @@ int main() {
                     cout<<"[HDF5] Pre-create started on master + slave."<<endl;
                 }
             }else if(g_pre_phase==2){
-                // 创建阶段: 本机完成 + (如有) slave 完成 → 握手退出
-                bool peer_ok=(!enable_net_sync)||g_pre_peer_done.load();
+                // 创建阶段: slave 本机完成即退出 (PRECREATE_DONE 已作为确认发给 master);
+                //           master 需等本机 + slave 双方完成
+                bool peer_ok=(!enable_net_sync)||(!is_master_pc)||g_pre_peer_done.load();
                 if(g_pre_local_done.load()&&peer_ok){
                     g_precreating=false;
                     cout<<"[HDF5] Pre-create complete on both hosts."<<endl;
