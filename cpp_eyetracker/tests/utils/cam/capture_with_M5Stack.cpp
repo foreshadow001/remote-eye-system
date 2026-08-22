@@ -160,10 +160,10 @@ extern string g_arm;   // 当前机械臂 ("upper"/"lower"), 定义在下方 Pip
 
 // 状态 → LED 图案命令 (每次切换仅一条指令; 呼吸动画由固件 MODE BREATH 实现)
 string pixCrossCmd() {
-    // 十字: 外臂+中心 (2,10,12,14,22) = 白; 内 3x3 小十字 (7,11,13,17) = 绿; 其余黑
+    // 十字: 外臂+中心 (2,10,12,14,22) = 绿; 内 3x3 小十字 (7,11,13,17) = 白; 其余黑
     string px[25]; for (auto& v : px) v = "000000";
-    for (int i : {7, 11, 13, 17}) px[i] = "00ff00";
-    for (int i : {2, 10, 12, 14, 22}) px[i] = "ffffff";
+    for (int i : {7, 11, 13, 17}) px[i] = "ffffff";
+    for (int i : {2, 10, 12, 14, 22}) px[i] = "00ff00";
     string cmd = "PIX"; for (auto& v : px) cmd += " " + v; return cmd;
 }
 string ledPatternCmd(LedState s) {
@@ -1430,7 +1430,21 @@ int main() {
             bool all_done=true;
             for(auto& ctx:cam_ctxs) if(!ctx->dump_ready.load()){all_done=false;break;}
             if (all_done) {
-                g_consecutive_faults=0; is_recording=false; is_dumping=true; g_recording_number++;
+                g_consecutive_faults=0; is_recording=false; g_recording_number++;
+                // 录制后延迟: 与录制前 capture_delay 对称 (SPACE→delay→录制→delay→dump)
+                if (g_capture_delay > 0.0) {
+                    logException("INFO","delay_post",to_string(g_capture_delay)+"s");
+                    cout<<"[Delay] Post-record pause "<<g_capture_delay<<"s..."<<endl;
+                    auto until=chrono::steady_clock::now()+chrono::duration<double>(g_capture_delay);
+                    while (chrono::steady_clock::now()<until && global_running) {
+                        cv::Mat loading=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
+                        cv::putText(loading,"Post-record delay...",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,200,255),2);
+                        if(is_master_pc) drawLedIndicator(loading);   // LED 仍为 CAPTURING
+                        cv::imshow("Multi-Cam Preview",loading);
+                        while(cv::waitKey(1)>=0){}   // 延迟期间吞掉按键
+                    }
+                }
+                is_dumping=true;
                 if(is_master_pc) setLedState(LedState::WAITING);  // update before loading screens
                 // OVER 检查: 本臂成功录制计数达到 num_targets_per_arm (运行期独立计数)
                 // → 在提前移动机械臂之前进入 OVER

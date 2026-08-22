@@ -98,13 +98,13 @@ void hsvToRgb(double h, double s, double v, int& r, int& g, int& b) {
     r = (int)((rp + m) * 255); g = (int)((gp + m) * 255); b = (int)((bp + m) * 255);
 }
 
-// 十字 PIX 命令: 外臂+中心 (2,10,12,14,22) = 白, 内 3x3 小十字 (7,11,13,17) = rgb, 其余黑
+// 十字 PIX 命令: 外臂+中心 (2,10,12,14,22) = rgb, 内 3x3 小十字 (7,11,13,17) = 白, 其余黑
 string pixCrossCmd(const array<int,3>& rgb) {
     char hexbuf[8];
     snprintf(hexbuf, sizeof(hexbuf), "%02x%02x%02x", rgb[0], rgb[1], rgb[2]);
     string px[25]; for (auto& v : px) v = "000000";
-    for (int i : {7, 11, 13, 17}) px[i] = hexbuf;
-    for (int i : {2, 10, 12, 14, 22}) px[i] = "ffffff";
+    for (int i : {7, 11, 13, 17}) px[i] = "ffffff";
+    for (int i : {2, 10, 12, 14, 22}) px[i] = hexbuf;
     string cmd = "PIX"; for (auto& v : px) cmd += " " + v; return cmd;
 }
 
@@ -130,10 +130,10 @@ void sendNextState() {
             g_grid[i] = {r, g, b};
         }
     } else if (st.kind == "CROSS") {
-        // 外臂+中心 = 白, 内 3x3 小十字 = rgb (与 PIX 命令一致)
+        // 外臂+中心 = rgb, 内 3x3 小十字 = 白 (与 PIX 命令一致)
         for (int j = 0; j < 9; ++j) {
             int i = CROSS_IDX[j];
-            g_grid[i] = (i == 2 || i == 10 || i == 12 || i == 14 || i == 22) ? array<int,3>{255, 255, 255} : st.rgb;
+            g_grid[i] = (i == 2 || i == 10 || i == 12 || i == 14 || i == 22) ? st.rgb : array<int,3>{255, 255, 255};
         }
     } else {
         for (int i = 0; i < 25; ++i) g_grid[i] = st.rgb;
