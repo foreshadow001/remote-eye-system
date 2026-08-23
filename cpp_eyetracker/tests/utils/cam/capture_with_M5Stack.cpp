@@ -292,19 +292,24 @@ int g_chunk_idx = 0; atomic<int> g_frame_offset{0};
 
 // ================== h5 sentry → 每臂录制进度 ==================
 // h5 sentry (chunk*capacity+offset) 永远指向下一次写入位置; 录制顺序固定
-// upper(25 chunk) → lower(25 chunk), 因此 sentry 可唯一推导两臂进度 → 断点续录
-const int kChunksPerArm = 25;              // 每臂 chunk 数 (与 precreateSerial 一致)
+// upper 先录满 → lower, 因此 sentry 可唯一推导两臂进度 → 断点续录。
+// 配额以帧数定义 (250 录 × 100 帧 = 25000 帧/臂), 两臂合计 50000 帧
+// = 25 个 chunk (0000..0024, 即 precreateSerial 创建的数量)
+const int64_t kFramesPerArm = 25000;       // 每臂录满帧数
 int g_core_frames = 100;                   // 每次录制帧数 (main 填充)
 vector<string> g_participant_roots; string g_sentry_root;
 int g_hdf5_chunk_capacity = 2000;
 int g_cam_w = 0, g_cam_h = 0;          // 相机分辨率 (main 加载, precreateSerial 用)
 int64_t h5FramesWritten() { return (int64_t)g_chunk_idx * g_hdf5_chunk_capacity + g_frame_offset.load(); }
-int recordingsPerArm() { return kChunksPerArm * g_hdf5_chunk_capacity / max(g_core_frames, 1); }
+int recordingsPerArm() { return (int)(kFramesPerArm / max(g_core_frames, 1)); }
 int armRecorded(const string& a) {
-    int64_t per_arm = (int64_t)kChunksPerArm * g_hdf5_chunk_capacity;
     int64_t tot = h5FramesWritten();
-    int64_t v = (a == "upper") ? min(tot, per_arm) : max((int64_t)0, tot - per_arm);
-    return (int)(min(v, per_arm) / max(g_core_frames, 1));
+    int64_t v = (a == "upper") ? min(tot, kFramesPerArm) : max((int64_t)0, tot - kFramesPerArm);
+    return (int)(min(v, kFramesPerArm) / max(g_core_frames, 1));
+}
+// 两臂合计所需 chunk 数 (ceil, precreateSerial 用)
+int precreateChunkCount() {
+    return (int)((2 * kFramesPerArm + g_hdf5_chunk_capacity - 1) / g_hdf5_chunk_capacity);
 }
 
 // ================== i 键: 预创建 HDF5 (双机握手 + 串行创建 + 进度 UI) ==================
@@ -734,10 +739,11 @@ H5::DSetCreatPropList allocEarlyPl() {
 // 串行创建 25×N 个 h5 (H5 文件必须逐个创建, 不可并行); 进度写入 g_pre_done/g_pre_total
 void precreateSerial() {
     int created = 0;
-    g_pre_total = (int)cam_ctxs.size() * kChunksPerArm;
+    const int n_chunks = precreateChunkCount();
+    g_pre_total = (int)cam_ctxs.size() * n_chunks;
     g_pre_done = 0;
     for (auto& ctx : cam_ctxs)
-        for (int ci = 0; ci < kChunksPerArm; ++ci) {
+        for (int ci = 0; ci < n_chunks; ++ci) {
             stringstream pss; pss << ctx->hdf5_dir << "/" << setw(4) << setfill('0') << ci << ".h5";
             if (!fs::exists(pss.str())) {   // 双端预检保证为空, 此处仅防御
                 try {
