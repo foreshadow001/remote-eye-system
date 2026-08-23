@@ -53,7 +53,7 @@ capture:
   # 自动流程 (capture_with_M5Stack.cpp)
   enable_auto_move: false          # true = READY 后最多等 click_window, 无 SPACE 则跳过本次录制直接移臂
   click_window: 0.5                # 秒, READY 状态等待 SPACE 的最大时长 (默认 0.5)
-  num_targets_per_arm: 250           # 每臂成功录制达到该数量 → OVER 状态 (0 = 不限制)
+  num_targets_per_arm: 250           # [废弃] 进度/OVER 改由 h5 sentry 推导 (upper 先录满 25 chunk 再 lower)
 
   # HDF5
   hdf5_chunk_frame_capacity: 2000

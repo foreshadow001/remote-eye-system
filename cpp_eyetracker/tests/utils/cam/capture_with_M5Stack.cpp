@@ -188,12 +188,8 @@ void sendLedPatternTo(HANDLE h, LedState s) {
     sendLedCmd(h, cmd);
 }
 
-// 每臂成功录制数 / OVER 标志 (运行期独立计数, 跨切换保持, 重启归零)
-int g_recorded_upper = 0, g_recorded_lower = 0;
-bool g_over_upper = false, g_over_lower = false;
-
-int& recordedOf() { return (g_arm == "upper") ? g_recorded_upper : g_recorded_lower; }
-bool& overOf()    { return (g_arm == "upper") ? g_over_upper : g_over_lower; }
+// 每臂录制进度: 由 h5 sentry 推导 (顺序固定 upper 先录满再 lower, 断点续录)
+// 见 armRecorded() — 不再用运行期内存计数
 
 // 设置全局状态 (UI 指示器), 只更新"当前臂"对应的设备
 void setLedState(LedState s) {
@@ -218,7 +214,7 @@ bool g_recording_enabled = false;
 // ================== AutoMove / OVER (capture.yaml) ==================
 bool g_enable_auto_move = false;          // READY 超时自动跳过
 double g_click_window = 0.5;              // READY 等待 SPACE 的最大时长 (s)
-int g_num_targets_per_arm = 0;            // 每臂成功录制数上限 (0 = 不限制)
+int g_num_targets_per_arm = 0;            // [废弃] 进度/OVER 改由 h5 sentry 推导
 bool g_show_over = false;                 // 当前臂的 OVER 显示标志 (随切换加载)
 atomic<int64_t> g_ready_since_us{0};      // READY 起始时刻 (us since epoch, 跨线程)
 
@@ -293,9 +289,23 @@ atomic<bool> g_fault_active{false}; atomic<int> g_faulty_cam{-1};
 atomic<bool> g_fault_on_master{false};
 chrono::steady_clock::time_point g_ready_time, g_fault_time;
 int g_chunk_idx = 0; atomic<int> g_frame_offset{0};
+
+// ================== h5 sentry → 每臂录制进度 ==================
+// h5 sentry (chunk*capacity+offset) 永远指向下一次写入位置; 录制顺序固定
+// upper(25 chunk) → lower(25 chunk), 因此 sentry 可唯一推导两臂进度 → 断点续录
+const int kChunksPerArm = 25;              // 每臂 chunk 数 (与 precreateSerial 一致)
+int g_core_frames = 100;                   // 每次录制帧数 (main 填充)
 vector<string> g_participant_roots; string g_sentry_root;
 int g_hdf5_chunk_capacity = 2000;
 int g_cam_w = 0, g_cam_h = 0;          // 相机分辨率 (main 加载, precreateSerial 用)
+int64_t h5FramesWritten() { return (int64_t)g_chunk_idx * g_hdf5_chunk_capacity + g_frame_offset.load(); }
+int recordingsPerArm() { return kChunksPerArm * g_hdf5_chunk_capacity / max(g_core_frames, 1); }
+int armRecorded(const string& a) {
+    int64_t per_arm = (int64_t)kChunksPerArm * g_hdf5_chunk_capacity;
+    int64_t tot = h5FramesWritten();
+    int64_t v = (a == "upper") ? min(tot, per_arm) : max((int64_t)0, tot - per_arm);
+    return (int)(min(v, per_arm) / max(g_core_frames, 1));
+}
 
 // ================== i 键: 预创建 HDF5 (双机握手 + 串行创建 + 进度 UI) ==================
 atomic<bool> g_precreating{false};      // 创建状态: 全屏进度 UI, 屏蔽所有按键
@@ -724,10 +734,10 @@ H5::DSetCreatPropList allocEarlyPl() {
 // 串行创建 25×N 个 h5 (H5 文件必须逐个创建, 不可并行); 进度写入 g_pre_done/g_pre_total
 void precreateSerial() {
     int created = 0;
-    g_pre_total = (int)cam_ctxs.size() * 25;
+    g_pre_total = (int)cam_ctxs.size() * kChunksPerArm;
     g_pre_done = 0;
     for (auto& ctx : cam_ctxs)
-        for (int ci = 0; ci < 25; ++ci) {
+        for (int ci = 0; ci < kChunksPerArm; ++ci) {
             stringstream pss; pss << ctx->hdf5_dir << "/" << setw(4) << setfill('0') << ci << ".h5";
             if (!fs::exists(pss.str())) {   // 双端预检保证为空, 此处仅防御
                 try {
@@ -1013,8 +1023,7 @@ int main() {
     // AutoMove / OVER 配置
     try{g_enable_auto_move=cap["enable_auto_move"].as<bool>();}catch(...){}
     try{g_click_window=cap["click_window"].as<double>();}catch(...){}
-    try{g_num_targets_per_arm=cap["num_targets_per_arm"].as<int>();}catch(...){}
-    try{g_capture_delay=cap["capture_delay"].as<double>();}catch(...){}
+    try{g_num_targets_per_arm=cap["num_targets_per_arm"].as<int>();}catch(...){}   // [废弃] 仅兼容旧配置    try{g_capture_delay=cap["capture_delay"].as<double>();}catch(...){}
     double target_fps=cap["fps"].as<double>(), gain=cap["gain"].as<double>();
     double gammav=cap["gamma"].as<double>(), exp_time=cap["exposure_time"].as<double>();
     g_win_w=cap["window_width"].as<int>(); g_win_h=cap["window_height"].as<int>();
@@ -1022,6 +1031,7 @@ int main() {
     int cam_w=cap["cam_width"].as<int>(), cam_h=cap["cam_height"].as<int>();
     g_cam_w=cam_w; g_cam_h=cam_h;
     int core_frames=(int)ceil(target_fps*record_time);
+    g_core_frames=core_frames;   // 每臂进度推导用 (armRecorded)
     double margin_ratio=cap["margin_frames_ratio"].as<double>();
     int margin_frames=(int)ceil(core_frames*margin_ratio);
     int total_record_frames=core_frames+2*margin_frames;
@@ -1050,7 +1060,7 @@ int main() {
     cout<<"Auto Move        : "<<(g_enable_auto_move?"ON":"OFF");
     if(g_enable_auto_move) cout<<" (click window "<<g_click_window<<"s)";
     cout<<endl;
-    cout<<"Targets per arm  : "<<(g_num_targets_per_arm>0?to_string(g_num_targets_per_arm):"unlimited")<<endl;
+    cout<<"Recordings/arm   : "<<recordingsPerArm()<<" (h5 sentry derived)"<<endl;
     cout<<"Capture Delay    : "<<g_capture_delay<<"s"<<endl;
     cout<<"----------------------------------\n"<<endl;
 
@@ -1278,6 +1288,12 @@ int main() {
     if(is_master_pc)cout<<"[s] Start session  [SPACE] Record  [b] Re-zero  [c] Clear piper sentry  [t] Switch arm  [ESC/q] Quit\n";
     else cout<<"Waiting for Master... [ESC/q] to quit.\n";
 
+    // 断点续录: 启动即按 h5 sentry 恢复本臂 OVER 状态 (upper 进度 = 已写帧数, lower = 溢出部分)
+    g_show_over = (armRecorded(g_arm) >= recordingsPerArm());
+    if (is_master_pc && g_show_over)
+        cout << "[Piper] " << g_arm << " already OVER by h5 sentry ("
+             << armRecorded(g_arm) << "/" << recordingsPerArm() << ")" << endl;
+
     // ================== MAIN LOOP ==================
     bool is_recording=false; atomic<bool> is_dumping{false};
     string current_record_timestr; chrono::steady_clock::time_point record_start_time;
@@ -1320,7 +1336,7 @@ int main() {
                 string msg = arm_name + " OVER";
                 cv::putText(canvas, msg, cv::Point(g_win_w/4, g_win_h/2-40), cv::FONT_HERSHEY_DUPLEX, 1.2, cv::Scalar(255,0,255), 2);
                 char buf[64];
-                snprintf(buf,sizeof(buf),"%d / %d targets recorded", recordedOf(), g_num_targets_per_arm);
+                snprintf(buf,sizeof(buf),"%d / %d targets recorded", armRecorded(g_arm), recordingsPerArm());
                 cv::putText(canvas,buf,cv::Point(g_win_w/4,g_win_h/2+10),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(255,255,255),1);
                 string hints = "Press 'b' to reset or 't' to switch arm | 'q' to quit";
                 cv::putText(canvas,hints,cv::Point(g_win_w/4,g_win_h/2+50),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,255),1);
@@ -1353,22 +1369,22 @@ int main() {
                 // LED state indicator (Master, top-left of canvas)
                 if (is_master_pc) drawLedIndicator(canvas);
 
-                // 右上角 (LED 指示下方): HDF5 chunk/offset + 每臂本次写入进度 (各占一行)
+                // 右上角 (LED 指示下方): HDF5 chunk/offset + 每臂进度 (h5 sentry 推导)
                 {
-                    string quota = (g_num_targets_per_arm > 0) ? to_string(g_num_targets_per_arm) : "-";
+                    string quota = to_string(recordingsPerArm());
                     char lb[96]; int bl = 0;
                     snprintf(lb, sizeof(lb), "chunk: %d   offset: %d", g_chunk_idx, g_frame_offset.load());
-                    cv::Size wsz = cv::getTextSize(lb, cv::FONT_HERSHEY_SIMPLEX, 0.5, 2, &bl);
-                    cv::putText(canvas, lb, cv::Point(g_win_w - wsz.width - 15, 60),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 215, 255), 2, cv::LINE_AA);
-                    snprintf(lb, sizeof(lb), "UPPER: %d/%s", g_recorded_upper, quota.c_str());
-                    wsz = cv::getTextSize(lb, cv::FONT_HERSHEY_SIMPLEX, 0.5, 2, &bl);
-                    cv::putText(canvas, lb, cv::Point(g_win_w - wsz.width - 15, 84),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 200), 2, cv::LINE_AA);
-                    snprintf(lb, sizeof(lb), "LOWER: %d/%s", g_recorded_lower, quota.c_str());
-                    wsz = cv::getTextSize(lb, cv::FONT_HERSHEY_SIMPLEX, 0.5, 2, &bl);
-                    cv::putText(canvas, lb, cv::Point(g_win_w - wsz.width - 15, 108),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 200), 2, cv::LINE_AA);
+                    cv::Size wsz = cv::getTextSize(lb, cv::FONT_HERSHEY_SIMPLEX, 0.6, 2, &bl);
+                    cv::putText(canvas, lb, cv::Point(g_win_w - wsz.width - 15, 64),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 215, 255), 2, cv::LINE_AA);
+                    snprintf(lb, sizeof(lb), "UPPER: %d/%s", armRecorded("upper"), quota.c_str());
+                    wsz = cv::getTextSize(lb, cv::FONT_HERSHEY_SIMPLEX, 0.75, 2, &bl);
+                    cv::putText(canvas, lb, cv::Point(g_win_w - wsz.width - 15, 98),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 255, 200), 2, cv::LINE_AA);
+                    snprintf(lb, sizeof(lb), "LOWER: %d/%s", armRecorded("lower"), quota.c_str());
+                    wsz = cv::getTextSize(lb, cv::FONT_HERSHEY_SIMPLEX, 0.75, 2, &bl);
+                    cv::putText(canvas, lb, cv::Point(g_win_w - wsz.width - 15, 132),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 255, 200), 2, cv::LINE_AA);
                 }
 
                 // Watermark hints (bottom-left of right panel)
@@ -1446,19 +1462,12 @@ int main() {
                 }
                 is_dumping=true;
                 if(is_master_pc) setLedState(LedState::WAITING);  // update before loading screens
-                // OVER 检查: 本臂成功录制计数达到 num_targets_per_arm (运行期独立计数)
-                // → 在提前移动机械臂之前进入 OVER
-                if (is_master_pc && g_num_targets_per_arm > 0) {
-                    recordedOf()++;
-                    cout << "[Piper] " << g_arm << " recorded " << recordedOf()
-                         << "/" << g_num_targets_per_arm << endl;
-                    if (recordedOf() >= g_num_targets_per_arm) {
-                        overOf() = true;
-                        g_show_over = true;
-                        g_recording_enabled = false;
-                        cout << "[Piper] " << g_arm << " reached " << g_num_targets_per_arm
-                             << " recordings — OVER." << endl;
-                    }
+                // OVER 检查 (h5 sentry 推导): 本次录制提交后本臂即满 → 提前移动前进入 OVER
+                if (is_master_pc && armRecorded(g_arm) + 1 >= recordingsPerArm()) {
+                    g_show_over = true;
+                    g_recording_enabled = false;
+                    cout << "[Piper] " << g_arm << " will reach " << recordingsPerArm()
+                         << " recordings — OVER." << endl;
                 }
                 auto t0=chrono::steady_clock::now();
 
@@ -1800,8 +1809,8 @@ int main() {
               drawLedIndicator(loading);
               cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
             zeroArm(g_arm);
-            // 回零 = 重置本臂 OVER 标志与录制计数 (运行期独立计数)
-            overOf()=false; recordedOf()=0; g_show_over=false;
+            // 回零后按 h5 sentry 重估本臂进度 (已满 → 仍 OVER; 断点续录语义)
+            g_show_over = (armRecorded(g_arm) >= recordingsPerArm());
             setLedState(LedState::PIPER_INIT);       // 回零完成 → INIT (按 s 开始录制)
             cout<<"[Piper] "<<g_arm<<" zeroed. Press [s] to start session."<<endl;
         }
@@ -1810,7 +1819,6 @@ int main() {
             if(g_arm=="upper"){g_upper_idx=0;g_upper_done=false;}
             else{g_lower_idx=0;g_lower_done=false;}
             g_show_exhausted=false;
-            overOf()=false; recordedOf()=0;
             g_recording_enabled=false; updatePiperSentry();
             syncPiperToSlave();
             cout<<"[Piper] "<<g_arm<<" sentry cleared."<<endl;
@@ -1852,8 +1860,8 @@ int main() {
                 sendLedPatternTo(g_led_lower, LedState::PIPER_INIT);
             }
             g_arm=new_arm;
-            // 加载新臂的 OVER 状态 (每臂独立标志, 切多少次都保持)
-            g_show_over = overOf();
+            // 加载新臂的 OVER 状态 (h5 sentry 推导, 切多少次都一致)
+            g_show_over = (armRecorded(new_arm) >= recordingsPerArm());
             if (g_show_over) {
                 setLedState(LedState::OVER);         // 新臂已 OVER → 彩流
             } else {
