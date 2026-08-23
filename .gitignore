@@ -14,3 +14,13 @@ cpp_eyetracker/log/
 # python cache
 __pycache__/
 *.py[cod]
+# 运行期配置/数据 (本地各自维护, 不入库)
+cpp_eyetracker/cfg/gaze_target/
+cpp_eyetracker/cfg/IR/
+cpp_eyetracker/cfg/arm_pose/
+cpp_eyetracker/cfg/cam_calib.yaml
+cpp_eyetracker/cfg/capture.yaml
+cpp_eyetracker/cfg/calib_arm.yaml
+cpp_eyetracker/cfg/M5Stack.yaml
+cpp_eyetracker/cfg/default.yaml
+cpp_eyetracker/cfg/day_participant_map.json
