@@ -214,7 +214,7 @@ bool g_recording_enabled = false;
 // ================== AutoMove / OVER (capture.yaml) ==================
 bool g_enable_auto_move = false;          // READY 超时自动跳过
 double g_click_window = 0.5;              // READY 等待 SPACE 的最大时长 (s)
-int g_num_targets_per_arm = 0;            // [废弃] 进度/OVER 改由 h5 sentry 推导
+int g_num_targets_per_arm = 0;            // 每臂录制次数配额 (capture.yaml; 进度/OVER 基准)
 bool g_show_over = false;                 // 当前臂的 OVER 显示标志 (随切换加载)
 atomic<int64_t> g_ready_since_us{0};      // READY 起始时刻 (us since epoch, 跨线程)
 
@@ -293,23 +293,24 @@ int g_chunk_idx = 0; atomic<int> g_frame_offset{0};
 // ================== h5 sentry → 每臂录制进度 ==================
 // h5 sentry (chunk*capacity+offset) 永远指向下一次写入位置; 录制顺序固定
 // upper 先录满 → lower, 因此 sentry 可唯一推导两臂进度 → 断点续录。
-// 配额以帧数定义 (250 录 × 100 帧 = 25000 帧/臂), 两臂合计 50000 帧
-// = 25 个 chunk (0000..0024, 即 precreateSerial 创建的数量)
-const int64_t kFramesPerArm = 25000;       // 每臂录满帧数
-int g_core_frames = 100;                   // 每次录制帧数 (main 填充)
+// 配额从配置推导 (不硬编码): 每臂帧数 = num_targets_per_arm × core_frames
+//   = 250 录 × ceil(fps×record_time) 帧 = 25000 帧/臂;
+// 两臂合计 50000 帧 = 25 chunk (0000..0024, precreateSerial 按此创建)
+int g_core_frames = 100;                   // 每次录制帧数 = ceil(fps×record_time), main 填充
+int64_t g_frames_per_arm = 25000;          // = num_targets_per_arm × g_core_frames, main 填充
 vector<string> g_participant_roots; string g_sentry_root;
 int g_hdf5_chunk_capacity = 2000;
 int g_cam_w = 0, g_cam_h = 0;          // 相机分辨率 (main 加载, precreateSerial 用)
 int64_t h5FramesWritten() { return (int64_t)g_chunk_idx * g_hdf5_chunk_capacity + g_frame_offset.load(); }
-int recordingsPerArm() { return (int)(kFramesPerArm / max(g_core_frames, 1)); }
+int recordingsPerArm() { return g_num_targets_per_arm; }
 int armRecorded(const string& a) {
     int64_t tot = h5FramesWritten();
-    int64_t v = (a == "upper") ? min(tot, kFramesPerArm) : max((int64_t)0, tot - kFramesPerArm);
-    return (int)(min(v, kFramesPerArm) / max(g_core_frames, 1));
+    int64_t v = (a == "upper") ? min(tot, g_frames_per_arm) : max((int64_t)0, tot - g_frames_per_arm);
+    return (int)(min(v, g_frames_per_arm) / max(g_core_frames, 1));
 }
 // 两臂合计所需 chunk 数 (ceil, precreateSerial 用)
 int precreateChunkCount() {
-    return (int)((2 * kFramesPerArm + g_hdf5_chunk_capacity - 1) / g_hdf5_chunk_capacity);
+    return (int)((2 * g_frames_per_arm + g_hdf5_chunk_capacity - 1) / g_hdf5_chunk_capacity);
 }
 
 // ================== i 键: 预创建 HDF5 (双机握手 + 串行创建 + 进度 UI) ==================
@@ -1029,7 +1030,8 @@ int main() {
     // AutoMove / OVER 配置
     try{g_enable_auto_move=cap["enable_auto_move"].as<bool>();}catch(...){}
     try{g_click_window=cap["click_window"].as<double>();}catch(...){}
-    try{g_num_targets_per_arm=cap["num_targets_per_arm"].as<int>();}catch(...){}   // [废弃] 仅兼容旧配置    try{g_capture_delay=cap["capture_delay"].as<double>();}catch(...){}
+    try{g_num_targets_per_arm=cap["num_targets_per_arm"].as<int>();}catch(...){}
+    if(g_num_targets_per_arm<=0){g_num_targets_per_arm=250;cout<<"[Cfg] num_targets_per_arm<=0, default 250"<<endl;}    try{g_capture_delay=cap["capture_delay"].as<double>();}catch(...){}
     double target_fps=cap["fps"].as<double>(), gain=cap["gain"].as<double>();
     double gammav=cap["gamma"].as<double>(), exp_time=cap["exposure_time"].as<double>();
     g_win_w=cap["window_width"].as<int>(); g_win_h=cap["window_height"].as<int>();
@@ -1037,7 +1039,8 @@ int main() {
     int cam_w=cap["cam_width"].as<int>(), cam_h=cap["cam_height"].as<int>();
     g_cam_w=cam_w; g_cam_h=cam_h;
     int core_frames=(int)ceil(target_fps*record_time);
-    g_core_frames=core_frames;   // 每臂进度推导用 (armRecorded)
+    g_core_frames=core_frames;                          // 每臂进度推导用 (armRecorded)
+    g_frames_per_arm=(int64_t)g_num_targets_per_arm*core_frames;   // 配额帧数 = 录制次数 × 每录帧数
     double margin_ratio=cap["margin_frames_ratio"].as<double>();
     int margin_frames=(int)ceil(core_frames*margin_ratio);
     int total_record_frames=core_frames+2*margin_frames;
@@ -1066,7 +1069,8 @@ int main() {
     cout<<"Auto Move        : "<<(g_enable_auto_move?"ON":"OFF");
     if(g_enable_auto_move) cout<<" (click window "<<g_click_window<<"s)";
     cout<<endl;
-    cout<<"Recordings/arm   : "<<recordingsPerArm()<<" (h5 sentry derived)"<<endl;
+    cout<<"Recordings/arm   : "<<recordingsPerArm()<<" ("<<g_num_targets_per_arm
+        <<" x "<<g_core_frames<<" frames = "<<g_frames_per_arm<<")"<<endl;
     cout<<"Capture Delay    : "<<g_capture_delay<<"s"<<endl;
     cout<<"----------------------------------\n"<<endl;
 
