@@ -1685,6 +1685,7 @@ int main() {
                 int& idx = (g_arm=="upper") ? g_upper_idx : g_lower_idx;
                 idx++; updatePiperSentry();          // 目标被跳过 (不录制, 仍消耗)
                 ArmResult ar = moveArmToTarget();
+                while(cv::waitKey(1)>=0){}           // 清空移动期间滞留的按键 (SPACE 仅 READY 内有效)
                 if (ar == ArmResult::ARM_OK) {
                     cout << "[AutoMove] " << g_arm << " at next target. Waiting for SPACE..." << endl;
                 } else if (ar == ArmResult::ARM_EXHAUSTED) {
@@ -1783,31 +1784,31 @@ int main() {
               cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
             ArmResult ar = moveArmToTarget();
             if(ar==ArmResult::ARM_OK){
-                this_thread::sleep_for(chrono::milliseconds(200));g_recording_enabled=true;
+                this_thread::sleep_for(chrono::milliseconds(200));
+                while(cv::waitKey(1)>=0){}   // 清空移动期间滞留的按键 (SPACE 仅 READY 内有效)
+                g_recording_enabled=true;
                 cout<<"[s] Session started. SPACE to record."<<endl;
             } else if(ar==ArmResult::ARM_EXHAUSTED){
                 g_show_exhausted=true; g_recording_enabled=false;
                 cout<<"[s] "<<g_arm<<" exhausted. Press t or c."<<endl;
             } else { cout<<"[s] Arm ERROR."<<endl; }
         }
-        else if(is_master_pc&&key==' '&&!is_recording&&!is_dumping&&!g_piper_busy&&!g_delay_pending){
-            if(g_recording_enabled){
-                g_e2e_start_us.store(nowUs());   // End-to-end 起点: SPACE 按下时刻
-                if(g_capture_delay>0.0){
-                    // 进入 CAPTURING, 延迟 capture_delay 后再真正录制 (受试者聚焦十字中心)
-                    setLedState(LedState::CAPTURING);
-                    g_delay_start_us.store(nowUs());
-                    g_delay_deadline_us.store(g_delay_start_us.load()+(int64_t)(g_capture_delay*1e6));
-                    g_delay_pending.store(true);
-                    cout<<"[Delay] Capturing - waiting "<<g_capture_delay<<"s before recording..."<<endl;
-                }else{
-                    instantTrigger(); trigger_start=true;
-                    if(enable_net_sync&&g_cmd_sock!=INVALID_SOCKET) sendLineRaw(g_cmd_sock,"TRIGGER");
-                    cout<<"[Recording] Started."<<endl;
-                }
-            } else {
-                cout<<"[SPACE] Recording not enabled. Press [s] first."<<endl;
-                if(g_upper_done&&g_lower_done) cout<<"[SPACE] Both arms DONE. Press [c] to clear sentry."<<endl;
+        else if(is_master_pc&&key==' '
+                &&!is_recording&&!is_dumping&&!g_piper_busy&&!g_delay_pending
+                &&g_recording_enabled&&!g_show_over&&!g_show_exhausted&&!g_syncing.load()){
+            // SPACE 仅 READY 状态有效 (完整 READY 谓词; 状态切换处另有滞留按键清空)
+            g_e2e_start_us.store(nowUs());   // End-to-end 起点: SPACE 按下时刻
+            if(g_capture_delay>0.0){
+                // 进入 CAPTURING, 延迟 capture_delay 后再真正录制 (受试者聚焦十字中心)
+                setLedState(LedState::CAPTURING);
+                g_delay_start_us.store(nowUs());
+                g_delay_deadline_us.store(g_delay_start_us.load()+(int64_t)(g_capture_delay*1e6));
+                g_delay_pending.store(true);
+                cout<<"[Delay] Capturing - waiting "<<g_capture_delay<<"s before recording..."<<endl;
+            }else{
+                instantTrigger(); trigger_start=true;
+                if(enable_net_sync&&g_cmd_sock!=INVALID_SOCKET) sendLineRaw(g_cmd_sock,"TRIGGER");
+                cout<<"[Recording] Started."<<endl;
             }
         }
         else if(is_master_pc&&(key=='b'||key=='B')&&!g_piper_busy&&!is_recording&&!is_dumping){
@@ -1822,6 +1823,7 @@ int main() {
             // 回零后按 h5 sentry 重估本臂进度 (已满 → 仍 OVER; 断点续录语义)
             g_show_over = (armRecorded(g_arm) >= recordingsPerArm());
             setLedState(LedState::PIPER_INIT);       // 回零完成 → INIT (按 s 开始录制)
+            while(cv::waitKey(1)>=0){}   // 清空回零期间滞留的按键 (SPACE 仅 READY 内有效)
             cout<<"[Piper] "<<g_arm<<" zeroed. Press [s] to start session."<<endl;
         }
         else if(is_master_pc&&(key=='c'||key=='C')&&!g_piper_busy&&!is_recording&&!is_dumping&&!g_show_over){
@@ -1878,6 +1880,7 @@ int main() {
                 setLedState(LedState::PIPER_INIT);   // 新臂 → INIT (按 s 开始录制)
             }
             syncPiperToSlave();
+            while(cv::waitKey(1)>=0){}   // 清空切臂/回零期间滞留的按键 (SPACE 仅 READY 内有效)
             cout<<"[t] Switched to "<<g_arm<<" (press 's' to start session)"<<endl;
         }
 
