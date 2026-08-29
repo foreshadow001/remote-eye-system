@@ -54,8 +54,8 @@ struct XferCfg {
 };
 XferCfg g_cfg;
 
-static const int    CHUNK = 4 * 1024 * 1024;
-static const int    SOCK_BUF = 16 * 1024 * 1024;
+static const int    CHUNK = 8 * 1024 * 1024;     // 8MB 流式块 (与 C++ 接收端一致)
+static const int    SOCK_BUF = 32 * 1024 * 1024;
 static const int    RETRIES = 3;
 static const int    REPLY_TIMEOUT_MS = 60000;
 
