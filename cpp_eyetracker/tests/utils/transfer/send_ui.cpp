@@ -89,6 +89,7 @@ static string g_last_fail;
 static SOCKET g_hs = INVALID_SOCKET;
 static atomic<bool> g_slave_ready{false};
 static atomic<bool> g_master_connected{false};   // slave 视角: 已连上 master
+static atomic<bool> g_exit{false};               // slave: 收到 master 退出信号 → 结束进程
 static string g_slave_summary;
 
 // ================== 日志 (时间戳) ==================
@@ -223,9 +224,11 @@ static void transferController() {
                 g_fail += 1;                          // 对端异常计入失败
             }
             sendLine(g_hs, "ACK");
+            // 不关闭 g_hs: 留给 master 退出 (ESC/q) 时发 QUIT 通知 slave
+        } else {
+            closesocket(g_hs);
+            g_hs = INVALID_SOCKET;
         }
-        closesocket(g_hs);
-        g_hs = INVALID_SOCKET;
     }
     g_phase.store((int)(g_abort.load() ? Phase::ABORTED : Phase::DONE));
 }
@@ -265,6 +268,9 @@ static void slaveQuitWatcher(SOCKET hs) {
         fd_set rf; FD_ZERO(&rf); FD_SET(hs, &rf);
         timeval tv{2, 0};
         if (select(0, &rf, nullptr, nullptr, &tv) > 0) {
+            // select 返回后再核验: 传输可能恰在等待间隙结束, 此刻到达的是
+            // SLAVE_DONE 的 ACK (不是退出信号) — 不算中止
+            if ((Phase)g_phase.load() != Phase::RUNNING) return;
             g_abort = true;
             cout << ts() << "[HS] master signalled quit / disconnected — aborting" << endl;
             return;
@@ -296,7 +302,16 @@ static void slaveHandshakeAndRun() {
                   + to_string(g_skip.load()) + " " + to_string(g_fail.load()));
     string ack;
     recvLine(s, ack, 60000);                          // ACK (尽力而为)
-    closesocket(s);
+    // 挂等 master 的最终退出信号 (master 按 ESC/q 时发 QUIT / 或连接关闭) —
+    // 收到前保持 DONE/ABORTED 屏, 由 master 决定两机何时一起结束
+    while (!g_exit.load()) {
+        fd_set rf; FD_ZERO(&rf); FD_SET(s, &rf);
+        timeval tv{2, 0};
+        if (select(0, &rf, nullptr, nullptr, &tv) > 0) {
+            g_exit.store(true);                       // QUIT 或 master 已关闭连接
+            return;
+        }
+    }
 }
 
 // ================== 阶段构建 ==================
@@ -455,9 +470,15 @@ static void drawProgress(cv::Mat& cv) {
         cv::putText(cv, "Slave:" + g_slave_summary, {40, y},
                     cv::FONT_HERSHEY_SIMPLEX, 0.5, {0, 255, 200}, 1, cv::LINE_AA); y += 30;
     }
-    string hint = (ph == Phase::RUNNING) ? "[q] Abort after current file"
-                : (ph == Phase::WAIT_SLAVE) ? "[q] Abort wait (slave continues)"
-                : "[SPACE/q] Exit";
+    string hint;
+    if (ph == Phase::RUNNING)
+        hint = g_cfg.is_master ? "[q] Abort after current file" : "Controlled by master";
+    else if (ph == Phase::WAIT_SLAVE)
+        hint = "[q] Abort wait (slave continues)";
+    else if (!g_cfg.is_master)
+        hint = "Waiting for master to exit...";
+    else
+        hint = "[ESC/q] Exit (quits slave too)";
     cv::putText(cv, hint, {40, 560}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {150, 150, 150}, 1, cv::LINE_AA);
 }
 
@@ -547,19 +568,13 @@ int main(int argc, char** argv) {
     cv::Mat canvas;
     thread ctl;
     while (true) {
+        if (g_exit.load()) break;                      // slave: master 已退出
         Phase ph = (Phase)g_phase.load();
         if (ph == Phase::CONFIG) drawConfig(canvas);
         else drawProgress(canvas);
         cv::imshow("send_ui", canvas);
         int key = cv::waitKey(ph == Phase::RUNNING ? 30 : 50);
-        if (!g_cfg.is_master) {
-            // slave: 按键全失效; 结束态显示 5s 后自动退出
-            if (ph == Phase::DONE || ph == Phase::ABORTED) {
-                static auto done_at = chrono::steady_clock::now();
-                if (chrono::steady_clock::now() - done_at > chrono::seconds(5)) break;
-            }
-            continue;
-        }
+        if (!g_cfg.is_master) continue;                 // slave: 按键全失效, 由 master 控制退出
         if (ph == Phase::CONFIG) {
             if (key == ' ' && g_slave_ready.load()) {   // 需 slave 已握手
                 g_phase.store((int)Phase::RUNNING);
@@ -582,11 +597,17 @@ int main(int argc, char** argv) {
                 break;
             }
         } else {
-            if (key >= 0) break;
+            if (key == 'q' || key == 27) break;         // DONE: 仅 ESC/q 退出
         }
     }
     g_abort = true;
     if (ctl.joinable()) ctl.join();
+    // master 退出前通知 slave 一并结束 (握手 socket 在 ACK 后保留至此)
+    if (g_cfg.is_master && g_hs != INVALID_SOCKET) {
+        sendLine(g_hs, "QUIT");
+        closesocket(g_hs);
+        g_hs = INVALID_SOCKET;
+    }
     cv::destroyAllWindows();
     WSACleanup();
     return g_fail.load() ? 1 : 0;
