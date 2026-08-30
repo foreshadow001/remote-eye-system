@@ -88,6 +88,7 @@ static string g_last_fail;
 // 完成后 START 令 slave 传输, 收 SLAVE_DONE 回 ACK — 全程 slave 按键无效
 static SOCKET g_hs = INVALID_SOCKET;
 static atomic<bool> g_slave_ready{false};
+static atomic<bool> g_master_connected{false};   // slave 视角: 已连上 master
 static string g_slave_summary;
 
 // ================== 日志 (时间戳) ==================
@@ -278,6 +279,7 @@ static void slaveHandshakeAndRun() {
          << ":" << g_cfg.handshake_port << " ..." << endl;
     SOCKET s = connectTo(g_cfg.master_ip, g_cfg.handshake_port);
     sendLine(s, "READY " + to_string(g_total_files) + " " + to_string(g_total_bytes));
+    g_master_connected.store(true);                   // UI: 已连上, 等 START
     string cmd;
     if (!recvLine(s, cmd, 2 * 3600 * 1000) || cmd != "START") {
         cerr << ts() << "[HS] master cmd: " << cmd << " — aborted" << endl;
@@ -372,6 +374,13 @@ static void drawConfig(cv::Mat& cv) {
     };
     put("100G Transfer - Configuration", 0.85, {0, 215, 255}, 46);
     put("Role        : " + string(g_cfg.is_master ? "MASTER" : "SLAVE"), 0.55, {255, 255, 255});
+    // 握手连接状态 (两端都显示)
+    if (g_cfg.is_master)
+        put("Slave       : " + string(g_slave_ready.load() ? "Connected" : "Not connected - waiting..."),
+            0.55, g_slave_ready.load() ? cv::Scalar{0, 255, 0} : cv::Scalar{0, 165, 255});
+    else
+        put("Master      : " + string(g_master_connected.load() ? "Connected - waiting for START" : "Connecting..."),
+            0.55, g_master_connected.load() ? cv::Scalar{0, 255, 0} : cv::Scalar{0, 165, 255});
     put("Participant : " + g_cfg.participant, 0.55, {255, 255, 255});
     put("Server      : " + g_cfg.server_ip + ":" + to_string(g_cfg.server_port), 0.55, {255, 255, 255});
     put("Streams     : " + to_string(g_cfg.workers) + "  (TransmitFile)", 0.55, {255, 255, 255});
