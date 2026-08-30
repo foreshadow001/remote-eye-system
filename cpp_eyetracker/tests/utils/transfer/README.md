@@ -18,7 +18,7 @@
 历史版本（send_data 串行握手版、send_v2 分条实验、baseline 快照、Python 接收端）
 已清理，见 git 历史与上述报告。
 
-## 落位布局（发送端 relpath 决定，接收端 `--out /data/dataset`）
+## 落位布局（发送端 relpath 决定；接收端默认输出根 `/data/dataset`，无需参数）
 
 ```
 /data/dataset/
