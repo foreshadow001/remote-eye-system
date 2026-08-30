@@ -1,7 +1,9 @@
-# transfer.yaml — send_data.exe (采集端 C++ 发送器) 配置
-# 数据接收端: 处理主机 (Ubuntu, recv_data.py)
+# transfer.yaml — 采集端发送器 (send_data / send_slave / send_ui) 配置
+# 数据接收端: 处理主机 (Ubuntu, baseline_recv_data)
 
 transfer:
+  # 要传输的参与者 (send_ui 默认读取; send_slave 也可用 --participant 覆盖)
+  participant_id: "P000"
   # 处理主机两个 100G 口 (两口合计 100G, 各接一台采集机)
   server_ip_master_link: "10.10.1.1"   # 口1 ← master 发往此处
   server_ip_slave_link: "10.10.2.1"    # 口2 ← slave 发往此处

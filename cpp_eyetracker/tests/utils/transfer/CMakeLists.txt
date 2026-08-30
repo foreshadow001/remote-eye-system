@@ -40,3 +40,16 @@ target_link_libraries(send_v2
 )
 
 message(STATUS "send_v2 will be built")
+
+# send_ui: 交互式串行传输 (UI 确认配置, SPACE 开始, D:/E: 逐盘串行)
+add_executable(send_ui
+    send_ui.cpp
+)
+
+target_link_libraries(send_ui
+    PRIVATE
+        eyetracker::cfg
+        ${OpenCV_LIBS}
+)
+
+message(STATUS "send_ui will be built")
