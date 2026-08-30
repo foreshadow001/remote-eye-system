@@ -155,16 +155,24 @@ static SOCKET openStream() {
     return s;
 }
 
-// ================== 传输引擎 (TransmitFile) ==================
+// ================== 传输引擎 (TransmitFile, 两段式协议) ==================
+// FILE|FORCE 头 → 等 GO/SKIP → (GO 时) TransmitFile 数据 → 等 OK
+// 先应答后发数据: 接收端对已存在文件回 SKIP 后不再读数据流,
+// 若发送端先行灌数据会 TCP 背压死锁 (10GB 大文件 SKIP 场景)
 static int sendOne(SOCKET s, const Job& j) {
-    HANDLE hf = CreateFileA(j.path.string().c_str(), GENERIC_READ, FILE_SHARE_READ,
-                            NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (hf == INVALID_HANDLE_VALUE) return -1;
     // FILE   = 大小一致则 SKIP (断点续传, 图像用)
     // FORCE  = 总是覆盖写入 (标定附件: xml / IR / map)
     string hdr = string(j.force ? "FORCE " : "FILE ") + j.rel + " "
                + to_string(j.size) + " 0";
-    if (!sendLine(s, hdr)) { CloseHandle(hf); return -1; }
+    if (!sendLine(s, hdr)) return -1;
+    string reply;
+    if (!recvLine(s, reply, REPLY_TIMEOUT_MS)) return -1;
+    if (reply.rfind("SKIP", 0) == 0) return 1;
+    if (reply.rfind("GO", 0) != 0) return -1;      // ERR / 异常
+
+    HANDLE hf = CreateFileA(j.path.string().c_str(), GENERIC_READ, FILE_SHARE_READ,
+                            NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return -1;
     uint64_t remaining = j.size;
     while (remaining > 0) {
         DWORD chunk = (DWORD)min<uint64_t>(remaining, 1ull << 30);
@@ -172,10 +180,8 @@ static int sendOne(SOCKET s, const Job& j) {
         remaining -= chunk;
     }
     CloseHandle(hf);
-    string reply;
     if (!recvLine(s, reply, REPLY_TIMEOUT_MS)) return -1;
     if (reply.rfind("OK", 0) == 0) return 0;
-    if (reply.rfind("SKIP", 0) == 0) return 1;
     return -1;
 }
 
