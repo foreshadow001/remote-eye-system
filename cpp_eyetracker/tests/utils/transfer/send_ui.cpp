@@ -93,6 +93,9 @@ static atomic<bool> g_exit{false};               // slave: 收到 master 退出�
 static string g_slave_summary;
 static atomic<bool> g_conn_fail{false};          // 数据连接失败 (UI 红字提示)
 static string g_conn_target;
+static atomic<bool> g_4090_ok{false};            // 4090 数据链路已连通至少一次
+static atomic<uint64_t> g_skip_bytes{0};         // SKIP 文件字节 (进度条计入)
+static atomic<uint64_t> g_wait_t0_us{0};         // WAIT_SLAVE 起始 (显示等待时长)
 
 // ================== 日志 (时间戳) ==================
 static string ts() {
@@ -149,6 +152,7 @@ static SOCKET connectTo(const string& ip, int port) {
 }
 static SOCKET openStream() {
     SOCKET s = connectTo(g_cfg.server_ip, g_cfg.server_port);
+    g_4090_ok.store(true);                           // UI: 4090 链路 OK
     int one = 1, buf = SOCK_BUF;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
     setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&buf, sizeof(buf));
@@ -201,7 +205,7 @@ static void workerLoop(vector<Job>* jobs, atomic<size_t>* next) {
         }
         g_done_files++;
         if (r == 0) g_bytes += j.size;
-        else if (r == 1) g_skip++;
+        else if (r == 1) { g_skip++; g_skip_bytes += j.size; }   // 进度条计入 SKIP
         else { g_fail++; g_last_fail = j.rel; }
     }
 }
@@ -224,7 +228,10 @@ static void transferController() {
     // master: 本机完成后令 slave 传输, 等 SLAVE_DONE
     if (g_cfg.is_master && g_hs != INVALID_SOCKET) {
         sendLine(g_hs, g_abort.load() ? "ABORT" : "START");
+        cout << ts() << "[HS] " << (g_abort.load() ? "ABORT" : "START") << " sent to slave" << endl;
         if (!g_abort.load()) {
+            g_wait_t0_us.store(chrono::duration_cast<chrono::microseconds>(
+                chrono::steady_clock::now().time_since_epoch()).count());
             g_phase.store((int)Phase::WAIT_SLAVE);
             cout << ts() << "[HS] Waiting for slave to finish..." << endl;
             string line;
@@ -312,6 +319,8 @@ static void slaveHandshakeAndRun() {
     thread(slaveQuitWatcher, s).detach();             // 监测 master QUIT/掉线
     transferController();                             // 结束时置 DONE/ABORTED
     int ok = g_done_files.load() - g_skip.load() - g_fail.load();
+    cout << ts() << "[HS] Sending SLAVE_DONE ok=" << ok << " skip="
+         << g_skip.load() << " fail=" << g_fail.load() << endl;
     sendLine(s, "SLAVE_DONE " + to_string(ok) + " "
                   + to_string(g_skip.load()) + " " + to_string(g_fail.load()));
     string ack;
@@ -394,6 +403,24 @@ static void addXmlPhase() {
 }
 
 // ================== UI ==================
+// 两行链路状态: 对端采集主机 (握手) + 4090 (数据)
+static void drawLinks(cv::Mat& cv, int& y) {
+    string peer = g_cfg.is_master
+        ? (g_slave_ready.load() ? "Slave      : Connected" : "Slave      : Not connected - waiting...")
+        : (g_master_connected.load() ? "Master     : Connected" : "Master     : Connecting...");
+    cv::Scalar pc = (g_cfg.is_master ? g_slave_ready.load() : g_master_connected.load())
+                    ? cv::Scalar{0, 255, 0} : cv::Scalar{0, 165, 255};
+    cv::putText(cv, peer, {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.55, pc, 1, cv::LINE_AA);
+    y += 30;
+    string srv;
+    cv::Scalar sc;
+    if (g_conn_fail.load()) { srv = "4090       : " + g_conn_target + "  FAIL (retrying)"; sc = {0, 0, 255}; }
+    else if (g_4090_ok.load()) { srv = "4090       : " + g_cfg.server_ip + ":" + to_string(g_cfg.server_port) + "  OK"; sc = {0, 255, 0}; }
+    else { srv = "4090       : " + g_cfg.server_ip + ":" + to_string(g_cfg.server_port) + "  idle"; sc = {150, 150, 150}; }
+    cv::putText(cv, srv, {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.55, sc, 1, cv::LINE_AA);
+    y += 34;
+}
+
 static void drawConfig(cv::Mat& cv) {
     cv = cv::Mat::zeros(600, 900, CV_8UC3);
     int y = 44;
@@ -403,13 +430,7 @@ static void drawConfig(cv::Mat& cv) {
     };
     put("100G Transfer - Configuration", 0.85, {0, 215, 255}, 46);
     put("Role        : " + string(g_cfg.is_master ? "MASTER" : "SLAVE"), 0.55, {255, 255, 255});
-    // 握手连接状态 (两端都显示)
-    if (g_cfg.is_master)
-        put("Slave       : " + string(g_slave_ready.load() ? "Connected" : "Not connected - waiting..."),
-            0.55, g_slave_ready.load() ? cv::Scalar{0, 255, 0} : cv::Scalar{0, 165, 255});
-    else
-        put("Master      : " + string(g_master_connected.load() ? "Connected - waiting for START" : "Connecting..."),
-            0.55, g_master_connected.load() ? cv::Scalar{0, 255, 0} : cv::Scalar{0, 165, 255});
+    drawLinks(cv, y);                                 // 对端主机 + 4090 链路状态
     put("Participant : " + g_cfg.participant, 0.55, {255, 255, 255});
     put("Server      : " + g_cfg.server_ip + ":" + to_string(g_cfg.server_port), 0.55, {255, 255, 255});
     put("Streams     : " + to_string(g_cfg.workers) + "  (TransmitFile)", 0.55, {255, 255, 255});
@@ -453,7 +474,16 @@ static void drawProgress(cv::Mat& cv) {
     phs << "Phase " << idx + 1 << "/" << g_plans.size() << "  " << g_plans[idx].label;
     cv::putText(cv, phs.str(), {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 255}, 1, cv::LINE_AA);
     y += 44;
-    double frac = g_total_bytes ? (double)g_bytes.load() / (double)g_total_bytes : 0;
+    drawLinks(cv, y);                                 // 对端主机 + 4090 链路状态
+    // WAIT_SLAVE: 显示已等待秒数
+    if (ph == Phase::WAIT_SLAVE && g_wait_t0_us.load()) {
+        uint64_t tnow = chrono::duration_cast<chrono::microseconds>(
+            chrono::steady_clock::now().time_since_epoch()).count();
+        char wb[64]; snprintf(wb, sizeof(wb), "Waiting %d s", (int)((tnow - g_wait_t0_us.load()) / 1000000));
+        cv::putText(cv, wb, {460, 64}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 255}, 1, cv::LINE_AA);
+    }
+    double frac = g_total_bytes
+        ? (double)(g_bytes.load() + g_skip_bytes.load()) / (double)g_total_bytes : 0;
     cv::rectangle(cv, {40, y}, {860, y + 36}, {80, 80, 80}, 1);
     cv::rectangle(cv, {40, y}, {40 + (int)(820 * min(frac, 1.0)), y + 36}, {0, 200, 0}, -1);
     char pct[16]; snprintf(pct, sizeof(pct), "%.1f%%", frac * 100);
@@ -470,8 +500,9 @@ static void drawProgress(cv::Mat& cv) {
     snprintf(b, sizeof(b), "Files : %d / %d    (skip %d, fail %d)",
              g_done_files.load(), g_total_files, g_skip.load(), g_fail.load());
     cv::putText(cv, b, {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {255, 255, 255}, 1, cv::LINE_AA); y += 34;
-    snprintf(b, sizeof(b), "Data  : %.2f / %.2f TB", (double)g_bytes.load() / 1e12,
-             (double)g_total_bytes / 1e12);
+    snprintf(b, sizeof(b), "Data  : %.2f / %.2f TB  (skipped %.2f TB counted)",
+             (double)(g_bytes.load() + g_skip_bytes.load()) / 1e12,
+             (double)g_total_bytes / 1e12, (double)g_skip_bytes.load() / 1e12);
     cv::putText(cv, b, {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {0, 255, 200}, 1, cv::LINE_AA); y += 34;
     snprintf(b, sizeof(b), "Rate  : %.2f GB/s    Elapsed : %.1f min    ETA : %.1f min",
              rate, el / 60, eta / 60);
