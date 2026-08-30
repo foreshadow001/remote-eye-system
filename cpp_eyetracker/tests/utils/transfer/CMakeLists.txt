@@ -27,3 +27,16 @@ target_link_libraries(send_slave
 )
 
 message(STATUS "send_slave will be built")
+
+# send_v2: V2 管道发送器 (1 顺序读线程 → 环队列 → K send() 发送线程)
+add_executable(send_v2
+    send_v2.cpp
+)
+
+target_link_libraries(send_v2
+    PRIVATE
+        eyetracker::cfg
+        ${OpenCV_LIBS}
+)
+
+message(STATUS "send_v2 will be built")

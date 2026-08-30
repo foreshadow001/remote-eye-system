@@ -11,5 +11,5 @@ transfer:
   handshake_port: 50100
 
   # 数据通道并发流数 (每流一个 TCP 连接, 顺序取文件队列)
-  # 单流 TCP 上限 ~880MB/s (同 iperf 单流), 8 流可逼近 57Gbps 线速
-  workers: 8
+  # 单盘实测: 4 流最优 ~4.4GB/s (8 流交错惩罚, 单流 1.1GB/s→450MB/s)
+  workers: 4
