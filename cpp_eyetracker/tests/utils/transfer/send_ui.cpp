@@ -63,6 +63,8 @@ struct UiCfg {
     string xml_dir;                   // {calib_save_dir}/{P}/output (master)
     string ir_file;                   // cfg/IR/{day_id}.txt (master)
     string map_file;                  // cfg/day_participant_map.json (master)
+    string master_ip;                 // 握手用 (capture.yaml network.master_ip)
+    int handshake_port = 50100;       // transfer.yaml
 };
 static UiCfg g_cfg;
 
@@ -71,7 +73,7 @@ struct Job { fs::path path; string rel; uint64_t size; bool force = false; };   
 struct PhasePlan { string label; vector<Job> jobs; uint64_t bytes = 0; };
 static vector<PhasePlan> g_plans;
 
-enum class Phase { CONFIG, RUNNING, DONE, ABORTED };
+enum class Phase { CONFIG, RUNNING, WAIT_SLAVE, DONE, ABORTED };
 static atomic<int> g_phase{(int)Phase::CONFIG};
 static atomic<bool> g_abort{false};
 static atomic<int> g_done_files{0}, g_skip{0}, g_fail{0};
@@ -81,6 +83,12 @@ static uint64_t g_total_bytes = 0;
 static int g_total_files = 0;
 static atomic<uint64_t> g_t0_us{0}, g_t_end_us{0};
 static string g_last_fail;
+
+// master↔slave 握手 (走现有 192.168.10.x 网): master SPACE 后先传自己,
+// 完成后 START 令 slave 传输, 收 SLAVE_DONE 回 ACK — 全程 slave 按键无效
+static SOCKET g_hs = INVALID_SOCKET;
+static atomic<bool> g_slave_ready{false};
+static string g_slave_summary;
 
 // ================== TCP 基础 (同 send_slave) ==================
 static bool sendLine(SOCKET s, const string& msg) {
@@ -185,7 +193,76 @@ static void transferController() {
     }
     g_t_end_us.store(chrono::duration_cast<chrono::microseconds>(
         chrono::steady_clock::now().time_since_epoch()).count());
+
+    // master: 本机完成后令 slave 传输, 等 SLAVE_DONE
+    if (g_cfg.is_master && g_hs != INVALID_SOCKET) {
+        sendLine(g_hs, g_abort.load() ? "ABORT" : "START");
+        if (!g_abort.load()) {
+            g_phase.store((int)Phase::WAIT_SLAVE);
+            cout << "[HS] Waiting for slave to finish..." << endl;
+            string line;
+            if (recvLine(g_hs, line, 4 * 3600 * 1000) &&
+                line.rfind("SLAVE_DONE", 0) == 0) {
+                g_slave_summary = line.substr(10);
+                cout << "[HS] Slave done:" << g_slave_summary << endl;
+            } else {
+                g_slave_summary = " (no response)";
+                cout << "[HS] Slave no SLAVE_DONE response!" << endl;
+                g_fail += 1;                          // 对端异常计入失败
+            }
+            sendLine(g_hs, "ACK");
+        }
+        closesocket(g_hs);
+        g_hs = INVALID_SOCKET;
+    }
     g_phase.store((int)(g_abort.load() ? Phase::ABORTED : Phase::DONE));
+}
+
+// master: 监听握手, 等 slave READY (SPACE 需 g_slave_ready)
+static void masterHandshakeListen() {
+    SOCKET lst = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    int one = 1;
+    setsockopt(lst, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof(one));
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((u_short)g_cfg.handshake_port);
+    sa.sin_addr.s_addr = INADDR_ANY;
+    if (::bind(lst, (sockaddr*)&sa, sizeof(sa)) != 0 || listen(lst, 1) != 0) {
+        cerr << "[HS] master bind/listen failed: " << WSAGetLastError() << endl;
+        return;
+    }
+    cout << "[HS] Master waiting for slave handshake on :" << g_cfg.handshake_port << endl;
+    SOCKET conn = accept(lst, nullptr, nullptr);
+    closesocket(lst);
+    if (conn == INVALID_SOCKET) return;
+    string line;
+    if (recvLine(conn, line, 600000) && line.rfind("READY", 0) == 0) {
+        cout << "[HS] Slave: " << line << endl;
+        g_hs = conn;
+        g_slave_ready.store(true);
+    } else {
+        cerr << "[HS] bad READY: " << line << endl;
+        closesocket(conn);
+    }
+}
+
+// slave: 连 master → READY → 等 START (master SPACE 且本机完成后才来) → 传输
+// slave 全程无有效按键
+static void slaveHandshakeAndRun() {
+    cout << "[HS] Slave connecting to master " << g_cfg.master_ip
+         << ":" << g_cfg.handshake_port << " ..." << endl;
+    SOCKET s = connectTo(g_cfg.master_ip, g_cfg.handshake_port);
+    sendLine(s, "READY " + to_string(g_total_files) + " " + to_string(g_total_bytes));
+    string cmd;
+    if (!recvLine(s, cmd, 2 * 3600 * 1000) || cmd != "START") {
+        cerr << "[HS] master cmd: " << cmd << " — aborted" << endl;
+        closesocket(s);
+        g_phase.store((int)Phase::ABORTED);
+        return;
+    }
+    closesocket(s);                                   // 数据/握手复用完成, 不等 ACK
+    cout << "[HS] Master ordered START — slave transferring." << endl;
+    transferController();
 }
 
 // ================== 阶段构建 ==================
@@ -279,8 +356,17 @@ static void drawConfig(cv::Mat& cv) {
     tot << "Total: " << g_total_files << " files, " << fixed << setprecision(2)
         << (double)g_total_bytes / 1e12 << " TB";
     put(tot.str(), 0.55, {0, 215, 255}, 52);
-    cv::putText(cv, "[SPACE] Start transfer      [q/ESC] Quit",
-                {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.65, {0, 255, 0}, 2, cv::LINE_AA);
+    if (g_cfg.is_master) {
+        if (g_slave_ready.load())
+            cv::putText(cv, "[SPACE] Start (master first, slave follows)      [q/ESC] Quit",
+                        {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.65, {0, 255, 0}, 2, cv::LINE_AA);
+        else
+            cv::putText(cv, "Waiting for slave handshake...      [q/ESC] Quit",
+                        {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.65, {0, 200, 255}, 2, cv::LINE_AA);
+    } else {
+        cv::putText(cv, "Waiting for master command (no keys) - master SPACE starts sequence",
+                    {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {0, 200, 255}, 2, cv::LINE_AA);
+    }
 }
 
 static void drawProgress(cv::Mat& cv) {
@@ -288,6 +374,7 @@ static void drawProgress(cv::Mat& cv) {
     Phase ph = (Phase)g_phase.load();
     int y = 64;
     cv::putText(cv, ph == Phase::RUNNING ? "Transferring..." :
+                ph == Phase::WAIT_SLAVE ? "Master done - slave transferring..." :
                 (ph == Phase::DONE ? "DONE" : "ABORTED"),
                 {40, y}, cv::FONT_HERSHEY_DUPLEX, 0.9, {0, 215, 255}, 2, cv::LINE_AA);
     y += 52;
@@ -323,8 +410,13 @@ static void drawProgress(cv::Mat& cv) {
         cv::putText(cv, "Last fail: " + g_last_fail, {40, y},
                     cv::FONT_HERSHEY_SIMPLEX, 0.5, {0, 0, 255}, 1, cv::LINE_AA); y += 34;
     }
+    if (ph == Phase::DONE && g_cfg.is_master && !g_slave_summary.empty()) {
+        cv::putText(cv, "Slave:" + g_slave_summary, {40, y},
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, {0, 255, 200}, 1, cv::LINE_AA); y += 30;
+    }
     string hint = (ph == Phase::RUNNING) ? "[q] Abort after current file"
-                                         : "[SPACE/q] Exit";
+                : (ph == Phase::WAIT_SLAVE) ? "[q] Abort wait (slave continues)"
+                : "[SPACE/q] Exit";
     cv::putText(cv, hint, {40, 560}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {150, 150, 150}, 1, cv::LINE_AA);
 }
 
@@ -351,8 +443,9 @@ int main(int argc, char** argv) {
     g_cfg.cfg_dir = (fs::path(__FILE__).parent_path().parent_path().parent_path()
                      .parent_path() / "cfg").string();
     try {
-        Cfg cap(g_cfg.cfg_dir + "/capture.yaml");     // 主机角色
+        Cfg cap(g_cfg.cfg_dir + "/capture.yaml");     // 主机角色 + 握手目标
         g_cfg.is_master = cap["capture"]["is_master"].as<bool>();
+        g_cfg.master_ip = cap["capture"]["master_ip"].as<string>();
         Cfg xf(g_cfg.cfg_dir + "/transfer.yaml"); auto& t = xf["transfer"];
         g_cfg.participant = participant_override.empty()
                             ? t["participant_id"].as<string>() : participant_override;
@@ -361,6 +454,7 @@ int main(int argc, char** argv) {
         g_cfg.server_ip = data_ip_override.empty() ? link : data_ip_override;
         g_cfg.server_port = port_override ? port_override : t["server_port"].as<int>();
         g_cfg.workers = workers_override ? workers_override : t["workers"].as<int>();
+        try { g_cfg.handshake_port = t["handshake_port"].as<int>(); } catch (...) {}
     } catch (const exception& e) {
         cerr << "[Error] config: " << e.what() << endl; return 1;
     }
@@ -403,6 +497,10 @@ int main(int argc, char** argv) {
         cerr << "[Error] no files found for " << g_cfg.participant << endl; return 1;
     }
 
+    // 握手协作: master 监听等 READY; slave 连上后挂等 START (按键全失效)
+    if (g_cfg.is_master) thread(masterHandshakeListen).detach();
+    else thread(slaveHandshakeAndRun).detach();
+
     cv::namedWindow("send_ui", cv::WINDOW_NORMAL);
     cv::resizeWindow("send_ui", 900, 600);
     cv::Mat canvas;
@@ -413,8 +511,9 @@ int main(int argc, char** argv) {
         else drawProgress(canvas);
         cv::imshow("send_ui", canvas);
         int key = cv::waitKey(ph == Phase::RUNNING ? 30 : 50);
+        if (!g_cfg.is_master) continue;                 // slave: 按键全失效
         if (ph == Phase::CONFIG) {
-            if (key == ' ') {
+            if (key == ' ' && g_slave_ready.load()) {   // 需 slave 已握手
                 g_phase.store((int)Phase::RUNNING);
                 ctl = thread(transferController);
             } else if (key == 'q' || key == 27) break;
