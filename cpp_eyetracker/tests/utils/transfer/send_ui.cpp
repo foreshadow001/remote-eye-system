@@ -90,6 +90,15 @@ static SOCKET g_hs = INVALID_SOCKET;
 static atomic<bool> g_slave_ready{false};
 static string g_slave_summary;
 
+// ================== 日志 (时间戳) ==================
+static string ts() {
+    char b[32];
+    auto t = chrono::system_clock::to_time_t(chrono::system_clock::now());
+    strftime(b, sizeof(b), "%H:%M:%S", localtime(&t));
+    return string("[") + b + "] ";
+}
+#define LOG(msg) (cout << ts() << msg << endl)
+
 // ================== TCP 基础 (同 send_slave) ==================
 static bool sendLine(SOCKET s, const string& msg) {
     string d = msg + "\n";
@@ -122,7 +131,9 @@ static SOCKET connectTo(const string& ip, int port) {
         inet_pton(AF_INET, ip.c_str(), &sa.sin_addr);
         if (connect(s, (sockaddr*)&sa, sizeof(sa)) == 0) return s;
         closesocket(s);
-        if (++retry % 10 == 1) cerr << "[Net] connect retry #" << retry << endl;
+        ++retry;
+        cout << ts() << "[Net] connect " << ip << ":" << port
+             << " failed (retry #" << retry << ", receiver running?)" << endl;
         this_thread::sleep_for(chrono::milliseconds(500));
     }
 }
@@ -199,15 +210,15 @@ static void transferController() {
         sendLine(g_hs, g_abort.load() ? "ABORT" : "START");
         if (!g_abort.load()) {
             g_phase.store((int)Phase::WAIT_SLAVE);
-            cout << "[HS] Waiting for slave to finish..." << endl;
+            cout << ts() << "[HS] Waiting for slave to finish..." << endl;
             string line;
             if (recvLine(g_hs, line, 4 * 3600 * 1000) &&
                 line.rfind("SLAVE_DONE", 0) == 0) {
                 g_slave_summary = line.substr(10);
-                cout << "[HS] Slave done:" << g_slave_summary << endl;
+                cout << ts() << "[HS] Slave done:" << g_slave_summary << endl;
             } else {
                 g_slave_summary = " (no response)";
-                cout << "[HS] Slave no SLAVE_DONE response!" << endl;
+                cout << ts() << "[HS] Slave no SLAVE_DONE response!" << endl;
                 g_fail += 1;                          // 对端异常计入失败
             }
             sendLine(g_hs, "ACK");
@@ -228,41 +239,62 @@ static void masterHandshakeListen() {
     sa.sin_port = htons((u_short)g_cfg.handshake_port);
     sa.sin_addr.s_addr = INADDR_ANY;
     if (::bind(lst, (sockaddr*)&sa, sizeof(sa)) != 0 || listen(lst, 1) != 0) {
-        cerr << "[HS] master bind/listen failed: " << WSAGetLastError() << endl;
+        cerr << ts() << "[HS] master bind/listen failed: " << WSAGetLastError() << endl;
         return;
     }
-    cout << "[HS] Master waiting for slave handshake on :" << g_cfg.handshake_port << endl;
+    cout << ts() << "[HS] Master waiting for slave handshake on :" << g_cfg.handshake_port << endl;
     SOCKET conn = accept(lst, nullptr, nullptr);
     closesocket(lst);
     if (conn == INVALID_SOCKET) return;
     string line;
     if (recvLine(conn, line, 600000) && line.rfind("READY", 0) == 0) {
-        cout << "[HS] Slave: " << line << endl;
+        cout << ts() << "[HS] Slave: " << line << endl;
         g_hs = conn;
         g_slave_ready.store(true);
     } else {
-        cerr << "[HS] bad READY: " << line << endl;
+        cerr << ts() << "[HS] bad READY: " << line << endl;
         closesocket(conn);
     }
 }
 
+// slave 看门狗: 传输期间监测握手 socket — master 发来 QUIT/ABORT 或连接关闭
+// (master 退出/崩溃) 一律中止当前传输 (文件粒度温和停止)
+static void slaveQuitWatcher(SOCKET hs) {
+    while ((Phase)g_phase.load() == Phase::RUNNING) {
+        fd_set rf; FD_ZERO(&rf); FD_SET(hs, &rf);
+        timeval tv{2, 0};
+        if (select(0, &rf, nullptr, nullptr, &tv) > 0) {
+            g_abort = true;
+            cout << ts() << "[HS] master signalled quit / disconnected — aborting" << endl;
+            return;
+        }
+    }
+}
+
 // slave: 连 master → READY → 等 START (master SPACE 且本机完成后才来) → 传输
-// slave 全程无有效按键
+// 完成后回 SLAVE_DONE, 等 ACK; slave 全程无有效按键
 static void slaveHandshakeAndRun() {
-    cout << "[HS] Slave connecting to master " << g_cfg.master_ip
+    cout << ts() << "[HS] Slave connecting to master " << g_cfg.master_ip
          << ":" << g_cfg.handshake_port << " ..." << endl;
     SOCKET s = connectTo(g_cfg.master_ip, g_cfg.handshake_port);
     sendLine(s, "READY " + to_string(g_total_files) + " " + to_string(g_total_bytes));
     string cmd;
     if (!recvLine(s, cmd, 2 * 3600 * 1000) || cmd != "START") {
-        cerr << "[HS] master cmd: " << cmd << " — aborted" << endl;
+        cerr << ts() << "[HS] master cmd: " << cmd << " — aborted" << endl;
         closesocket(s);
         g_phase.store((int)Phase::ABORTED);
         return;
     }
-    closesocket(s);                                   // 数据/握手复用完成, 不等 ACK
-    cout << "[HS] Master ordered START — slave transferring." << endl;
-    transferController();
+    cout << ts() << "[HS] Master ordered START — slave transferring." << endl;
+    g_phase.store((int)Phase::RUNNING);               // UI 切进度屏
+    thread(slaveQuitWatcher, s).detach();             // 监测 master QUIT/掉线
+    transferController();                             // 结束时置 DONE/ABORTED
+    int ok = g_done_files.load() - g_skip.load() - g_fail.load();
+    sendLine(s, "SLAVE_DONE " + to_string(ok) + " "
+                  + to_string(g_skip.load()) + " " + to_string(g_fail.load()));
+    string ack;
+    recvLine(s, ack, 60000);                          // ACK (尽力而为)
+    closesocket(s);
 }
 
 // ================== 阶段构建 ==================
@@ -283,7 +315,7 @@ static void addImagePhase(const string& root) {
         sort(plan.jobs.begin(), plan.jobs.end(),
              [](const Job& a, const Job& b) { return a.rel < b.rel; });
     } else {
-        cout << "[Warn] missing " << base.string() << endl;
+        cout << ts() << "[Warn] missing " << base.string() << endl;
     }
     g_total_files += (int)plan.jobs.size();
     g_total_bytes += plan.bytes;
@@ -299,7 +331,7 @@ static void addFilePhase(const string& src, const string& rel, const string& lab
         plan.jobs.push_back({fs::path(src), rel, sz, /*force=*/true});
         plan.bytes = sz;
     } else {
-        cout << "[Warn] missing (phase skipped): " << src << endl;
+        cout << ts() << "[Warn] missing (phase skipped): " << src << endl;
         return;                                  // 不加入 (配置屏不显示缺失项)
     }
     g_total_files += 1;
@@ -322,7 +354,7 @@ static void addXmlPhase() {
         sort(plan.jobs.begin(), plan.jobs.end(),
              [](const Job& a, const Job& b) { return a.rel < b.rel; });
     } else {
-        cout << "[Warn] missing (phase skipped): " << g_cfg.xml_dir << endl;
+        cout << ts() << "[Warn] missing (phase skipped): " << g_cfg.xml_dir << endl;
         return;
     }
     g_total_files += (int)plan.jobs.size();
@@ -456,7 +488,7 @@ int main(int argc, char** argv) {
         g_cfg.workers = workers_override ? workers_override : t["workers"].as<int>();
         try { g_cfg.handshake_port = t["handshake_port"].as<int>(); } catch (...) {}
     } catch (const exception& e) {
-        cerr << "[Error] config: " << e.what() << endl; return 1;
+        cerr << ts() << "[Error] config: " << e.what() << endl; return 1;
     }
     if (roots_override.empty()) g_cfg.roots = {"D:/capture", "E:/capture"};
     else g_cfg.roots = roots_override;
@@ -494,7 +526,7 @@ int main(int argc, char** argv) {
                          "day_participant_map.json");
     }
     if (!g_total_files) {
-        cerr << "[Error] no files found for " << g_cfg.participant << endl; return 1;
+        cerr << ts() << "[Error] no files found for " << g_cfg.participant << endl; return 1;
     }
 
     // 握手协作: master 监听等 READY; slave 连上后挂等 START (按键全失效)
@@ -511,14 +543,35 @@ int main(int argc, char** argv) {
         else drawProgress(canvas);
         cv::imshow("send_ui", canvas);
         int key = cv::waitKey(ph == Phase::RUNNING ? 30 : 50);
-        if (!g_cfg.is_master) continue;                 // slave: 按键全失效
+        if (!g_cfg.is_master) {
+            // slave: 按键全失效; 结束态显示 5s 后自动退出
+            if (ph == Phase::DONE || ph == Phase::ABORTED) {
+                static auto done_at = chrono::steady_clock::now();
+                if (chrono::steady_clock::now() - done_at > chrono::seconds(5)) break;
+            }
+            continue;
+        }
         if (ph == Phase::CONFIG) {
             if (key == ' ' && g_slave_ready.load()) {   // 需 slave 已握手
                 g_phase.store((int)Phase::RUNNING);
                 ctl = thread(transferController);
-            } else if (key == 'q' || key == 27) break;
+            } else if (key == 'q' || key == 27) {       // 通知 slave 一并退出
+                if (g_hs != INVALID_SOCKET) {
+                    sendLine(g_hs, "QUIT");
+                    closesocket(g_hs); g_hs = INVALID_SOCKET;
+                } else {
+                    cout << ts() << "[HS] slave not connected — it will keep waiting" << endl;
+                }
+                break;
+            }
         } else if (ph == Phase::RUNNING) {
-            if (key == 'q' || key == 27) g_abort = true;   // 文件粒度温和中止
+            if (key == 'q' || key == 27) g_abort = true;   // 完成后 controller 发 ABORT
+        } else if (ph == Phase::WAIT_SLAVE) {
+            if ((key == 'q' || key == 27) && g_hs != INVALID_SOCKET) {
+                sendLine(g_hs, "QUIT");                    // slave 看门狗捕获后中止
+                closesocket(g_hs); g_hs = INVALID_SOCKET;
+                break;
+            }
         } else {
             if (key >= 0) break;
         }
