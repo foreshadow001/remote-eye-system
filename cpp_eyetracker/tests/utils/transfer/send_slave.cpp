@@ -45,6 +45,7 @@ static string g_server_ip, g_participant;
 static int g_server_port = 5001, g_workers = 4;
 static vector<string> g_roots;
 static vector<string> g_cams;              // 空 = 全部相机
+static bool g_tx_user = false;             // --tx user: 用户态重叠读发 (对照 TransmitFile)
 
 static const int CHUNK = 8 * 1024 * 1024;     // 8MB 流式块 (与 C++ 接收端一致)
 static const int SOCK_BUF = 32 * 1024 * 1024;
@@ -156,6 +157,70 @@ int sendOne(SOCKET s, const Job& j) {
     return -1;
 }
 
+// ---- 用户态重叠读发 (--tx user): 每文件一个读线程填 3 槽缓冲, 发送线程送出 ----
+// 用于对照 TransmitFile 是否存在全机吞吐上限
+int sendOneUser(SOCKET s, const Job& j) {
+    ifstream in(j.path, ios::binary);
+    if (!in) return -1;
+    if (!sendLine(s, "FILE " + j.rel + " " + to_string(j.size) + " 0")) return -1;
+
+    struct Slot { vector<char> buf; uint64_t len = 0; };
+    vector<Slot> slots(3, Slot{vector<char>(CHUNK), 0});
+    mutex mtx;
+    condition_variable cv_empty, cv_full;
+    size_t rd = 0, wr = 0, count = 0;      // 环形槽
+    bool read_done = false, read_fail = false;
+    uint64_t total_read = 0;
+
+    thread reader([&]() {
+        while (true) {
+            unique_lock<mutex> lk(mtx);
+            cv_empty.wait(lk, [&] { return count < slots.size() || read_done; });
+            if (read_done) return;
+            lk.unlock();
+            in.read(slots[wr].buf.data(), CHUNK);
+            int got = (int)in.gcount();
+            lk.lock();
+            if (got <= 0) { read_fail = total_read < j.size; read_done = true; }
+            else { slots[wr].len = (uint64_t)got; total_read += (uint64_t)got;
+                   wr = (wr + 1) % slots.size(); ++count; }
+            cv_full.notify_one();
+            if (read_done) return;
+        }
+    });
+
+    bool send_fail = false;
+    while (true) {
+        unique_lock<mutex> lk(mtx);
+        cv_full.wait(lk, [&] { return count > 0 || read_done; });
+        if (count == 0) break;                    // 读尽
+        Slot& sl = slots[rd];
+        lk.unlock();
+        const char* p = sl.buf.data();
+        uint64_t off = 0;
+        while (off < sl.len) {
+            int n = send(s, p + off, (int)min<uint64_t>(sl.len - off, 1u << 30), 0);
+            if (n <= 0) { send_fail = true; break; }
+            off += (uint64_t)n;
+        }
+        lk.lock();
+        rd = (rd + 1) % slots.size(); --count;
+        cv_empty.notify_one();
+        if (send_fail) break;
+    }
+    { unique_lock<mutex> lk(mtx); read_done = true; }
+    cv_empty.notify_all();
+    reader.join();
+    if (read_fail || send_fail || total_read != j.size) return -1;
+
+    string reply;
+    if (!recvLine(s, reply, REPLY_TIMEOUT_MS)) return -1;
+    if (reply.rfind("OK", 0) == 0) return 0;
+    if (reply.rfind("SKIP", 0) == 0) return 1;
+    cerr << "\n[Recv] " << j.rel << ": " << reply << endl;
+    return -1;
+}
+
 void workerMain(const vector<Job>* jobs, atomic<size_t>* next) {
     while (true) {
         size_t i = next->fetch_add(1);
@@ -166,7 +231,7 @@ void workerMain(const vector<Job>* jobs, atomic<size_t>* next) {
             int one = 1, buf = SOCK_BUF;
             setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
             setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&buf, sizeof(buf));
-            int r = sendOne(s, j);
+            int r = g_tx_user ? sendOneUser(s, j) : sendOne(s, j);
             closesocket(s);
             if (r == 0) { g_prog.done++; g_prog.bytes += j.size; break; }
             if (r == 1) { g_prog.done++; g_prog.skip++; break; }
@@ -201,6 +266,9 @@ int main(int argc, char** argv) {
         else if (a == "--cams") {
             while (i + 1 < argc && string(argv[i + 1]).rfind("--", 0) != 0)
                 g_cams.push_back(argv[++i]);
+        }
+        else if (a == "--tx") {                  // transmitfile (默认) | user (重叠读发对照)
+            string mode; nextval(mode); g_tx_user = (mode == "user");
         }
         else { cerr << "unknown arg " << a << endl; return 1; }
     }
