@@ -89,8 +89,10 @@ static string g_last_fail;
 static SOCKET g_hs = INVALID_SOCKET;
 static atomic<bool> g_slave_ready{false};
 static atomic<bool> g_master_connected{false};   // slave 视角: 已连上 master
-static atomic<bool> g_exit{false};               // slave: 收到 master 退出信号 → 结束进程
+static atomic<bool> g_exit{false};               // slave: 收到 master 退出信号 → 结程
 static string g_slave_summary;
+static atomic<bool> g_conn_fail{false};          // 数据连接失败 (UI 红字提示)
+static string g_conn_target;
 
 // ================== 日志 (时间戳) ==================
 static string ts() {
@@ -131,11 +133,17 @@ static SOCKET connectTo(const string& ip, int port) {
         sockaddr_in sa{};
         sa.sin_family = AF_INET; sa.sin_port = htons((u_short)port);
         inet_pton(AF_INET, ip.c_str(), &sa.sin_addr);
-        if (connect(s, (sockaddr*)&sa, sizeof(sa)) == 0) return s;
+        if (connect(s, (sockaddr*)&sa, sizeof(sa)) == 0) {
+            g_conn_fail.store(false);                 // 恢复: 清除告警
+            return s;
+        }
         closesocket(s);
         ++retry;
-        cout << ts() << "[Net] connect " << ip << ":" << port
-             << " failed (retry #" << retry << ", receiver running?)" << endl;
+        g_conn_target = ip + ":" + to_string(port);
+        g_conn_fail.store(true);                      // UI 红字: 环境问题一眼可见
+        if (retry == 1 || retry % 10 == 0)
+            cout << ts() << "[Net] connect " << ip << ":" << port
+                 << " failed (retry #" << retry << ", receiver running?)" << endl;
         this_thread::sleep_for(chrono::milliseconds(500));
     }
 }
@@ -465,6 +473,10 @@ static void drawProgress(cv::Mat& cv) {
     if (g_fail.load()) {
         cv::putText(cv, "Last fail: " + g_last_fail, {40, y},
                     cv::FONT_HERSHEY_SIMPLEX, 0.5, {0, 0, 255}, 1, cv::LINE_AA); y += 34;
+    }
+    if (g_conn_fail.load()) {
+        cv::putText(cv, "Cannot connect " + g_conn_target + " — is receiver running?",
+                    {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {0, 0, 255}, 2, cv::LINE_AA); y += 34;
     }
     if (ph == Phase::DONE && g_cfg.is_master && !g_slave_summary.empty()) {
         cv::putText(cv, "Slave:" + g_slave_summary, {40, y},
