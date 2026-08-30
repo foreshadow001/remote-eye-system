@@ -2,7 +2,7 @@
 
 把采集主机（master / slave）上一名参与者的采集数据经 100G 直连发送到
 数据处理主机（4090, Ubuntu, [preprocess-server](../../../../..
-/../preprocess-server)，接收端以 `--out /data/dataset` 启动）。
+/../preprocess-server)，接收端默认输出 `/data/dataset`)。
 配套调研与实测结论见
 [plan/transfer_100g.md](../../../plan/transfer_100g.md)、
 [plan/transfer_perf_report.md](../../../plan/transfer_perf_report.md)、
