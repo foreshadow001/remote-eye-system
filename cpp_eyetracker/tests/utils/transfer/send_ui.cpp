@@ -1,9 +1,17 @@
 // ================== send_ui ==================
-// 交互式串行传输 (Windows, slave): OpenCV UI 确认配置 → SPACE 开始 →
-// D:/capture 与 E:/capture 逐盘串行发送到处理主机 (baseline_recv_data)。
-// participant 默认读 cfg/transfer.yaml 的 participant_id (可用 --participant 覆盖)。
-// 按键: SPACE=开始传输, q/ESC=退出 (传输中 q=在当前文件完成后中止)
-// 引擎与 send_slave 相同: TransmitFile 内核态读发重叠, 默认 4 流。
+// 交互式串行传输 (Windows, master/slave 自动识别): OpenCV UI 确认配置 →
+// SPACE 开始 → 逐阶段串行发送到处理主机 (baseline_recv_data --out /data/dataset)。
+//
+// 阶段 (slave: 1-2; master: 1-5):
+//   1/2. D:/capture、E:/capture 的 h5 → /data/dataset/capture/{P}/
+//   3. 相机内外参 XML ({calib_save_dir}/{P}/output) → /data/dataset/calib/cams/{P}/
+//   4. 红外发射器位置 cfg/IR/{day_id}.txt → /data/dataset/calib/IR/{day_id}.txt
+//   5. cfg/day_participant_map.json → /data/dataset/day_participant_map.json
+//
+// 配置: transfer.yaml (participant_id/链路/流数), capture.yaml (is_master),
+//       cam_calib.yaml (calib_save_dir), calib_arm.yaml (record.day_id)
+// 按键: SPACE=开始, q/ESC=退出 (传输中 q=当前文件完成后温和中止)
+// 引擎: TransmitFile 内核态读发重叠, 默认 4 流, SKIP 断点续传。
 // =================================================================
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -45,26 +53,30 @@ static const int REPLY_TIMEOUT_MS = 60000;
 
 // ================== 配置 ==================
 struct UiCfg {
-    string server_ip;                 // 按 capture.yaml is_master 自动选 master/slave 链路
+    string server_ip;                 // 按 capture.yaml is_master 选 master/slave 链路
     int server_port = 5001;
     int workers = 4;
     string participant;
     bool is_master = false;
-    vector<string> roots;             // 串行顺序: D:/capture, E:/capture
+    vector<string> roots;             // 图像盘串行顺序: D:/capture, E:/capture
+    string cfg_dir;                   // cpp_eyetracker/cfg (xml/IR/map 源)
+    string xml_dir;                   // {calib_save_dir}/{P}/output (master)
+    string ir_file;                   // cfg/IR/{day_id}.txt (master)
+    string map_file;                  // cfg/day_participant_map.json (master)
 };
 static UiCfg g_cfg;
 
 // ================== 传输状态 ==================
-struct Job { fs::path path; string rel; uint64_t size; };
-struct DiskPlan { string root; vector<Job> jobs; uint64_t bytes = 0; };
-static vector<DiskPlan> g_plans;
+struct Job { fs::path path; string rel; uint64_t size; bool force = false; };   // force: 覆盖式 (标定附件)
+struct PhasePlan { string label; vector<Job> jobs; uint64_t bytes = 0; };
+static vector<PhasePlan> g_plans;
 
 enum class Phase { CONFIG, RUNNING, DONE, ABORTED };
 static atomic<int> g_phase{(int)Phase::CONFIG};
 static atomic<bool> g_abort{false};
 static atomic<int> g_done_files{0}, g_skip{0}, g_fail{0};
 static atomic<uint64_t> g_bytes{0};
-static atomic<int> g_disk_idx{0};                 // 当前盘 (RUNNING)
+static atomic<int> g_plan_idx{0};
 static uint64_t g_total_bytes = 0;
 static int g_total_files = 0;
 static atomic<uint64_t> g_t0_us{0}, g_t_end_us{0};
@@ -114,12 +126,16 @@ static SOCKET openStream() {
     return s;
 }
 
-// ================== 传输引擎 (TransmitFile, 同 send_slave) ==================
+// ================== 传输引擎 (TransmitFile) ==================
 static int sendOne(SOCKET s, const Job& j) {
     HANDLE hf = CreateFileA(j.path.string().c_str(), GENERIC_READ, FILE_SHARE_READ,
                             NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (hf == INVALID_HANDLE_VALUE) return -1;
-    if (!sendLine(s, "FILE " + j.rel + " " + to_string(j.size) + " 0")) { CloseHandle(hf); return -1; }
+    // FILE   = 大小一致则 SKIP (断点续传, 图像用)
+    // FORCE  = 总是覆盖写入 (标定附件: xml / IR / map)
+    string hdr = string(j.force ? "FORCE " : "FILE ") + j.rel + " "
+               + to_string(j.size) + " 0";
+    if (!sendLine(s, hdr)) { CloseHandle(hf); return -1; }
     uint64_t remaining = j.size;
     while (remaining > 0) {
         DWORD chunk = (DWORD)min<uint64_t>(remaining, 1ull << 30);
@@ -160,7 +176,7 @@ static void transferController() {
         chrono::steady_clock::now().time_since_epoch()).count());
     for (size_t d = 0; d < g_plans.size(); ++d) {
         if (g_abort.load()) break;
-        g_disk_idx = (int)d;
+        g_plan_idx = (int)d;
         atomic<size_t> next{0};
         vector<thread> ths;
         for (int i = 0; i < g_cfg.workers; ++i)
@@ -172,58 +188,120 @@ static void transferController() {
     g_phase.store((int)(g_abort.load() ? Phase::ABORTED : Phase::DONE));
 }
 
+// ================== 阶段构建 ==================
+static void addImagePhase(const string& root) {
+    PhasePlan plan;
+    plan.label = root + "  (h5 -> capture/" + g_cfg.participant + ")";
+    fs::path base = fs::path(root) / g_cfg.participant;
+    if (fs::exists(base)) {
+        for (auto& e : fs::recursive_directory_iterator(base)) {
+            if (!e.is_regular_file() || e.path().extension() != ".h5") continue;
+            string rel = "capture/" + g_cfg.participant + "/"
+                       + e.path().parent_path().filename().string()
+                       + "/" + e.path().filename().string();
+            uint64_t sz = (uint64_t)e.file_size();
+            plan.jobs.push_back({e.path(), rel, sz});
+            plan.bytes += sz;
+        }
+        sort(plan.jobs.begin(), plan.jobs.end(),
+             [](const Job& a, const Job& b) { return a.rel < b.rel; });
+    } else {
+        cout << "[Warn] missing " << base.string() << endl;
+    }
+    g_total_files += (int)plan.jobs.size();
+    g_total_bytes += plan.bytes;
+    g_plans.push_back(move(plan));
+}
+
+static void addFilePhase(const string& src, const string& rel, const string& label) {
+    PhasePlan plan;
+    plan.label = label;
+    error_code ec;
+    if (fs::exists(src, ec) && fs::is_regular_file(src, ec)) {
+        uint64_t sz = (uint64_t)fs::file_size(src, ec);
+        plan.jobs.push_back({fs::path(src), rel, sz, /*force=*/true});
+        plan.bytes = sz;
+    } else {
+        cout << "[Warn] missing (phase skipped): " << src << endl;
+        return;                                  // 不加入 (配置屏不显示缺失项)
+    }
+    g_total_files += 1;
+    g_total_bytes += plan.bytes;
+    g_plans.push_back(move(plan));
+}
+
+static void addXmlPhase() {
+    PhasePlan plan;
+    plan.label = g_cfg.xml_dir + "  (xml -> calib/cams/" + g_cfg.participant + ")";
+    if (fs::exists(g_cfg.xml_dir)) {
+        for (auto& e : fs::recursive_directory_iterator(g_cfg.xml_dir)) {
+            if (!e.is_regular_file() || e.path().extension() != ".xml") continue;
+            fs::path sub = fs::relative(e.path(), g_cfg.xml_dir);
+            string rel = "calib/cams/" + g_cfg.participant + "/" + sub.generic_string();
+            uint64_t sz = (uint64_t)e.file_size();
+            plan.jobs.push_back({e.path(), rel, sz, /*force=*/true});
+            plan.bytes += sz;
+        }
+        sort(plan.jobs.begin(), plan.jobs.end(),
+             [](const Job& a, const Job& b) { return a.rel < b.rel; });
+    } else {
+        cout << "[Warn] missing (phase skipped): " << g_cfg.xml_dir << endl;
+        return;
+    }
+    g_total_files += (int)plan.jobs.size();
+    g_total_bytes += plan.bytes;
+    g_plans.push_back(move(plan));
+}
+
 // ================== UI ==================
 static void drawConfig(cv::Mat& cv) {
-    cv = cv::Mat::zeros(560, 860, CV_8UC3);
-    int y = 50;
-    auto put = [&](const string& s, double sc, cv::Scalar c, int dy = 34) {
+    cv = cv::Mat::zeros(600, 900, CV_8UC3);
+    int y = 44;
+    auto put = [&](const string& s, double sc, cv::Scalar c, int dy = 30) {
         cv::putText(cv, s, {40, y}, cv::FONT_HERSHEY_SIMPLEX, sc, c, 1, cv::LINE_AA);
         y += dy;
     };
-    put("100G Transfer - Configuration", 0.9, {0, 215, 255}, 50);
-    put("Role        : " + string(g_cfg.is_master ? "MASTER" : "SLAVE")
-        + "   (from capture.yaml is_master)", 0.6, {255, 255, 255});
-    put("Participant : " + g_cfg.participant, 0.6, {255, 255, 255});
-    put("Server      : " + g_cfg.server_ip + ":" + to_string(g_cfg.server_port), 0.6, {255, 255, 255});
-    put("Streams     : " + to_string(g_cfg.workers) + "  (TransmitFile)", 0.6, {255, 255, 255});
-    put("Serial disk plan:", 0.6, {200, 200, 200}, 44);
+    put("100G Transfer - Configuration", 0.85, {0, 215, 255}, 46);
+    put("Role        : " + string(g_cfg.is_master ? "MASTER" : "SLAVE"), 0.55, {255, 255, 255});
+    put("Participant : " + g_cfg.participant, 0.55, {255, 255, 255});
+    put("Server      : " + g_cfg.server_ip + ":" + to_string(g_cfg.server_port), 0.55, {255, 255, 255});
+    put("Streams     : " + to_string(g_cfg.workers) + "  (TransmitFile)", 0.55, {255, 255, 255});
+    y += 8;
+    put("Serial phases:", 0.55, {200, 200, 200}, 32);
     for (auto& p : g_plans) {
         ostringstream os;
-        os << "  " << p.root << "   " << p.jobs.size() << " files   "
-           << fixed << setprecision(2) << (double)p.bytes / 1e12 << " TB";
-        put(os.str(), 0.55, {0, 255, 200});
+        os << "  " << p.label << "   " << p.jobs.size() << " files  "
+           << fixed << setprecision(2) << (double)p.bytes / 1e9 << " GB";
+        put(os.str(), 0.45, {0, 255, 200}, 26);
     }
-    y += 16;
+    y += 10;
     ostringstream tot;
     tot << "Total: " << g_total_files << " files, " << fixed << setprecision(2)
         << (double)g_total_bytes / 1e12 << " TB";
-    put(tot.str(), 0.6, {0, 215, 255}, 60);
+    put(tot.str(), 0.55, {0, 215, 255}, 52);
     cv::putText(cv, "[SPACE] Start transfer      [q/ESC] Quit",
-                {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.7, {0, 255, 0}, 2, cv::LINE_AA);
+                {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.65, {0, 255, 0}, 2, cv::LINE_AA);
 }
 
 static void drawProgress(cv::Mat& cv) {
-    cv = cv::Mat::zeros(560, 860, CV_8UC3);
+    cv = cv::Mat::zeros(600, 900, CV_8UC3);
     Phase ph = (Phase)g_phase.load();
-    int y = 60;
+    int y = 64;
     cv::putText(cv, ph == Phase::RUNNING ? "Transferring..." :
                 (ph == Phase::DONE ? "DONE" : "ABORTED"),
                 {40, y}, cv::FONT_HERSHEY_DUPLEX, 0.9, {0, 215, 255}, 2, cv::LINE_AA);
-    y += 50;
-    // 当前盘
-    ostringstream dsk;
-    dsk << "Disk " << min(g_disk_idx.load() + 1, (int)g_plans.size()) << "/" << g_plans.size()
-        << "  " << g_plans[min((size_t)g_disk_idx.load(), g_plans.size() - 1)].root;
-    cv::putText(cv, dsk.str(), {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {255, 255, 255}, 1, cv::LINE_AA);
+    y += 52;
+    int idx = min(g_plan_idx.load(), (int)g_plans.size() - 1);
+    ostringstream phs;
+    phs << "Phase " << idx + 1 << "/" << g_plans.size() << "  " << g_plans[idx].label;
+    cv::putText(cv, phs.str(), {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {255, 255, 255}, 1, cv::LINE_AA);
     y += 44;
-    // 进度条
     double frac = g_total_bytes ? (double)g_bytes.load() / (double)g_total_bytes : 0;
-    cv::rectangle(cv, {40, y}, {820, y + 36}, {80, 80, 80}, 1);
-    cv::rectangle(cv, {40, y}, {40 + (int)(780 * min(frac, 1.0)), y + 36}, {0, 200, 0}, -1);
+    cv::rectangle(cv, {40, y}, {860, y + 36}, {80, 80, 80}, 1);
+    cv::rectangle(cv, {40, y}, {40 + (int)(820 * min(frac, 1.0)), y + 36}, {0, 200, 0}, -1);
     char pct[16]; snprintf(pct, sizeof(pct), "%.1f%%", frac * 100);
-    cv::putText(cv, pct, {410, y + 25}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {255, 255, 255}, 1, cv::LINE_AA);
+    cv::putText(cv, pct, {425, y + 25}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {255, 255, 255}, 1, cv::LINE_AA);
     y += 70;
-    // 数字
     uint64_t t0 = g_t0_us.load();
     uint64_t tnow = g_t_end_us.load() ? g_t_end_us.load()
                   : chrono::duration_cast<chrono::microseconds>(
@@ -247,7 +325,7 @@ static void drawProgress(cv::Mat& cv) {
     }
     string hint = (ph == Phase::RUNNING) ? "[q] Abort after current file"
                                          : "[SPACE/q] Exit";
-    cv::putText(cv, hint, {40, 520}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {150, 150, 150}, 1, cv::LINE_AA);
+    cv::putText(cv, hint, {40, 560}, cv::FONT_HERSHEY_SIMPLEX, 0.55, {150, 150, 150}, 1, cv::LINE_AA);
 }
 
 // ================== main ==================
@@ -270,15 +348,14 @@ int main(int argc, char** argv) {
         else { cerr << "unknown arg " << a << endl; return 1; }
     }
 
-    auto cfg_dir = (fs::path(__FILE__).parent_path().parent_path().parent_path()
-                    .parent_path() / "cfg").string();
+    g_cfg.cfg_dir = (fs::path(__FILE__).parent_path().parent_path().parent_path()
+                     .parent_path() / "cfg").string();
     try {
-        Cfg cap(cfg_dir + "/capture.yaml");    // 主机角色 (每台机器自己的 capture.yaml 声明)
+        Cfg cap(g_cfg.cfg_dir + "/capture.yaml");     // 主机角色
         g_cfg.is_master = cap["capture"]["is_master"].as<bool>();
-        Cfg xf(cfg_dir + "/transfer.yaml"); auto& t = xf["transfer"];
+        Cfg xf(g_cfg.cfg_dir + "/transfer.yaml"); auto& t = xf["transfer"];
         g_cfg.participant = participant_override.empty()
                             ? t["participant_id"].as<string>() : participant_override;
-        // master → 口1 (10.10.1.1), slave → 口2 (10.10.2.1); --data-ip 覆盖
         string link = g_cfg.is_master ? t["server_ip_master_link"].as<string>()
                                       : t["server_ip_slave_link"].as<string>();
         g_cfg.server_ip = data_ip_override.empty() ? link : data_ip_override;
@@ -290,33 +367,44 @@ int main(int argc, char** argv) {
     if (roots_override.empty()) g_cfg.roots = {"D:/capture", "E:/capture"};
     else g_cfg.roots = roots_override;
 
-    // 扫描各盘 (串行顺序)
-    for (auto& root : g_cfg.roots) {
-        DiskPlan plan; plan.root = root;
-        fs::path base = fs::path(root) / g_cfg.participant;
-        if (fs::exists(base)) {
-            for (auto& e : fs::recursive_directory_iterator(base)) {
-                if (!e.is_regular_file() || e.path().extension() != ".h5") continue;
-                string rel = g_cfg.participant + "/" + e.path().parent_path().filename().string()
-                           + "/" + e.path().filename().string();
-                uint64_t sz = (uint64_t)e.file_size();
-                plan.jobs.push_back({e.path(), rel, sz});
-                plan.bytes += sz;
-            }
-        }
-        sort(plan.jobs.begin(), plan.jobs.end(),
-             [](const Job& a, const Job& b) { return a.rel < b.rel; });
-        g_total_files += (int)plan.jobs.size();
-        g_total_bytes += plan.bytes;
-        g_plans.push_back(move(plan));
+    // master 附加源 (xml / IR / map); 缺失则跳过该阶段并告警
+    if (g_cfg.is_master) {
+        string calib_save, calib_part, day_id;
+        try {
+            Cfg cc(g_cfg.cfg_dir + "/cam_calib.yaml");
+            calib_save = cc["calib"]["calib_save_dir"].as<string>();
+            try { calib_part = cc["calib"]["participant_id"].as<string>(); }
+            catch (...) { calib_part = "P001"; }
+        } catch (...) {}
+        try {
+            Cfg arm(g_cfg.cfg_dir + "/calib_arm.yaml");
+            day_id = arm["record"]["day_id"].as<string>();
+        } catch (...) {}
+        if (!calib_save.empty())
+            g_cfg.xml_dir = (fs::path(calib_save) / calib_part / "output").string();
+        if (!day_id.empty())
+            g_cfg.ir_file = g_cfg.cfg_dir + "/IR/" + day_id + ".txt";
+        g_cfg.map_file = g_cfg.cfg_dir + "/day_participant_map.json";
+    }
+
+    // 构建阶段
+    addImagePhase(g_cfg.roots[0]);
+    if (g_cfg.roots.size() > 1) addImagePhase(g_cfg.roots[1]);
+    if (g_cfg.is_master) {
+        if (!g_cfg.xml_dir.empty()) addXmlPhase();
+        if (!g_cfg.ir_file.empty())
+            addFilePhase(g_cfg.ir_file, "calib/IR/" + fs::path(g_cfg.ir_file).filename().generic_string(),
+                         "IR positions (calib/IR)");
+        if (!g_cfg.map_file.empty())
+            addFilePhase(g_cfg.map_file, "day_participant_map.json",
+                         "day_participant_map.json");
     }
     if (!g_total_files) {
-        cerr << "[Error] no h5 found for " << g_cfg.participant
-             << " under roots" << endl; return 1;
+        cerr << "[Error] no files found for " << g_cfg.participant << endl; return 1;
     }
 
     cv::namedWindow("send_ui", cv::WINDOW_NORMAL);
-    cv::resizeWindow("send_ui", 860, 560);
+    cv::resizeWindow("send_ui", 900, 600);
     cv::Mat canvas;
     thread ctl;
     while (true) {
@@ -332,7 +420,7 @@ int main(int argc, char** argv) {
             } else if (key == 'q' || key == 27) break;
         } else if (ph == Phase::RUNNING) {
             if (key == 'q' || key == 27) g_abort = true;   // 文件粒度温和中止
-        } else {                                            // DONE / ABORTED
+        } else {
             if (key >= 0) break;
         }
     }
