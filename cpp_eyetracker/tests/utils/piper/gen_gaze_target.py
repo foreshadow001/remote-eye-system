@@ -8,8 +8,8 @@
 #   cpp_eyetracker/cfg/gaze_target/{participant_id}/piper_{arm}.txt  (逗号分隔 x,y,z, 匹配 C++ loadTgts)
 #   同目录 sentry.txt (仅重置本次生成的臂)
 # 判据: 点阵腐蚀 (仅内部格点) + min_dist <= r*sqrt(3)/2
-# 排序: 两组各自 chain_pts (小盒任意序 / 二分递归 + 最近交界点对),
-#   组2起点 = 离组1终点最近的点; 失败整批重采样
+# 排序: 两组各自贪心最近邻游走 (多起点重试, 全败转瓶颈最小插入修复),
+#   组2起点 = 离组1终点最近的点; 仍失败整批重采样
 # =================================================================
 
 import argparse
@@ -21,8 +21,6 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-sys.setrecursionlimit(10000)   # 递归桥接链: 不平衡分裂时深度可接近点数
-
 SCRIPT_DIR = Path(__file__).resolve().parent      # cpp_eyetracker/tests/utils/piper
 CPP_DIR = SCRIPT_DIR.parents[2]                   # cpp_eyetracker (parents[0]=utils, [1]=tests)
 PIPER_SCRIPTS = (SCRIPT_DIR.parents[4] / "piper_ros"
@@ -31,6 +29,7 @@ OUT_ROOT = CPP_DIR / "cfg" / "gaze_target"
 
 _MIN_DIST_CHUNK = 2048         # 分批广播的候选点块大小
 _MAX_SAMPLE_ATTEMPTS = 10      # 排序/桥接失败时的整批重采样次数
+_NUM_CHAIN_STARTS = 40         # 组1贪心游走的随机起点数 (全败转插入修复)
 
 
 def fatal(msg):
@@ -131,77 +130,86 @@ def sample_points(box, interior, r, n, rng, label):
     return np.array(pts)
 
 
-def chain_pts(pts, start, end, max_dist):
-    """返回 pts 的索引排列: 首=start, 尾=end, 相邻距离 <= max_dist.
-
-    归纳构造 (两组共用同一逻辑):
-    - 小盒 (包围盒对角线 <= max_dist): 盒内任意两点都满足 -> 任意序;
-    - 否则在 start/end 坐标的中点二分 (保证两者分居两侧), 交界取最近交叉
-      点对 (须 <= max_dist 且不与链首尾重合); 两侧递归, 首尾由交界对确定.
-    交界不可行抛 ValueError (调用方整批重采样).
-    """
-    n = len(pts)
-    if n == 1:
-        return [start]
-    ext = pts.max(0) - pts.min(0)
-    if np.sqrt((ext ** 2).sum()) <= max_dist:   # 小盒: 任意序
-        return [start] + [i for i in range(n) if i != start and i != end] + [end]
-
-    # 分裂轴: start/end 坐标不同的轴 (优先跨度大的), 中点分裂保证两者异侧
-    cand = [i for i in range(3) if pts[start][i] != pts[end][i]]
-    axis = max(cand, key=lambda i: ext[i])
-    split_val = (pts[start][axis] + pts[end][axis]) / 2.0
-    li = np.flatnonzero(pts[:, axis] < split_val)    # start 侧
-    ri = np.flatnonzero(pts[:, axis] >= split_val)   # end 侧
-    L, R = pts[li], pts[ri]
-    d_cross = np.sqrt(((L[:, None, :] - R[None, :, :]) ** 2).sum(-1))
-
-    def pos(arr, v):
-        return int(np.where(arr == v)[0][0])
-
-    s_in_L = start in li
-    s_pos = pos(li, start) if s_in_L else pos(ri, start)
-    e_pos = pos(ri, end) if s_in_L else pos(li, end)
-
-    # 最近交叉点对作交界 (避开与链首尾重合, 否则两侧链首尾同点)
-    k = None
-    for kk in np.argsort(d_cross.ravel()):
-        a, b = int(kk) // len(ri), int(kk) % len(ri)
-        l_s, l_e = (s_pos, a) if s_in_L else (a, e_pos)   # L 链首尾
-        r_s, r_e = (b, e_pos) if s_in_L else (s_pos, b)   # R 链首尾
-        if len(li) >= 2 and l_s == l_e:
-            continue
-        if len(ri) >= 2 and r_s == r_e:
-            continue
-        if d_cross[a, b] <= max_dist:
-            k = int(kk)
-            break
-    if k is None:
-        raise ValueError("bridge exceeds max_dist")
-    a, b = k // len(ri), k % len(ri)
-    if s_in_L:
-        return ([li[i] for i in chain_pts(L, s_pos, a, max_dist)]
-                + [ri[i] for i in chain_pts(R, b, e_pos, max_dist)])
-    return ([ri[i] for i in chain_pts(R, s_pos, b, max_dist)]
-            + [li[i] for i in chain_pts(L, a, e_pos, max_dist)])
-
-
-def chain_two_halves(a, b, max_dist):
-    """两组独立排序 (同一套 chain_pts) + 桥接; 失败返回 None -> 整批重采样.
-
-    组1: 任意首尾; 组2: 起点 = 组2中离组1终点最近的点 (须 <= max_dist).
-    """
-    try:
-        a_chain = a[chain_pts(a, 0, len(a) - 1, max_dist)]
-        a_end = a_chain[-1]
-        d_b = np.sqrt(((b - a_end) ** 2).sum(1))
-        j = int(d_b.argmin())
-        if d_b[j] > max_dist:
+def nn_walk(D, start, max_dist):
+    """从 start 出发的贪心最近邻游走; 任一步 > max_dist 返回 None."""
+    n = D.shape[0]
+    unv = np.ones(n, bool)
+    unv[start] = False
+    order, cur = [start], start
+    while unv.any():
+        d = D[cur].copy()
+        d[~unv] = np.inf
+        j = int(d.argmin())
+        if d[j] > max_dist:
             return None
-        b_end = (len(b) - 1) if j != len(b) - 1 else 0
-        b_chain = b[chain_pts(b, j, b_end, max_dist)]
-    except ValueError:
+        unv[j] = False
+        order.append(j)
+        cur = j
+    return order
+
+
+def insert_repair(path, D, rem, max_dist):
+    """剩余点逐个插入瓶颈代价最小的边 (代价 = max(d(u,x), d(x,v))).
+
+    单点贪心游走会把已消耗走廊两侧的叶尖困死, 插入可绕过已用点借道.
+    """
+    while rem:
+        best = None                          # (代价, 点, 插入位置)
+        for x in rem:
+            c = np.maximum(D[x, path[:-1]], D[x, path[1:]])
+            p = int(c.argmin())
+            if best is None or c[p] < best[0]:
+                best = (c[p], x, p)
+        if best[0] > max_dist:
+            return None
+        _, x, p = best
+        path.insert(p + 1, x)
+        rem.remove(x)
+    return path
+
+
+def chain_order(pts, start, max_dist, rng):
+    """返回 pts 的索引序: 相邻距离 <= max_dist; start 为起点 (None 则任意).
+
+    贪心最近邻对起点敏感 (薄走廊区域从中间出发会困死叶尖), 故多起点重试;
+    全败时以「起点+距起点最近点」为骨架做瓶颈插入修复.
+    不可行返回 None (调用方整批重采样).
+    """
+    D = np.sqrt(((pts[:, None, :] - pts[None, :, :]) ** 2).sum(-1))
+    n = len(pts)
+    starts = ([start] if start is not None
+              else rng.permutation(n))[:_NUM_CHAIN_STARTS]
+    for s in starts:
+        order = nn_walk(D, int(s), max_dist)
+        if order is not None:
+            return order
+    s0 = int(starts[0])
+    d0 = D[s0].copy()
+    d0[s0] = np.inf
+    s1 = int(d0.argmin())
+    if D[s0, s1] > max_dist:
         return None
+    rem = [i for i in range(n) if i not in (s0, s1)]
+    return insert_repair([s0, s1], D, rem, max_dist)
+
+
+def chain_two_halves(a, b, max_dist, rng):
+    """两组独立排序 + 桥接; 失败返回 None -> 整批重采样.
+
+    组1: 起点任意 (多起点贪心); 组2: 起点 = 组2中离组1终点最近的点 (须 <= max_dist).
+    """
+    a_order = chain_order(a, None, max_dist, rng)
+    if a_order is None:
+        return None
+    a_end = a_order[-1]
+    d_b = np.sqrt(((b - a[a_end]) ** 2).sum(1))
+    j = int(d_b.argmin())
+    if d_b[j] > max_dist:
+        return None
+    b_order = chain_order(b, j, max_dist, rng)
+    if b_order is None:
+        return None
+    a_chain, b_chain = a[a_order], b[b_order]
     full = np.vstack([a_chain, b_chain])
     d = np.linalg.norm(np.diff(full, axis=0), axis=1)
     if (d > max_dist + 1e-9).any():   # 防御性复核
@@ -284,7 +292,7 @@ def main():
         for attempt in range(1, _MAX_SAMPLE_ATTEMPTS + 1):
             pts = sample_points(gen_box, interior, r, args.num, rng, f"{arm}")
             a, b = pts[:args.num // 2], pts[args.num // 2:]
-            res = chain_two_halves(a, b, args.max_dist)
+            res = chain_two_halves(a, b, args.max_dist, rng)
             if res is not None:
                 a_ord, b_ord = res
                 full = np.vstack([a_ord, b_ord])
