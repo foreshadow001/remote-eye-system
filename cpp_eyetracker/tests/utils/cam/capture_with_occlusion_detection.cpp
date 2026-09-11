@@ -627,26 +627,42 @@ static bool occSegHitsRect(double u0,double v0,double u1,double v1,double w,doub
     return true;
 }
 static bool occTriInFrame(const OccCam& c, const array<double,3>* tri) {
-    double u[3], v[3]; int front = 0;
+    double P[3][3];                                   // 三角形顶点 → 相机系 (z 可为任意值)
     for (int k = 0; k < 3; ++k) {
         double d[3] = {tri[k][0]-c.t[0], tri[k][1]-c.t[1], tri[k][2]-c.t[2]};
-        double R[3];                                                   // Rᵀ·d
-        for (int i=0;i<3;++i) R[i]=c.R.m[0][i]*d[0]+c.R.m[1][i]*d[1]+c.R.m[2][i]*d[2];
-        if (R[2] > 1e-6) { u[k]=c.fx*R[0]/R[2]+c.cx; v[k]=c.fy*R[1]/R[2]+c.cy; ++front; }
+        for (int i=0;i<3;++i)
+            P[k][i] = c.R.m[0][i]*d[0] + c.R.m[1][i]*d[1] + c.R.m[2][i]*d[2];
     }
-    if (front == 0) return false;
-    if (front < 3) return true;                       // 横跨近平面: 保守算进入画面
-    for (int k = 0; k < 3; ++k) {
-        double uu=u[k], vv=v[k];
-        if (uu>=0 && uu<=c.w && vv>=0 && vv<=c.h) return true;
-        int k2=(k+1)%3;
-        if (occSegHitsRect(uu, vv, u[k2], v[k2], c.w, c.h)) return true;
+    // 近平面 z>=eps 裁剪 (Sutherland-Hodgman 单平面, 三角形→至多四边形):
+    // 横跨相机平面的三角形只保留镜头前方部分再投影判入画, 视场外的跨越不再误报
+    const double eps = 1e-4;                          // 0.1mm (镜头内顶点视为不可见)
+    double Q[4][3]; int n = 0;
+    for (int a = 0; a < 3; ++a) {
+        int b = (a+1)%3;
+        bool ain = P[a][2] >= eps, bin = P[b][2] >= eps;
+        if (ain) { for (int i=0;i<3;++i) Q[n][i] = P[a][i]; ++n; }
+        if (ain != bin) {
+            double t = (eps - P[a][2]) / (P[b][2] - P[a][2]);
+            for (int i=0;i<3;++i) Q[n][i] = P[a][i] + t*(P[b][i]-P[a][i]);
+            ++n;
+        }
     }
-    double px=c.w/2, py=c.h/2;                        // 画面中心在三角形内 (大三角包围整幅)
-    double d1=(u[1]-u[0])*(py-v[0])-(v[1]-v[0])*(px-u[0]);
-    double d2=(u[2]-u[1])*(py-v[1])-(v[2]-v[1])*(px-u[1]);
-    double d3=(u[0]-u[2])*(py-v[2])-(v[0]-v[2])*(px-u[2]);
-    return (d1>=0&&d2>=0&&d3>=0) || (d1<=0&&d2<=0&&d3<=0);
+    if (n < 3) return false;                          // 完全在镜头后方或裁剪后零面积
+    double u[4], v[4];
+    for (int k = 0; k < n; ++k) { u[k]=c.fx*Q[k][0]/Q[k][2]+c.cx; v[k]=c.fy*Q[k][1]/Q[k][2]+c.cy; }
+    for (int k = 0; k < n; ++k) {                     // 顶点入矩形 / 边与矩形相交 (含闭合边)
+        if (u[k]>=0 && u[k]<=c.w && v[k]>=0 && v[k]<=c.h) return true;
+        int k2=(k+1)%n;
+        if (occSegHitsRect(u[k], v[k], u[k2], v[k2], c.w, c.h)) return true;
+    }
+    double px=c.w/2, py=c.h/2;                        // 画面中心在裁剪后凸多边形内 (近处大三角包围整幅)
+    bool allp = true, alln = true;
+    for (int k = 0; k < n; ++k) {
+        int k2=(k+1)%n;
+        double cr = (u[k2]-u[k])*(py-v[k]) - (v[k2]-v[k])*(px-u[k]);
+        if (cr > 0) alln = false; else if (cr < 0) allp = false;
+    }
+    return allp || alln;
 }
 
 // ---- 启动加载: URDF + 全部相机 XML (Master; Slave 经 OCCL 同步结果, 不加载) ----
@@ -1968,9 +1984,9 @@ int main() {
                         ArmResult ar = moveArmToTarget();
                         if(ar==ArmResult::ARM_EXHAUSTED){
                             g_show_exhausted = true;
-                        } else {
+                        } else if(ar==ArmResult::ARM_ERROR){
                             logException("ERROR","piper","arm move failed");
-                        }
+                        }   // ARM_OK: 正常, 不记错误
                     });
                 }
 
@@ -2027,11 +2043,17 @@ int main() {
 
                 // ====== SYNC: Wait Slave HDF5 → GAZE forward → GAZE_DONE ======
                 if (is_master_pc) {
-                    // (1) Wait for Slave HDF5_DONE
+                    // (1) Wait for Slave HDF5_DONE (120s 超时: 消息丢失/Slave 掉线时不永久卡住按键)
                     auto t_wait0=chrono::steady_clock::now();
                     cout<<"[Sync] Waiting for Slave HDF5_DONE..."<<endl;
-                    while(global_running && !g_slave_hdf5_done.load())
+                    while(global_running && !g_slave_hdf5_done.load()) {
                         this_thread::sleep_for(chrono::milliseconds(50));
+                        if (chrono::duration<double>(chrono::steady_clock::now()-t_wait0).count() > 120.0) {
+                            logException("WARN","sync","Slave HDF5_DONE timeout (120s) - continuing");
+                            cout<<"[Sync] WARN: Slave HDF5_DONE timeout - continuing"<<endl;
+                            break;
+                        }
+                    }
                     g_slave_hdf5_done = false;
                     auto t_wait1=chrono::steady_clock::now();
                     g_wait_slave_hdf5_s = chrono::duration<double>(t_wait1-t_wait0).count();
@@ -2072,8 +2094,11 @@ int main() {
                     int64_t local_total=(int64_t)local_ci*g_hdf5_chunk_capacity+local_fo;
                     if (is_master_pc) {
                         SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);int opt=1;setsockopt(hs,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
+                        {DWORD to=15000;setsockopt(hs,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));}  // accept 可中断 (同 gaze server)
                         sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(handshake_port);sa.sin_addr.s_addr=INADDR_ANY;
                         ::bind(hs,(sockaddr*)&sa,sizeof(sa));listen(hs,1);sockaddr_in ca;socklen_t cl=sizeof(ca);SOCKET cs=accept(hs,(sockaddr*)&ca,&cl);
+                        if(cs==INVALID_SOCKET)
+                            logException("WARN","sentry","handshake accept timeout - skipped");
                         if(cs!=INVALID_SOCKET){int64_t peer_buf[2];recv(cs,(char*)peer_buf,sizeof(peer_buf),0);int64_t peer_total=peer_buf[0];
                             int64_t send_buf[2]={local_total,local_total};send(cs,(const char*)send_buf,sizeof(send_buf),0);closesocket(cs);
                             int64_t peer_val=peer_total,local_val=local_total;
@@ -2290,13 +2315,13 @@ int main() {
             cout<<"[Piper] "<<g_arm<<" zeroed. Press [s] to start session."<<endl;
         }
         else if(is_master_pc&&(key=='c'||key=='C')&&!g_piper_busy&&!is_recording&&!is_dumping&&!g_show_over){
-            // Clear only current arm's piper sentry (OVER 状态下禁用, 只能 b/t/q)
-            if(g_arm=="upper"){g_upper_idx=0;g_upper_done=false;}
-            else{g_lower_idx=0;g_lower_done=false;}
+            // 两臂 piper sentry 一并清零 (否则另一臂 done 时 't' 无法切入, 也无法单独清它)
+            g_upper_idx=0; g_upper_done=false;
+            g_lower_idx=0; g_lower_done=false;
             g_show_exhausted=false;
             g_recording_enabled=false; updatePiperSentry();
             syncPiperToSlave();
-            cout<<"[Piper] "<<g_arm<<" sentry cleared."<<endl;
+            cout<<"[Piper] Both arms' sentry cleared (upper+lower)."<<endl;
         }
         else if(is_master_pc&&(key=='i'||key=='I')&&!g_piper_busy&&!is_recording&&!is_dumping&&!g_precreating.load()){
             // 提前创建 25×N 个 h5: 双机握手预检 → 各自串行创建 → 握手退出
@@ -2314,7 +2339,12 @@ int main() {
                 cout<<"[HDF5] Master clear. Pre-checking slave..."<<endl;
             }
         }
-        else if(is_master_pc&&(key=='t'||key=='T')&&!g_piper_busy&&!is_recording&&!is_dumping){
+        else if(is_master_pc&&(key=='t'||key=='T')){
+            // 守卫被挡时显式提示 (原来静默吞掉, 排障无从下手)
+            if(g_piper_busy)      cout<<"[t] ignored: arm busy (moving/zeroing/occlusion check)"<<endl;
+            else if(is_recording) cout<<"[t] ignored: recording in progress"<<endl;
+            else if(is_dumping)   cout<<"[t] ignored: HDF5 dump in progress (stuck? see [Sync]/[Sentry] lines)"<<endl;
+            else {
             string new_arm=(g_arm=="upper")?"lower":"upper";
             bool nd=(new_arm=="upper")?g_upper_done:g_lower_done;
             if(nd){cout<<"[t] "<<new_arm<<" already done."<<endl;goto next_iter;}
@@ -2345,6 +2375,7 @@ int main() {
             syncPiperToSlave();
             while(cv::waitKey(1)>=0){}   // 清空切臂/回零期间滞留的按键 (SPACE 仅 READY 内有效)
             cout<<"[t] Switched to "<<g_arm<<" (press 's' to start session)"<<endl;
+            }
         }
 
         bool trig_fired = trigger_start || g_trigger_pending.exchange(false);
