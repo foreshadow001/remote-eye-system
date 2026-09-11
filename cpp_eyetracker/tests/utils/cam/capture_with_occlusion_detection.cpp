@@ -2170,6 +2170,7 @@ int main() {
                 auto t_sync_done=chrono::steady_clock::now();
 
                 // Step 4: Post-dump sentry handshake
+                // 双向 15s 真超时 (select): 对端掉线时不再永久卡死 (SO_RCVTIMEO 不作用于 accept)
                 auto t_sentry0=chrono::steady_clock::now();
                 if (enable_net_sync) {
                     g_syncing=true;
@@ -2178,34 +2179,86 @@ int main() {
                     int64_t local_total=(int64_t)local_ci*g_hdf5_chunk_capacity+local_fo;
                     if (is_master_pc) {
                         SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);int opt=1;setsockopt(hs,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
-                        {DWORD to=15000;setsockopt(hs,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));}  // accept 可中断 (同 gaze server)
                         sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(handshake_port);sa.sin_addr.s_addr=INADDR_ANY;
-                        ::bind(hs,(sockaddr*)&sa,sizeof(sa));listen(hs,1);sockaddr_in ca;socklen_t cl=sizeof(ca);SOCKET cs=accept(hs,(sockaddr*)&ca,&cl);
-                        if(cs==INVALID_SOCKET)
-                            logException("WARN","sentry","handshake accept timeout - skipped");
-                        if(cs!=INVALID_SOCKET){int64_t peer_buf[2];recv(cs,(char*)peer_buf,sizeof(peer_buf),0);int64_t peer_total=peer_buf[0];
-                            int64_t send_buf[2]={local_total,local_total};send(cs,(const char*)send_buf,sizeof(send_buf),0);closesocket(cs);
-                            int64_t peer_val=peer_total,local_val=local_total;
-                            cout<<"[Sentry] Post-dump handshake: Local="<<local_val<<" Peer="<<peer_val<<endl;
-                            if(peer_val!=local_val){g_sentry_mismatch_count++;int peer_ci=(int)(peer_val/g_hdf5_chunk_capacity),peer_fo=(int)(peer_val%g_hdf5_chunk_capacity);
-                                if(peer_val<local_val){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;}
-                                logException("WARN","sentry","Mismatch #"+to_string(g_sentry_mismatch_count)+" diff="+to_string(llabs(local_val-peer_val))+" - using min");
-                                if(g_sentry_mismatch_count>=3){logException("FATAL","sentry","3 consecutive mismatches - exiting.");global_running=false;}}
-                            else{g_sentry_mismatch_count=0;}}
+                        if(::bind(hs,(sockaddr*)&sa,sizeof(sa))==0&&listen(hs,1)==0){
+                            cout<<"[Sentry] Master waiting Slave on port "<<handshake_port<<" (15s timeout)..."<<endl;
+                            u_long nb=1;ioctlsocket(hs,FIONBIO,&nb);          // 非阻塞 + select 真超时
+                            fd_set fds;FD_ZERO(&fds);FD_SET(hs,&fds);
+                            timeval tv{15,0};
+                            SOCKET cs=INVALID_SOCKET;
+                            if(select(0,&fds,nullptr,nullptr,&tv)>0){
+                                sockaddr_in ca;socklen_t cl=sizeof(ca);
+                                cs=accept(hs,(sockaddr*)&ca,&cl);
+                                if(cs!=INVALID_SOCKET){u_long b=0;ioctlsocket(cs,FIONBIO,&b);}
+                            }
+                            if(cs==INVALID_SOCKET){
+                                logException("WARN","sentry","handshake accept timeout - skipped");
+                                cout<<"[Sentry] WARN: Slave did not connect within 15s - handshake skipped"<<endl;
+                            } else {
+                                DWORD to=15000;setsockopt(cs,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));
+                                int64_t peer_buf[2]={0,0};int need=sizeof(peer_buf),got=0,r;
+                                while(got<need){r=recv(cs,(char*)peer_buf+got,need-got,0);if(r<=0)break;got+=r;}
+                                if(got==need){
+                                    int64_t send_buf[2]={local_total,local_total};send(cs,(const char*)send_buf,sizeof(send_buf),0);
+                                    int64_t peer_val=peer_buf[0],local_val=local_total;
+                                    cout<<"[Sentry] Post-dump handshake: Local="<<local_val<<" Peer="<<peer_val<<endl;
+                                    if(peer_val!=local_val){g_sentry_mismatch_count++;int peer_ci=(int)(peer_val/g_hdf5_chunk_capacity),peer_fo=(int)(peer_val%g_hdf5_chunk_capacity);
+                                        if(peer_val<local_val){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;}
+                                        logException("WARN","sentry","Mismatch #"+to_string(g_sentry_mismatch_count)+" diff="+to_string(llabs(local_val-peer_val))+" - using min");
+                                        if(g_sentry_mismatch_count>=3){logException("FATAL","sentry","3 consecutive mismatches - exiting.");global_running=false;}}
+                                    else{g_sentry_mismatch_count=0;}
+                                } else {
+                                    logException("WARN","sentry","handshake recv failed/partial - skipped");
+                                    cout<<"[Sentry] WARN: recv from Slave failed - handshake skipped"<<endl;
+                                }
+                                closesocket(cs);
+                            }
+                        } else {
+                            logException("WARN","sentry","handshake bind/listen failed - skipped");
+                            cout<<"[Sentry] WARN: bind/listen on port "<<handshake_port<<" failed (err "<<WSAGetLastError()<<") - skipped"<<endl;
+                        }
                         closesocket(hs);
                     } else {
                         SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(handshake_port);
                         inet_pton(AF_INET,g_master_ip.c_str(),&sa.sin_addr);
-                        while(connect(hs,(sockaddr*)&sa,sizeof(sa))==-1&&global_running){this_thread::sleep_for(chrono::milliseconds(100));cv::waitKey(1);}
-                        if(hs!=INVALID_SOCKET){int64_t send_buf[2]={local_total,local_total};send(hs,(const char*)send_buf,sizeof(send_buf),0);
-                            int64_t peer_buf[2];recv(hs,(char*)peer_buf,sizeof(peer_buf),0);int64_t peer_total=peer_buf[0];closesocket(hs);
-                            int64_t peer_val=peer_total,local_val=local_total;
-                            cout<<"[Sentry] Post-dump handshake: Local="<<local_val<<" Peer="<<peer_val<<endl;
-                            if(peer_val!=local_val){g_sentry_mismatch_count++;int peer_ci=(int)(peer_val/g_hdf5_chunk_capacity),peer_fo=(int)(peer_val%g_hdf5_chunk_capacity);
-                                if(peer_val<local_val){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;}
-                                logException("WARN","sentry","Mismatch #"+to_string(g_sentry_mismatch_count)+" diff="+to_string(llabs(local_val-peer_val))+" - using min");
-                                if(g_sentry_mismatch_count>=3){logException("FATAL","sentry","3 consecutive mismatches - exiting.");global_running=false;}}
-                            else{g_sentry_mismatch_count=0;}}
+                        cout<<"[Sentry] Slave connecting to "<<g_master_ip<<":"<<handshake_port<<" (15s timeout)..."<<endl;
+                        u_long nb=1;ioctlsocket(hs,FIONBIO,&nb);              // 非阻塞 connect + select 写就绪
+                        int cr=connect(hs,(sockaddr*)&sa,sizeof(sa));
+                        if(cr!=0&&WSAGetLastError()!=WSAEWOULDBLOCK){closesocket(hs);hs=INVALID_SOCKET;}
+                        if(hs!=INVALID_SOCKET){
+                            fd_set wfds;FD_ZERO(&wfds);FD_SET(hs,&wfds);
+                            timeval tv{15,0};
+                            if(select(0,nullptr,&wfds,nullptr,&tv)<=0){
+                                cout<<"[Sentry] WARN: connect to Master timeout - handshake skipped"<<endl;
+                                logException("WARN","sentry","connect to master timeout - skipped");
+                            } else {
+                                int soerr=0;int sl=sizeof(soerr);
+                                getsockopt(hs,SOL_SOCKET,SO_ERROR,(char*)&soerr,&sl);
+                                if(soerr!=0){
+                                    cout<<"[Sentry] WARN: connect failed (err "<<soerr<<") - handshake skipped"<<endl;
+                                    logException("WARN","sentry","connect failed - skipped");
+                                } else {
+                                    u_long b=0;ioctlsocket(hs,FIONBIO,&b);
+                                    DWORD to=15000;setsockopt(hs,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));
+                                    int64_t send_buf[2]={local_total,local_total};send(hs,(const char*)send_buf,sizeof(send_buf),0);
+                                    int64_t peer_buf[2]={0,0};int need=sizeof(peer_buf),got=0,r;
+                                    while(got<need){r=recv(hs,(char*)peer_buf+got,need-got,0);if(r<=0)break;got+=r;}
+                                    if(got==need){
+                                        int64_t peer_val=peer_buf[0],local_val=local_total;
+                                        cout<<"[Sentry] Post-dump handshake: Local="<<local_val<<" Peer="<<peer_val<<endl;
+                                        if(peer_val!=local_val){g_sentry_mismatch_count++;int peer_ci=(int)(peer_val/g_hdf5_chunk_capacity),peer_fo=(int)(peer_val%g_hdf5_chunk_capacity);
+                                            if(peer_val<local_val){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;}
+                                            logException("WARN","sentry","Mismatch #"+to_string(g_sentry_mismatch_count)+" diff="+to_string(llabs(local_val-peer_val))+" - using min");
+                                            if(g_sentry_mismatch_count>=3){logException("FATAL","sentry","3 consecutive mismatches - exiting.");global_running=false;}}
+                                        else{g_sentry_mismatch_count=0;}
+                                    } else {
+                                        cout<<"[Sentry] WARN: recv from Master failed - handshake skipped"<<endl;
+                                        logException("WARN","sentry","recv from master failed - skipped");
+                                    }
+                                }
+                            }
+                        }
+                        if(hs!=INVALID_SOCKET)closesocket(hs);
                     }
                     g_syncing=false;
                 }
