@@ -384,28 +384,37 @@ bool recvLine(SOCKET sock, string& line, int timeout_ms = 3000) {
 }
 
 // 带状态返回的 recvLine: 0=收到一行, 1=超时(无数据), 2=连接关闭/错误
+// 每套接字残留缓冲跨调用保留: 一次 recv 可能带回多行 (Nagle 合并分段),
+// 只取首行返回、剩余必须存回, 否则同分段的后续行被静默丢弃
+// (P001 教训: OCCL+OCCL_J 连发合并 → GAZE_DONE 被丢 → 流水线死锁)
+static mutex s_linebuf_mtx;
+static map<SOCKET,string> s_linebuf;
 int recvLineStatus(SOCKET sock, string& line, int timeout_ms = 3000) {
     DWORD to = timeout_ms;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
     char buf[256]; string acc;
+    { lock_guard<mutex> lk(s_linebuf_mtx); acc.swap(s_linebuf[sock]); }   // 取走残留
     auto deadline = chrono::steady_clock::now() + chrono::milliseconds(timeout_ms);
     while (chrono::steady_clock::now() < deadline) {
+        size_t nl = acc.find('\n');              // 先查已有缓冲 (可能残留完整行)
+        if (nl != string::npos) { line = acc.substr(0,nl);
+            if (!line.empty() && line.back()=='\r') line.pop_back();
+            { lock_guard<mutex> lk(s_linebuf_mtx); s_linebuf[sock] = acc.substr(nl+1); }
+            return 0; }
         int n = recv(sock, buf, sizeof(buf)-1, 0);
-        if (n == 0) return 2;                     // 对端正常关闭
+        if (n == 0) { lock_guard<mutex> lk(s_linebuf_mtx); s_linebuf[sock] = acc; return 2; }   // 对端正常关闭 (残留仍存回)
         if (n < 0) {
 #ifdef _WIN32
             int e = WSAGetLastError();
-            if (e == WSAETIMEDOUT) return 1;      // 空闲超时, 不是断连
+            if (e == WSAETIMEDOUT) { lock_guard<mutex> lk(s_linebuf_mtx); s_linebuf[sock] = acc; return 1; }   // 空闲超时
 #else
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { lock_guard<mutex> lk(s_linebuf_mtx); s_linebuf[sock] = acc; return 1; }
 #endif
-            return 2;                              // 其他错误视为断连
+            { lock_guard<mutex> lk(s_linebuf_mtx); s_linebuf[sock] = acc; return 2; }            // 其他错误视为断连
         }
         buf[n] = '\0'; acc += buf;
-        size_t nl = acc.find('\n');
-        if (nl != string::npos) { line = acc.substr(0,nl);
-            if (!line.empty() && line.back()=='\r') line.pop_back(); return 0; }
     }
+    { lock_guard<mutex> lk(s_linebuf_mtx); s_linebuf[sock] = acc; }       // 超时退出也存回
     return 1;
 }
 bool sendLineRaw(SOCKET sock, const string& msg) {
@@ -445,8 +454,7 @@ static string g_occ_last_line;            // UI 一行摘要
 static array<double,12> g_occ_joints{};   // 本目标判定所用关节 (qU6+qL6; h5 occ_joints 调试数据集)
 static bool g_occ_joints_ok = false;      // false = 本目标无有效关节 (h5 写 NaN)
 
-// sentry 专用链路 (独立端口; 启动握手测试通过才启用每录同步)
-static bool g_sentry_link_ok = false;
+void sendJointsToSlave();                                    // 专用 joints 通道推送 (定义在 gaze 段前)
 
 // ---- 小型 3x3 数学 (FK 专用, 不引入新依赖) ----
 struct OccMat3 { double m[3][3]; };
@@ -781,22 +789,18 @@ static bool occQueryPose(const string& arm, ArmPose& pose) {
 
 static void runOcclusionCheck(const string& arm, int target_idx) {
     if (!g_occ_enabled) {
-        // 停用也要同步 Slave (空 OCCL/OCCL_J), 否则残留上一目标结果
+        // 停用也要同步 Slave (空 OCCL / 空 JOINTS), 否则残留上一目标结果
         { lock_guard<mutex> lk(g_occ_mtx); g_occ_occluded.clear(); g_occ_joints_ok = false; }
-        if (g_cmd_sock != INVALID_SOCKET) {
-            sendLine(g_cmd_sock, "OCCL:");
-            sendLine(g_cmd_sock, "OCCL_J:");
-        }
+        if (g_cmd_sock != INVALID_SOCKET) sendLine(g_cmd_sock, "OCCL:");
+        sendJointsToSlave();
         return;
     }
     double qU[6], qL[6];
     if (!occQueryJoints("upper", qU) || !occQueryJoints("lower", qL)) {
         cerr << "[Occ] GET_JOINTS failed — no camera marked occluded this target" << endl;
         { lock_guard<mutex> lk(g_occ_mtx); g_occ_occluded.clear(); g_occ_joints_ok = false; }
-        if (g_cmd_sock != INVALID_SOCKET) {          // 同步清 Slave 残留 (valid 恢复 1)
-            sendLine(g_cmd_sock, "OCCL:");
-            sendLine(g_cmd_sock, "OCCL_J:");
-        }
+        if (g_cmd_sock != INVALID_SOCKET) sendLine(g_cmd_sock, "OCCL:");   // 同步清 Slave 残留 (valid 恢复 1)
+        sendJointsToSlave();
         g_occ_last_line = "Occ: query FAILED (valid=1)";
         return;
     }
@@ -831,13 +835,8 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
               g_occ_occluded.clear(); g_occ_last_line.clear();
               for (int k = 0; k < 6; ++k) { g_occ_joints[k] = qU[k]; g_occ_joints[6+k] = qL[k]; }
               g_occ_joints_ok = true; }
-            if (g_cmd_sock != INVALID_SOCKET) {      // 同步清 Slave 残留 (关节仍下发)
-                sendLine(g_cmd_sock, "OCCL:");
-                string jm = "OCCL_J:";
-                char b[32];
-                for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), "%s%.6f", k ? "," : "", g_occ_joints[k]); jm += b; }
-                sendLine(g_cmd_sock, jm);
-            }
+            if (g_cmd_sock != INVALID_SOCKET) sendLine(g_cmd_sock, "OCCL:");   // 同步清 Slave 残留 (关节仍经专用通道下发)
+            sendJointsToSlave();
             return;
         }
     }
@@ -867,19 +866,13 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
     }
     cout << "[Occ] " << arm << " target #" << (target_idx + 1) << ": "
          << occ.size() << "/" << g_occ_cams.size() << " cams occluded" << endl;
-    // 同步 Slave: 遮挡集 (Slave 自行与本机相机求交) + 判定所用关节 (h5 occ_joints)
+    // 同步 Slave: 遮挡集走 cmd (Slave 自行与本机相机求交); 关节走专用 joints 通道 (h5 occ_joints)
     if (g_cmd_sock != INVALID_SOCKET) {
         string msg = "OCCL:";
         for (auto& sn : occ) msg += (msg.size() > 5 ? "," : "") + sn;
         sendLine(g_cmd_sock, msg);
-        string jm = "OCCL_J:";
-        { lock_guard<mutex> lk(g_occ_mtx);
-          if (g_occ_joints_ok) {
-              char b[32];
-              for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), "%s%.6f", k ? "," : "", g_occ_joints[k]); jm += b; }
-          } }
-        sendLine(g_cmd_sock, jm);
     }
+    sendJointsToSlave();
 }
 
 // ================== Piper: compute tool in CCS ==================
@@ -929,6 +922,85 @@ void syncPiperToSlave(bool send_init_ok=false) {
     if(send_init_ok) {
         sendLineRaw(g_cmd_sock,"INIT_OK"); this_thread::sleep_for(chrono::milliseconds(50));
         cout<<"[Init] INIT_OK sent to Slave."<<endl;
+    }
+}
+
+// ================== Joints channel (遮挡判定关节, 独立端口) ==================
+// Master 判定所用关节 (qU6+qL6) 推送给 Slave → 随本录写入各相机 h5 occ_joints。
+// 不走 cmd 通道: 调试数据流与控制流隔离, 且避免 cmd 上多行连发被合并分段。
+static SOCKET g_joints_listen_sock = INVALID_SOCKET;
+static SOCKET g_joints_sock = INVALID_SOCKET;
+static atomic<bool> g_joints_connected{false};
+static mutex g_joints_send_mtx;
+
+// Master: 把当前 g_occ_joints 推给 Slave ("JOINTS:q0,...,q11"; 无效 → "JOINTS:")
+void sendJointsToSlave() {
+    if (g_joints_sock == INVALID_SOCKET) return;                 // 通道未连 (单机/未就绪) → 静默
+    string msg = "JOINTS:";
+    { lock_guard<mutex> lk(g_occ_mtx);
+      if (g_occ_joints_ok) {
+          char b[32];
+          for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), "%s%.6f", k ? "," : "", g_occ_joints[k]); msg += b; }
+      } }
+    lock_guard<mutex> lk(g_joints_send_mtx);
+    if (send(g_joints_sock, (msg + "\n").c_str(), (int)msg.size() + 1, 0) <= 0)
+        cerr << "[Joints] send to Slave failed (err " << WSAGetLastError() << ")" << endl;
+}
+
+void jointsServerWorker(int joints_port) {                       // Master: 监听 + 保持连接
+    g_joints_listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (g_joints_listen_sock == INVALID_SOCKET) return;
+    int opt = 1; setsockopt(g_joints_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(joints_port); sa.sin_addr.s_addr = INADDR_ANY;
+    if (::bind(g_joints_listen_sock, (sockaddr*)&sa, sizeof(sa)) != 0 || listen(g_joints_listen_sock, 1) != 0) {
+        cerr << "[Joints] Master bind/listen on port " << joints_port << " failed (err " << WSAGetLastError() << ")" << endl;
+        return;
+    }
+    cout << "[Joints] Master listening TCP ::" << joints_port << endl;
+    while (global_running) {
+        sockaddr_in ca; socklen_t cl = sizeof(ca);
+        SOCKET cs = accept(g_joints_listen_sock, (sockaddr*)&ca, &cl);   // 阻塞; 退出时 closesocket 打断
+        if (cs == INVALID_SOCKET) { if (!global_running) break; continue; }
+        { lock_guard<mutex> lk(g_joints_send_mtx);
+          if (g_joints_sock != INVALID_SOCKET) closesocket(g_joints_sock);
+          g_joints_sock = cs; }
+        g_joints_connected = true;
+        cout << "[Joints] Slave connected." << endl;
+    }
+}
+
+void jointsClientWorker(const string& master_ip, int joints_port) {  // Slave: 连接 + 接收
+    while (global_running) {
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) { this_thread::sleep_for(chrono::seconds(2)); continue; }
+        sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(joints_port);
+        inet_pton(AF_INET, master_ip.c_str(), &sa.sin_addr);
+        if (connect(sock, (sockaddr*)&sa, sizeof(sa)) != 0) {
+            closesocket(sock); this_thread::sleep_for(chrono::seconds(2)); continue;
+        }
+        g_joints_connected = true;
+        cout << "[Joints] Slave connected to Master." << endl;
+        while (global_running) {
+            string line;
+            int st = recvLineStatus(sock, line, 300000);
+            if (st == 2) { cerr << "[Joints] Connection closed by Master - reconnecting." << endl; break; }
+            if (st == 1) continue;
+            if (line.rfind("JOINTS:", 0) == 0) {
+                lock_guard<mutex> lk(g_occ_mtx);
+                g_occ_joints_ok = false;
+                stringstream ss(line.substr(7)); string tok;
+                int k = 0;
+                while (k < 12 && getline(ss, tok, ',')) {
+                    try { g_occ_joints[k++] = stod(tok); }
+                    catch (...) { k = 0; break; }
+                }
+                if (k == 12) g_occ_joints_ok = true;
+                sendLineRaw(sock, "JOINTS_ACK");
+            }
+        }
+        g_joints_connected = false; closesocket(sock);
+        if (!global_running) break;
+        this_thread::sleep_for(chrono::seconds(1));
     }
 }
 
@@ -1360,19 +1432,6 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
                     g_occ_last_line = "Occluded: " + to_string(n) + "/20 (Master judged)";
                     cout << "[Cmd] OCCL: " << n << " cams occluded (Master judged)" << endl;
                 }
-                else if(line.rfind("OCCL_J:",0)==0){
-                    // Master 判定所用关节 (qU6+qL6 逗号表; 空 = 本目标无有效关节)
-                    // 仅调试用: 随本录写入各相机 h5 的 occ_joints 数据集
-                    lock_guard<mutex> lk(g_occ_mtx);
-                    g_occ_joints_ok = false;
-                    stringstream ss(line.substr(7)); string tok;
-                    int k = 0;
-                    while (k < 12 && getline(ss, tok, ',')) {
-                        try { g_occ_joints[k++] = stod(tok); }
-                        catch (...) { k = 0; break; }
-                    }
-                    if (k == 12) g_occ_joints_ok = true;
-                }
                 else if(line.rfind("PIPER:",0)==0){
                     size_t c2=line.find(':',6); if(c2==string::npos) continue;
                     string an=line.substr(6,c2-6);
@@ -1540,8 +1599,8 @@ int main() {
     g_master_ip=cap["master_ip"].as<string>();
     string slave_ip=cap["slave_ip"].as<string>();
     int net_port=cap["port"].as<int>();
-    int sentry_port=net_port+500;                       // sentry 专用端口 (启动握手测试 + 每录同步)
-    try{sentry_port=cap["sentry_port"].as<int>();}catch(...){}
+    int joints_port=net_port+500;                       // joints 专用端口 (遮挡判定关节 → Slave h5)
+    try{joints_port=cap["joints_port"].as<int>();}catch(...){}
     vector<string> camera_ids=cap["cam_indices"].as<vector<string>>();
     bool use_hw_trigger=cap["hardware_trigger"].as<bool>();
     bool enable_offset=true, enable_intersection=true, enable_net_sync=true;
@@ -1657,7 +1716,7 @@ int main() {
     }
 
     // ====== TCP handshakes (sequential, one port at a time, before camera init) ======
-    thread cmd_thread, gaze_thread;
+    thread cmd_thread, gaze_thread, joints_thread;
     atomic<bool> cmd_ready{false}, gaze_ready{false};
 
     if (enable_net_sync) {
@@ -1685,6 +1744,11 @@ int main() {
             if(is_master_pc&&g_cmd_sock!=INVALID_SOCKET)sendLineRaw(g_cmd_sock,"EXIT");
             global_running=false;if(cmd_thread.joinable())cmd_thread.join();return 1; }
         cout<<"[Gaze] Gaze channel established."<<endl;
+
+        // 3. Joints channel (遮挡判定关节 → Slave h5 occ_joints; 与 cmd 控制流隔离)
+        cout<<"[Joints] Starting joints channel on port "<<joints_port<<"..."<<endl;
+        if (is_master_pc) joints_thread=thread(jointsServerWorker, joints_port);
+        else joints_thread=thread(jointsClientWorker, g_master_ip, joints_port);
     }
 
     // 3. Piper connection (Master only, with retry)
@@ -1784,82 +1848,35 @@ int main() {
         cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1);
     }
     if (enable_net_sync) {
-        // 专用 sentry 端口 (sentry_port, main 作用域读入)。
-        // 启动即握手 = 链路连通性测试 + sentry 对齐; 失败则本录程停用每录握手
-        // (避免防火墙阻断时每录空等 15s), 大声警告提示排查。
         auto local_ci=g_chunk_idx; auto local_fo=g_frame_offset.load();
         int64_t local_total=(int64_t)local_ci*g_hdf5_chunk_capacity+local_fo;
-        cout<<"[Sentry] Startup handshake: local="<<local_total<<" (chunk="<<local_ci<<" offset="<<local_fo<<") port="<<sentry_port<<endl;
+        cout<<"[Sentry] Startup handshake: local="<<local_total<<" (chunk="<<local_ci<<" offset="<<local_fo<<")"<<endl;
         if (is_master_pc) {
             SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);int opt=1;setsockopt(hs,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
-            sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(sentry_port);sa.sin_addr.s_addr=INADDR_ANY;
-            if(::bind(hs,(sockaddr*)&sa,sizeof(sa))==0&&listen(hs,1)==0){
-                cout<<"[Sentry] Master waiting for Slave (20s timeout)..."<<endl;
-                u_long nb=1;ioctlsocket(hs,FIONBIO,&nb);
-                fd_set fds;FD_ZERO(&fds);FD_SET(hs,&fds);
-                timeval tv{20,0};
-                SOCKET cs=INVALID_SOCKET;
-                if(select(0,&fds,nullptr,nullptr,&tv)>0){
-                    sockaddr_in ca;socklen_t cl=sizeof(ca);
-                    cs=accept(hs,(sockaddr*)&ca,&cl);
-                    if(cs!=INVALID_SOCKET){u_long b=0;ioctlsocket(cs,FIONBIO,&b);}
-                }
-                if(cs==INVALID_SOCKET){
-                    cerr<<"[Sentry] FAIL: Slave did not connect on port "<<sentry_port
-                        <<" — check firewall (inbound to Master). Per-recording sentry sync DISABLED."<<endl;
-                    logException("WARN","sentry","startup handshake timeout - per-recording sync disabled");
-                } else {
-                    DWORD to=20000;setsockopt(cs,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));
-                    int64_t peer_buf[2]={0,0};int need=sizeof(peer_buf),got=0,r;
-                    while(got<need){r=recv(cs,(char*)peer_buf+got,need-got,0);if(r<=0)break;got+=r;}
-                    if(got==need){
-                        int64_t send_buf[2]={local_total,local_total};send(cs,(const char*)send_buf,sizeof(send_buf),0);
-                        int64_t peer_total=peer_buf[0];
-                        if(peer_total!=local_total){int peer_ci=(int)(peer_total/g_hdf5_chunk_capacity),peer_fo=(int)(peer_total%g_hdf5_chunk_capacity);
-                            logException("WARN","sentry","Startup mismatch: Master("+to_string(local_ci)+","+to_string(local_fo)
-                                +") Slave("+to_string(peer_ci)+","+to_string(peer_fo)+") diff="+to_string(llabs(local_total-peer_total))+" - using min");
-                            if(peer_total<local_total){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;updateSentry(g_sentry_root);}}
-                        g_sentry_link_ok=true;
-                        cout<<"[Sentry] Startup handshake PASS. Synced to: chunk="<<g_chunk_idx<<" offset="<<g_frame_offset<<endl;
-                    } else {cerr<<"[Sentry] FAIL: recv from Slave — per-recording sync DISABLED."<<endl;}
-                    closesocket(cs);
-                }
-            } else {cerr<<"[Sentry] FAIL: bind/listen on port "<<sentry_port<<" (err "<<WSAGetLastError()<<")"<<endl;}
+            sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(net_port+300);sa.sin_addr.s_addr=INADDR_ANY;
+            ::bind(hs,(sockaddr*)&sa,sizeof(sa));listen(hs,1);
+            cout<<"[Sentry] Master waiting for Slave startup handshake on port "<<net_port+300<<"..."<<endl;
+            sockaddr_in ca;socklen_t cl=sizeof(ca);SOCKET cs=accept(hs,(sockaddr*)&ca,&cl);
+            if(cs!=INVALID_SOCKET){int64_t peer_buf[2];recv(cs,(char*)peer_buf,sizeof(peer_buf),0);int64_t peer_total=peer_buf[0];
+                int64_t send_buf[2]={local_total,local_total};send(cs,(const char*)send_buf,sizeof(send_buf),0);closesocket(cs);
+                if(peer_total!=local_total){int peer_ci=(int)(peer_total/g_hdf5_chunk_capacity),peer_fo=(int)(peer_total%g_hdf5_chunk_capacity);
+                    logException("WARN","sentry","Startup mismatch: Master("+to_string(local_ci)+","+to_string(local_fo)
+                        +") Slave("+to_string(peer_ci)+","+to_string(peer_fo)+") diff="+to_string(llabs(local_total-peer_total))+" - using min");
+                    if(peer_total<local_total){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;updateSentry(g_sentry_root);}}
+                cout<<"[Sentry] Startup handshake done. Synced to: chunk="<<g_chunk_idx<<" offset="<<g_frame_offset<<endl;}
             closesocket(hs);
         } else {
-            SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(sentry_port);
+            cout<<"[Sentry] Slave connecting to Master for startup handshake on port "<<net_port+300<<"..."<<endl;
+            SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(net_port+300);
             inet_pton(AF_INET,g_master_ip.c_str(),&sa.sin_addr);
-            cout<<"[Sentry] Slave connecting to Master (20s timeout)..."<<endl;
-            u_long nb=1;ioctlsocket(hs,FIONBIO,&nb);
-            int cr=connect(hs,(sockaddr*)&sa,sizeof(sa));
-            if(cr!=0&&WSAGetLastError()!=WSAEWOULDBLOCK){closesocket(hs);hs=INVALID_SOCKET;}
-            bool ok=false;
-            if(hs!=INVALID_SOCKET){
-                fd_set wfds;FD_ZERO(&wfds);FD_SET(hs,&wfds);
-                timeval tv{20,0};
-                if(select(0,nullptr,&wfds,nullptr,&tv)>0){
-                    int soerr=0;int sl=sizeof(soerr);
-                    getsockopt(hs,SOL_SOCKET,SO_ERROR,(char*)&soerr,&sl);
-                    if(soerr==0){
-                        u_long b=0;ioctlsocket(hs,FIONBIO,&b);
-                        DWORD to=20000;setsockopt(hs,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));
-                        int64_t send_buf[2]={local_total,local_total};send(hs,(const char*)send_buf,sizeof(send_buf),0);
-                        int64_t peer_buf[2]={0,0};int need=sizeof(peer_buf),got=0,r;
-                        while(got<need){r=recv(hs,(char*)peer_buf+got,need-got,0);if(r<=0)break;got+=r;}
-                        if(got==need){
-                            int64_t peer_total=peer_buf[0];
-                            if(peer_total!=local_total){int peer_ci=(int)(peer_total/g_hdf5_chunk_capacity),peer_fo=(int)(peer_total%g_hdf5_chunk_capacity);
-                                logException("WARN","sentry","Startup mismatch: Master("+to_string(peer_ci)+","+to_string(peer_fo)
-                                    +") Slave("+to_string(local_ci)+","+to_string(local_fo)+") diff="+to_string(llabs(local_total-peer_total))+" - using min");
-                                if(peer_total<local_total){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;updateSentry(g_sentry_root);}}
-                            ok=true;
-                            cout<<"[Sentry] Startup handshake PASS. Synced to: chunk="<<g_chunk_idx<<" offset="<<g_frame_offset<<endl;
-                        } else {cerr<<"[Sentry] FAIL: recv from Master"<<endl;}
-                    } else {cerr<<"[Sentry] FAIL: connect error "<<soerr<<endl;}
-                } else {cerr<<"[Sentry] FAIL: connect to Master timeout — check network/firewall."<<endl;}
-            }
-            g_sentry_link_ok=ok;
-            if(hs!=INVALID_SOCKET)closesocket(hs);
+            while(connect(hs,(sockaddr*)&sa,sizeof(sa))==-1&&global_running) this_thread::sleep_for(chrono::milliseconds(100));
+            if(hs!=INVALID_SOCKET){int64_t send_buf[2]={local_total,local_total};send(hs,(const char*)send_buf,sizeof(send_buf),0);
+                int64_t peer_buf[2];recv(hs,(char*)peer_buf,sizeof(peer_buf),0);int64_t peer_total=peer_buf[0];closesocket(hs);
+                if(peer_total!=local_total){int peer_ci=(int)(peer_total/g_hdf5_chunk_capacity),peer_fo=(int)(peer_total%g_hdf5_chunk_capacity);
+                    logException("WARN","sentry","Startup mismatch: Master("+to_string(peer_ci)+","+to_string(peer_fo)
+                        +") Slave("+to_string(local_ci)+","+to_string(local_fo)+") diff="+to_string(llabs(local_total-peer_total))+" - using min");
+                    if(peer_total<local_total){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;updateSentry(g_sentry_root);}}
+                cout<<"[Sentry] Startup handshake done. Synced to: chunk="<<g_chunk_idx<<" offset="<<g_frame_offset<<endl;}
         }
     }
     cout<<"[HDF5] Ready."<<endl;
@@ -2285,97 +2302,40 @@ int main() {
                 }
                 auto t_sync_done=chrono::steady_clock::now();
 
-                // Step 4: Post-dump sentry handshake
-                // 双向 15s 真超时 (select): 对端掉线时不再永久卡死 (SO_RCVTIMEO 不作用于 accept)
-                // 启动握手测试失败 (g_sentry_link_ok=false) 则整段跳过, 不每录空等
+                // Step 4: Post-dump sentry handshake (原版: net_port+300, 阻塞 accept/重试 connect)
                 auto t_sentry0=chrono::steady_clock::now();
-                if (enable_net_sync && g_sentry_link_ok) {
+                if (enable_net_sync) {
                     g_syncing=true;
-                    int handshake_port=sentry_port;
+                    int handshake_port=net_port+300;
                     auto local_ci=g_chunk_idx; auto local_fo=g_frame_offset.load();
                     int64_t local_total=(int64_t)local_ci*g_hdf5_chunk_capacity+local_fo;
                     if (is_master_pc) {
                         SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);int opt=1;setsockopt(hs,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
                         sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(handshake_port);sa.sin_addr.s_addr=INADDR_ANY;
-                        if(::bind(hs,(sockaddr*)&sa,sizeof(sa))==0&&listen(hs,1)==0){
-                            cout<<"[Sentry] Master waiting Slave on port "<<handshake_port<<" (15s timeout)..."<<endl;
-                            u_long nb=1;ioctlsocket(hs,FIONBIO,&nb);          // 非阻塞 + select 真超时
-                            fd_set fds;FD_ZERO(&fds);FD_SET(hs,&fds);
-                            timeval tv{15,0};
-                            SOCKET cs=INVALID_SOCKET;
-                            if(select(0,&fds,nullptr,nullptr,&tv)>0){
-                                sockaddr_in ca;socklen_t cl=sizeof(ca);
-                                cs=accept(hs,(sockaddr*)&ca,&cl);
-                                if(cs!=INVALID_SOCKET){u_long b=0;ioctlsocket(cs,FIONBIO,&b);}
-                            }
-                            if(cs==INVALID_SOCKET){
-                                logException("WARN","sentry","handshake accept timeout - skipped");
-                                cout<<"[Sentry] WARN: Slave did not connect within 15s - handshake skipped"<<endl;
-                            } else {
-                                DWORD to=15000;setsockopt(cs,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));
-                                int64_t peer_buf[2]={0,0};int need=sizeof(peer_buf),got=0,r;
-                                while(got<need){r=recv(cs,(char*)peer_buf+got,need-got,0);if(r<=0)break;got+=r;}
-                                if(got==need){
-                                    int64_t send_buf[2]={local_total,local_total};send(cs,(const char*)send_buf,sizeof(send_buf),0);
-                                    int64_t peer_val=peer_buf[0],local_val=local_total;
-                                    cout<<"[Sentry] Post-dump handshake: Local="<<local_val<<" Peer="<<peer_val<<endl;
-                                    if(peer_val!=local_val){g_sentry_mismatch_count++;int peer_ci=(int)(peer_val/g_hdf5_chunk_capacity),peer_fo=(int)(peer_val%g_hdf5_chunk_capacity);
-                                        if(peer_val<local_val){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;}
-                                        logException("WARN","sentry","Mismatch #"+to_string(g_sentry_mismatch_count)+" diff="+to_string(llabs(local_val-peer_val))+" - using min");
-                                        if(g_sentry_mismatch_count>=3){logException("FATAL","sentry","3 consecutive mismatches - exiting.");global_running=false;}}
-                                    else{g_sentry_mismatch_count=0;}
-                                } else {
-                                    logException("WARN","sentry","handshake recv failed/partial - skipped");
-                                    cout<<"[Sentry] WARN: recv from Slave failed - handshake skipped"<<endl;
-                                }
-                                closesocket(cs);
-                            }
-                        } else {
-                            logException("WARN","sentry","handshake bind/listen failed - skipped");
-                            cout<<"[Sentry] WARN: bind/listen on port "<<handshake_port<<" failed (err "<<WSAGetLastError()<<") - skipped"<<endl;
-                        }
+                        ::bind(hs,(sockaddr*)&sa,sizeof(sa));listen(hs,1);sockaddr_in ca;socklen_t cl=sizeof(ca);SOCKET cs=accept(hs,(sockaddr*)&ca,&cl);
+                        if(cs!=INVALID_SOCKET){int64_t peer_buf[2];recv(cs,(char*)peer_buf,sizeof(peer_buf),0);int64_t peer_total=peer_buf[0];
+                            int64_t send_buf[2]={local_total,local_total};send(cs,(const char*)send_buf,sizeof(send_buf),0);closesocket(cs);
+                            int64_t peer_val=peer_total,local_val=local_total;
+                            cout<<"[Sentry] Post-dump handshake: Local="<<local_val<<" Peer="<<peer_val<<endl;
+                            if(peer_val!=local_val){g_sentry_mismatch_count++;int peer_ci=(int)(peer_val/g_hdf5_chunk_capacity),peer_fo=(int)(peer_val%g_hdf5_chunk_capacity);
+                                if(peer_val<local_val){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;}
+                                logException("WARN","sentry","Mismatch #"+to_string(g_sentry_mismatch_count)+" diff="+to_string(llabs(local_val-peer_val))+" - using min");
+                                if(g_sentry_mismatch_count>=3){logException("FATAL","sentry","3 consecutive mismatches - exiting.");global_running=false;}}
+                            else{g_sentry_mismatch_count=0;}}
                         closesocket(hs);
                     } else {
                         SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(handshake_port);
                         inet_pton(AF_INET,g_master_ip.c_str(),&sa.sin_addr);
-                        cout<<"[Sentry] Slave connecting to "<<g_master_ip<<":"<<handshake_port<<" (15s timeout)..."<<endl;
-                        u_long nb=1;ioctlsocket(hs,FIONBIO,&nb);              // 非阻塞 connect + select 写就绪
-                        int cr=connect(hs,(sockaddr*)&sa,sizeof(sa));
-                        if(cr!=0&&WSAGetLastError()!=WSAEWOULDBLOCK){closesocket(hs);hs=INVALID_SOCKET;}
-                        if(hs!=INVALID_SOCKET){
-                            fd_set wfds;FD_ZERO(&wfds);FD_SET(hs,&wfds);
-                            timeval tv{15,0};
-                            if(select(0,nullptr,&wfds,nullptr,&tv)<=0){
-                                cout<<"[Sentry] WARN: connect to Master timeout - handshake skipped"<<endl;
-                                logException("WARN","sentry","connect to master timeout - skipped");
-                            } else {
-                                int soerr=0;int sl=sizeof(soerr);
-                                getsockopt(hs,SOL_SOCKET,SO_ERROR,(char*)&soerr,&sl);
-                                if(soerr!=0){
-                                    cout<<"[Sentry] WARN: connect failed (err "<<soerr<<") - handshake skipped"<<endl;
-                                    logException("WARN","sentry","connect failed - skipped");
-                                } else {
-                                    u_long b=0;ioctlsocket(hs,FIONBIO,&b);
-                                    DWORD to=15000;setsockopt(hs,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));
-                                    int64_t send_buf[2]={local_total,local_total};send(hs,(const char*)send_buf,sizeof(send_buf),0);
-                                    int64_t peer_buf[2]={0,0};int need=sizeof(peer_buf),got=0,r;
-                                    while(got<need){r=recv(hs,(char*)peer_buf+got,need-got,0);if(r<=0)break;got+=r;}
-                                    if(got==need){
-                                        int64_t peer_val=peer_buf[0],local_val=local_total;
-                                        cout<<"[Sentry] Post-dump handshake: Local="<<local_val<<" Peer="<<peer_val<<endl;
-                                        if(peer_val!=local_val){g_sentry_mismatch_count++;int peer_ci=(int)(peer_val/g_hdf5_chunk_capacity),peer_fo=(int)(peer_val%g_hdf5_chunk_capacity);
-                                            if(peer_val<local_val){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;}
-                                            logException("WARN","sentry","Mismatch #"+to_string(g_sentry_mismatch_count)+" diff="+to_string(llabs(local_val-peer_val))+" - using min");
-                                            if(g_sentry_mismatch_count>=3){logException("FATAL","sentry","3 consecutive mismatches - exiting.");global_running=false;}}
-                                        else{g_sentry_mismatch_count=0;}
-                                    } else {
-                                        cout<<"[Sentry] WARN: recv from Master failed - handshake skipped"<<endl;
-                                        logException("WARN","sentry","recv from master failed - skipped");
-                                    }
-                                }
-                            }
-                        }
-                        if(hs!=INVALID_SOCKET)closesocket(hs);
+                        while(connect(hs,(sockaddr*)&sa,sizeof(sa))==-1&&global_running){this_thread::sleep_for(chrono::milliseconds(100));cv::waitKey(1);}
+                        if(hs!=INVALID_SOCKET){int64_t send_buf[2]={local_total,local_total};send(hs,(const char*)send_buf,sizeof(send_buf),0);
+                            int64_t peer_buf[2];recv(hs,(char*)peer_buf,sizeof(peer_buf),0);int64_t peer_total=peer_buf[0];closesocket(hs);
+                            int64_t peer_val=peer_total,local_val=local_total;
+                            cout<<"[Sentry] Post-dump handshake: Local="<<local_val<<" Peer="<<peer_val<<endl;
+                            if(peer_val!=local_val){g_sentry_mismatch_count++;int peer_ci=(int)(peer_val/g_hdf5_chunk_capacity),peer_fo=(int)(peer_val%g_hdf5_chunk_capacity);
+                                if(peer_val<local_val){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;}
+                                logException("WARN","sentry","Mismatch #"+to_string(g_sentry_mismatch_count)+" diff="+to_string(llabs(local_val-peer_val))+" - using min");
+                                if(g_sentry_mismatch_count>=3){logException("FATAL","sentry","3 consecutive mismatches - exiting.");global_running=false;}}
+                            else{g_sentry_mismatch_count=0;}}
                     }
                     g_syncing=false;
                 }
@@ -2666,12 +2626,15 @@ int main() {
     global_running=false;
     if(g_cmd_sock!=INVALID_SOCKET) closesocket(g_cmd_sock);
     if(g_cmd_listen_sock!=INVALID_SOCKET) closesocket(g_cmd_listen_sock);  // 打断 accept
+    if(g_joints_listen_sock!=INVALID_SOCKET) closesocket(g_joints_listen_sock);  // 打断 joints accept
+    if(g_joints_sock!=INVALID_SOCKET) closesocket(g_joints_sock);
     for(auto& ctx:cam_ctxs){
         if(ctx->capture_thread.joinable())ctx->capture_thread.join();
         if(ctx->copy_thread.joinable())ctx->copy_thread.join();
     }
     if(cmd_thread.joinable()) cmd_thread.join();
     if(gaze_thread.joinable()) gaze_thread.join();
+    if(joints_thread.joinable()) joints_thread.join();
     // 遮挡统计汇总 (Master; 每相机被遮挡目标数)
     if (!g_occ_stats.empty()) {
         cout << "\n=== Occlusion summary (targets with arm in frame) ===" << endl;
