@@ -445,6 +445,9 @@ static string g_occ_last_line;            // UI 一行摘要
 static array<double,12> g_occ_joints{};   // 本目标判定所用关节 (qU6+qL6; h5 occ_joints 调试数据集)
 static bool g_occ_joints_ok = false;      // false = 本目标无有效关节 (h5 写 NaN)
 
+// sentry 专用链路 (独立端口; 启动握手测试通过才启用每录同步)
+static bool g_sentry_link_ok = false;
+
 // ---- 小型 3x3 数学 (FK 专用, 不引入新依赖) ----
 struct OccMat3 { double m[3][3]; };
 struct OccFrame { OccMat3 R; double t[3]; };          // p' = R·p + t
@@ -1537,6 +1540,8 @@ int main() {
     g_master_ip=cap["master_ip"].as<string>();
     string slave_ip=cap["slave_ip"].as<string>();
     int net_port=cap["port"].as<int>();
+    int sentry_port=net_port+500;                       // sentry 专用端口 (启动握手测试 + 每录同步)
+    try{sentry_port=cap["sentry_port"].as<int>();}catch(...){}
     vector<string> camera_ids=cap["cam_indices"].as<vector<string>>();
     bool use_hw_trigger=cap["hardware_trigger"].as<bool>();
     bool enable_offset=true, enable_intersection=true, enable_net_sync=true;
@@ -1779,36 +1784,82 @@ int main() {
         cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1);
     }
     if (enable_net_sync) {
-        int handshake_port=net_port+300;
+        // 专用 sentry 端口 (sentry_port, main 作用域读入)。
+        // 启动即握手 = 链路连通性测试 + sentry 对齐; 失败则本录程停用每录握手
+        // (避免防火墙阻断时每录空等 15s), 大声警告提示排查。
         auto local_ci=g_chunk_idx; auto local_fo=g_frame_offset.load();
         int64_t local_total=(int64_t)local_ci*g_hdf5_chunk_capacity+local_fo;
-        cout<<"[Sentry] Startup handshake: local="<<local_total<<" (chunk="<<local_ci<<" offset="<<local_fo<<")"<<endl;
+        cout<<"[Sentry] Startup handshake: local="<<local_total<<" (chunk="<<local_ci<<" offset="<<local_fo<<") port="<<sentry_port<<endl;
         if (is_master_pc) {
             SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);int opt=1;setsockopt(hs,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
-            sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(handshake_port);sa.sin_addr.s_addr=INADDR_ANY;
-            ::bind(hs,(sockaddr*)&sa,sizeof(sa));listen(hs,1);
-            cout<<"[Sentry] Master waiting for Slave startup handshake on port "<<handshake_port<<"..."<<endl;
-            sockaddr_in ca;socklen_t cl=sizeof(ca);SOCKET cs=accept(hs,(sockaddr*)&ca,&cl);
-            if(cs!=INVALID_SOCKET){int64_t peer_buf[2];recv(cs,(char*)peer_buf,sizeof(peer_buf),0);int64_t peer_total=peer_buf[0];
-                int64_t send_buf[2]={local_total,local_total};send(cs,(const char*)send_buf,sizeof(send_buf),0);closesocket(cs);
-                if(peer_total!=local_total){int peer_ci=(int)(peer_total/g_hdf5_chunk_capacity),peer_fo=(int)(peer_total%g_hdf5_chunk_capacity);
-                    logException("WARN","sentry","Startup mismatch: Master("+to_string(local_ci)+","+to_string(local_fo)
-                        +") Slave("+to_string(peer_ci)+","+to_string(peer_fo)+") diff="+to_string(llabs(local_total-peer_total))+" - using min");
-                    if(peer_total<local_total){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;updateSentry(g_sentry_root);}}
-                cout<<"[Sentry] Startup handshake done. Synced to: chunk="<<g_chunk_idx<<" offset="<<g_frame_offset<<endl;}
+            sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(sentry_port);sa.sin_addr.s_addr=INADDR_ANY;
+            if(::bind(hs,(sockaddr*)&sa,sizeof(sa))==0&&listen(hs,1)==0){
+                cout<<"[Sentry] Master waiting for Slave (20s timeout)..."<<endl;
+                u_long nb=1;ioctlsocket(hs,FIONBIO,&nb);
+                fd_set fds;FD_ZERO(&fds);FD_SET(hs,&fds);
+                timeval tv{20,0};
+                SOCKET cs=INVALID_SOCKET;
+                if(select(0,&fds,nullptr,nullptr,&tv)>0){
+                    sockaddr_in ca;socklen_t cl=sizeof(ca);
+                    cs=accept(hs,(sockaddr*)&ca,&cl);
+                    if(cs!=INVALID_SOCKET){u_long b=0;ioctlsocket(cs,FIONBIO,&b);}
+                }
+                if(cs==INVALID_SOCKET){
+                    cerr<<"[Sentry] FAIL: Slave did not connect on port "<<sentry_port
+                        <<" — check firewall (inbound to Master). Per-recording sentry sync DISABLED."<<endl;
+                    logException("WARN","sentry","startup handshake timeout - per-recording sync disabled");
+                } else {
+                    DWORD to=20000;setsockopt(cs,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));
+                    int64_t peer_buf[2]={0,0};int need=sizeof(peer_buf),got=0,r;
+                    while(got<need){r=recv(cs,(char*)peer_buf+got,need-got,0);if(r<=0)break;got+=r;}
+                    if(got==need){
+                        int64_t send_buf[2]={local_total,local_total};send(cs,(const char*)send_buf,sizeof(send_buf),0);
+                        int64_t peer_total=peer_buf[0];
+                        if(peer_total!=local_total){int peer_ci=(int)(peer_total/g_hdf5_chunk_capacity),peer_fo=(int)(peer_total%g_hdf5_chunk_capacity);
+                            logException("WARN","sentry","Startup mismatch: Master("+to_string(local_ci)+","+to_string(local_fo)
+                                +") Slave("+to_string(peer_ci)+","+to_string(peer_fo)+") diff="+to_string(llabs(local_total-peer_total))+" - using min");
+                            if(peer_total<local_total){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;updateSentry(g_sentry_root);}}
+                        g_sentry_link_ok=true;
+                        cout<<"[Sentry] Startup handshake PASS. Synced to: chunk="<<g_chunk_idx<<" offset="<<g_frame_offset<<endl;
+                    } else {cerr<<"[Sentry] FAIL: recv from Slave — per-recording sync DISABLED."<<endl;}
+                    closesocket(cs);
+                }
+            } else {cerr<<"[Sentry] FAIL: bind/listen on port "<<sentry_port<<" (err "<<WSAGetLastError()<<")"<<endl;}
             closesocket(hs);
         } else {
-            cout<<"[Sentry] Slave connecting to Master for startup handshake on port "<<handshake_port<<"..."<<endl;
-            SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(handshake_port);
+            SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(sentry_port);
             inet_pton(AF_INET,g_master_ip.c_str(),&sa.sin_addr);
-            while(connect(hs,(sockaddr*)&sa,sizeof(sa))==-1&&global_running) this_thread::sleep_for(chrono::milliseconds(100));
-            if(hs!=INVALID_SOCKET){int64_t send_buf[2]={local_total,local_total};send(hs,(const char*)send_buf,sizeof(send_buf),0);
-                int64_t peer_buf[2];recv(hs,(char*)peer_buf,sizeof(peer_buf),0);int64_t peer_total=peer_buf[0];closesocket(hs);
-                if(peer_total!=local_total){int peer_ci=(int)(peer_total/g_hdf5_chunk_capacity),peer_fo=(int)(peer_total%g_hdf5_chunk_capacity);
-                    logException("WARN","sentry","Startup mismatch: Master("+to_string(peer_ci)+","+to_string(peer_fo)
-                        +") Slave("+to_string(local_ci)+","+to_string(local_fo)+") diff="+to_string(llabs(local_total-peer_total))+" - using min");
-                    if(peer_total<local_total){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;updateSentry(g_sentry_root);}}
-                cout<<"[Sentry] Startup handshake done. Synced to: chunk="<<g_chunk_idx<<" offset="<<g_frame_offset<<endl;}
+            cout<<"[Sentry] Slave connecting to Master (20s timeout)..."<<endl;
+            u_long nb=1;ioctlsocket(hs,FIONBIO,&nb);
+            int cr=connect(hs,(sockaddr*)&sa,sizeof(sa));
+            if(cr!=0&&WSAGetLastError()!=WSAEWOULDBLOCK){closesocket(hs);hs=INVALID_SOCKET;}
+            bool ok=false;
+            if(hs!=INVALID_SOCKET){
+                fd_set wfds;FD_ZERO(&wfds);FD_SET(hs,&wfds);
+                timeval tv{20,0};
+                if(select(0,nullptr,&wfds,nullptr,&tv)>0){
+                    int soerr=0;int sl=sizeof(soerr);
+                    getsockopt(hs,SOL_SOCKET,SO_ERROR,(char*)&soerr,&sl);
+                    if(soerr==0){
+                        u_long b=0;ioctlsocket(hs,FIONBIO,&b);
+                        DWORD to=20000;setsockopt(hs,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));
+                        int64_t send_buf[2]={local_total,local_total};send(hs,(const char*)send_buf,sizeof(send_buf),0);
+                        int64_t peer_buf[2]={0,0};int need=sizeof(peer_buf),got=0,r;
+                        while(got<need){r=recv(hs,(char*)peer_buf+got,need-got,0);if(r<=0)break;got+=r;}
+                        if(got==need){
+                            int64_t peer_total=peer_buf[0];
+                            if(peer_total!=local_total){int peer_ci=(int)(peer_total/g_hdf5_chunk_capacity),peer_fo=(int)(peer_total%g_hdf5_chunk_capacity);
+                                logException("WARN","sentry","Startup mismatch: Master("+to_string(peer_ci)+","+to_string(peer_fo)
+                                    +") Slave("+to_string(local_ci)+","+to_string(local_fo)+") diff="+to_string(llabs(local_total-peer_total))+" - using min");
+                                if(peer_total<local_total){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;updateSentry(g_sentry_root);}}
+                            ok=true;
+                            cout<<"[Sentry] Startup handshake PASS. Synced to: chunk="<<g_chunk_idx<<" offset="<<g_frame_offset<<endl;
+                        } else {cerr<<"[Sentry] FAIL: recv from Master"<<endl;}
+                    } else {cerr<<"[Sentry] FAIL: connect error "<<soerr<<endl;}
+                } else {cerr<<"[Sentry] FAIL: connect to Master timeout — check network/firewall."<<endl;}
+            }
+            g_sentry_link_ok=ok;
+            if(hs!=INVALID_SOCKET)closesocket(hs);
         }
     }
     cout<<"[HDF5] Ready."<<endl;
@@ -2155,26 +2206,39 @@ int main() {
                     // Signal Master: HDF5 done + timing
                     char hbuf[64]; snprintf(hbuf,sizeof(hbuf),"HDF5_DONE:%.3f",g_slave_hdf5_s);
                     sendLineRaw(g_cmd_sock, hbuf);
-                    // Wait for gaze from Master
+                    // Wait for gaze from Master (30s 超时: Master 掉线时自报卡点, 不再无限等)
                     g_gaze_need_send = false;
                     cout<<"[Sync] Waiting for Master GAZE..."<<endl;
-                    while(global_running && !g_gaze_need_send.load())
+                    { auto tw0=chrono::steady_clock::now();
+                      while(global_running && !g_gaze_need_send.load()) {
                         this_thread::sleep_for(chrono::milliseconds(50));
+                        if (chrono::duration<double>(chrono::steady_clock::now()-tw0).count() > 30.0) {
+                            cerr<<"[Sync] WARN: Master GAZE timeout (30s) - continuing without"<<endl;
+                            logException("WARN","sync","slave: master GAZE timeout");
+                            break;
+                        } } }
                     g_gaze_need_send = false;
                     // Wait for GAZE_DONE from Master (cmdWorker sets g_gaze_done)
                     cout<<"[Sync] Waiting for Master GAZE_DONE..."<<endl;
-                    while(global_running && !g_gaze_done.load())
+                    { auto tw0=chrono::steady_clock::now();
+                      while(global_running && !g_gaze_done.load()) {
                         this_thread::sleep_for(chrono::milliseconds(50));
+                        if (chrono::duration<double>(chrono::steady_clock::now()-tw0).count() > 30.0) {
+                            cerr<<"[Sync] WARN: Master GAZE_DONE timeout (30s) - continuing without"<<endl;
+                            logException("WARN","sync","slave: master GAZE_DONE timeout");
+                            break;
+                        } } }
                     g_gaze_done = false;
                 }
                 auto t_sync_done=chrono::steady_clock::now();
 
                 // Step 4: Post-dump sentry handshake
                 // 双向 15s 真超时 (select): 对端掉线时不再永久卡死 (SO_RCVTIMEO 不作用于 accept)
+                // 启动握手测试失败 (g_sentry_link_ok=false) 则整段跳过, 不每录空等
                 auto t_sentry0=chrono::steady_clock::now();
-                if (enable_net_sync) {
+                if (enable_net_sync && g_sentry_link_ok) {
                     g_syncing=true;
-                    int handshake_port=net_port+300;
+                    int handshake_port=sentry_port;
                     auto local_ci=g_chunk_idx; auto local_fo=g_frame_offset.load();
                     int64_t local_total=(int64_t)local_ci*g_hdf5_chunk_capacity+local_fo;
                     if (is_master_pc) {
