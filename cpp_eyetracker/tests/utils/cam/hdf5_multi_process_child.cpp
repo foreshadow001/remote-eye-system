@@ -31,11 +31,12 @@ int main(int argc, char* argv[]) {
     // argv[7]  = cam_w           argv[8]  = margin_frames
     // argv[9]  = shm_name        argv[10] = gaze_x
     // argv[11] = gaze_y          argv[12] = gaze_z
+    // argv[13] = occluded (0/1, 可选; 1 = 本相机此目标被遮挡, valid 整段写 0)
     if (argc < 13) {
         cerr << "Usage: " << argv[0]
              << " <camera_index> <hdf5_dir> <chunk_idx> <frame_offset>"
              << " <core_frames> <cam_h> <cam_w> <margin_frames> <shm_name>"
-             << " <gaze_x> <gaze_y> <gaze_z>"
+             << " <gaze_x> <gaze_y> <gaze_z> [occluded]"
              << endl;
         return 2;
     }
@@ -52,6 +53,7 @@ int main(int argc, char* argv[]) {
     double gaze_x        = atof(argv[10]);
     double gaze_y        = atof(argv[11]);
     double gaze_z        = atof(argv[12]);
+    int    occluded      = (argc > 13) ? atoi(argv[13]) : 0;
 
     // ---- Open shared memory ----
     // Must map margin_frames + N frames to reach the core data region.
@@ -116,14 +118,14 @@ int main(int argc, char* argv[]) {
             gaze_ds.write(gz_buf.data(), H5::PredType::NATIVE_DOUBLE, gz_mem, gz_file);
         }
 
-        // ---- valid: all ones (tiny, ~0.001s) ----
+        // ---- valid: 被遮挡相机整段写 0, 其余全 1 (tiny, ~0.001s) ----
         {
             hsize_t v_start[1] = {(hsize_t)frame_offset};
             hsize_t v_count[1] = {(hsize_t)N};
             H5::DataSpace v_mem(1, v_count);
             H5::DataSpace v_file = valid_ds.getSpace();
             v_file.selectHyperslab(H5S_SELECT_SET, v_count, v_start);
-            vector<uint8_t> v_buf((size_t)N, 1);
+            vector<uint8_t> v_buf((size_t)N, occluded ? 0 : 1);
             valid_ds.write(v_buf.data(), H5::PredType::NATIVE_UINT8, v_mem, v_file);
         }
 

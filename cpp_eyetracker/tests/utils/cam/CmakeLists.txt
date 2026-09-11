@@ -156,3 +156,25 @@ target_include_directories(capture_with_M5Stack
 )
 
 message(STATUS "capture_with_M5Stack will be built")
+
+# ---- capture_with_occlusion_detection (capture_with_M5Stack + 臂入画面遮挡判定) ----
+find_package(pugixml CONFIG REQUIRED)
+add_executable(capture_with_occlusion_detection
+    capture_with_occlusion_detection.cpp
+)
+
+target_link_libraries(capture_with_occlusion_detection
+    PRIVATE
+        eyetracker::piper
+        eyetracker::cfg
+        eyetracker::cam
+        pugixml::pugixml
+        ${HDF5_CXX_LIBRARIES}
+)
+
+target_include_directories(capture_with_occlusion_detection
+    PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+)
+
+message(STATUS "capture_with_occlusion_detection will be built")

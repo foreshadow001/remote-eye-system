@@ -1,120 +1,150 @@
-# 遮挡检测计划 — viz_gaze_coverage.py 集成
+# 遮挡检测计划 v3 — capture_with_occlusion_detection.cpp（臂入画面判定 + valid=0，无 CSV）
 
-## 1. 目标
+## 0. 与 v2 的区别
 
-在 `cpp_eyetracker/tests/utils/piper/viz_gaze_coverage.py` 中新增遮挡检测：
-对每个相机判断其到被试眼位的视线是否被机械臂遮挡。
+v2 只输出 CSV 供事后查看。v3 按新要求把判定结果**写进数据集**：
+h5 写盘前判定"本次录制对应 gaze target"的遮挡情况，被遮挡相机的
+**valid 数据集整段置 0（该目标全部 core_frames=100 帧）**；每录制只判定一次
+（臂静止时），判定用的位姿**缓存**（h5 阶段臂已开始移往下一目标）。
 
-**约束：只依赖三类已有数据，不引入其他信息（不用 URDF 网格、不用关节角、不用图像）：**
+**判定口径（v3 定稿）：机械臂进入相机画面即遮挡** —— 把臂网格经内参外参投影，
+任一三角形落在该相机图像范围内（且在近平面前方）→ 该相机遮挡。
+不再使用"眼→光心精确视线、碰到即遮挡"；**眼位不再参与判定**，
+遮挡标志由 内参 K + 外参 R|T + 臂 FK 完全决定。该口径偏保守：
+"臂挡住眼"必然属于"臂进入画面"（眼≈画面中心），反之未必 ——
+臂只出现在画面边缘、眼区通畅时也计为遮挡。
 
-| 输入 | 来源 | 用途 |
+**坐标系事实（已在 viz_gaze_coverage.py 验证）：**
+- 相机标定 XML 的参考系 = `arm_in_ccs` 的 CCS = 40772280（center_cam）相机系，全部同系；
+- URDF 链：joint1..6 全部绕 z 轴（revolute），origin xyz/rpy 已知；link1..6 + base_link +
+  gripper_base 均有 STL 网格（`piper_description/meshes/*.STL`，scale=1）；
+- 关节角来源：ROS 话题 `{can_port}/joint_states_actual`（rad），控制服务器可查询。
+
+## 1. 关键时序（capture_with_M5Stack 现有流程）
+
+```
+moveArmToTarget(#N) → ARM_OK   ← 臂静止在目标 #N（判定时机！）
+  → READY → SPACE → 录 100 帧(入 RAM)
+  → h5 阶段: 子进程写盘 #N 的 100 帧 ∥ arm 线程 moveArmToTarget(#N+1)
+             (rec_gaze 在此之前已按同样思路缓存 — line ~1484)
+```
+
+- **判定时机**：ARM_OK 后、SPACE 前（臂静止，另一臂停在上一目标）。
+  GET_JOINTS × 2 → FK → 20 相机遮挡标志 → **缓存** `g_occ_flags`（属于 #N）。
+  **判定同步完成才进入 READY**（遮挡检验阻塞在 ARM_OK → READY 之间，
+  失败/停用则直接放行）。
+  每录制一次判定，覆盖该目标全部 100 帧（"抽取一帧"代表整段，臂静止故成立）。
+  判定内容：两臂（按当前关节角构型）是否进入各相机画面。
+- **应用时机**：h5 阶段启动子进程时，把该相机 occluded 标志作为命令行参数传入；
+  子进程写 valid 时整段写 0。此时无需再算几何，直接用缓存。
+- **跨机同步**：Master 算全部 20 相机（纯几何，无需图像）；ARM_OK 后立即经
+  cmd 通道发送 `OCCL:sn1,sn2,...`（被遮挡 SN 列表），Slave 缓存并在自己的
+  h5 阶段同样应用。发送远早于 Slave 写盘，无竞态。
+
+## 2. 输入（全部运行时可得）
+
+| 数据 | 来源 | 说明 |
 |---|---|---|
-| 相机内参+外参 | `{calib_save_dir}/{day}/output/{SN}_Data.xml`（世界系=40772280 相机系） | 光心位置（外参 T）、视线方向、FOV 判断（内参 K） |
-| 机械臂位置 | `cfg/arm_pose/{day}.yaml` 的 `arm_in_ccs`（臂基座在世界系中的位姿） | 遮挡体的锚点（基座原点） |
-| gaze target | `cfg/gaze_target/{P}/piper_{upper,lower}.txt`（臂基座系目标点） | 遮挡体的另一锚点（臂末端必在目标点） |
+| 关节角×6×2 臂 | 控制服务器（新增 `GET_JOINTS` 命令） | 每次判定查询一次（臂静止） |
+| URDF | `piper_ros/.../piper_description/urdf/piper_description.urdf` | pugixml 解析（项目已有依赖） |
+| STL 网格 | `piper_ros/.../piper_description/meshes/*.STL` | 二进制/ASCII STL 解析器（~50 行） |
+| 相机内参 | `{SN}_Data.xml` 的 `InternalParameters/RawData` | `area_scan_division Focus Kappa Sx Sy Cx Cy W H` → K=[[f/Sx,0,Cx],[0,f/Sy,Cy],[0,0,1]]，像面 W×H |
+| 相机外参 | 同 XML `ExternalParameters` | gba：`R=Rx(α)Ry(β)Rz(γ)`，`p_ref=R·p_cam+T` |
+| 臂基座位姿 | `cfg/arm_pose/{day}.yaml` 的 `arm_in_ccs`（脚本已加载） | 复用现有 zxz 加载代码 |
 
-眼位沿用现有实现：全部相机光轴的最小二乘交点（已验证 20 轴平均汇聚角 0.7°）。
+（末端理想化为**不装任何工具**：遮挡体 = 两臂 URDF 连杆本身，无工装模型；
+眼位不参与本判定口径。）
 
-## 2. 几何模型
-
-### 2.1 遮挡体（机械臂的近似）
-
-无关节角，臂的真实构型未知，但两端确定：**基座原点**（arm_in_ccs 平移）与**当前目标点**（臂末端定位工装所在）。据此提出三个方案：
-
-**方案 A（推荐）：基座→目标 单胶囊 + 基座球 + 工装小球**
+## 3. 算法
 
 ```
-胶囊:  线段 [base_world, target_world], 半径 r_arm (默认 0.05 m)
-基座球: 球 base_world, 半径 r_base   (默认 0.07 m, 基座较粗)
-工装球: 球 target_world, 半径 r_tool (默认 0.03 m, 末端定位工装+标记)
+每次判定（ARM_OK 后，臂静止）:
+  1) GET_JOINTS upper/lower → j[6] × 2（连同时间戳一起缓存）
+  2) FK: URDF 链 × 关节角 → 各 link 网格顶点 → 世界系（经 arm_in_ccs，
+     复用 utils/piper 的 zxzToQuat/composePoses）
+  3) 对每相机 i（内参 K_i, 外参 R_i|T_i）:
+       像素投影 p_uv = K_i · (R_i⁻¹(p_w − T_i))
+       臂任一三角形与"画面范围"相交（三角形任一顶点落图内且 z>0，
+       或三角形横跨画面边界——按视锥 4 侧面+近平面作平面相交测试）
+       → occluded[i] = 1
+  4) 缓存 occluded[]（本目标）→ UI 显示 → Master 发 OCCL 给 Slave
+     （判定结果只进 valid 数据集与 UI/报告，不写 CSV）
 ```
 
-- 依据：Piper 连杆直径 4–6 cm、关节处约 8–10 cm，0.05 m 胶囊半径覆盖直线路径上的典型截面；
-- 优点：实现最简（一次线段-线段距离 + 两次线段-球距离），毫秒级算完 20 相机 × 1000 目标；
-- 缺点：臂弯曲时肘部偏离基座-目标直线 —— 弯得越狠误差越大（可能漏报或误报个别相机）。
+- 实现：先做 link 级快速剔除（link 包围盒四角投影出图 → 整 link 跳过），
+  再逐三角形；顶点投影 20 相机 × 2 臂 × ~3 万顶点 ≈ 百万次乘法，毫秒级。
+- 规模：2 臂 × 7 link × 数千三角形 × 20 相机，在 READY 等待期执行，
+  不占录制/写盘热路径。
+- gripper 手指（link7/8，joint7/8）默认**不含**（末端装的是定位工装），常量开关可启用。
 
-**方案 B（备选）：两段折线胶囊（肘部启发）**
+## 4. 修改位置与内容
 
-在线段中点处把"肘部"沿世界竖直向上抬一定比例（如臂长的 20%），构成两段胶囊。
-- 优点：更接近 Piper 常见的"肘上抬"构型；
-- 缺点：肘部方向纯猜测，不同目标构型不同，可能比直线错得更多。不推荐默认启用。
+### A. 新文件 `tests/utils/cam/capture_with_occlusion_detection.cpp`（复制 capture_with_M5Stack.cpp）
 
-**方案 C（否决）：全工作空间包络**
+| # | 位置 | 内容 |
+|---|---|---|
+| 1 | 文件头 | 更名注释；include pugixml；遮挡开关常量（如 link 膨胀余量 `OCC_MARGIN`） |
+| 2 | Piper 区块后新增「Occlusion detection」区块 | `UrdfModel`（joint 链+link 网格）+ `loadUrdf()`/`loadStl()`；`fkLinks(joints)→link 世界系位姿`；`loadCamXmls(dir)`（内参 K + 外参 R\|T 解析）；`triInFrame()`（顶点投影 + 视锥平面测试）；`queryJoints(arm)`（GET_JOINTS 协议）；`runOcclusionCheck()`（臂入画面判定 + 缓存 `g_occ_flags`） |
+| 3 | main() 初始化（加载 arm_pose 之后） | 加载 XML/URDF、启动自检（第 5 节）；失败仅警告并停用遮挡（valid 恒写 1，不阻断采集） |
+| 4 | `moveArmToTarget()` ARM_OK 分支（返回前） | 调 `runOcclusionCheck()`；Master 额外 `sendLineRaw(cmd_sock, "OCCL:...")` 同步 Slave |
+| 5 | cmdWorker（Slave 侧） | 新增 `OCCL:` 消息解析 → 缓存到本机 `g_occ_flags` |
+| 6 | h5 阶段子进程参数（line ~1540 args 构造） | 追加 `argv[13] = 本相机 occluded(0/1)`（Master 用自身判定，Slave 用 OCCL 缓存） |
+| 7 | UI canvas（READY 画面） | 一行：`Occluded: 3/20 — SN1 SN2 SN3`（红字） |
+| 8 | Session report | 汇总每相机被遮挡目标数（20 行表，控制台输出） |
 
-以基座为心的可达球做遮挡体 —— 过度保守，几乎所有相机恒被遮挡，无区分度。
+### B. `tests/utils/cam/hdf5_multi_process_child.cpp`（约 3 行）
 
-### 2.2 视线（被检测对象）
+- argv 新增 `occluded`（0/1）；
+- valid 写入：`vector<uint8_t> v_buf(N, occluded ? 0 : 1);`
+  （gaze_target 仍照常写 —— 数据集结构不变，仅 valid 置 0）。
 
-- 每相机视线 = 线段 [eye, cam_origin]（cam_origin = 外参 T，即该相机光心）。
-- 内参用途（可选增强）：把眼位用 K 投影到像面，判断是否落在图像范围内（FOV 检查），
-  与遮挡位或并列输出。核心遮挡判定只需要外参。
+### C. `piper_ros/.../scripts/piper_windows_ctrl_server.py`（约 15 行）
 
-## 3. 判定算法
+- 新增命令 `GET_JOINTS:<arm>`：`wait_for_message(f"{can_port}/joint_states_actual", JointState)`
+  → 回复 `JOINTS:<arm>:j1,...,j6`（rad）；命令表注释同步。
 
-对每个 (相机 i, 臂目标 j)：
+### D. `tests/utils/cam/CMakeLists.txt`（3 行）
 
-```
-d1 = dist(线段[eye, T_i], 线段[base, target_j])   # 线段-线段最近距离
-d2 = dist(线段[eye, T_i], base 球心) - r_base
-d3 = dist(线段[eye, T_i], target_j 球心) - r_tool
-遮挡(i, j) = (d1 < r_arm) or (d2 < 0) or (d3 < 0)
-```
+- 新 target `capture_with_occlusion_detection`（链接 pugixml）。
 
-- 线段-线段距离：标准参数化最近点解（两端 clamp），纯 numpy 标量实现；
-- 规模：20 相机 × 1000 目标 × 2 臂 = 4 万次判定，Python 毫秒~秒级。
+### E. `tests/utils/cam/test_load_hdf5_frame.cpp` — 遮挡提示（人工验证）
 
-可选精细化（先不做，保持 KISS）：眼位以 5 mm 半径圆盘采样多点分别判定，
-统计"眼瞳完全可见比例"。
+valid=0 即遮挡标记（数据集自带，无需读 CSV）：
 
-## 4. 输出口径
+| # | 位置 | 内容 |
+|---|---|---|
+| 1 | `loadFrame()` | 已读 valid（现状 `!valid → N/A`）— 保留数据，新增 `c.occluded = !valid` |
+| 2 | render() 缩略图格 | `occluded` 相机：红色边框 + 左上角红色 `OCC` 角标（区别于"未写入"的黑色 N/A） |
+| 3 | render() 放大视图 | Frame 信息行追加 `Arm/Target`（帧号→目标映射，复用 `armRecorded()` 口径）与 `VALID/INVALID(occluded)` 徽标 |
 
-控制台表格（每相机一行）：
+验证口径：浏览到某目标帧 → 标红相机画面里应能看到机械臂本体挡在眼区前方；
+未标相机眼区应通畅。
 
-```
-SN        光心位置(m)      |eye|   遮挡比例 upper / lower / all   示例遮挡目标
-40772276  [0.095 0.00 -0.00] 0.76   12.4% /  3.2% /  7.8%        #37 upper
-...
-```
+## 5. 一致性自检（关键验证，启动时 + 首目标各一次）
 
-聚合定义：`遮挡比例 = 被遮挡目标数 / 该臂目标总数`；`all` 为两臂合并。
-另打印 FOV 列（眼位投影是否在像面内）。
+1. **FK ↔ MOVED 对账**：URDF FK 的 flange 位姿（世界系）与服务器 `MOVED`
+   回报（经 armToolToCamPose）位置差 < 1 cm，否则告警停用遮挡（valid 恒 1）；
+2. **FK 工具尖 ↔ 目标点**：FK 定位工装尖 vs 当前 gaze target（CCS）距离 < 1 cm；
+3. 全零关节角下遮挡数应为 0 或极少（臂折叠于基座附近，远离各相机视锥）。
 
-## 5. 可视化集成（现有 3D 窗口）
+两条对账同时通过才启用遮挡输出，保证 URDF/FK/坐标系链整体正确。
 
-1. **相机标记**：每个光心画小方块，按遮挡比例上色（绿=0%，黄→红=升高），加色条；
-2. **视线**：眼→各光心画细线，恒清亮绿、曾遮挡灰、高遮挡红（按 all 比例）；
-3. **遮挡体**：画出"最坏目标"（遮挡相机数最多的那个目标）对应的两臂胶囊+球，
-   半透明，其余目标不画（1000 条胶囊不可读）；
-4. 其余（目标散点、视线射线、世界三轴、初始视角）保持不变。
+## 6. 已知局限
 
-## 6. 参数（脚本顶部常量）
+- **口径偏保守**：臂出现在画面任何角落即遮挡，即使眼区视野通畅；
+  反之"臂挡眼"必然伴随"臂入画面"，不会漏报真正的视线遮挡；
+- 只判定"到位后静止"状态（录制只发生在静止期，与判定一致）；
+- 末端理想化为无工具；线缆/支架等其他遮挡物不在模型内；
+- 关节角精度 = 编码器反馈精度（远小于网格尺寸，可忽略）；
+- 若遮挡功能因自检失败停用，valid 全 1（与现状一致，安全回退）。
 
-```python
-R_ARM  = 0.05   # 臂胶囊半径 m
-R_BASE = 0.07   # 基座球半径 m
-R_TOOL = 0.03   # 末端工装球半径 m
-```
+## 7. 实施顺序
 
-## 7. 已知局限（写进脚本注释）
-
-- 直线胶囊不含肘部外凸：构型弯曲时与真实臂有偏差，结果应视为近似而非精确；
-- 臂在两目标间**移动途中**的遮挡未覆盖（只判断到位后状态）；
-- 不含相机支架/线缆等其他潜在遮挡物。
-
-## 8. 实施步骤
-
-1. 在 viz_gaze_coverage.py 顶部加常量与新函数：
-   `seg_seg_dist(p1,q1,p2,q2)`、`seg_sphere_dist(seg, c)`；
-2. 主流程在算完眼位与目标（世界系）后调用 `occlusion_report(...)`：
-   逐 (相机×目标) 判定 → 控制台表格；
-3. 3D 窗口加第 5 节三个元素；
-4. headless 运行验证：表格输出 + 无异常 + 遮挡相机集合的方位合理性
-   （应集中在臂基座→目标带附近方位的相机）。
-
-## 9. 验证方法（无图像数据下）
-
-- **极端自检**：`R_ARM→0` 时应无遮挡（视线恰好穿过基座-目标线段是零测度事件）；
-  打印最小 d1 分布确认量级合理；
-- **方位合理性**：被遮挡相机应偏向臂基座方位（世界系中两臂基座位于相机环后方
-  z≈−0.1 m，臂越过相机环伸向目标）；
-- **后续可选**：与实拍 h5 图像人工抽查对照（超出本脚本约束，仅作外部验证）。
+1. C：服务器加 GET_JOINTS（先打通数据源，手工 telnet 验证）；
+2. D：CMake 占位 + 复制源文件；
+3. A-2/A-3：URDF/STL/XML 加载 + FK + 眼位 + 自检对账（第 5 节）；
+4. B：子进程 occluded 参数 + valid 写 0；
+5. A-4..A-8：判定接入 ARM_OK + OCCL 同步 + 子进程传参 + UI + 报告；
+6. E：viewer 遮挡提示；
+7. 联调：空跑一轮（臂+服务器即可）核对 UI 与 valid；
+   正式采集后用 E 浏览实拍帧，人工抽验遮挡标记与画面一致。

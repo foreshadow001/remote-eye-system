@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <vector>
 #include <string>
+#include <cmath>
+#include <cstdint>
 #include <opencv2/opencv.hpp>
 #include <H5Cpp.h>
 
@@ -27,6 +29,7 @@ struct CamInfo {
     int frame_offset;  // within chunk
     cv::Mat raw;       // current frame data
     uint8_t valid;
+    bool occluded;     // valid=0 (已写入区域) = 遮挡判定置 0
     bool loaded;
 };
 
@@ -34,6 +37,14 @@ static vector<CamInfo> g_cams;
 static int g_global_frame = 0;  // current global frame index
 static int g_max_frame = 0;     // upper bound (from sentry)
 static string g_sentry_root;
+static int g_core_frames = 100;          // = ceil(fps×record_time)
+static int64_t g_frames_per_arm = 25000; // = num_targets_per_arm × core_frames
+
+// 帧号 → (臂, 目标序号) — 复用 capture_with_M5Stack armRecorded() 口径
+static void frameToTarget(int64_t frame, string& arm, int& target_idx) {
+    if (frame < g_frames_per_arm) { arm = "upper"; target_idx = (int)(frame / g_core_frames); }
+    else { arm = "lower"; target_idx = (int)((frame - g_frames_per_arm) / g_core_frames); }
+}
 
 static void updateLayout() {
     g_left_w = g_win_h * 2 / 5;
@@ -72,7 +83,9 @@ static bool loadFrame(int global_idx) {
             H5::DataSpace v_file = valid_ds.getSpace();
             v_file.selectHyperslab(H5S_SELECT_SET, v_count, v_start);
             valid_ds.read(&c.valid, H5::PredType::NATIVE_UINT8, v_mem, v_file);
-            if (!c.valid) continue;
+            // valid=0 且在已写入范围内 → 遮挡判定置 0 (仍加载图像供查看);
+            // 未写入区域 (>= sentry) 不在本函数出现 (调用方以 g_max_frame 限界)
+            c.occluded = !c.valid;
 
             c.raw = cv::Mat(g_cam_h, g_cam_w, CV_8UC1);
             hsize_t r_start[3] = {(hsize_t)c.frame_offset, 0, 0};
@@ -114,14 +127,23 @@ static void render(cv::Mat& canvas) {
                 cv::putText(cell, g_cams[i].sn + " (N/A)", {4, g_thumb_h-20},
                             cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(0,0,255), 1);
             }
-            // SN label at bottom center
+            // SN label at bottom center (被遮挡相机: 红色)
             int bl; cv::Size ts = cv::getTextSize(g_cams[i].sn, cv::FONT_HERSHEY_SIMPLEX, 0.4, 1, &bl);
+            cv::Scalar sn_col = g_cams[i].occluded ? cv::Scalar(0,0,255) : cv::Scalar(255,255,255);
             cv::putText(cell, g_cams[i].sn, {(g_thumb_w - ts.width)/2, g_thumb_h - 5},
                         cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0,0,0), 3);
             cv::putText(cell, g_cams[i].sn, {(g_thumb_w - ts.width)/2, g_thumb_h - 5},
-                        cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255,255,255), 1);
+                        cv::FONT_HERSHEY_SIMPLEX, 0.4, sn_col, 1);
+            // OCC 角标 (左上角, 红): 本目标该相机被遮挡 (valid=0)
+            if (g_cams[i].occluded) {
+                cv::putText(cell, "OCC", {4, 16}, cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                            cv::Scalar(0,0,0), 3);
+                cv::putText(cell, "OCC", {4, 16}, cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                            cv::Scalar(0,0,255), 1);
+            }
             cell.copyTo(canvas(roi));
-            if (i == g_enlarged) cv::rectangle(canvas, roi, {0,255,0}, 2);
+            if (i == g_enlarged) cv::rectangle(canvas, roi, {0,255,0}, 2);   // 选中: 绿框
+            if (g_cams[i].occluded) cv::rectangle(canvas, roi, {0,0,255}, 2); // 遮挡: 红框 (覆盖选中框)
         } else {
             canvas(roi) = cv::Scalar(0,0,0);
         }
@@ -149,11 +171,17 @@ static void render(cv::Mat& canvas) {
         cv::putText(canvas, cfo, {off_x + dw - cs.width - 10, off_y + 30},
                     cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,255,255), 2);
 
-        string fi = "Frame:" + to_string(g_global_frame) + "  " + g_cams[g_enlarged].sn;
+        // Frame 信息行: 帧号 + 臂/目标 (armRecorded 口径) + SN + VALID/OCCLUDED
+        string arm; int tgt_i = 0;
+        frameToTarget(g_global_frame, arm, tgt_i);
+        string fi = "Frame:" + to_string(g_global_frame) + "  " + arm + " #" + to_string(tgt_i + 1)
+                    + "  " + g_cams[g_enlarged].sn
+                    + (g_cams[g_enlarged].occluded ? "  OCCLUDED" : "  VALID");
+        cv::Scalar fi_col = g_cams[g_enlarged].occluded ? cv::Scalar(0,0,255) : cv::Scalar(0,255,0);
         cv::putText(canvas, fi, {off_x + 10, off_y + 30},
                     cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,0,0), 3);
         cv::putText(canvas, fi, {off_x + 10, off_y + 30},
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,255,0), 2);
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7, fi_col, 2);
     } else {
         canvas(right) = cv::Scalar(0,0,0);
     }
@@ -185,6 +213,14 @@ int main(int argc, char* argv[]) {
         sns = loader["cam_indices"].as<vector<string>>();
         g_cam_w = loader["cam_width"].as<int>();
         g_cam_h = loader["cam_height"].as<int>();
+        // 帧号 → 目标映射参数 (与 capture_with_M5Stack 同口径)
+        try {
+            auto& c = cfg["capture"];
+            double fps = c["fps"].as<double>(), rt = c["record_time"].as<double>();
+            int ntpa = c["num_targets_per_arm"].as<int>();
+            g_core_frames = (int)ceil(fps * rt);
+            g_frames_per_arm = (int64_t)ntpa * g_core_frames;
+        } catch (...) {}   // 缺键保持默认 (100/25000)
     } catch (...) {
         cerr << "Cannot read cfg/capture.yaml loader node." << endl;
         return 1;
