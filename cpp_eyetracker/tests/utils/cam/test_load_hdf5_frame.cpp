@@ -31,6 +31,7 @@ struct CamInfo {
     uint8_t valid;
     bool occluded;     // valid=0 (已写入区域) = 遮挡判定置 0
     bool loaded;
+    double gt[3] = {0, 0, 0};   // gaze_target (40772280 相机系)
 };
 
 static vector<CamInfo> g_cams;
@@ -77,6 +78,8 @@ static bool loadFrame(int global_idx) {
             H5::H5File f(ss.str(), H5F_ACC_RDONLY);
             H5::DataSet raw_ds = f.openDataSet("raw_image");
             H5::DataSet valid_ds = f.openDataSet("valid");
+            H5::DataSet gt_ds; bool has_gt = false;
+            try { gt_ds = f.openDataSet("gaze_target"); has_gt = true; } catch (const H5::Exception&) {}
 
             hsize_t v_start[1] = {(hsize_t)c.frame_offset}, v_count[1] = {1};
             H5::DataSpace v_mem(1, v_count);
@@ -94,6 +97,18 @@ static bool loadFrame(int global_idx) {
             H5::DataSpace r_file = raw_ds.getSpace();
             r_file.selectHyperslab(H5S_SELECT_SET, r_count, r_start);
             raw_ds.read(c.raw.data, H5::PredType::NATIVE_UINT8, r_mem, r_file);
+            // gaze_target: 该帧录制对应的定位工装尖 (40772280 相机系, 每录恒定)
+            // 旧数据可能缺该数据集 → 独立 try, 不影响图像加载 (显示 0)
+            if (has_gt) {
+                try {
+                    hsize_t g_start[2] = {(hsize_t)c.frame_offset, 0};
+                    hsize_t g_count[2] = {1, 3};
+                    H5::DataSpace g_mem(2, g_count);
+                    H5::DataSpace g_file = gt_ds.getSpace();
+                    g_file.selectHyperslab(H5S_SELECT_SET, g_count, g_start);
+                    gt_ds.read(c.gt, H5::PredType::NATIVE_DOUBLE, g_mem, g_file);
+                } catch (const H5::Exception&) {}
+            }
             c.loaded = true;
             any_loaded = true;
         } catch (const H5::Exception&) {}
@@ -182,6 +197,16 @@ static void render(cv::Mat& canvas) {
                     cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,0,0), 3);
         cv::putText(canvas, fi, {off_x + 10, off_y + 30},
                     cv::FONT_HERSHEY_SIMPLEX, 0.7, fi_col, 2);
+
+        // gaze target 坐标 (本相机系; 每录恒定, 显示当前帧所属录制的值)
+        { auto& ec = g_cams[g_enlarged];
+          char gb[160];
+          snprintf(gb, sizeof(gb), "Gaze target (cam frame): [%.4f, %.4f, %.4f] m",
+                   ec.gt[0], ec.gt[1], ec.gt[2]);
+          cv::putText(canvas, gb, {off_x + 10, off_y + 62},
+                      cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0,0,0), 3);
+          cv::putText(canvas, gb, {off_x + 10, off_y + 62},
+                      cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(200,200,0), 2); }
     } else {
         canvas(right) = cv::Scalar(0,0,0);
     }
@@ -191,6 +216,16 @@ static void render(cv::Mat& canvas) {
 
     // Watermark + crosshair
     int hx = g_right_x + 10, hy = g_win_h - 25;
+    { // gaze target 摘要 (未放大时也可见; 取首个已加载相机 — 各相机同值)
+      const CamInfo* gc = nullptr;
+      for (auto& c : g_cams) if (c.loaded) { gc = &c; break; }
+      if (gc) {
+          char gb[160];
+          snprintf(gb, sizeof(gb), "GT(cam): [%.3f, %.3f, %.3f] m",
+                   gc->gt[0], gc->gt[1], gc->gt[2]);
+          cv::putText(canvas, gb, {hx, hy - 20}, cv::FONT_HERSHEY_SIMPLEX, 0.35,
+                      cv::Scalar(200,200,0), 1, cv::LINE_AA);
+      } }
     cv::putText(canvas, "Frame " + to_string(g_global_frame) + "/" + to_string(g_max_frame) + "  [A][D] +/-1  [W][S] +/-100  [ESC] quit",
                 {hx, hy}, cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(140,140,140), 1);
     int cx = g_right_x + g_right_w/2, cy = g_win_h/2;

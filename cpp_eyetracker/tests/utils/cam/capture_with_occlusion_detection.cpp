@@ -650,14 +650,14 @@ static bool occTriInFrame(const OccCam& c, const array<double,3>* tri) {
 }
 
 // ---- 启动加载: URDF + 全部相机 XML (Master; Slave 经 OCCL 同步结果, 不加载) ----
-static bool occSetup(const string& cfg_dir, const string& participant, const string& day) {
+static bool occSetup(const string& cfg_dir, const string& day) {
     fs::path urdf = fs::path(cfg_dir).parent_path().parent_path().parent_path()
                     / "piper_ros" / "src" / "piper_description" / "urdf" / "piper_description.urdf";
     if (!occLoadUrdf(urdf, g_occ_arm_upper) || !occLoadUrdf(urdf, g_occ_arm_lower)) {
         cerr << "[Occ] WARN: URDF load failed (" << urdf.string() << ") — occlusion disabled" << endl;
         return false;
     }
-    // 相机 XML: 优先 {P}/output, 否则 {day}/output (同 viz_gaze_coverage)
+    // 相机 XML: 只用 {day}/output (精确外参 + 大致内参; 不加载 participant 内参)
     string save_dir;
     try { Cfg cc(cfg_dir + "/cam_calib.yaml"); save_dir = cc["calib"]["calib_save_dir"].as<string>(); }
     catch (...) {}
@@ -665,8 +665,7 @@ static bool occSetup(const string& cfg_dir, const string& participant, const str
         cerr << "[Occ] WARN: cam_calib.yaml calib_save_dir missing — occlusion disabled" << endl;
         return false;
     }
-    fs::path xml_dir = fs::path(save_dir) / participant / "output";
-    if (!fs::is_directory(xml_dir)) xml_dir = fs::path(save_dir) / day / "output";
+    fs::path xml_dir = fs::path(save_dir) / day / "output";
     if (!fs::is_directory(xml_dir)) {
         cerr << "[Occ] WARN: no calib XML dir (" << xml_dir.string() << ") — occlusion disabled" << endl;
         return false;
@@ -688,6 +687,31 @@ static bool occSetup(const string& cfg_dir, const string& participant, const str
     cout << "[Occ] loaded: " << g_occ_cams.size() << " cams, URDF chain "
          << g_occ_arm_upper.chain.size() << " joints, " << tris << " tris/arm-pair" << endl;
     return true;
+}
+
+// ---- gaze target 各相机系转换 (外参 = day XML; h5 gaze_target 按相机系保存) ----
+static map<string, array<double,3>> g_gaze_cam;   // Slave: GAZE_CAM 接收的各相机系值
+static mutex g_gaze_cam_mtx;
+
+static void occToCam(const OccCam& c, const double p_w[3], double out[3]) {
+    double d[3] = {p_w[0]-c.t[0], p_w[1]-c.t[1], p_w[2]-c.t[2]};
+    for (int i=0;i<3;++i) out[i] = c.R.m[0][i]*d[0] + c.R.m[1][i]*d[1] + c.R.m[2][i]*d[2];  // Rᵀ·d
+}
+
+static string buildGazeCamMsg() {
+    // "GAZE_CAM:<中心系 x,y,z>[;<sn>:<相机系 x,y,z>...]" — 中心系值 + 全部 20 相机系值
+    // (g_occ_cams 加载后只读, 无需加锁; 加载失败时仅含中心系值, 从机回退中心系)
+    double pw[3] = {g_gaze_x.load(), g_gaze_y.load(), g_gaze_z.load()};
+    char head[64];
+    snprintf(head, sizeof(head), "GAZE_CAM:%.6f,%.6f,%.6f", pw[0], pw[1], pw[2]);
+    string msg = head;
+    for (auto& cam : g_occ_cams) {
+        double pc[3]; occToCam(cam, pw, pc);
+        char e[96];
+        snprintf(e, sizeof(e), ";%s:%.6f,%.6f,%.6f", cam.sn.c_str(), pc[0], pc[1], pc[2]);
+        msg += e;
+    }
+    return msg;
 }
 
 // ---- GET_JOINTS 查询 (复用 piper 控制连接; 调用时臂静止且 socket 空闲) ----
@@ -855,10 +879,9 @@ void gazeServerWorker(int gaze_port) {
         while (global_running) {
             this_thread::sleep_for(chrono::milliseconds(50));
             if (g_gaze_need_send.exchange(false)) {
-                char buf[128];
-                snprintf(buf,sizeof(buf),"GAZE:%.6f,%.6f,%.6f\n", g_gaze_x.load(), g_gaze_y.load(), g_gaze_z.load());
+                string msg = buildGazeCamMsg() + "\n";   // 中心系 + 各相机系 gaze target
                 lock_guard<mutex> lk(g_gaze_send_mtx);
-                if (send(g_gaze_sock, buf, (int)strlen(buf), 0) <= 0) {cerr<<"[Gaze] Send failed - exiting."<<endl;global_running=false;break;}
+                if (send(g_gaze_sock, msg.c_str(), (int)msg.size(), 0) <= 0) {cerr<<"[Gaze] Send failed - exiting."<<endl;global_running=false;break;}
                 string ack; recvLine(g_gaze_sock, ack, 5000);
                 cout << "[Gaze] Sent ("<<g_gaze_x<<","<<g_gaze_y<<","<<g_gaze_z<<") ack="<<ack<<endl;
             }
@@ -884,7 +907,32 @@ void gazeClientWorker(const string& master_ip, int gaze_port) {
             int st = recvLineStatus(sock, line, 300000);
             if (st == 2) { cerr<<"[Gaze] Connection closed by Master - reconnecting."<<endl; break; }  // 真断连 → 重连, 不退出
             if (st == 1) continue;  // 空闲超时 → 继续等待
-            if (line.rfind("GAZE:",0) == 0) {
+            if (line.rfind("GAZE_CAM:",0) == 0) {
+                // 中心系 + 各相机系 gaze target ("GAZE_CAM:x,y,z;sn:x,y,z;...")
+                string body = line.substr(9);
+                size_t sc = body.find(';');
+                double gx,gy,gz;
+                if (sscanf_s((sc==string::npos?body:body.substr(0,sc)).c_str(),
+                             "%lf,%lf,%lf", &gx,&gy,&gz) == 3) {
+                    g_gaze_x=gx; g_gaze_y=gy; g_gaze_z=gz;
+                    { lock_guard<mutex> lk(g_gaze_cam_mtx);
+                      g_gaze_cam.clear();
+                      if (sc != string::npos) {
+                          stringstream rest(body.substr(sc+1)); string ent;
+                          while (getline(rest, ent, ';')) {
+                              size_t c1 = ent.find(':');
+                              if (c1 == string::npos) continue;
+                              array<double,3> v{};
+                              if (sscanf_s(ent.c_str()+c1+1, "%lf,%lf,%lf",
+                                           &v[0],&v[1],&v[2]) == 3)
+                                  g_gaze_cam[ent.substr(0,c1)] = v;
+                          } } }
+                    g_gaze_ready = true;
+                    g_gaze_need_send = true;  // signal main thread ARM stage loop
+                }
+                sendLineRaw(sock, "GAZE_ACK");
+            }
+            else if (line.rfind("GAZE:",0) == 0) {
                 double gx,gy,gz; sscanf_s(line.c_str()+5, "%lf,%lf,%lf", &gx, &gy, &gz);
                 g_gaze_x=gx; g_gaze_y=gy; g_gaze_z=gz;
                 g_gaze_ready = true;
@@ -1483,7 +1531,7 @@ int main() {
                 <<" — check cfg/day_participant_map.json. Transforms NOT loaded."<<endl;
         }
         // 遮挡检测资源加载 (Master only; Slave 经 OCCL 消息接收判定结果)
-        g_occ_enabled = occSetup(cfg_dir, participant_id, day_id);
+        g_occ_enabled = occSetup(cfg_dir, day_id);
         auto loadTgts=[&](const string& path)->vector<array<double,3>>{
             vector<array<double,3>> out; ifstream in(path); string line;
             while(getline(in,line)){if(line.empty())continue;stringstream ss(line);string token;array<double,3>pt{};
@@ -1879,6 +1927,21 @@ int main() {
                 // 同理快照 #N 的遮挡集 (ARM_OK(#N+1) 的 OCCL 可能先于本机子进程启动)
                 set<string> rec_occl;
                 { lock_guard<mutex> lk(g_occ_mtx); rec_occl = g_occ_occluded; }
+                // gaze target 各相机系快照 (h5 按相机系保存):
+                // Master 用 day 外参现算; Slave 用 GAZE_CAM 接收值 (缺相机回退中心系)
+                map<string, array<double,3>> rec_gaze_cam;
+                {
+                    double pw[3] = {rec_gaze_x, rec_gaze_y, rec_gaze_z};
+                    if (is_master_pc) {
+                        for (auto& cam : g_occ_cams) {
+                            double pc[3]; occToCam(cam, pw, pc);
+                            rec_gaze_cam[cam.sn] = {pc[0], pc[1], pc[2]};
+                        }
+                    } else {
+                        lock_guard<mutex> lk(g_gaze_cam_mtx);
+                        rec_gaze_cam = g_gaze_cam;
+                    }
+                }
 
                 // ====== PARALLEL: ARM (thread) + HDF5 (main thread) ======
                 { cv::Mat loading=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
@@ -1933,9 +1996,14 @@ int main() {
                 vector<PROCESS_INFORMATION> procs(cam_ctxs.size());
                 for (size_t i=0;i<cam_ctxs.size();++i){auto& ctx=cam_ctxs[i];
                     string shm_name="HDF5_"+to_string(GetCurrentProcessId())+"_CAM_"+to_string(i);
+                    // gaze target: 本相机系值 (无则回退中心系)
+                    auto git = rec_gaze_cam.find(ctx->id);
+                    double gz_x = (git!=rec_gaze_cam.end()) ? git->second[0] : rec_gaze_x;
+                    double gz_y = (git!=rec_gaze_cam.end()) ? git->second[1] : rec_gaze_y;
+                    double gz_z = (git!=rec_gaze_cam.end()) ? git->second[2] : rec_gaze_z;
                     stringstream args; args<<"\"hdf5_multi_process_child.exe\" "<<i<<" \""<<ctx->hdf5_dir<<"\" "<<g_chunk_idx
                         <<" "<<g_frame_offset<<" "<<core_frames<<" "<<cam_h<<" "<<cam_w<<" "<<margin_frames<<" "<<shm_name
-                        <<" "<<rec_gaze_x<<" "<<rec_gaze_y<<" "<<rec_gaze_z
+                        <<" "<<gz_x<<" "<<gz_y<<" "<<gz_z
                         <<" "<<(rec_occl.count(ctx->id) ? 1 : 0);   // 本相机 #N 遮挡标志 → valid
                     STARTUPINFOA si{sizeof(si)};PROCESS_INFORMATION pi{};
                     string cmd_line=args.str();
@@ -1969,9 +2037,9 @@ int main() {
                     g_wait_slave_hdf5_s = chrono::duration<double>(t_wait1-t_wait0).count();
                     // (2)+(3) Forward gaze + GAZE_DONE
                     cout<<"[Gaze] Forwarding to Slave: ("<<g_gaze_x<<","<<g_gaze_y<<","<<g_gaze_z<<")"<<endl;
-                    char gbuf[128]; snprintf(gbuf,sizeof(gbuf),"GAZE:%.6f,%.6f,%.6f",g_gaze_x.load(),g_gaze_y.load(),g_gaze_z.load());
+                    string gmsg = buildGazeCamMsg();                  // 中心系 + 各相机系
                     { lock_guard<mutex> lk(g_gaze_send_mtx);
-                      send(g_gaze_sock, (string(gbuf)+"\n").c_str(), (int)strlen(gbuf)+1, 0); }
+                      send(g_gaze_sock, (gmsg+"\n").c_str(), (int)gmsg.size()+1, 0); }
                     string ack; recvLine(g_gaze_sock, ack, 5000);
                     cout<<"[Gaze] Slave ACK: "<<ack<<endl;
                     sendLineRaw(g_cmd_sock, "GAZE_DONE");
