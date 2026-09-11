@@ -442,6 +442,8 @@ static set<string> g_occ_occluded;        // 本目标被遮挡 SN (Master: 判�
 static map<string,int> g_occ_stats;       // 每相机累计遮挡目标数 (Master, 报告用)
 static mutex g_occ_mtx;
 static string g_occ_last_line;            // UI 一行摘要
+static array<double,12> g_occ_joints{};   // 本目标判定所用关节 (qU6+qL6; h5 occ_joints 调试数据集)
+static bool g_occ_joints_ok = false;      // false = 本目标无有效关节 (h5 写 NaN)
 
 // ---- 小型 3x3 数学 (FK 专用, 不引入新依赖) ----
 struct OccMat3 { double m[3][3]; };
@@ -744,57 +746,101 @@ static bool occQueryJoints(const string& arm, double q[6]) {
 }
 
 // ---- 主判定 (Master, moveArmToTarget ARM_OK 后同步调用, 完成才置 READY 计时) ----
-static bool g_occ_checked = false;      // 首目标 FK↔MOVED 对账已通过
 static vector<array<double,3>> g_occ_wu, g_occ_wl;   // FK 世界系三角形缓冲 (复用)
+
+// FK 法兰 (世界系): 链求至 link6, 经 zxz 臂变换入世界
+static void occFkFlange(const OccArmModel& mdl, const double q[6],
+                        const ArmTransform& xf, double out[3]) {
+    OccFrame M{occId(), {0,0,0}}; int qi = 0;
+    for (auto& n : mdl.chain) {
+        OccFrame o{occRpy(n.rpy[0], n.rpy[1], n.rpy[2]), {n.xyz[0], n.xyz[1], n.xyz[2]}};
+        OccFrame jr{occId(), {0,0,0}};
+        if (n.revolute && qi < 6) jr.R = occRz(q[qi++]);
+        M = occFm(M, occFm(o, jr));
+        if (qi == 6) break;                                   // M = link6 (flange) 臂基座系
+    }
+    Quat qa = zxzToQuat(xf.ccs_r.x, xf.ccs_r.y, xf.ccs_r.z);
+    Pt3 fk_flange = quatRotate(qa, Pt3{M.t[0], M.t[1], M.t[2]});
+    out[0] = fk_flange.x + xf.ccs_t.x;
+    out[1] = fk_flange.y + xf.ccs_t.y;
+    out[2] = fk_flange.z + xf.ccs_t.z;
+}
+
+// GET_POSE:臂 → 法兰位姿 (停臂对账用)
+static bool occQueryPose(const string& arm, ArmPose& pose) {
+    if (g_piper_sock == INVALID_SOCKET) return false;
+    if (!sendLineRaw(g_piper_sock, "GET_POSE:" + arm)) return false;
+    string resp;
+    if (!recvLine(g_piper_sock, resp, 5000)) return false;
+    string resp_arm;
+    return parsePoseResponse(resp, resp_arm, pose) && resp_arm == arm;
+}
 
 static void runOcclusionCheck(const string& arm, int target_idx) {
     if (!g_occ_enabled) {
-        // 停用也要同步 Slave (空 OCCL = 本目标无遮挡), 否则残留上一目标结果
-        { lock_guard<mutex> lk(g_occ_mtx); g_occ_occluded.clear(); }
-        if (g_cmd_sock != INVALID_SOCKET) sendLine(g_cmd_sock, "OCCL:");
+        // 停用也要同步 Slave (空 OCCL/OCCL_J), 否则残留上一目标结果
+        { lock_guard<mutex> lk(g_occ_mtx); g_occ_occluded.clear(); g_occ_joints_ok = false; }
+        if (g_cmd_sock != INVALID_SOCKET) {
+            sendLine(g_cmd_sock, "OCCL:");
+            sendLine(g_cmd_sock, "OCCL_J:");
+        }
         return;
     }
     double qU[6], qL[6];
     if (!occQueryJoints("upper", qU) || !occQueryJoints("lower", qL)) {
         cerr << "[Occ] GET_JOINTS failed — no camera marked occluded this target" << endl;
-        lock_guard<mutex> lk(g_occ_mtx); g_occ_occluded.clear();
+        { lock_guard<mutex> lk(g_occ_mtx); g_occ_occluded.clear(); g_occ_joints_ok = false; }
+        if (g_cmd_sock != INVALID_SOCKET) {          // 同步清 Slave 残留 (valid 恢复 1)
+            sendLine(g_cmd_sock, "OCCL:");
+            sendLine(g_cmd_sock, "OCCL_J:");
+        }
         g_occ_last_line = "Occ: query FAILED (valid=1)";
         return;
     }
-    occFkWorld(g_occ_arm_upper, qU, g_xf_upper, g_occ_wu);
-    occFkWorld(g_occ_arm_lower, qL, g_xf_lower, g_occ_wl);
 
-    // 首目标对账 (一次性): FK flange ↔ MOVED flange (均世界系), 超 1 cm 停用
-    if (!g_occ_checked) {
-        g_occ_checked = true;
-        const OccArmModel& mdl = (arm == "upper") ? g_occ_arm_upper : g_occ_arm_lower;
-        const double* q = (arm == "upper") ? qU : qL;
-        const ArmTransform& xf = (arm == "upper") ? g_xf_upper : g_xf_lower;
-        OccFrame M{occId(), {0,0,0}}; int qi = 0;
-        for (auto& n : mdl.chain) {
-            OccFrame o{occRpy(n.rpy[0], n.rpy[1], n.rpy[2]), {n.xyz[0], n.xyz[1], n.xyz[2]}};
-            OccFrame jr{occId(), {0,0,0}};
-            if (n.revolute && qi < 6) jr.R = occRz(q[qi++]);
-            M = occFm(M, occFm(o, jr));
-            if (qi == 6) break;                                   // M = link6 (flange) 臂基座系
-        }
-        Quat qa = zxzToQuat(xf.ccs_r.x, xf.ccs_r.y, xf.ccs_r.z);
-        Pt3 fk_flange = quatRotate(qa, Pt3{M.t[0], M.t[1], M.t[2]});
-        fk_flange.x += xf.ccs_t.x; fk_flange.y += xf.ccs_t.y; fk_flange.z += xf.ccs_t.z;
-        Pose sdk_flange{{g_last_piper_pose.x, g_last_piper_pose.y, g_last_piper_pose.z},
-                        {g_last_piper_pose.qx, g_last_piper_pose.qy, g_last_piper_pose.qz, g_last_piper_pose.qw}};
+    // ---- 双臂关节对账 (每判定): FK 法兰 ↔ 真实法兰 (动臂=MOVED 应答, 停臂=GET_POSE) ----
+    // P001 教训: 关节若串到另一臂/停更, 模型错位 → valid 写出系统性错误值;
+    // 每次都用真实位姿复核两臂, 失配超 1 cm 立即停用并大声报错
+    for (int i = 0; i < 2; ++i) {
+        const string& a = (i == 0) ? "upper" : "lower";
+        ArmPose real;
+        bool have_real = false;
+        if (a == arm) { real = g_last_piper_pose; have_real = true; }   // 刚移动的臂
+        else          { have_real = occQueryPose(a, real); }           // 停臂: 现查
+        if (!have_real) continue;                                      // 查不到 → 无法对账, 跳过
+        const OccArmModel& mdl = (a == "upper") ? g_occ_arm_upper : g_occ_arm_lower;
+        const double* q       = (a == "upper") ? qU : qL;
+        const ArmTransform& xf= (a == "upper") ? g_xf_upper : g_xf_lower;
+        double fk[3];
+        occFkFlange(mdl, q, xf, fk);
+        Pose sdk_flange{{real.x, real.y, real.z},
+                        {real.qx, real.qy, real.qz, real.qw}};
         Pose sdk_ccs = armToolToCamPose(sdk_flange, {0,0,0}, {0,0,0}, xf.ccs_t, xf.ccs_r);
-        double dx = fk_flange.x - sdk_ccs.pos.x, dy = fk_flange.y - sdk_ccs.pos.y,
-               dz = fk_flange.z - sdk_ccs.pos.z;
+        double dx = fk[0] - sdk_ccs.pos.x, dy = fk[1] - sdk_ccs.pos.y, dz = fk[2] - sdk_ccs.pos.z;
         double err = sqrt(dx*dx + dy*dy + dz*dz);
-        cout << "[Occ] self-check FK vs MOVED flange: err = " << err * 1000.0 << " mm" << endl;
+        cout << "[Occ] joint check " << a << ": FK vs real flange err = " << err * 1000.0 << " mm" << endl;
         if (err > 0.01) {
-            cerr << "[Occ] WARN: FK/MOVED mismatch > 10 mm — occlusion disabled (valid stays 1)" << endl;
+            cerr << "[Occ] WARN: " << a << " joints mismatch real pose > 10 mm"
+                 << " (joints wrong/stale/crossed?) — occlusion disabled (valid stays 1)" << endl;
             g_occ_enabled = false;
-            lock_guard<mutex> lk(g_occ_mtx); g_occ_occluded.clear(); g_occ_last_line.clear();
+            // 失配关节仍原样记录 (h5 occ_joints) — 离线重放定位串台来源的证据
+            { lock_guard<mutex> lk(g_occ_mtx);
+              g_occ_occluded.clear(); g_occ_last_line.clear();
+              for (int k = 0; k < 6; ++k) { g_occ_joints[k] = qU[k]; g_occ_joints[6+k] = qL[k]; }
+              g_occ_joints_ok = true; }
+            if (g_cmd_sock != INVALID_SOCKET) {      // 同步清 Slave 残留 (关节仍下发)
+                sendLine(g_cmd_sock, "OCCL:");
+                string jm = "OCCL_J:";
+                char b[32];
+                for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), "%s%.6f", k ? "," : "", g_occ_joints[k]); jm += b; }
+                sendLine(g_cmd_sock, jm);
+            }
             return;
         }
     }
+
+    occFkWorld(g_occ_arm_upper, qU, g_xf_upper, g_occ_wu);
+    occFkWorld(g_occ_arm_lower, qL, g_xf_lower, g_occ_wl);
 
     set<string> occ;
     for (auto& cam : g_occ_cams) {
@@ -809,6 +855,8 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
     {
         lock_guard<mutex> lk(g_occ_mtx);
         g_occ_occluded = occ;
+        for (int k = 0; k < 6; ++k) { g_occ_joints[k] = qU[k]; g_occ_joints[6+k] = qL[k]; }
+        g_occ_joints_ok = true;
         for (auto& sn : occ) ++g_occ_stats[sn];
         string sns; for (auto& sn : occ) sns += (sns.empty() ? "" : " ") + sn;
         g_occ_last_line = "Occluded: " + to_string(occ.size()) + "/" + to_string(g_occ_cams.size())
@@ -816,11 +864,18 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
     }
     cout << "[Occ] " << arm << " target #" << (target_idx + 1) << ": "
          << occ.size() << "/" << g_occ_cams.size() << " cams occluded" << endl;
-    // 同步 Slave (master 视角全部相机; Slave 自行与本机相机求交)
+    // 同步 Slave: 遮挡集 (Slave 自行与本机相机求交) + 判定所用关节 (h5 occ_joints)
     if (g_cmd_sock != INVALID_SOCKET) {
         string msg = "OCCL:";
         for (auto& sn : occ) msg += (msg.size() > 5 ? "," : "") + sn;
         sendLine(g_cmd_sock, msg);
+        string jm = "OCCL_J:";
+        { lock_guard<mutex> lk(g_occ_mtx);
+          if (g_occ_joints_ok) {
+              char b[32];
+              for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), "%s%.6f", k ? "," : "", g_occ_joints[k]); jm += b; }
+          } }
+        sendLine(g_cmd_sock, jm);
     }
 }
 
@@ -1181,6 +1236,8 @@ void precreateSerial() {
                     // close 时触发整个空洞的同步零填充 (~115ms/GB, 首录尖峰根因)
                     hsize_t gd[2] = {(hsize_t)g_hdf5_chunk_capacity, 3};
                     f.createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd), pl);
+                    hsize_t jd[2] = {(hsize_t)g_hdf5_chunk_capacity, 12};
+                    f.createDataSet("occ_joints", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, jd), pl);
                     hsize_t vd[1] = {(hsize_t)g_hdf5_chunk_capacity};
                     f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd), pl);
                     hsize_t rd[3] = {(hsize_t)g_hdf5_chunk_capacity, (hsize_t)g_cam_h, (hsize_t)g_cam_w};
@@ -1299,6 +1356,19 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
                     while (getline(ss, sn, ',')) if (!sn.empty()) { g_occ_occluded.insert(sn); ++n; }
                     g_occ_last_line = "Occluded: " + to_string(n) + "/20 (Master judged)";
                     cout << "[Cmd] OCCL: " << n << " cams occluded (Master judged)" << endl;
+                }
+                else if(line.rfind("OCCL_J:",0)==0){
+                    // Master 判定所用关节 (qU6+qL6 逗号表; 空 = 本目标无有效关节)
+                    // 仅调试用: 随本录写入各相机 h5 的 occ_joints 数据集
+                    lock_guard<mutex> lk(g_occ_mtx);
+                    g_occ_joints_ok = false;
+                    stringstream ss(line.substr(7)); string tok;
+                    int k = 0;
+                    while (k < 12 && getline(ss, tok, ',')) {
+                        try { g_occ_joints[k++] = stod(tok); }
+                        catch (...) { k = 0; break; }
+                    }
+                    if (k == 12) g_occ_joints_ok = true;
                 }
                 else if(line.rfind("PIPER:",0)==0){
                     size_t c2=line.find(':',6); if(c2==string::npos) continue;
@@ -1940,9 +2010,11 @@ int main() {
                 double rec_gaze_x = g_gaze_x.load();
                 double rec_gaze_y = g_gaze_y.load();
                 double rec_gaze_z = g_gaze_z.load();
-                // 同理快照 #N 的遮挡集 (ARM_OK(#N+1) 的 OCCL 可能先于本机子进程启动)
+                // 同理快照 #N 的遮挡集与判定关节 (ARM_OK(#N+1) 的 OCCL 可能先于本机子进程启动)
                 set<string> rec_occl;
-                { lock_guard<mutex> lk(g_occ_mtx); rec_occl = g_occ_occluded; }
+                array<double,12> rec_joints{}; bool rec_joints_ok;
+                { lock_guard<mutex> lk(g_occ_mtx);
+                  rec_occl = g_occ_occluded; rec_joints = g_occ_joints; rec_joints_ok = g_occ_joints_ok; }
                 // gaze target 各相机系快照 (h5 按相机系保存):
                 // Master 用 day 外参现算; Slave 用 GAZE_CAM 接收值 (缺相机回退中心系)
                 map<string, array<double,3>> rec_gaze_cam;
@@ -1997,6 +2069,8 @@ int main() {
                         H5::DSetCreatPropList pl=allocEarlyPl();
                         hsize_t gd[2]={(hsize_t)g_hdf5_chunk_capacity,3};
                         f.createDataSet("gaze_target",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,gd),pl);
+                        hsize_t jd[2]={(hsize_t)g_hdf5_chunk_capacity,12};
+                        f.createDataSet("occ_joints",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,jd),pl);
                         hsize_t vd[1]={(hsize_t)g_hdf5_chunk_capacity};
                         f.createDataSet("valid",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,vd),pl);
                         hsize_t rd[3]={(hsize_t)g_hdf5_chunk_capacity,(hsize_t)cam_h,(hsize_t)cam_w};
@@ -2021,6 +2095,16 @@ int main() {
                         <<" "<<g_frame_offset<<" "<<core_frames<<" "<<cam_h<<" "<<cam_w<<" "<<margin_frames<<" "<<shm_name
                         <<" "<<gz_x<<" "<<gz_y<<" "<<gz_z
                         <<" "<<(rec_occl.count(ctx->id) ? 1 : 0);   // 本相机 #N 遮挡标志 → valid
+                    {   // 判定所用关节 (qU6+qL6 逗号表; "-" = 本目标无有效关节 → NaN)
+                        args << " ";
+                        if (rec_joints_ok) {
+                            char jb[32];
+                            for (int k = 0; k < 12; ++k) {
+                                snprintf(jb, sizeof(jb), "%s%.6f", k ? "," : "", rec_joints[k]);
+                                args << jb;
+                            }
+                        } else args << "-";
+                    }
                     STARTUPINFOA si{sizeof(si)};PROCESS_INFORMATION pi{};
                     string cmd_line=args.str();
                     if(CreateProcessA(child_exe.c_str(),&cmd_line[0],NULL,NULL,FALSE,0,NULL,NULL,&si,&pi)){

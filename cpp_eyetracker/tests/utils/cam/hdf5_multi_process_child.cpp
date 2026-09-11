@@ -20,6 +20,7 @@
 #include <vector>
 #include <string>
 #include <cstdlib>
+#include <limits>
 
 using namespace std;
 
@@ -32,11 +33,12 @@ int main(int argc, char* argv[]) {
     // argv[9]  = shm_name        argv[10] = gaze_x
     // argv[11] = gaze_y          argv[12] = gaze_z
     // argv[13] = occluded (0/1, 可选; 1 = 本相机此目标被遮挡, valid 整段写 0)
+    // argv[14] = joints (可选; "qU0,...,qU5,qL0,...,qL5" 逗号表 或 "-"; 写 occ_joints, "-" → NaN)
     if (argc < 13) {
         cerr << "Usage: " << argv[0]
              << " <camera_index> <hdf5_dir> <chunk_idx> <frame_offset>"
              << " <core_frames> <cam_h> <cam_w> <margin_frames> <shm_name>"
-             << " <gaze_x> <gaze_y> <gaze_z> [occluded]"
+             << " <gaze_x> <gaze_y> <gaze_z> [occluded] [joints]"
              << endl;
         return 2;
     }
@@ -54,6 +56,24 @@ int main(int argc, char* argv[]) {
     double gaze_y        = atof(argv[11]);
     double gaze_z        = atof(argv[12]);
     int    occluded      = (argc > 13) ? atoi(argv[13]) : 0;
+
+    // 判定所用关节 (qU6+qL6; 无效/缺失 → NaN, 与图像/valid 同时序可辨识)
+    double joints[12];
+    {
+        const double NAN_VAL = numeric_limits<double>::quiet_NaN();
+        bool ok = false;
+        if (argc > 14 && argv[14][0] != '-') {
+            ok = true;
+            stringstream js(argv[14]); string tok;
+            int k = 0;
+            while (k < 12 && getline(js, tok, ',')) {
+                try { joints[k++] = stod(tok); }
+                catch (...) { ok = false; break; }
+            }
+            ok = ok && (k == 12);
+        }
+        if (!ok) for (int k = 0; k < 12; ++k) joints[k] = NAN_VAL;
+    }
 
     // ---- Open shared memory ----
     // Must map margin_frames + N frames to reach the core data region.
@@ -117,6 +137,22 @@ int main(int argc, char* argv[]) {
             }
             gaze_ds.write(gz_buf.data(), H5::PredType::NATIVE_DOUBLE, gz_mem, gz_file);
         }
+
+        // ---- occ_joints: 判定所用关节 (qU6+qL6, 每录恒定; 调试用) ----
+        // 旧文件可能缺该数据集 (预创建早于本字段引入) → 跳过, 不影响其他写入
+        try {
+            H5::DataSet jnt_ds = f.openDataSet("occ_joints");
+            hsize_t jn_start[2] = {(hsize_t)frame_offset, 0};
+            hsize_t jn_count[2] = {(hsize_t)N, 12};
+            H5::DataSpace jn_mem(2, jn_count);
+            H5::DataSpace jn_file = jnt_ds.getSpace();
+            jn_file.selectHyperslab(H5S_SELECT_SET, jn_count, jn_start);
+            vector<double> jn_buf((size_t)N * 12);
+            for (int i = 0; i < N; ++i)
+                for (int k = 0; k < 12; ++k)
+                    jn_buf[i * 12 + k] = joints[k];
+            jnt_ds.write(jn_buf.data(), H5::PredType::NATIVE_DOUBLE, jn_mem, jn_file);
+        } catch (const H5::Exception&) {}
 
         // ---- valid: 被遮挡相机整段写 0, 其余全 1 (tiny, ~0.001s) ----
         {
