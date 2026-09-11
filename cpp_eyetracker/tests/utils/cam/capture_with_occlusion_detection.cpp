@@ -455,6 +455,7 @@ static array<double,12> g_occ_joints{};   // 本目标判定所用关节 (qU6+qL
 static bool g_occ_joints_ok = false;      // false = 本目标无有效关节 (h5 写 NaN)
 
 void sendJointsToSlave();                                    // 专用 joints 通道推送 (定义在 gaze 段前)
+static string g_occ_xml_dir;                                 // day 标定 XML 目录 (Master 权威; 启动推送给 Slave)
 
 // ---- 小型 3x3 数学 (FK 专用, 不引入新依赖) ----
 struct OccMat3 { double m[3][3]; };
@@ -602,13 +603,17 @@ static void occFkWorld(const OccArmModel& mdl, const double q[6], const ArmTrans
     Quat qa = zxzToQuat(xf.ccs_r.x, xf.ccs_r.y, xf.ccs_r.z);        // 臂基座系 → 世界
     OccMat3 Rw = occQuatMat(qa);
     auto push_link = [&](const OccMesh& mesh, const OccFrame& M) {
+        // p_w = Rw·(M_R·v + M_t) + ccs_t — link 原点平移 M_t 必须同样经 Rw 旋转入世界
+        // (P001 教训: 漏转 M.t → 网格整体错位几十 cm, 法兰自检却因路径不同而通过)
+        double wt[3];
+        occMv(Rw, M.t, wt);                                         // link 原点: 臂基座系 → 世界系
         for (auto& v : mesh.tris) {
             double va[3], vw[3];
             occMv(M.R, &v[0], va);                                  // link 局部 → 臂基座系
             occMv(Rw, va, vw);                                      // 臂基座系 → 世界系
-            out.push_back({vw[0] + M.t[0] + xf.ccs_t.x,
-                           vw[1] + M.t[1] + xf.ccs_t.y,
-                           vw[2] + M.t[2] + xf.ccs_t.z});
+            out.push_back({vw[0] + wt[0] + xf.ccs_t.x,
+                           vw[1] + wt[1] + xf.ccs_t.y,
+                           vw[2] + wt[2] + xf.ccs_t.z});
         }
     };
     out.clear();
@@ -699,6 +704,7 @@ static bool occSetup(const string& cfg_dir, const string& day) {
         cerr << "[Occ] WARN: no calib XML dir (" << xml_dir.string() << ") — occlusion disabled" << endl;
         return false;
     }
+    g_occ_xml_dir = xml_dir.string();      // 记录权威目录 (joints 通道启动时推送给 Slave)
     for (auto& e : fs::directory_iterator(xml_dir)) {
         string fn = e.path().filename().string();
         if (fn.size() > 9 && fn.substr(fn.size()-9) == "_Data.xml") {
@@ -947,6 +953,64 @@ void sendJointsToSlave() {
         cerr << "[Joints] send to Slave failed (err " << WSAGetLastError() << ")" << endl;
 }
 
+// ---- base64 (标定 XML 经文本通道传输; 无第三方依赖) ----
+static string occB64Encode(const string& in) {
+    static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    string out; out.reserve((in.size() + 2) / 3 * 4);
+    size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        uint32_t v = (uint32_t)(uint8_t)in[i] << 16 | (uint32_t)(uint8_t)in[i+1] << 8 | (uint8_t)in[i+2];
+        out += T[v >> 18 & 63]; out += T[v >> 12 & 63]; out += T[v >> 6 & 63]; out += T[v & 63];
+    }
+    if (i + 1 == in.size()) {
+        uint32_t v = (uint32_t)(uint8_t)in[i] << 16;
+        out += T[v >> 18 & 63]; out += T[v >> 12 & 63]; out += "==";
+    } else if (i + 2 == in.size()) {
+        uint32_t v = (uint32_t)(uint8_t)in[i] << 16 | (uint32_t)(uint8_t)in[i+1] << 8;
+        out += T[v >> 18 & 63]; out += T[v >> 12 & 63]; out += T[v >> 6 & 63]; out += '=';
+    }
+    return out;
+}
+static bool occB64Decode(const string& in, string& out) {
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    out.clear(); uint32_t buf = 0; int bits = 0;
+    for (char c : in) {
+        if (c == '=') break;
+        int v = val(c); if (v < 0) return false;
+        buf = buf << 6 | (uint32_t)v; bits += 6;
+        if (bits >= 8) { bits -= 8; out += char(buf >> bits & 0xFF); }
+    }
+    return true;
+}
+
+// Master: day 标定 XML 推送给 Slave (Slave 本地副本可能过时, 离线重放需要权威数据)
+string findDayForParticipant(const string& map_path, const string& participant);   // 前置声明 (定义在 main 前)
+static void sendCalibToSlave() {
+    if (g_occ_xml_dir.empty() || g_joints_sock == INVALID_SOCKET) return;
+    int n = 0;
+    try {
+        for (auto& e : fs::directory_iterator(g_occ_xml_dir)) {
+            string fn = e.path().filename().string();
+            if (fn.size() <= 9 || fn.substr(fn.size() - 9) != "_Data.xml") continue;
+            ifstream f(e.path(), ios::binary);
+            stringstream ss; ss << f.rdbuf();
+            { lock_guard<mutex> lk(g_joints_send_mtx);
+              sendLineRaw(g_joints_sock, "CALIB:" + fn.substr(0, fn.size() - 9) + ":" + occB64Encode(ss.str())); }
+            ++n;
+        }
+    } catch (...) {}
+    { lock_guard<mutex> lk(g_joints_send_mtx);
+      sendLineRaw(g_joints_sock, "CALIB_END:" + to_string(n)); }
+    cout << "[Calib] pushed " << n << " day XMLs to Slave" << endl;
+}
+
 void jointsServerWorker(int joints_port) {                       // Master: 监听 + 保持连接
     g_joints_listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (g_joints_listen_sock == INVALID_SOCKET) return;
@@ -966,10 +1030,11 @@ void jointsServerWorker(int joints_port) {                       // Master: 监�
           g_joints_sock = cs; }
         g_joints_connected = true;
         cout << "[Joints] Slave connected." << endl;
+        sendCalibToSlave();                       // 连上即推送 day 标定 XML (覆盖 Slave 本地可能过时的副本)
     }
 }
 
-void jointsClientWorker(const string& master_ip, int joints_port) {  // Slave: 连接 + 接收
+void jointsClientWorker(const string& master_ip, int joints_port, const string& cfg_dir) {  // Slave: 连接 + 接收
     while (global_running) {
         SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (sock == INVALID_SOCKET) { this_thread::sleep_for(chrono::seconds(2)); continue; }
@@ -980,12 +1045,37 @@ void jointsClientWorker(const string& master_ip, int joints_port) {  // Slave: �
         }
         g_joints_connected = true;
         cout << "[Joints] Slave connected to Master." << endl;
+        static string s_calib_out_dir;          // 本地 day 输出目录 (懒初始化; 接收标定时定位)
         while (global_running) {
             string line;
             int st = recvLineStatus(sock, line, 300000);
             if (st == 2) { cerr << "[Joints] Connection closed by Master - reconnecting." << endl; break; }
             if (st == 1) continue;
-            if (line.rfind("JOINTS:", 0) == 0) {
+            if (line.rfind("CALIB:", 0) == 0) {
+                // Master 推送的 day 标定 XML ("CALIB:SN:<base64>") — 覆盖本地, 保证离线重放/后续使用为权威数据
+                size_t c1 = line.find(':', 6);
+                if (c1 == string::npos) continue;
+                string sn = line.substr(6, c1 - 6), xml;
+                if (!occB64Decode(line.substr(c1 + 1), xml)) continue;
+                if (s_calib_out_dir.empty()) {
+                    try {
+                        Cfg cc(cfg_dir + "/cam_calib.yaml");
+                        string sd = cc["calib"]["calib_save_dir"].as<string>();
+                        string day = findDayForParticipant(cfg_dir + "/day_participant_map.json", g_participant_id);
+                        if (!sd.empty() && !day.empty()) {
+                            s_calib_out_dir = (fs::path(sd) / day / "output").string();
+                            fs::create_directories(s_calib_out_dir);
+                        }
+                    } catch (...) {}
+                }
+                if (!s_calib_out_dir.empty())
+                    { ofstream(s_calib_out_dir + "/" + sn + "_Data.xml", ios::binary) << xml; }
+            }
+            else if (line.rfind("CALIB_END:", 0) == 0) {
+                cout << "[Calib] synced " << line.substr(10) << " day XMLs from Master -> "
+                     << (s_calib_out_dir.empty() ? "(dir resolve FAILED)" : s_calib_out_dir) << endl;
+            }
+            else if (line.rfind("JOINTS:", 0) == 0) {
                 lock_guard<mutex> lk(g_occ_mtx);
                 g_occ_joints_ok = false;
                 stringstream ss(line.substr(7)); string tok;
@@ -1748,7 +1838,7 @@ int main() {
         // 3. Joints channel (遮挡判定关节 → Slave h5 occ_joints; 与 cmd 控制流隔离)
         cout<<"[Joints] Starting joints channel on port "<<joints_port<<"..."<<endl;
         if (is_master_pc) joints_thread=thread(jointsServerWorker, joints_port);
-        else joints_thread=thread(jointsClientWorker, g_master_ip, joints_port);
+        else joints_thread=thread(jointsClientWorker, g_master_ip, joints_port, cfg_dir);
     }
 
     // 3. Piper connection (Master only, with retry)
