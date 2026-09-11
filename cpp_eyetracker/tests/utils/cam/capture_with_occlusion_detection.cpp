@@ -1875,6 +1875,7 @@ int main() {
     // ================== MAIN LOOP ==================
     bool is_recording=false; atomic<bool> is_dumping{false};
     string current_record_timestr; chrono::steady_clock::time_point record_start_time;
+    int dump_wait_reports=0;   // 相机就绪等待进度已打印次数 (每录重置, 每 2s 一次)
     double target_ui_fps=cap["ui_fps"].as<double>();
     auto ui_interval=chrono::milliseconds((int)(1000.0/target_ui_fps));
     auto last_ui_time=chrono::steady_clock::now()-ui_interval;
@@ -2031,7 +2032,36 @@ int main() {
         if (is_recording&&!is_dumping) {
             bool all_done=true;
             for(auto& ctx:cam_ctxs) if(!ctx->dump_ready.load()){all_done=false;break;}
+            // 进度上报 (每 2s): 哪台相机没就绪、录到第几帧 — 停更相机一目了然
+            if (!all_done && record_start_time.time_since_epoch().count() > 0) {
+                double rec_waited = chrono::duration<double>(chrono::steady_clock::now()-record_start_time).count();
+                int report_due = (int)(rec_waited / 2.0);
+                if (report_due > dump_wait_reports) {
+                    dump_wait_reports = report_due;
+                    int ready = 0; string pend;
+                    for(auto& ctx:cam_ctxs){ if(ctx->dump_ready.load()) ++ready;
+                        else pend += ctx->id + "(" + to_string(ctx->recorded_frames.load()) + "/"
+                                  + to_string(total_record_frames) + ") "; }
+                    cout<<"[Dump#"<<g_recording_number<<"] cameras ready "<<ready<<"/"<<cam_ctxs.size()
+                        <<" — not ready: "<<pend<<endl;
+                }
+            }
+            // 超时保护: 相机停更 (如 CXP 掉链) 时 dump_ready 永不置位 → 整条流水线
+            // (dump→sync→GAZE_DONE→sentry 握手) 死等。15s 后点名卡住的相机并强制继续。
+            if (!all_done && record_start_time.time_since_epoch().count() > 0) {
+                double rec_waited = chrono::duration<double>(chrono::steady_clock::now()-record_start_time).count();
+                if (rec_waited > 15.0) {
+                    string stuck;
+                    for(auto& ctx:cam_ctxs) if(!ctx->dump_ready.load())
+                        stuck += ctx->id + "(" + to_string(ctx->recorded_frames.load()) + "/"
+                               + to_string(total_record_frames) + ") ";
+                    cerr<<"[REC] WARN: camera dump timeout after 15s — stuck: "<<stuck<<"— proceeding anyway"<<endl;
+                    logException("WARN","rec","camera dump timeout: "+stuck);
+                    all_done = true;
+                }
+            }
             if (all_done) {
+                dump_wait_reports = 0;
                 g_consecutive_faults=0; is_recording=false; g_recording_number++;
                 // 录制后延迟: 与录制前 capture_delay 对称 (SPACE→delay→录制→delay→dump)
                 if (g_capture_delay > 0.0) {
@@ -2047,6 +2077,8 @@ int main() {
                     }
                 }
                 is_dumping=true;
+                cout<<"[Dump#"<<g_recording_number<<"] stage start ("<<(is_master_pc?"Master":"Slave")
+                    <<", "<<cam_ctxs.size()<<" cams)"<<endl;
                 if(is_master_pc) setLedState(LedState::WAITING);  // update before loading screens
                 // OVER 检查 (h5 sentry 推导): 本次录制提交后本臂即满 → 提前移动前进入 OVER
                 if (is_master_pc && armRecorded(g_arm) + 1 >= recordingsPerArm()) {
@@ -2164,6 +2196,9 @@ int main() {
                 auto t_launch=chrono::steady_clock::now();
 
                 // Step 2-3: Wait for children + cleanup
+                cout<<"[Dump#"<<g_recording_number<<"] children launched ("<<cam_ctxs.size()
+                    <<"), waiting exit... (precreate "
+                    <<chrono::duration<double>(t_pre-t_par0).count()*1000.0<<"ms)"<<endl;
                 vector<HANDLE> handles;for(auto&p:procs)if(p.hProcess)handles.push_back(p.hProcess);
                 if(!handles.empty())WaitForMultipleObjects((DWORD)handles.size(),handles.data(),TRUE,INFINITE);
                 auto t_hdf5_done=chrono::steady_clock::now();
@@ -2171,10 +2206,15 @@ int main() {
                 for(auto&p:procs){if(!p.hProcess){all_ok=false;continue;}DWORD ec;if(GetExitCodeProcess(p.hProcess,&ec)&&ec!=0){all_ok=false;logException("ERROR","hdf5:cam","child exit "+to_string(ec));}CloseHandle(p.hProcess);}
                 if(hJob)CloseHandle(hJob);
                 for(auto& ctx:cam_ctxs)ctx->dump_end_time=chrono::steady_clock::now();
+                cout<<"[Dump#"<<g_recording_number<<"] children done in "
+                    <<chrono::duration<double>(t_hdf5_done-t_launch).count()*1000.0<<"ms, all_ok="<<all_ok<<endl;
 
                 // Join arm thread (if Master)
+                cout<<"[Dump#"<<g_recording_number<<"] joining arm thread..."<<endl;
                 if(arm_thread.joinable()) arm_thread.join();
                 auto t_arm_done=chrono::steady_clock::now();
+                cout<<"[Dump#"<<g_recording_number<<"] arm thread joined at +"
+                    <<chrono::duration<double>(t_arm_done-t_par0).count()*1000.0<<"ms"<<endl;
 
                 // ====== SYNC: Wait Slave HDF5 → GAZE forward → GAZE_DONE ======
                 if (is_master_pc) {
@@ -2199,13 +2239,26 @@ int main() {
                       send(g_gaze_sock, (gmsg+"\n").c_str(), (int)gmsg.size()+1, 0); }
                     string ack; recvLine(g_gaze_sock, ack, 5000);
                     cout<<"[Gaze] Slave ACK: "<<ack<<endl;
-                    sendLineRaw(g_cmd_sock, "GAZE_DONE");
+                    // GAZE_DONE 发送结果显式检查 (发送失败 = Slave 永远等不到, 流水线死锁)
+                    if (sendLineRaw(g_cmd_sock, "GAZE_DONE"))
+                        cout<<"[Dump#"<<g_recording_number<<"] GAZE_DONE sent to Slave"<<endl;
+                    else {
+                        cerr<<"[Dump#"<<g_recording_number<<"] WARN: GAZE_DONE send FAILED (err "
+                            <<WSAGetLastError()<<") — Slave will hit GAZE_DONE timeout"<<endl;
+                        logException("WARN","sync","GAZE_DONE send failed");
+                    }
                     auto t_gaze_done=chrono::steady_clock::now();
                     g_gaze_forward_s = chrono::duration<double>(t_gaze_done-t_wait1).count();
                 } else {
-                    // Signal Master: HDF5 done + timing
+                    // Signal Master: HDF5 done + timing (发送结果显式检查 — 失败则 Master 死等)
                     char hbuf[64]; snprintf(hbuf,sizeof(hbuf),"HDF5_DONE:%.3f",g_slave_hdf5_s);
-                    sendLineRaw(g_cmd_sock, hbuf);
+                    if (sendLineRaw(g_cmd_sock, hbuf))
+                        cout<<"[Dump#"<<g_recording_number<<"] HDF5_DONE sent to Master"<<endl;
+                    else {
+                        cerr<<"[Dump#"<<g_recording_number<<"] WARN: HDF5_DONE send FAILED (err "
+                            <<WSAGetLastError()<<") — Master will hit wait timeout"<<endl;
+                        logException("WARN","sync","HDF5_DONE send failed");
+                    }
                     // Wait for gaze from Master (30s 超时: Master 掉线时自报卡点, 不再无限等)
                     g_gaze_need_send = false;
                     cout<<"[Sync] Waiting for Master GAZE..."<<endl;
