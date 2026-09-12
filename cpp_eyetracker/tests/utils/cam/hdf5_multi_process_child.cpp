@@ -34,11 +34,13 @@ int main(int argc, char* argv[]) {
     // argv[11] = gaze_y          argv[12] = gaze_z
     // argv[13] = occluded (0/1, 可选; 1 = 本相机此目标被遮挡, valid 整段写 0)
     // argv[14] = joints (可选; "qU0,...,qU5,qL0,...,qL5" 逗号表 或 "-"; 写 occ_joints, "-" → NaN)
+    // argv[15] = occ_status (可选; 判定状态, 写 occ_status: 0正常 1停用 2查询失败 3下发失败 4对账失配)
+    // argv[16] = err_upper  / argv[17] = err_lower (可选; 对账误差 mm, "nan"→NaN; 写 occ_check_err)
     if (argc < 13) {
         cerr << "Usage: " << argv[0]
              << " <camera_index> <hdf5_dir> <chunk_idx> <frame_offset>"
              << " <core_frames> <cam_h> <cam_w> <margin_frames> <shm_name>"
-             << " <gaze_x> <gaze_y> <gaze_z> [occluded] [joints]"
+             << " <gaze_x> <gaze_y> <gaze_z> [occluded] [joints] [status] [errU] [errL]"
              << endl;
         return 2;
     }
@@ -56,6 +58,10 @@ int main(int argc, char* argv[]) {
     double gaze_y        = atof(argv[11]);
     double gaze_z        = atof(argv[12]);
     int    occluded      = (argc > 13) ? atoi(argv[13]) : 0;
+    int    occ_status    = (argc > 15) ? atoi(argv[15]) : 0;
+    float  occ_err[2];
+    occ_err[0] = (argc > 16) ? (float)atof(argv[16]) : numeric_limits<float>::quiet_NaN();
+    occ_err[1] = (argc > 17) ? (float)atof(argv[17]) : numeric_limits<float>::quiet_NaN();
 
     // 判定所用关节 (qU6+qL6; 无效/缺失 → NaN, 与图像/valid 同时序可辨识)
     double joints[12];
@@ -152,6 +158,32 @@ int main(int argc, char* argv[]) {
                 for (int k = 0; k < 12; ++k)
                     jn_buf[i * 12 + k] = joints[k];
             jnt_ds.write(jn_buf.data(), H5::PredType::NATIVE_DOUBLE, jn_mem, jn_file);
+        } catch (const H5::Exception&) {}
+
+        // ---- occ_status / occ_check_err: 判定状态 + 双臂对账误差 (每录恒定; 离线排障) ----
+        // 旧文件可能缺数据集 (预创建早于本字段引入) → 跳过, 不影响其他写入
+        try {
+            {
+                H5::DataSet st_ds = f.openDataSet("occ_status");
+                hsize_t st_start[1] = {(hsize_t)frame_offset};
+                hsize_t st_count[1] = {(hsize_t)N};
+                H5::DataSpace st_mem(1, st_count);
+                H5::DataSpace st_file = st_ds.getSpace();
+                st_file.selectHyperslab(H5S_SELECT_SET, st_count, st_start);
+                vector<uint8_t> st_buf((size_t)N, (uint8_t)occ_status);
+                st_ds.write(st_buf.data(), H5::PredType::NATIVE_UINT8, st_mem, st_file);
+            }
+            {
+                H5::DataSet er_ds = f.openDataSet("occ_check_err");
+                hsize_t er_start[2] = {(hsize_t)frame_offset, 0};
+                hsize_t er_count[2] = {(hsize_t)N, 2};
+                H5::DataSpace er_mem(2, er_count);
+                H5::DataSpace er_file = er_ds.getSpace();
+                er_file.selectHyperslab(H5S_SELECT_SET, er_count, er_start);
+                vector<float> er_buf((size_t)N * 2);
+                for (int i = 0; i < N; ++i) { er_buf[i*2] = occ_err[0]; er_buf[i*2+1] = occ_err[1]; }
+                er_ds.write(er_buf.data(), H5::PredType::NATIVE_FLOAT, er_mem, er_file);
+            }
         } catch (const H5::Exception&) {}
 
         // ---- valid: 被遮挡相机整段写 0, 其余全 1 (tiny, ~0.001s) ----

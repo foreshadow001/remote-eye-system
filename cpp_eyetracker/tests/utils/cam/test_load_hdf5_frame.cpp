@@ -32,6 +32,8 @@ struct CamInfo {
     bool occluded;     // valid=0 (已写入区域) = 遮挡判定置 0
     bool loaded;
     double gt[3] = {0, 0, 0};   // gaze_target (40772280 相机系)
+    int occ_status = -1;        // 判定状态 (-1=旧文件无数据集; 0正常 1停用 2查询失败 3下发失败 4对账失配)
+    double occ_err[2] = {0, 0}; // 双臂对账误差 mm (NaN=未对账)
 };
 
 static vector<CamInfo> g_cams;
@@ -110,6 +112,21 @@ static bool loadFrame(int global_idx) {
                     gt_ds.read(c.gt, H5::PredType::NATIVE_DOUBLE, g_mem, g_file);
                 } catch (const H5::Exception&) {}
             }
+            // occ_status / occ_check_err: 判定状态与双臂对账误差 (旧文件缺 → 保持 -1)
+            try {
+                H5::DataSet st_ds = f.openDataSet("occ_status");
+                hsize_t s_start[1] = {(hsize_t)c.frame_offset}, s_count[1] = {1};
+                H5::DataSpace s_mem(1, s_count), s_file = st_ds.getSpace();
+                s_file.selectHyperslab(H5S_SELECT_SET, s_count, s_start);
+                uint8_t st = 0; st_ds.read(&st, H5::PredType::NATIVE_UINT8, s_mem, s_file);
+                c.occ_status = (int)st;
+                H5::DataSet er_ds = f.openDataSet("occ_check_err");
+                hsize_t e_start[2] = {(hsize_t)c.frame_offset, 0}, e_count[2] = {1, 2};
+                H5::DataSpace e_mem(2, e_count), e_file = er_ds.getSpace();
+                e_file.selectHyperslab(H5S_SELECT_SET, e_count, e_start);
+                float ev[2]; er_ds.read(ev, H5::PredType::NATIVE_FLOAT, e_mem, e_file);
+                c.occ_err[0] = ev[0]; c.occ_err[1] = ev[1];
+            } catch (const H5::Exception&) {}
             c.loaded = true;
             any_loaded = true;
         } catch (const H5::Exception&) {}
@@ -189,12 +206,24 @@ static void render(cv::Mat& canvas) {
         cv::putText(canvas, cfo, {off_x + dw - cs.width - 10, off_y + 30},
                     cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,255,255), 2);
 
-        // Frame 信息行: 帧号 + 臂/目标 (armRecorded 口径) + SN + VALID/OCCLUDED
+        // Frame 信息行: 帧号 + 臂/目标 (armRecorded 口径) + SN + VALID/OCCLUDED + 判定状态
         string arm; int tgt_i = 0;
         frameToTarget(g_global_frame, arm, tgt_i);
+        static const char* kOccStName[] = {"OK", "DISABLED", "QUERY_FAIL", "DELIVERY_FAIL", "MISMATCH"};
         string fi = "Frame:" + to_string(g_global_frame) + "  " + arm + " #" + to_string(tgt_i + 1)
                     + "  " + g_cams[g_enlarged].sn
                     + (g_cams[g_enlarged].occluded ? "  OCCLUDED" : "  VALID");
+        {   // 判定状态徽标 (≠0 黄色提示; -1 旧文件) + 双臂对账误差
+            auto& ec2 = g_cams[g_enlarged];
+            if (ec2.occ_status > 0)
+                fi += string("  [") + kOccStName[min(ec2.occ_status, 4)] + "]";
+            else if (ec2.occ_status < 0)
+                fi += "  [legacy]";
+            if (ec2.occ_status >= 0 && ec2.occ_err[0] == ec2.occ_err[0]) {   // 非 NaN
+                char eb[80]; snprintf(eb, sizeof(eb), "  chk U:%.1f L:%.1fmm", ec2.occ_err[0], ec2.occ_err[1]);
+                fi += eb;
+            }
+        }
         cv::Scalar fi_col = g_cams[g_enlarged].occluded ? cv::Scalar(0,0,255) : cv::Scalar(0,255,0);
         cv::putText(canvas, fi, {off_x + 10, off_y + 30},
                     cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,0,0), 3);

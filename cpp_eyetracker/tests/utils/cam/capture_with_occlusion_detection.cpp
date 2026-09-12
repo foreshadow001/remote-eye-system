@@ -453,6 +453,11 @@ static mutex g_occ_mtx;
 static string g_occ_last_line;            // UI 一行摘要
 static array<double,12> g_occ_joints{};   // 本目标判定所用关节 (qU6+qL6; h5 occ_joints 调试数据集)
 static bool g_occ_joints_ok = false;      // false = 本目标无有效关节 (h5 写 NaN)
+// 本目标判定状态 (h5 occ_status; 离线区分 valid=0 的成因):
+// 0=判定正常 1=停用期 2=关节查询失败 3=关节下发失败 4=对账失配(证据关节已存)
+static atomic<int> g_occ_status{0};
+// 双臂 FK↔真实法兰对账误差 mm (h5 occ_check_err; NaN=未对账) — 离线看漂移趋势/停用根因
+static double g_occ_check_err[2] = {NAN, NAN};
 
 bool sendJointsToSlave();                                    // 专用 joints 通道推送 (ACK+重试; 定义在 gaze 段前)
 static string g_occ_xml_dir;                                 // day 标定 XML 目录 (Master 权威; 启动推送给 Slave)
@@ -805,38 +810,60 @@ static bool occQueryPose(const string& arm, ArmPose& pose) {
     return parsePoseResponse(resp, resp_arm, pose) && resp_arm == arm;
 }
 
+// OCCL 集下发 (cmd 通道); 无法判定时传全集 → Slave 该录全 valid=0
+static void sendOcclSet(const set<string>& occ) {
+    if (g_cmd_sock == INVALID_SOCKET) return;
+    string msg = "OCCL:";
+    for (auto& sn : occ) msg += (msg.size() > 5 ? "," : "") + sn;
+    sendLine(g_cmd_sock, msg);
+}
+
+// GET_JOINTS 双臂 (3 次重试, 间隔 500ms); 停用期与判定期共用
+static bool occQueryJointsRetry(double qU[6], double qL[6]) {
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        if (occQueryJoints("upper", qU) && occQueryJoints("lower", qL)) return true;
+        cerr << "[Occ] GET_JOINTS attempt " << attempt << "/3 failed — retrying..." << endl;
+        this_thread::sleep_for(chrono::milliseconds(500));
+    }
+    return false;
+}
+
 static void runOcclusionCheck(const string& arm, int target_idx) {
     if (!g_occ_enabled) {
-        // 停用也要同步 Slave (空 OCCL / 空 JOINTS), 否则残留上一目标结果
-        { lock_guard<mutex> lk(g_occ_mtx); g_occ_occluded.clear(); g_occ_joints_ok = false; }
-        if (g_cmd_sock != INVALID_SOCKET) sendLine(g_cmd_sock, "OCCL:");
+        // 停用期: 判定不做, 但关节照常采集保存 (对账失败构型对离线排查有价值);
+        // 无法判定 → 全相机 valid=0 (P001 重采教训: 停用发空 OCCL,
+        // 出现 132/500 录 occ_joints=NaN 而 valid=1 的不可验证数据)
+        double qU[6], qL[6];
+        bool ok = occQueryJointsRetry(qU, qL);
+        set<string> occ_all;
+        { lock_guard<mutex> lk(g_occ_mtx);
+          g_occ_occluded.clear();
+          for (auto& c : g_occ_cams) { g_occ_occluded.insert(c.sn); ++g_occ_stats[c.sn]; }
+          occ_all = g_occ_occluded;
+          if (ok) for (int k = 0; k < 6; ++k) { g_occ_joints[k] = qU[k]; g_occ_joints[6+k] = qL[k]; }
+          g_occ_joints_ok = ok;
+          g_occ_status = 1;
+          g_occ_check_err[0] = g_occ_check_err[1] = NAN;         // 停用期不对账
+          g_occ_last_line = "Occ DISABLED (all valid=0)"; }
+        sendOcclSet(occ_all);
         sendJointsToSlave();
         return;
     }
     double qU[6], qL[6];
-    // 关节查询重试 (3 次): 失败不允许静默发生 — 无法判定的录制按全相机 valid=0 处理
-    bool joints_ok = false;
-    for (int attempt = 1; attempt <= 3 && !joints_ok; ++attempt) {
-        if (occQueryJoints("upper", qU) && occQueryJoints("lower", qL)) joints_ok = true;
-        else {
-            cerr << "[Occ] GET_JOINTS attempt " << attempt << "/3 failed — retrying..." << endl;
-            this_thread::sleep_for(chrono::milliseconds(500));
-        }
-    }
-    if (!joints_ok) {
+    // 关节查询 (3 次重试): 失败不允许静默发生 — 无法判定的录制按全相机 valid=0 处理
+    if (!occQueryJointsRetry(qU, qL)) {
         cerr << "[Occ] WARN: joint query exhausted retries — ALL cameras valid=0 this target" << endl;
         logException("WARN","occ","joint query failed - all valid=0");
+        set<string> occ_all;
         { lock_guard<mutex> lk(g_occ_mtx);
           g_occ_occluded.clear();
           for (auto& c : g_occ_cams) { g_occ_occluded.insert(c.sn); ++g_occ_stats[c.sn]; }
+          occ_all = g_occ_occluded;
           g_occ_joints_ok = false;
+          g_occ_status = 2;
+          g_occ_check_err[0] = g_occ_check_err[1] = NAN;
           g_occ_last_line = "Occ: JOINTS QUERY FAILED (all valid=0)"; }
-        if (g_cmd_sock != INVALID_SOCKET) {                     // OCCL: 全集 → Slave 同步全 valid=0
-            string msg = "OCCL:";
-            { lock_guard<mutex> lk(g_occ_mtx);
-              for (auto& sn : g_occ_occluded) msg += (msg.size() > 5 ? "," : "") + sn; }
-            sendLine(g_cmd_sock, msg);
-        }
+        sendOcclSet(occ_all);                                   // 全集 → Slave 同步全 valid=0
         sendJointsToSlave();                                    // 空关节 (NaN) — 重试耗尽仍尝试下发
         return;
     }
@@ -844,6 +871,7 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
     // ---- 双臂关节对账 (每判定): FK 法兰 ↔ 真实法兰 (动臂=MOVED 应答, 停臂=GET_POSE) ----
     // P001 教训: 关节若串到另一臂/停更, 模型错位 → valid 写出系统性错误值;
     // 每次都用真实位姿复核两臂, 失配超 1 cm 立即停用并大声报错
+    double err_mm[2] = {NAN, NAN};                            // 对账误差 (h5 occ_check_err)
     for (int i = 0; i < 2; ++i) {
         const string& a = (i == 0) ? "upper" : "lower";
         ArmPose real;
@@ -861,18 +889,26 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
         Pose sdk_ccs = armToolToCamPose(sdk_flange, {0,0,0}, {0,0,0}, xf.ccs_t, xf.ccs_r);
         double dx = fk[0] - sdk_ccs.pos.x, dy = fk[1] - sdk_ccs.pos.y, dz = fk[2] - sdk_ccs.pos.z;
         double err = sqrt(dx*dx + dy*dy + dz*dz);
+        err_mm[i] = err * 1000.0;
         cout << "[Occ] joint check " << a << ": FK vs real flange err = " << err * 1000.0 << " mm" << endl;
         if (err > 0.01) {
             cerr << "[Occ] WARN: " << a << " joints mismatch real pose > 10 mm"
-                 << " (joints wrong/stale/crossed?) — occlusion disabled (valid stays 1)" << endl;
+                 << " (joints wrong/stale/crossed?) — occlusion disabled, this and later targets ALL valid=0" << endl;
+            logException("ERROR","occ","joint check mismatch - disabled, all valid=0");
             g_occ_enabled = false;
-            // 失配关节仍原样记录 (h5 occ_joints) — 离线重放定位串台来源的证据
+            // 失配关节仍原样记录 (h5 occ_joints) — 离线重放定位串台来源的证据;
+            // 本目标不可判定 → 全集 OCCL (NaN/失配 joints 不允许 valid=1)
+            set<string> occ_bad;
             { lock_guard<mutex> lk(g_occ_mtx);
-              g_occ_occluded.clear(); g_occ_last_line.clear();
+              for (auto& c : g_occ_cams) { g_occ_occluded.insert(c.sn); ++g_occ_stats[c.sn]; }
+              occ_bad = g_occ_occluded;
+              g_occ_status = 4;
+              g_occ_check_err[0] = err_mm[0]; g_occ_check_err[1] = err_mm[1];
+              g_occ_last_line = "Occ: JOINTS MISMATCH — DISABLED (all valid=0)";
               for (int k = 0; k < 6; ++k) { g_occ_joints[k] = qU[k]; g_occ_joints[6+k] = qL[k]; }
               g_occ_joints_ok = true; }
-            if (g_cmd_sock != INVALID_SOCKET) sendLine(g_cmd_sock, "OCCL:");   // 同步清 Slave 残留 (关节仍经专用通道下发)
-            sendJointsToSlave();
+            sendOcclSet(occ_bad);
+            sendJointsToSlave();                              // 失配关节仍经专用通道下发 (证据)
             return;
         }
     }
@@ -895,6 +931,8 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
         g_occ_occluded = occ;
         for (int k = 0; k < 6; ++k) { g_occ_joints[k] = qU[k]; g_occ_joints[6+k] = qL[k]; }
         g_occ_joints_ok = true;
+        g_occ_status = 0;
+        g_occ_check_err[0] = err_mm[0]; g_occ_check_err[1] = err_mm[1];
         for (auto& sn : occ) ++g_occ_stats[sn];
         string sns; for (auto& sn : occ) sns += (sns.empty() ? "" : " ") + sn;
         g_occ_last_line = "Occluded: " + to_string(occ.size()) + "/" + to_string(g_occ_cams.size())
@@ -911,14 +949,11 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
         for (auto& c : g_occ_cams) { occ.insert(c.sn); ++g_occ_stats[c.sn]; }
         { lock_guard<mutex> lk(g_occ_mtx);
           g_occ_occluded = occ;
+          g_occ_status = 3;
           g_occ_last_line = "Occ: JOINTS DELIVERY FAILED (all valid=0)"; }
     }
     // 遮挡集走 cmd (Slave 自行与本机相机求交)
-    if (g_cmd_sock != INVALID_SOCKET) {
-        string msg = "OCCL:";
-        for (auto& sn : occ) msg += (msg.size() > 5 ? "," : "") + sn;
-        sendLine(g_cmd_sock, msg);
-    }
+    sendOcclSet(occ);
 }
 
 // ================== Piper: compute tool in CCS ==================
@@ -979,13 +1014,18 @@ static SOCKET g_joints_sock = INVALID_SOCKET;
 static atomic<bool> g_joints_connected{false};
 static mutex g_joints_send_mtx;
 
-// Master: 把当前 g_occ_joints 推给 Slave ("JOINTS:q0,...,q11"; 无效 → "JOINTS:")
+// Master: 把当前判定关节+状态推给 Slave:
+//   "JOINTS:<status>,<errU>,<errL>|<q0,...,q11>"  (关节无效 → '|' 后为空 → h5 NaN)
 // 带 ACK 确认 + 重发 (P001 教训: 单次丢消息 → 该录 occ_joints=NaN 无法判定);
 // 返回 false = 重试耗尽, 调用方须将本目标全相机 valid=0
 bool sendJointsToSlave() {
     if (g_joints_sock == INVALID_SOCKET) return false;
     string msg = "JOINTS:";
     { lock_guard<mutex> lk(g_occ_mtx);
+      char h[64];
+      snprintf(h, sizeof(h), "%d,%.3f,%.3f|", g_occ_status.load(),
+               g_occ_check_err[0], g_occ_check_err[1]);
+      msg += h;
       if (g_occ_joints_ok) {
           char b[32];
           for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), "%s%.6f", k ? "," : "", g_occ_joints[k]); msg += b; }
@@ -1125,15 +1165,31 @@ void jointsClientWorker(const string& master_ip, int joints_port, const string& 
                      << (s_calib_out_dir.empty() ? "(dir resolve FAILED)" : s_calib_out_dir) << endl;
             }
             else if (line.rfind("JOINTS:", 0) == 0) {
+                // "JOINTS:<status>,<errU>,<errL>|<q0,...,q11 或空>"
                 lock_guard<mutex> lk(g_occ_mtx);
                 g_occ_joints_ok = false;
-                stringstream ss(line.substr(7)); string tok;
-                int k = 0;
-                while (k < 12 && getline(ss, tok, ',')) {
-                    try { g_occ_joints[k++] = stod(tok); }
-                    catch (...) { k = 0; break; }
+                string body = line.substr(7);
+                size_t bar = body.find('|');
+                {   // 头部: 状态 + 双臂对账误差
+                    stringstream hs(bar == string::npos ? body : body.substr(0, bar));
+                    string tok; int k = 0; double hv[3];
+                    while (k < 3 && getline(hs, tok, ',')) {
+                        try { hv[k++] = stod(tok); } catch (...) { k = 0; break; }
+                    }
+                    if (k == 3) {
+                        g_occ_status = (int)hv[0];
+                        g_occ_check_err[0] = hv[1]; g_occ_check_err[1] = hv[2];
+                    } else { g_occ_status = -1; g_occ_check_err[0] = g_occ_check_err[1] = NAN; }
                 }
-                if (k == 12) g_occ_joints_ok = true;
+                if (bar != string::npos) {   // '|': 关节表
+                    stringstream ss(body.substr(bar + 1)); string tok;
+                    int k = 0;
+                    while (k < 12 && getline(ss, tok, ',')) {
+                        try { g_occ_joints[k++] = stod(tok); }
+                        catch (...) { k = 0; break; }
+                    }
+                    if (k == 12) g_occ_joints_ok = true;
+                }
                 sendLineRaw(sock, "JOINTS_ACK");
             }
         }
@@ -1452,6 +1508,10 @@ void precreateSerial() {
                     f.createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd), pl);
                     hsize_t jd[2] = {(hsize_t)g_hdf5_chunk_capacity, 12};
                     f.createDataSet("occ_joints", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, jd), pl);
+                    hsize_t sd[1] = {(hsize_t)g_hdf5_chunk_capacity};
+                    f.createDataSet("occ_status", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, sd), pl);
+                    hsize_t ed[2] = {(hsize_t)g_hdf5_chunk_capacity, 2};
+                    f.createDataSet("occ_check_err", H5::PredType::NATIVE_FLOAT, H5::DataSpace(2, ed), pl);
                     hsize_t vd[1] = {(hsize_t)g_hdf5_chunk_capacity};
                     f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd), pl);
                     hsize_t rd[3] = {(hsize_t)g_hdf5_chunk_capacity, (hsize_t)g_cam_h, (hsize_t)g_cam_w};
@@ -1840,7 +1900,17 @@ int main() {
                 <<" — check cfg/day_participant_map.json. Transforms NOT loaded."<<endl;
         }
         // 遮挡检测资源加载 (Master only; Slave 经 OCCL 消息接收判定结果)
-        g_occ_enabled = occSetup(cfg_dir, day_id);
+        // 自检失败 = 遮挡判定无从谈起 → fail-fast 退出, 不允许带病采集 (旧版仅告警停用,
+        // 停用期数据 valid 恒 1 且无法离线验证, P001 重采教训)
+        if (!occSetup(cfg_dir, day_id)) {
+            cerr << "\n[Occ] FATAL: occlusion setup failed — check:"
+                 << "\n    1. cam_calib.yaml calib_save_dir / day XMLs (20 cams)"
+                 << "\n    2. piper URDF + meshes"
+                 << "\n    3. cfg/arm_pose/" << day_id << ".yaml"
+                 << "\nFix and restart. Exiting." << endl;
+            return 1;
+        }
+        g_occ_enabled = true;
         auto loadTgts=[&](const string& path)->vector<array<double,3>>{
             vector<array<double,3>> out; ifstream in(path); string line;
             while(getline(in,line)){if(line.empty())continue;stringstream ss(line);string token;array<double,3>pt{};
@@ -2272,8 +2342,16 @@ int main() {
                 // 同理快照 #N 的遮挡集与判定关节 (ARM_OK(#N+1) 的 OCCL 可能先于本机子进程启动)
                 set<string> rec_occl;
                 array<double,12> rec_joints{}; bool rec_joints_ok;
+                int rec_occ_status = 0; double rec_occ_err[2] = {NAN, NAN};
                 { lock_guard<mutex> lk(g_occ_mtx);
-                  rec_occl = g_occ_occluded; rec_joints = g_occ_joints; rec_joints_ok = g_occ_joints_ok; }
+                  rec_occl = g_occ_occluded; rec_joints = g_occ_joints; rec_joints_ok = g_occ_joints_ok;
+                  rec_occ_status = g_occ_status.load();
+                  rec_occ_err[0] = g_occ_check_err[0]; rec_occ_err[1] = g_occ_check_err[1]; }
+                // 兜底 (写盘前最后防线): 本录无有效关节 (occ_joints 将为 NaN) 时无法
+                // 离线判定遮挡 → 本机全部相机 valid=0。不依赖 Master 的任何消息到达,
+                // 无论判定停用/查询失败/下发丢失, NaN ⇒ valid=0 恒成立
+                if (!rec_joints_ok)
+                    for (auto& ctx : cam_ctxs) rec_occl.insert(ctx->id);
                 // gaze target 各相机系快照 (h5 按相机系保存):
                 // Master 用 day 外参现算; Slave 用 GAZE_CAM 接收值 (缺相机回退中心系)
                 map<string, array<double,3>> rec_gaze_cam;
@@ -2330,6 +2408,10 @@ int main() {
                         f.createDataSet("gaze_target",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,gd),pl);
                         hsize_t jd[2]={(hsize_t)g_hdf5_chunk_capacity,12};
                         f.createDataSet("occ_joints",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,jd),pl);
+                        hsize_t sd[1]={(hsize_t)g_hdf5_chunk_capacity};
+                        f.createDataSet("occ_status",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,sd),pl);
+                        hsize_t ed[2]={(hsize_t)g_hdf5_chunk_capacity,2};
+                        f.createDataSet("occ_check_err",H5::PredType::NATIVE_FLOAT,H5::DataSpace(2,ed),pl);
                         hsize_t vd[1]={(hsize_t)g_hdf5_chunk_capacity};
                         f.createDataSet("valid",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,vd),pl);
                         hsize_t rd[3]={(hsize_t)g_hdf5_chunk_capacity,(hsize_t)cam_h,(hsize_t)cam_w};
@@ -2364,6 +2446,11 @@ int main() {
                             }
                         } else args << "-";
                     }
+                    // 判定状态 + 双臂对账误差 (h5 occ_status / occ_check_err; NaN → "nan" 字面量)
+                    {   char eb[2][32];
+                        for (int k = 0; k < 2; ++k)
+                            snprintf(eb[k], sizeof(eb[k]), "%.3f", rec_occ_err[k]);
+                        args << " " << rec_occ_status << " " << eb[0] << " " << eb[1]; }
                     STARTUPINFOA si{sizeof(si)};PROCESS_INFORMATION pi{};
                     string cmd_line=args.str();
                     if(CreateProcessA(child_exe.c_str(),&cmd_line[0],NULL,NULL,FALSE,0,NULL,NULL,&si,&pi)){
