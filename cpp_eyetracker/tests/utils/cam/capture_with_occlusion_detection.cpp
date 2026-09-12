@@ -2507,6 +2507,11 @@ int main() {
                             }
                         } else args << "-";
                     }
+                    // 排障日志: joints 段是此刻 args 的最后一个 token (与 child 端打印对账)
+                    {   const string full = args.str();
+                        size_t sp = full.rfind(' ');
+                        cout << "[Dump#" << g_recording_number << "] cam" << i << " argv14=["
+                             << full.substr(sp + 1, 24) << "]" << endl; }
                     // 判定状态 + 双臂对账误差 (h5 occ_status / occ_check_err; NaN → "nan" 字面量)
                     {   char eb[2][32];
                         for (int k = 0; k < 2; ++k)

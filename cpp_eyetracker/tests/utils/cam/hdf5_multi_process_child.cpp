@@ -146,6 +146,10 @@ int main(int argc, char* argv[]) {
             ok = ok && (k == 12);
         }
         if (!ok) for (int k = 0; k < 12; ++k) joints[k] = NAN_VAL;
+        // 排障日志: child 实际收到的 argv[14] 与解析结果 (与主程序 [Dump#N] argv14 对账)
+        cerr << "[Child cam " << cam_idx << "] argc=" << argc << " argv14=["
+             << (argc > 14 ? string(argv[14]).substr(0, 24) : "(none)") << "] j0="
+             << joints[0] << endl;
     }
 
     // ---- Open shared memory ----
