@@ -2390,9 +2390,13 @@ int main() {
                   for (int k = 0; k < 12; ++k) rec_occ_arm_pose[k] = g_occ_arm_pose[k]; }
                 // 兜底 (写盘前最后防线): 本录无有效关节 (occ_joints 将为 NaN) 时无法
                 // 离线判定遮挡 → 本机全部相机 valid=0。不依赖 Master 的任何消息到达,
-                // 无论判定停用/查询失败/下发丢失, NaN ⇒ valid=0 恒成立
-                if (!rec_joints_ok)
+                // 无论判定停用/查询失败/下发丢失, NaN ⇒ valid=0 恒成立。
+                // status 覆写为 5: 区分 "Slave 端 joints 缺失/无效" (本机兜底触发) 与
+                // Master 判定失败 (2/3/4) — P001 三采排障: status=0+NaN 无法归因
+                if (!rec_joints_ok) {
+                    rec_occ_status = 5;
                     for (auto& ctx : cam_ctxs) rec_occl.insert(ctx->id);
+                }
                 // gaze target 各相机系快照 (h5 按相机系保存):
                 // Master 用 day 外参现算; Slave 用 GAZE_CAM 接收值 (缺相机回退中心系)
                 map<string, array<double,3>> rec_gaze_cam;

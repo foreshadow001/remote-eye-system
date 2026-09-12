@@ -217,7 +217,7 @@ static void render(cv::Mat& canvas) {
         string arm; int tgt_i = 0;
         frameToTarget(g_global_frame, arm, tgt_i);
         if (g_cams[g_enlarged].occ_arm >= 0) arm = (g_cams[g_enlarged].occ_arm == 0) ? "upper" : "lower";
-        static const char* kOccStName[] = {"OK", "?", "QUERY_FAIL", "DELIVERY_FAIL", "MISMATCH"};
+        static const char* kOccStName[] = {"OK", "?", "QUERY_FAIL", "DELIVERY_FAIL", "MISMATCH", "SLAVE_NO_JOINTS"};
         string fi = "Frame:" + to_string(g_global_frame) + "  " + arm + " #" + to_string(tgt_i + 1)
                     + "  " + g_cams[g_enlarged].sn
                     + (g_cams[g_enlarged].occluded ? "  OCCLUDED" : "  VALID");
