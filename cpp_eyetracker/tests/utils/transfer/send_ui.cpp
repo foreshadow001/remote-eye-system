@@ -216,10 +216,24 @@ static void transferController() {
     for (size_t d = 0; d < g_plans.size(); ++d) {
         if (g_abort.load()) break;
         g_plan_idx = (int)d;
-        atomic<size_t> next{0};
+        // 按数据盘分桶 + worker 绑定盘: 单一队列会让 4 流交错取到同一块盘的文件
+        // (单盘主要读惩罚, master 实测 4.0→1.3 GB/s 衰减); 每盘固定流数连续顺序读
+        vector<vector<Job>> buckets;
+        for (auto& j : g_plans[d].jobs) {
+            string drv = j.path.root_name().string();
+            auto it = find_if(buckets.begin(), buckets.end(),
+                              [&](const vector<Job>& b) { return !b.empty() && b[0].path.root_name().string() == drv; });
+            if (it != buckets.end()) it->push_back(j);
+            else buckets.push_back({j});
+        }
+        int nb = (int)buckets.size();
+        vector<atomic<size_t>> nexts(nb);
         vector<thread> ths;
-        for (int i = 0; i < g_cfg.workers; ++i)
-            ths.emplace_back(workerLoop, &g_plans[d].jobs, &next);
+        for (int b = 0; b < nb; ++b) {
+            int nw = g_cfg.workers / nb + (b < g_cfg.workers % nb ? 1 : 0);
+            for (int i = 0; i < nw; ++i)
+                ths.emplace_back(workerLoop, &buckets[b], &nexts[b]);
+        }
         for (auto& t : ths) t.join();
     }
     g_t_end_us.store(chrono::duration_cast<chrono::microseconds>(

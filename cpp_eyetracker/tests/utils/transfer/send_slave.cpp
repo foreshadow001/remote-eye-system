@@ -330,9 +330,24 @@ int main(int argc, char** argv) {
          << g_prog.total_bytes / 1e12 << " TB -> " << g_server_ip << ":" << g_server_port
          << " (" << g_workers << " streams) ===" << endl;
 
-    atomic<size_t> next{0};
+    // 按数据盘分桶 + worker 绑定盘 (每盘流数 = workers/盘数): 4 流跨盘交错取队列时
+    // 会交错打在同一块盘上 (单盘主要读惩罚, master 实测 4.0→1.3 GB/s 衰减);
+    // 每盘固定流数做连续顺序读, 交错惩罚减半
+    vector<vector<Job>> buckets;                  // 按盘符 (如 "D:" / "E:")
+    for (auto& j : jobs) {
+        string drv = j.path.root_name().string();
+        auto it = find_if(buckets.begin(), buckets.end(),
+                          [&](const vector<Job>& b) { return !b.empty() && b[0].path.root_name().string() == drv; });
+        if (it != buckets.end()) it->push_back(j);
+        else buckets.push_back({j});
+    }
+    int nb = (int)buckets.size();
+    vector<atomic<size_t>> nexts(nb);
     vector<thread> ths;
-    for (int i = 0; i < g_workers; ++i) ths.emplace_back(workerMain, &jobs, &next);
+    for (int b = 0; b < nb; ++b) {
+        int nw = g_workers / nb + (b < g_workers % nb ? 1 : 0);
+        for (int i = 0; i < nw; ++i) ths.emplace_back(workerMain, &buckets[b], &nexts[b]);
+    }
     for (auto& t : ths) t.join();
     g_prog.line(); cout << endl;
     double el = chrono::duration<double>(chrono::steady_clock::now() - g_prog.t0).count();
