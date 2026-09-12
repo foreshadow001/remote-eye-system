@@ -1042,6 +1042,8 @@ bool sendJointsToSlave() {
       for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), ",%.6f", g_occ_arm_pose[k]); msg += b; }
       if (g_occ_joints_ok)
           for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), ",%.6f", g_occ_joints[k]); msg += b; } }
+    // 排障日志 (NaN 三采未定位): 发送的消息尾段 = joints 值 (好值/"nan"/缺失)
+    cout << "[Joints] TX len=" << msg.size() << " tail=" << msg.substr(msg.size() > 60 ? msg.size() - 60 : 0) << endl;
     lock_guard<mutex> lk(g_joints_send_mtx);
     for (int attempt = 1; attempt <= 5; ++attempt) {
         if (send(g_joints_sock, (msg + "\n").c_str(), (int)msg.size() + 1, 0) <= 0)
@@ -1202,6 +1204,9 @@ void jointsClientWorker(const string& master_ip, int joints_port, const string& 
                         g_occ_joints_ok = true;
                     }
                 }
+                // 排障日志: 收到的值数 + 存储结果 (与 master TX 对照定位断链)
+                cout << "[Joints] RX n=" << v.size() << " ok=" << g_occ_joints_ok
+                     << " j0=" << g_occ_joints[0] << endl;
                 sendLineRaw(sock, "JOINTS_ACK");
             }
         }
@@ -2399,6 +2404,9 @@ int main() {
                     rec_occ_status = 5;
                     for (auto& ctx : cam_ctxs) rec_occl.insert(ctx->id);
                 }
+                // 排障日志: dump 时刻的关节快照状态 (与 [Joints] RX 对照定位时序/覆盖)
+                cout << "[Dump#" << g_recording_number << "] joints ok=" << rec_joints_ok
+                     << " j0=" << rec_joints[0] << " st=" << rec_occ_status << endl;
                 // gaze target 各相机系快照 (h5 按相机系保存):
                 // Master 用 day 外参现算; Slave 用 GAZE_CAM 接收值 (缺相机回退中心系)
                 map<string, array<double,3>> rec_gaze_cam;
