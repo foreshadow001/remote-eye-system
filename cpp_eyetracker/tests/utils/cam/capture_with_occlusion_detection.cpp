@@ -1890,6 +1890,8 @@ int main() {
     cout<<"Sentry root      : "<<g_sentry_root<<endl;
     cout<<"HDF5 chunk cap   : "<<g_hdf5_chunk_capacity<<endl;
     cout<<"Cameras          : "<<camera_ids.size()<<endl;
+    // 版本指纹: 编译时刻 (区分运行进程与最新编译产物 — 排查"编译了但没跑新版")
+    cout<<"BUILD            : "<<__DATE__<<" "<<__TIME__<<endl;
     cout<<"----------------------------------\n"<<endl;
 
     cout<<"\n--- Network Sync Configuration ---"<<endl;
