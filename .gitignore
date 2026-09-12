@@ -24,3 +24,4 @@ cpp_eyetracker/cfg/calib_arm.yaml
 cpp_eyetracker/cfg/M5Stack.yaml
 cpp_eyetracker/cfg/default.yaml
 cpp_eyetracker/cfg/day_participant_map.json
+cpp_eyetracker/cfg/transfer.yaml

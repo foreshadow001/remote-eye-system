@@ -8,7 +8,7 @@
 //   4. 红外发射器位置 cfg/IR/{day_id}.txt → /data/dataset/calib/IR/{day_id}.txt
 //   5. cfg/day_participant_map.json → /data/dataset/day_participant_map.json
 //
-// 配置: transfer.yaml (participant_id/链路/流数), capture.yaml (is_master),
+// 配置: capture.yaml (participant_id/is_master/master_ip), transfer.yaml (链路/流数),
 //       cam_calib.yaml (calib_save_dir), calib_arm.yaml (record.day_id)
 // 按键: SPACE=开始, q/ESC=退出 (传输中 q=当前文件完成后温和中止)
 // 引擎: TransmitFile 内核态读发重叠, 默认 4 流, SKIP 断点续传。
@@ -554,12 +554,12 @@ int main(int argc, char** argv) {
     g_cfg.cfg_dir = (fs::path(__FILE__).parent_path().parent_path().parent_path()
                      .parent_path() / "cfg").string();
     try {
-        Cfg cap(g_cfg.cfg_dir + "/capture.yaml");     // 主机角色 + 握手目标
+        Cfg cap(g_cfg.cfg_dir + "/capture.yaml");     // 主机角色 + 握手目标 + participant
         g_cfg.is_master = cap["capture"]["is_master"].as<bool>();
         g_cfg.master_ip = cap["capture"]["master_ip"].as<string>();
-        Cfg xf(g_cfg.cfg_dir + "/transfer.yaml"); auto& t = xf["transfer"];
         g_cfg.participant = participant_override.empty()
-                            ? t["participant_id"].as<string>() : participant_override;
+                            ? cap["capture"]["participant_id"].as<string>() : participant_override;
+        Cfg xf(g_cfg.cfg_dir + "/transfer.yaml"); auto& t = xf["transfer"];
         string link = g_cfg.is_master ? t["server_ip_master_link"].as<string>()
                                       : t["server_ip_slave_link"].as<string>();
         g_cfg.server_ip = data_ip_override.empty() ? link : data_ip_override;
