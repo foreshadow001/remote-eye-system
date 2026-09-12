@@ -32,8 +32,9 @@ struct CamInfo {
     bool occluded;     // valid=0 (已写入区域) = 遮挡判定置 0
     bool loaded;
     double gt[3] = {0, 0, 0};   // gaze_target (40772280 相机系)
-    int occ_status = -1;        // 判定状态 (-1=旧文件无数据集; 0正常 1停用 2查询失败 3下发失败 4对账失配)
+    int occ_status = -1;        // 判定状态 (-1=旧文件无数据集; 0正常 2查询失败 3下发失败 4对账失配)
     double occ_err[2] = {0, 0}; // 双臂对账误差 mm (NaN=未对账)
+    int occ_arm = -1;           // 录制臂 (-1=旧文件; 0=upper 1=lower) — 真值, 优先于帧号推导
 };
 
 static vector<CamInfo> g_cams;
@@ -112,7 +113,7 @@ static bool loadFrame(int global_idx) {
                     gt_ds.read(c.gt, H5::PredType::NATIVE_DOUBLE, g_mem, g_file);
                 } catch (const H5::Exception&) {}
             }
-            // occ_status / occ_check_err: 判定状态与双臂对账误差 (旧文件缺 → 保持 -1)
+            // occ_status / occ_check_err / occ_arm: 判定状态/对账误差/录制臂 (旧文件缺 → 保持 -1)
             try {
                 H5::DataSet st_ds = f.openDataSet("occ_status");
                 hsize_t s_start[1] = {(hsize_t)c.frame_offset}, s_count[1] = {1};
@@ -126,6 +127,11 @@ static bool loadFrame(int global_idx) {
                 e_file.selectHyperslab(H5S_SELECT_SET, e_count, e_start);
                 float ev[2]; er_ds.read(ev, H5::PredType::NATIVE_FLOAT, e_mem, e_file);
                 c.occ_err[0] = ev[0]; c.occ_err[1] = ev[1];
+                H5::DataSet ar_ds = f.openDataSet("occ_arm");
+                H5::DataSpace a_file = ar_ds.getSpace();
+                a_file.selectHyperslab(H5S_SELECT_SET, s_count, s_start);
+                uint8_t av = 0; ar_ds.read(&av, H5::PredType::NATIVE_UINT8, s_mem, a_file);
+                c.occ_arm = (int)av;
             } catch (const H5::Exception&) {}
             c.loaded = true;
             any_loaded = true;
@@ -206,10 +212,12 @@ static void render(cv::Mat& canvas) {
         cv::putText(canvas, cfo, {off_x + dw - cs.width - 10, off_y + 30},
                     cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,255,255), 2);
 
-        // Frame 信息行: 帧号 + 臂/目标 (armRecorded 口径) + SN + VALID/OCCLUDED + 判定状态
+        // Frame 信息行: 帧号 + 臂/目标 + SN + VALID/OCCLUDED + 判定状态
+        // 臂: occ_arm 真值优先 (h5 记录), 旧文件回退帧号推导 (armRecorded 口径)
         string arm; int tgt_i = 0;
         frameToTarget(g_global_frame, arm, tgt_i);
-        static const char* kOccStName[] = {"OK", "DISABLED", "QUERY_FAIL", "DELIVERY_FAIL", "MISMATCH"};
+        if (g_cams[g_enlarged].occ_arm >= 0) arm = (g_cams[g_enlarged].occ_arm == 0) ? "upper" : "lower";
+        static const char* kOccStName[] = {"OK", "?", "QUERY_FAIL", "DELIVERY_FAIL", "MISMATCH"};
         string fi = "Frame:" + to_string(g_global_frame) + "  " + arm + " #" + to_string(tgt_i + 1)
                     + "  " + g_cams[g_enlarged].sn
                     + (g_cams[g_enlarged].occluded ? "  OCCLUDED" : "  VALID");

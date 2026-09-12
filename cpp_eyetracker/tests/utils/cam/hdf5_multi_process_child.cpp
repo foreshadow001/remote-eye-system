@@ -34,8 +34,11 @@ int main(int argc, char* argv[]) {
     // argv[11] = gaze_y          argv[12] = gaze_z
     // argv[13] = occluded (0/1, 可选; 1 = 本相机此目标被遮挡, valid 整段写 0)
     // argv[14] = joints (可选; "qU0,...,qU5,qL0,...,qL5" 逗号表 或 "-"; 写 occ_joints, "-" → NaN)
-    // argv[15] = occ_status (可选; 判定状态, 写 occ_status: 0正常 1停用 2查询失败 3下发失败 4对账失配)
+    // argv[15] = occ_status (可选; 判定状态, 写 occ_status: 0正常 2查询失败 3下发失败 4对账失配)
     // argv[16] = err_upper  / argv[17] = err_lower (可选; 对账误差 mm, "nan"→NaN; 写 occ_check_err)
+    // argv[18] = occ_arm (可选; 录制臂 0=upper 1=lower; 写 occ_arm)
+    // argv[19] = flange 14 逗号表 (可选; SDK 法兰位姿 U7+L7, "nan"→NaN; 写 occ_flange)
+    // argv[20] = arm_pose 12 逗号表 (可选; 运行时手眼值 Ut3r3+Lt3r3; 写 occ_arm_pose)
     if (argc < 13) {
         cerr << "Usage: " << argv[0]
              << " <camera_index> <hdf5_dir> <chunk_idx> <frame_offset>"
@@ -62,6 +65,18 @@ int main(int argc, char* argv[]) {
     float  occ_err[2];
     occ_err[0] = (argc > 16) ? (float)atof(argv[16]) : numeric_limits<float>::quiet_NaN();
     occ_err[1] = (argc > 17) ? (float)atof(argv[17]) : numeric_limits<float>::quiet_NaN();
+    int    occ_arm       = (argc > 18) ? atoi(argv[18]) : 0;
+    double occ_flange[14], occ_arm_pose[12];
+    {   const double NAN_VAL = numeric_limits<double>::quiet_NaN();
+        auto parse_list = [&](const char* s, double* out, int n) {
+            for (int k = 0; k < n; ++k) out[k] = NAN_VAL;
+            if (!s || !*s) return;
+            stringstream js(s); string tok; int k = 0;
+            while (k < n && getline(js, tok, ',')) {
+                try { out[k++] = stod(tok); } catch (...) { return; }
+            } };
+        parse_list(argc > 19 ? argv[19] : nullptr, occ_flange, 14);
+        parse_list(argc > 20 ? argv[20] : nullptr, occ_arm_pose, 12); }
 
     // 判定所用关节 (qU6+qL6; 无效/缺失 → NaN, 与图像/valid 同时序可辨识)
     double joints[12];
@@ -160,7 +175,8 @@ int main(int argc, char* argv[]) {
             jnt_ds.write(jn_buf.data(), H5::PredType::NATIVE_DOUBLE, jn_mem, jn_file);
         } catch (const H5::Exception&) {}
 
-        // ---- occ_status / occ_check_err: 判定状态 + 双臂对账误差 (每录恒定; 离线排障) ----
+        // ---- occ_status / occ_check_err / occ_arm / occ_flange / occ_arm_pose ----
+        // 判定状态 + 对账误差 + 录制臂 + SDK 法兰位姿 + 运行时手眼值 (每录恒定; 离线排障)
         // 旧文件可能缺数据集 (预创建早于本字段引入) → 跳过, 不影响其他写入
         try {
             {
@@ -183,6 +199,40 @@ int main(int argc, char* argv[]) {
                 vector<float> er_buf((size_t)N * 2);
                 for (int i = 0; i < N; ++i) { er_buf[i*2] = occ_err[0]; er_buf[i*2+1] = occ_err[1]; }
                 er_ds.write(er_buf.data(), H5::PredType::NATIVE_FLOAT, er_mem, er_file);
+            }
+            {
+                H5::DataSet ar_ds = f.openDataSet("occ_arm");
+                hsize_t ar_start[1] = {(hsize_t)frame_offset};
+                hsize_t ar_count[1] = {(hsize_t)N};
+                H5::DataSpace ar_mem(1, ar_count);
+                H5::DataSpace ar_file = ar_ds.getSpace();
+                ar_file.selectHyperslab(H5S_SELECT_SET, ar_count, ar_start);
+                vector<uint8_t> ar_buf((size_t)N, (uint8_t)occ_arm);
+                ar_ds.write(ar_buf.data(), H5::PredType::NATIVE_UINT8, ar_mem, ar_file);
+            }
+            {
+                H5::DataSet fl_ds = f.openDataSet("occ_flange");
+                hsize_t fl_start[2] = {(hsize_t)frame_offset, 0};
+                hsize_t fl_count[2] = {(hsize_t)N, 14};
+                H5::DataSpace fl_mem(2, fl_count);
+                H5::DataSpace fl_file = fl_ds.getSpace();
+                fl_file.selectHyperslab(H5S_SELECT_SET, fl_count, fl_start);
+                vector<double> fl_buf((size_t)N * 14);
+                for (int i = 0; i < N; ++i)
+                    for (int k = 0; k < 14; ++k) fl_buf[i*14+k] = occ_flange[k];
+                fl_ds.write(fl_buf.data(), H5::PredType::NATIVE_DOUBLE, fl_mem, fl_file);
+            }
+            {
+                H5::DataSet ap_ds = f.openDataSet("occ_arm_pose");
+                hsize_t ap_start[2] = {(hsize_t)frame_offset, 0};
+                hsize_t ap_count[2] = {(hsize_t)N, 12};
+                H5::DataSpace ap_mem(2, ap_count);
+                H5::DataSpace ap_file = ap_ds.getSpace();
+                ap_file.selectHyperslab(H5S_SELECT_SET, ap_count, ap_start);
+                vector<double> ap_buf((size_t)N * 12);
+                for (int i = 0; i < N; ++i)
+                    for (int k = 0; k < 12; ++k) ap_buf[i*12+k] = occ_arm_pose[k];
+                ap_ds.write(ap_buf.data(), H5::PredType::NATIVE_DOUBLE, ap_mem, ap_file);
             }
         } catch (const H5::Exception&) {}
 

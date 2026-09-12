@@ -446,7 +446,7 @@ bool parsePoseResponse(const string& resp, string& arm, ArmPose& pose) {
 // 世界系 = 相机标定参考系 (= 40772280 相机系, 与 arm_in_ccs 的 CCS 同系)。
 // 口径: 任一臂连杆三角形进入相机画面 (顶点投影落像面且 z>0, 或三角形横跨
 // 像面边界/近平面) → 该相机遮挡。加载失败/查询失败/对账超差 → 停用 (valid 恒 1)。
-static bool g_occ_enabled = false;        // 启动加载 + 首目标对账通过后 true
+static bool g_occ_enabled = false;        // 兼容保留 (恒 true; occSetup 失败已 fail-fast, 停用机制已删)
 static set<string> g_occ_occluded;        // 本目标被遮挡 SN (Master: 判定; Slave: OCCL 同步)
 static map<string,int> g_occ_stats;       // 每相机累计遮挡目标数 (Master, 报告用)
 static mutex g_occ_mtx;
@@ -454,10 +454,17 @@ static string g_occ_last_line;            // UI 一行摘要
 static array<double,12> g_occ_joints{};   // 本目标判定所用关节 (qU6+qL6; h5 occ_joints 调试数据集)
 static bool g_occ_joints_ok = false;      // false = 本目标无有效关节 (h5 写 NaN)
 // 本目标判定状态 (h5 occ_status; 离线区分 valid=0 的成因):
-// 0=判定正常 1=停用期 2=关节查询失败 3=关节下发失败 4=对账失配(证据关节已存)
+// 0=判定正常 2=关节查询失败 3=关节下发失败 4=对账失配(证据关节已存)
 static atomic<int> g_occ_status{0};
-// 双臂 FK↔真实法兰对账误差 mm (h5 occ_check_err; NaN=未对账) — 离线看漂移趋势/停用根因
+// 双臂 FK↔真实法兰对账误差 mm (h5 occ_check_err; NaN=未对账) — 离线看漂移趋势/失配根因
 static double g_occ_check_err[2] = {NAN, NAN};
+// 本目标 SDK 法兰原始位姿 (h5 occ_flange; U:x,y,z,qx,qy,qz,qw + L:同; NaN=未查到) —
+// 离线独立重构对账: URDF FK(occ_joints) vs SDK(occ_flange), 分离关节错/标定错/实现错
+static double g_occ_flange[14];
+// 本录录制臂 (h5 occ_arm; 0=upper 1=lower) — gaze_target 归属哪条臂的工装
+static atomic<int> g_occ_arm{0};
+// master 运行时实际手眼值 (h5 occ_arm_pose; U:t3+zxz3, L:同) — slave 本地 yaml 可能过时, 以此为准
+static double g_occ_arm_pose[12];
 
 bool sendJointsToSlave();                                    // 专用 joints 通道推送 (ACK+重试; 定义在 gaze 段前)
 static string g_occ_xml_dir;                                 // day 标定 XML 目录 (Master 权威; 启动推送给 Slave)
@@ -829,26 +836,17 @@ static bool occQueryJointsRetry(double qU[6], double qL[6]) {
 }
 
 static void runOcclusionCheck(const string& arm, int target_idx) {
-    if (!g_occ_enabled) {
-        // 停用期: 判定不做, 但关节照常采集保存 (对账失败构型对离线排查有价值);
-        // 无法判定 → 全相机 valid=0 (P001 重采教训: 停用发空 OCCL,
-        // 出现 132/500 录 occ_joints=NaN 而 valid=1 的不可验证数据)
-        double qU[6], qL[6];
-        bool ok = occQueryJointsRetry(qU, qL);
-        set<string> occ_all;
-        { lock_guard<mutex> lk(g_occ_mtx);
-          g_occ_occluded.clear();
-          for (auto& c : g_occ_cams) { g_occ_occluded.insert(c.sn); ++g_occ_stats[c.sn]; }
-          occ_all = g_occ_occluded;
-          if (ok) for (int k = 0; k < 6; ++k) { g_occ_joints[k] = qU[k]; g_occ_joints[6+k] = qL[k]; }
-          g_occ_joints_ok = ok;
-          g_occ_status = 1;
-          g_occ_check_err[0] = g_occ_check_err[1] = NAN;         // 停用期不对账
-          g_occ_last_line = "Occ DISABLED (all valid=0)"; }
-        sendOcclSet(occ_all);
-        sendJointsToSlave();
-        return;
-    }
+    // 本录元数据 (h5 occ_arm / occ_arm_pose; Slave 经 JOINTS 头部同步):
+    // 录制臂 + master 运行时实际手眼值 (slave 本地 yaml 副本可能过时, 离线以此为准)
+    { lock_guard<mutex> lk(g_occ_mtx);
+      g_occ_arm = (arm == "upper") ? 0 : 1;
+      g_occ_arm_pose[0] = g_xf_upper.ccs_t.x; g_occ_arm_pose[1] = g_xf_upper.ccs_t.y;
+      g_occ_arm_pose[2] = g_xf_upper.ccs_t.z; g_occ_arm_pose[3] = g_xf_upper.ccs_r.x;
+      g_occ_arm_pose[4] = g_xf_upper.ccs_r.y; g_occ_arm_pose[5] = g_xf_upper.ccs_r.z;
+      g_occ_arm_pose[6] = g_xf_lower.ccs_t.x; g_occ_arm_pose[7] = g_xf_lower.ccs_t.y;
+      g_occ_arm_pose[8] = g_xf_lower.ccs_t.z; g_occ_arm_pose[9] = g_xf_lower.ccs_r.x;
+      g_occ_arm_pose[10]= g_xf_lower.ccs_r.y; g_occ_arm_pose[11]= g_xf_lower.ccs_r.z; }
+
     double qU[6], qL[6];
     // 关节查询 (3 次重试): 失败不允许静默发生 — 无法判定的录制按全相机 valid=0 处理
     if (!occQueryJointsRetry(qU, qL)) {
@@ -862,6 +860,7 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
           g_occ_joints_ok = false;
           g_occ_status = 2;
           g_occ_check_err[0] = g_occ_check_err[1] = NAN;
+          for (int k = 0; k < 14; ++k) g_occ_flange[k] = NAN;
           g_occ_last_line = "Occ: JOINTS QUERY FAILED (all valid=0)"; }
         sendOcclSet(occ_all);                                   // 全集 → Slave 同步全 valid=0
         sendJointsToSlave();                                    // 空关节 (NaN) — 重试耗尽仍尝试下发
@@ -869,9 +868,12 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
     }
 
     // ---- 双臂关节对账 (每判定): FK 法兰 ↔ 真实法兰 (动臂=MOVED 应答, 停臂=GET_POSE) ----
-    // P001 教训: 关节若串到另一臂/停更, 模型错位 → valid 写出系统性错误值;
-    // 每次都用真实位姿复核两臂, 失配超 1 cm 立即停用并大声报错
-    double err_mm[2] = {NAN, NAN};                            // 对账误差 (h5 occ_check_err)
+    // P001 教训: 关节若串到另一臂/停更, 模型错位 → valid 写出系统性错误值。
+    // 失配只废当次目标 (全 valid=0, 证据关节照存 h5) — 下一目标重新对账自愈;
+    // 不再"停用到重启" (旧设计一次毛刺即丢整场判定, 132/500 NaN 的帮凶)
+    double err_mm[2] = {NAN, NAN};                              // 对账误差 (h5 occ_check_err)
+    double flange_raw[14];                                      // SDK 法兰原始位姿 (h5 occ_flange)
+    for (int k = 0; k < 14; ++k) flange_raw[k] = NAN;
     for (int i = 0; i < 2; ++i) {
         const string& a = (i == 0) ? "upper" : "lower";
         ArmPose real;
@@ -879,6 +881,8 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
         if (a == arm) { real = g_last_piper_pose; have_real = true; }   // 刚移动的臂
         else          { have_real = occQueryPose(a, real); }           // 停臂: 现查
         if (!have_real) continue;                                      // 查不到 → 无法对账, 跳过
+        flange_raw[i*7+0]=real.x; flange_raw[i*7+1]=real.y; flange_raw[i*7+2]=real.z;
+        flange_raw[i*7+3]=real.qx; flange_raw[i*7+4]=real.qy; flange_raw[i*7+5]=real.qz; flange_raw[i*7+6]=real.qw;
         const OccArmModel& mdl = (a == "upper") ? g_occ_arm_upper : g_occ_arm_lower;
         const double* q       = (a == "upper") ? qU : qL;
         const ArmTransform& xf= (a == "upper") ? g_xf_upper : g_xf_lower;
@@ -893,18 +897,18 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
         cout << "[Occ] joint check " << a << ": FK vs real flange err = " << err * 1000.0 << " mm" << endl;
         if (err > 0.01) {
             cerr << "[Occ] WARN: " << a << " joints mismatch real pose > 10 mm"
-                 << " (joints wrong/stale/crossed?) — occlusion disabled, this and later targets ALL valid=0" << endl;
-            logException("ERROR","occ","joint check mismatch - disabled, all valid=0");
-            g_occ_enabled = false;
-            // 失配关节仍原样记录 (h5 occ_joints) — 离线重放定位串台来源的证据;
-            // 本目标不可判定 → 全集 OCCL (NaN/失配 joints 不允许 valid=1)
+                 << " (joints wrong/stale/crossed?) — this target ALL valid=0, next target re-checks" << endl;
+            logException("ERROR","occ","joint check mismatch - all valid=0 this target");
+            // 失配关节/法兰仍原样记录 (h5 occ_joints/occ_flange) — 离线重放定位串台来源的证据;
+            // 本目标不可判定 → 全集 OCCL (失配 joints 不允许 valid=1)
             set<string> occ_bad;
             { lock_guard<mutex> lk(g_occ_mtx);
               for (auto& c : g_occ_cams) { g_occ_occluded.insert(c.sn); ++g_occ_stats[c.sn]; }
               occ_bad = g_occ_occluded;
               g_occ_status = 4;
               g_occ_check_err[0] = err_mm[0]; g_occ_check_err[1] = err_mm[1];
-              g_occ_last_line = "Occ: JOINTS MISMATCH — DISABLED (all valid=0)";
+              for (int k = 0; k < 14; ++k) g_occ_flange[k] = flange_raw[k];
+              g_occ_last_line = "Occ: JOINTS MISMATCH (all valid=0 this target)";
               for (int k = 0; k < 6; ++k) { g_occ_joints[k] = qU[k]; g_occ_joints[6+k] = qL[k]; }
               g_occ_joints_ok = true; }
             sendOcclSet(occ_bad);
@@ -933,6 +937,7 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
         g_occ_joints_ok = true;
         g_occ_status = 0;
         g_occ_check_err[0] = err_mm[0]; g_occ_check_err[1] = err_mm[1];
+        for (int k = 0; k < 14; ++k) g_occ_flange[k] = flange_raw[k];
         for (auto& sn : occ) ++g_occ_stats[sn];
         string sns; for (auto& sn : occ) sns += (sns.empty() ? "" : " ") + sn;
         g_occ_last_line = "Occluded: " + to_string(occ.size()) + "/" + to_string(g_occ_cams.size())
@@ -1014,22 +1019,23 @@ static SOCKET g_joints_sock = INVALID_SOCKET;
 static atomic<bool> g_joints_connected{false};
 static mutex g_joints_send_mtx;
 
-// Master: 把当前判定关节+状态推给 Slave:
-//   "JOINTS:<status>,<errU>,<errL>|<q0,...,q11>"  (关节无效 → '|' 后为空 → h5 NaN)
+// Master: 把本目标判定全套数据推给 Slave (逗号定长流, NaN → "nan"):
+//   JOINTS:arm,status,errU,errL, flangeU[7],flangeL[7], arm_pose[12], joints[12]
+//   (关节无效 → 末段 12 值缺省, 共 30 值; h5 occ_joints 写 NaN)
 // 带 ACK 确认 + 重发 (P001 教训: 单次丢消息 → 该录 occ_joints=NaN 无法判定);
 // 返回 false = 重试耗尽, 调用方须将本目标全相机 valid=0
 bool sendJointsToSlave() {
     if (g_joints_sock == INVALID_SOCKET) return false;
     string msg = "JOINTS:";
     { lock_guard<mutex> lk(g_occ_mtx);
-      char h[64];
-      snprintf(h, sizeof(h), "%d,%.3f,%.3f|", g_occ_status.load(),
+      char b[40];
+      snprintf(b, sizeof(b), "%d,%d,%.3f,%.3f", g_occ_arm.load(), g_occ_status.load(),
                g_occ_check_err[0], g_occ_check_err[1]);
-      msg += h;
-      if (g_occ_joints_ok) {
-          char b[32];
-          for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), "%s%.6f", k ? "," : "", g_occ_joints[k]); msg += b; }
-      } }
+      msg += b;
+      for (int k = 0; k < 14; ++k) { snprintf(b, sizeof(b), ",%.6f", g_occ_flange[k]); msg += b; }
+      for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), ",%.6f", g_occ_arm_pose[k]); msg += b; }
+      if (g_occ_joints_ok)
+          for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), ",%.6f", g_occ_joints[k]); msg += b; } }
     lock_guard<mutex> lk(g_joints_send_mtx);
     for (int attempt = 1; attempt <= 5; ++attempt) {
         if (send(g_joints_sock, (msg + "\n").c_str(), (int)msg.size() + 1, 0) <= 0)
@@ -1165,30 +1171,25 @@ void jointsClientWorker(const string& master_ip, int joints_port, const string& 
                      << (s_calib_out_dir.empty() ? "(dir resolve FAILED)" : s_calib_out_dir) << endl;
             }
             else if (line.rfind("JOINTS:", 0) == 0) {
-                // "JOINTS:<status>,<errU>,<errL>|<q0,...,q11 或空>"
+                // 逗号定长流: arm,status,errU,errL, flange[14], arm_pose[12], joints[12?]
                 lock_guard<mutex> lk(g_occ_mtx);
                 g_occ_joints_ok = false;
-                string body = line.substr(7);
-                size_t bar = body.find('|');
-                {   // 头部: 状态 + 双臂对账误差
-                    stringstream hs(bar == string::npos ? body : body.substr(0, bar));
-                    string tok; int k = 0; double hv[3];
-                    while (k < 3 && getline(hs, tok, ',')) {
-                        try { hv[k++] = stod(tok); } catch (...) { k = 0; break; }
-                    }
-                    if (k == 3) {
-                        g_occ_status = (int)hv[0];
-                        g_occ_check_err[0] = hv[1]; g_occ_check_err[1] = hv[2];
-                    } else { g_occ_status = -1; g_occ_check_err[0] = g_occ_check_err[1] = NAN; }
-                }
-                if (bar != string::npos) {   // '|': 关节表
-                    stringstream ss(body.substr(bar + 1)); string tok;
-                    int k = 0;
-                    while (k < 12 && getline(ss, tok, ',')) {
-                        try { g_occ_joints[k++] = stod(tok); }
-                        catch (...) { k = 0; break; }
-                    }
-                    if (k == 12) g_occ_joints_ok = true;
+                vector<double> v; v.reserve(42);
+                { stringstream ss(line.substr(7)); string tok;
+                  while (getline(ss, tok, ',')) {
+                      try { v.push_back(stod(tok)); } catch (...) { v.clear(); break; }
+                  } }
+                if (v.size() >= 4) {
+                    g_occ_arm    = (int)v[0];
+                    g_occ_status = (int)v[1];
+                    g_occ_check_err[0] = v[2]; g_occ_check_err[1] = v[3];
+                } else { g_occ_status = -1; g_occ_check_err[0] = g_occ_check_err[1] = NAN; }
+                if (v.size() >= 18) for (int k = 0; k < 14; ++k) g_occ_flange[k] = v[4+k];
+                else for (int k = 0; k < 14; ++k) g_occ_flange[k] = NAN;
+                if (v.size() >= 30) for (int k = 0; k < 12; ++k) g_occ_arm_pose[k] = v[18+k];
+                if (v.size() >= 42) {
+                    for (int k = 0; k < 12; ++k) g_occ_joints[k] = v[30+k];
+                    g_occ_joints_ok = true;
                 }
                 sendLineRaw(sock, "JOINTS_ACK");
             }
@@ -1512,6 +1513,12 @@ void precreateSerial() {
                     f.createDataSet("occ_status", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, sd), pl);
                     hsize_t ed[2] = {(hsize_t)g_hdf5_chunk_capacity, 2};
                     f.createDataSet("occ_check_err", H5::PredType::NATIVE_FLOAT, H5::DataSpace(2, ed), pl);
+                    hsize_t ad[1] = {(hsize_t)g_hdf5_chunk_capacity};
+                    f.createDataSet("occ_arm", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, ad), pl);
+                    hsize_t fd[2] = {(hsize_t)g_hdf5_chunk_capacity, 14};
+                    f.createDataSet("occ_flange", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, fd), pl);
+                    hsize_t pd[2] = {(hsize_t)g_hdf5_chunk_capacity, 12};
+                    f.createDataSet("occ_arm_pose", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, pd), pl);
                     hsize_t vd[1] = {(hsize_t)g_hdf5_chunk_capacity};
                     f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd), pl);
                     hsize_t rd[3] = {(hsize_t)g_hdf5_chunk_capacity, (hsize_t)g_cam_h, (hsize_t)g_cam_w};
@@ -2343,10 +2350,14 @@ int main() {
                 set<string> rec_occl;
                 array<double,12> rec_joints{}; bool rec_joints_ok;
                 int rec_occ_status = 0; double rec_occ_err[2] = {NAN, NAN};
+                int rec_occ_arm = 0; double rec_occ_flange[14]; double rec_occ_arm_pose[12];
                 { lock_guard<mutex> lk(g_occ_mtx);
                   rec_occl = g_occ_occluded; rec_joints = g_occ_joints; rec_joints_ok = g_occ_joints_ok;
                   rec_occ_status = g_occ_status.load();
-                  rec_occ_err[0] = g_occ_check_err[0]; rec_occ_err[1] = g_occ_check_err[1]; }
+                  rec_occ_err[0] = g_occ_check_err[0]; rec_occ_err[1] = g_occ_check_err[1];
+                  rec_occ_arm = g_occ_arm.load();
+                  for (int k = 0; k < 14; ++k) rec_occ_flange[k] = g_occ_flange[k];
+                  for (int k = 0; k < 12; ++k) rec_occ_arm_pose[k] = g_occ_arm_pose[k]; }
                 // 兜底 (写盘前最后防线): 本录无有效关节 (occ_joints 将为 NaN) 时无法
                 // 离线判定遮挡 → 本机全部相机 valid=0。不依赖 Master 的任何消息到达,
                 // 无论判定停用/查询失败/下发丢失, NaN ⇒ valid=0 恒成立
@@ -2412,6 +2423,12 @@ int main() {
                         f.createDataSet("occ_status",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,sd),pl);
                         hsize_t ed[2]={(hsize_t)g_hdf5_chunk_capacity,2};
                         f.createDataSet("occ_check_err",H5::PredType::NATIVE_FLOAT,H5::DataSpace(2,ed),pl);
+                        hsize_t ad[1]={(hsize_t)g_hdf5_chunk_capacity};
+                        f.createDataSet("occ_arm",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,ad),pl);
+                        hsize_t fd[2]={(hsize_t)g_hdf5_chunk_capacity,14};
+                        f.createDataSet("occ_flange",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,fd),pl);
+                        hsize_t pd[2]={(hsize_t)g_hdf5_chunk_capacity,12};
+                        f.createDataSet("occ_arm_pose",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,pd),pl);
                         hsize_t vd[1]={(hsize_t)g_hdf5_chunk_capacity};
                         f.createDataSet("valid",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,vd),pl);
                         hsize_t rd[3]={(hsize_t)g_hdf5_chunk_capacity,(hsize_t)cam_h,(hsize_t)cam_w};
@@ -2451,6 +2468,18 @@ int main() {
                         for (int k = 0; k < 2; ++k)
                             snprintf(eb[k], sizeof(eb[k]), "%.3f", rec_occ_err[k]);
                         args << " " << rec_occ_status << " " << eb[0] << " " << eb[1]; }
+                    // 录制臂 + SDK 法兰位姿 + 运行时手眼值 (h5 occ_arm / occ_flange / occ_arm_pose)
+                    {   args << " " << rec_occ_arm;
+                        char fb[32];
+                        for (int k = 0; k < 14; ++k) {
+                            snprintf(fb, sizeof(fb), "%s%.6f", k ? "," : "", rec_occ_flange[k]);
+                            args << (k ? "" : " ") << fb;
+                        }
+                        args << " ";
+                        for (int k = 0; k < 12; ++k) {
+                            snprintf(fb, sizeof(fb), "%s%.6f", k ? "," : "", rec_occ_arm_pose[k]);
+                            args << fb;
+                        } }
                     STARTUPINFOA si{sizeof(si)};PROCESS_INFORMATION pi{};
                     string cmd_line=args.str();
                     if(CreateProcessA(child_exe.c_str(),&cmd_line[0],NULL,NULL,FALSE,0,NULL,NULL,&si,&pi)){
