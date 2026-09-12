@@ -454,7 +454,7 @@ static string g_occ_last_line;            // UI 一行摘要
 static array<double,12> g_occ_joints{};   // 本目标判定所用关节 (qU6+qL6; h5 occ_joints 调试数据集)
 static bool g_occ_joints_ok = false;      // false = 本目标无有效关节 (h5 写 NaN)
 
-void sendJointsToSlave();                                    // 专用 joints 通道推送 (定义在 gaze 段前)
+bool sendJointsToSlave();                                    // 专用 joints 通道推送 (ACK+重试; 定义在 gaze 段前)
 static string g_occ_xml_dir;                                 // day 标定 XML 目录 (Master 权威; 启动推送给 Slave)
 
 // ---- 小型 3x3 数学 (FK 专用, 不引入新依赖) ----
@@ -563,8 +563,10 @@ static bool occLoadUrdf(const fs::path& urdf, OccArmModel& mdl) {
         if (!pick) break;
         OccNode n; n.link = pick->child; n.revolute = (pick->type == "revolute");
         memcpy(n.xyz, pick->xyz, sizeof(n.xyz)); memcpy(n.rpy, pick->rpy, sizeof(n.rpy));
+        // gripper_base 网格不加载: URDF 里是原装夹爪安装座 (14.5cm 大支架), 实际装置
+        // 仅装法兰盘大小转接件 (理想化裸臂止于 link6) — 该网格会造成幻影遮挡
         auto it = link_mesh.find(n.link);
-        if (it != link_mesh.end()) occLoadStl(it->second, n.mesh);   // 网格缺失不致命
+        if (it != link_mesh.end() && n.link != "gripper_base") occLoadStl(it->second, n.mesh);   // 网格缺失不致命
         mdl.chain.push_back(move(n));
         cur = pick->child;
         if (cur == "gripper_base") break;
@@ -630,11 +632,12 @@ static void occFkWorld(const OccArmModel& mdl, const double q[6], const ArmTrans
 }
 
 // ---- 画面进入判定 ----
-// 线段与像面矩形相交 (Liang-Barsky)
-static bool occSegHitsRect(double u0,double v0,double u1,double v1,double w,double h) {
+// 线段与矩形 [x0,y1]×[x1,y1] 相交 (Liang-Barsky)
+static bool occSegHitsRect(double u0,double v0,double u1,double v1,
+                           double x0,double y0,double x1,double y1) {
     double t0=0, t1=1, du=u1-u0, dv=v1-v0;
-    double clip[4][3] = {{-du, u0},      {du,  w-u0},
-                         {-dv, v0},      {dv,  h-v0}};
+    double clip[4][3] = {{-du, u0-x0},  {du,  x1-u0},
+                         {-dv, v0-y0},  {dv,  y1-v0}};
     for (auto& c : clip) {
         double p=c[0], q=c[1];
         if (p == 0) { if (q < 0) return false; continue; }
@@ -644,6 +647,11 @@ static bool occSegHitsRect(double u0,double v0,double u1,double v1,double w,doub
     }
     return true;
 }
+// 入画边距: 投影几何须穿透画面边界 ≥ 此深度才算遮挡 (px)。
+// 大致内参的固有角误差 ~1.6° (≈170px @fx5900) 会把画外物体画入边缘 → 擦边误报;
+// 200px ≈ 2° 覆盖该误差并留余量。深穿透的真遮挡不受影响。
+static constexpr double kOccEdgeMargin = 200.0;
+
 static bool occTriInFrame(const OccCam& c, const array<double,3>* tri) {
     double P[3][3];                                   // 三角形顶点 → 相机系 (z 可为任意值)
     for (int k = 0; k < 3; ++k) {
@@ -668,10 +676,14 @@ static bool occTriInFrame(const OccCam& c, const array<double,3>* tri) {
     if (n < 3) return false;                          // 完全在镜头后方或裁剪后零面积
     double u[4], v[4];
     for (int k = 0; k < n; ++k) { u[k]=c.fx*Q[k][0]/Q[k][2]+c.cx; v[k]=c.fy*Q[k][1]/Q[k][2]+c.cy; }
-    for (int k = 0; k < n; ++k) {                     // 顶点入矩形 / 边与矩形相交 (含闭合边)
-        if (u[k]>=0 && u[k]<=c.w && v[k]>=0 && v[k]<=c.h) return true;
+    // 判定矩形 = 画面内缩 kOccEdgeMargin: 擦边 (标定误差量级) 不算遮挡
+    const double x0 = kOccEdgeMargin, y0 = kOccEdgeMargin,
+                 x1 = c.w - kOccEdgeMargin, y1 = c.h - kOccEdgeMargin;
+    if (x1 <= x0 || y1 <= y0) return false;           // 边距配得比画面还大 (异常配置)
+    for (int k = 0; k < n; ++k) {                     // 顶点入内矩形 / 边与内矩形相交 (含闭合边)
+        if (u[k]>=x0 && u[k]<=x1 && v[k]>=y0 && v[k]<=y1) return true;
         int k2=(k+1)%n;
-        if (occSegHitsRect(u[k], v[k], u[k2], v[k2], c.w, c.h)) return true;
+        if (occSegHitsRect(u[k], v[k], u[k2], v[k2], x0, y0, x1, y1)) return true;
     }
     double px=c.w/2, py=c.h/2;                        // 画面中心在裁剪后凸多边形内 (近处大三角包围整幅)
     bool allp = true, alln = true;
@@ -802,12 +814,30 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
         return;
     }
     double qU[6], qL[6];
-    if (!occQueryJoints("upper", qU) || !occQueryJoints("lower", qL)) {
-        cerr << "[Occ] GET_JOINTS failed — no camera marked occluded this target" << endl;
-        { lock_guard<mutex> lk(g_occ_mtx); g_occ_occluded.clear(); g_occ_joints_ok = false; }
-        if (g_cmd_sock != INVALID_SOCKET) sendLine(g_cmd_sock, "OCCL:");   // 同步清 Slave 残留 (valid 恢复 1)
-        sendJointsToSlave();
-        g_occ_last_line = "Occ: query FAILED (valid=1)";
+    // 关节查询重试 (3 次): 失败不允许静默发生 — 无法判定的录制按全相机 valid=0 处理
+    bool joints_ok = false;
+    for (int attempt = 1; attempt <= 3 && !joints_ok; ++attempt) {
+        if (occQueryJoints("upper", qU) && occQueryJoints("lower", qL)) joints_ok = true;
+        else {
+            cerr << "[Occ] GET_JOINTS attempt " << attempt << "/3 failed — retrying..." << endl;
+            this_thread::sleep_for(chrono::milliseconds(500));
+        }
+    }
+    if (!joints_ok) {
+        cerr << "[Occ] WARN: joint query exhausted retries — ALL cameras valid=0 this target" << endl;
+        logException("WARN","occ","joint query failed - all valid=0");
+        { lock_guard<mutex> lk(g_occ_mtx);
+          g_occ_occluded.clear();
+          for (auto& c : g_occ_cams) { g_occ_occluded.insert(c.sn); ++g_occ_stats[c.sn]; }
+          g_occ_joints_ok = false;
+          g_occ_last_line = "Occ: JOINTS QUERY FAILED (all valid=0)"; }
+        if (g_cmd_sock != INVALID_SOCKET) {                     // OCCL: 全集 → Slave 同步全 valid=0
+            string msg = "OCCL:";
+            { lock_guard<mutex> lk(g_occ_mtx);
+              for (auto& sn : g_occ_occluded) msg += (msg.size() > 5 ? "," : "") + sn; }
+            sendLine(g_cmd_sock, msg);
+        }
+        sendJointsToSlave();                                    // 空关节 (NaN) — 重试耗尽仍尝试下发
         return;
     }
 
@@ -872,13 +902,23 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
     }
     cout << "[Occ] " << arm << " target #" << (target_idx + 1) << ": "
          << occ.size() << "/" << g_occ_cams.size() << " cams occluded" << endl;
-    // 同步 Slave: 遮挡集走 cmd (Slave 自行与本机相机求交); 关节走专用 joints 通道 (h5 occ_joints)
+    // 同步 Slave: 关节先经专用通道下发 (ACK+重试); 下发失败 → 本目标全相机 valid=0
+    // (occ_joints=NaN 的录制无法离线判定, 不允许静默按 valid=1 放行)
+    if (!sendJointsToSlave()) {
+        cerr << "[Occ] WARN: joints delivery to Slave failed — ALL cameras valid=0 this target" << endl;
+        logException("WARN","occ","joints delivery failed - all valid=0");
+        occ.clear();
+        for (auto& c : g_occ_cams) { occ.insert(c.sn); ++g_occ_stats[c.sn]; }
+        { lock_guard<mutex> lk(g_occ_mtx);
+          g_occ_occluded = occ;
+          g_occ_last_line = "Occ: JOINTS DELIVERY FAILED (all valid=0)"; }
+    }
+    // 遮挡集走 cmd (Slave 自行与本机相机求交)
     if (g_cmd_sock != INVALID_SOCKET) {
         string msg = "OCCL:";
         for (auto& sn : occ) msg += (msg.size() > 5 ? "," : "") + sn;
         sendLine(g_cmd_sock, msg);
     }
-    sendJointsToSlave();
 }
 
 // ================== Piper: compute tool in CCS ==================
@@ -940,8 +980,10 @@ static atomic<bool> g_joints_connected{false};
 static mutex g_joints_send_mtx;
 
 // Master: 把当前 g_occ_joints 推给 Slave ("JOINTS:q0,...,q11"; 无效 → "JOINTS:")
-void sendJointsToSlave() {
-    if (g_joints_sock == INVALID_SOCKET) return;                 // 通道未连 (单机/未就绪) → 静默
+// 带 ACK 确认 + 重发 (P001 教训: 单次丢消息 → 该录 occ_joints=NaN 无法判定);
+// 返回 false = 重试耗尽, 调用方须将本目标全相机 valid=0
+bool sendJointsToSlave() {
+    if (g_joints_sock == INVALID_SOCKET) return false;
     string msg = "JOINTS:";
     { lock_guard<mutex> lk(g_occ_mtx);
       if (g_occ_joints_ok) {
@@ -949,8 +991,15 @@ void sendJointsToSlave() {
           for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), "%s%.6f", k ? "," : "", g_occ_joints[k]); msg += b; }
       } }
     lock_guard<mutex> lk(g_joints_send_mtx);
-    if (send(g_joints_sock, (msg + "\n").c_str(), (int)msg.size() + 1, 0) <= 0)
-        cerr << "[Joints] send to Slave failed (err " << WSAGetLastError() << ")" << endl;
+    for (int attempt = 1; attempt <= 5; ++attempt) {
+        if (send(g_joints_sock, (msg + "\n").c_str(), (int)msg.size() + 1, 0) <= 0)
+            cerr << "[Joints] send failed (err " << WSAGetLastError() << ")" << endl;
+        string ack;
+        if (recvLine(g_joints_sock, ack, 2000) && ack == "JOINTS_ACK") return true;
+        cerr << "[Joints] ACK not received, retry " << attempt << "/5" << endl;
+        this_thread::sleep_for(chrono::milliseconds(300));
+    }
+    return false;
 }
 
 // ---- base64 (标定 XML 经文本通道传输; 无第三方依赖) ----

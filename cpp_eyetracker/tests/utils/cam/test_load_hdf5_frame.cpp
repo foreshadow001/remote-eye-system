@@ -37,6 +37,7 @@ struct CamInfo {
 static vector<CamInfo> g_cams;
 static int g_global_frame = 0;  // current global frame index
 static int g_max_frame = 0;     // upper bound (from sentry)
+static double g_gain = 1.0;     // 显示增益 (画面实际很暗; [L]加亮 [D]变暗)
 static string g_sentry_root;
 static int g_core_frames = 100;          // = ceil(fps×record_time)
 static int64_t g_frames_per_arm = 25000; // = num_targets_per_arm × core_frames
@@ -135,6 +136,7 @@ static void render(cv::Mat& canvas) {
                 double sc = min((double)g_thumb_w / bgr.cols, (double)g_thumb_h / bgr.rows);
                 int dw = (int)(bgr.cols * sc), dh = (int)(bgr.rows * sc);
                 cv::Mat rz; cv::resize(bgr, rz, {dw, dh});
+                if (g_gain != 1.0) rz.convertTo(rz, -1, g_gain, 0);   // 显示增益
                 cell = cv::Mat(g_thumb_h, g_thumb_w, CV_8UC3, cv::Scalar(0,0,0));
                 rz.copyTo(cell(cv::Rect((g_thumb_w-dw)/2, (g_thumb_h-dh)/2, dw, dh)));
             } else {
@@ -173,6 +175,7 @@ static void render(cv::Mat& canvas) {
         double sc = min((double)g_right_w / bgr.cols, (double)g_win_h / bgr.rows);
         int dw = (int)(bgr.cols * sc), dh = (int)(bgr.rows * sc);
         cv::Mat rz; cv::resize(bgr, rz, {dw, dh});
+        if (g_gain != 1.0) rz.convertTo(rz, -1, g_gain, 0);           // 显示增益
         canvas(right) = cv::Scalar(0,0,0);
         rz.copyTo(canvas(cv::Rect(g_right_x + (g_right_w-dw)/2, (g_win_h-dh)/2, dw, dh)));
 
@@ -226,7 +229,9 @@ static void render(cv::Mat& canvas) {
           cv::putText(canvas, gb, {hx, hy - 20}, cv::FONT_HERSHEY_SIMPLEX, 0.35,
                       cv::Scalar(200,200,0), 1, cv::LINE_AA);
       } }
-    cv::putText(canvas, "Frame " + to_string(g_global_frame) + "/" + to_string(g_max_frame) + "  [A][D] +/-1  [W][S] +/-100  [ESC] quit",
+    cv::putText(canvas, "Frame " + to_string(g_global_frame) + "/" + to_string(g_max_frame)
+                + "  [<-][->] +/-1  [W][S] +/-100  [L] brighter  [D] darker"
+                + "  gain x" + ([](){ char b[16]; snprintf(b,sizeof(b),"%.2f",g_gain); return string(b); })(),
                 {hx, hy}, cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(140,140,140), 1);
     int cx = g_right_x + g_right_w/2, cy = g_win_h/2;
     cv::line(canvas, {cx-20, cy}, {cx+20, cy}, {100,100,100}, 1);
@@ -303,9 +308,11 @@ int main(int argc, char* argv[]) {
         if (key == 'q' || key == 27) break;
         int prev = g_global_frame;
         if (key == 2424832 || key == 'a')       g_global_frame = max(0, g_global_frame - 1);    // LEFT/A: -1
-        else if (key == 2555904 || key == 'd')  g_global_frame = min(g_max_frame - 1, g_global_frame + 1);   // RIGHT/D: +1
+        else if (key == 2555904)                g_global_frame = min(g_max_frame - 1, g_global_frame + 1);   // RIGHT: +1
         else if (key == 2490368 || key == 'w')  g_global_frame = min(g_max_frame - 1, g_global_frame + 100); // UP/W: +100
         else if (key == 2621440 || key == 's')  g_global_frame = max(0, g_global_frame - 100);               // DOWN/S: -100
+        else if (key == 'l' || key == 'L')      g_gain = min(32.0, g_gain * 1.25);              // L: 加亮
+        else if (key == 'd' || key == 'D')      g_gain = max(0.05, g_gain / 1.25);              // D: 变暗
         if (g_global_frame != prev) loadFrame(g_global_frame);
     }
 
