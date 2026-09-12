@@ -774,6 +774,9 @@ static string buildGazeCamMsg() {
 }
 
 // ---- GET_JOINTS 查询 (复用 piper 控制连接; 调用时臂静止且 socket 空闲) ----
+// NaN 防线 (P001 二采教训): 服务器可能回报 "nan" 关节 — stod("nan") 不抛异常且
+// NaN 参与一切比较均为 false, 会穿透对账/判定所有防线 (err=NaN 判"通过"、
+// FK=NaN 判"不遮挡") → 必须在入口按查询失败处理
 static bool occQueryJoints(const string& arm, double q[6]) {
     if (g_piper_sock == INVALID_SOCKET) return false;
     if (!sendLineRaw(g_piper_sock, "GET_JOINTS:" + arm)) return false;
@@ -783,7 +786,9 @@ static bool occQueryJoints(const string& arm, double q[6]) {
     if (resp.rfind(tag, 0) != 0) return false;
     stringstream ss(resp.substr(tag.size())); string tok; int i = 0;
     try { while (i < 6 && getline(ss, tok, ',')) q[i++] = stod(tok); } catch (...) { return false; }
-    return i == 6;
+    if (i != 6) return false;
+    for (int k = 0; k < 6; ++k) if (!std::isfinite(q[k])) return false;
+    return true;
 }
 
 // ---- 主判定 (Master, moveArmToTarget ARM_OK 后同步调用, 完成才置 READY 计时) ----
@@ -895,7 +900,8 @@ static void runOcclusionCheck(const string& arm, int target_idx) {
         double err = sqrt(dx*dx + dy*dy + dz*dz);
         err_mm[i] = err * 1000.0;
         cout << "[Occ] joint check " << a << ": FK vs real flange err = " << err * 1000.0 << " mm" << endl;
-        if (err > 0.01) {
+        // NaN 防线: err 为 NaN/Inf 时 (NaN>x 恒 false 会被误判"通过") 按失配处理
+        if (!std::isfinite(err) || err > 0.01) {
             cerr << "[Occ] WARN: " << a << " joints mismatch real pose > 10 mm"
                  << " (joints wrong/stale/crossed?) — this target ALL valid=0, next target re-checks" << endl;
             logException("ERROR","occ","joint check mismatch - all valid=0 this target");
@@ -1188,8 +1194,13 @@ void jointsClientWorker(const string& master_ip, int joints_port, const string& 
                 else for (int k = 0; k < 14; ++k) g_occ_flange[k] = NAN;
                 if (v.size() >= 30) for (int k = 0; k < 12; ++k) g_occ_arm_pose[k] = v[18+k];
                 if (v.size() >= 42) {
-                    for (int k = 0; k < 12; ++k) g_occ_joints[k] = v[30+k];
-                    g_occ_joints_ok = true;
+                    // NaN 防线: joints 段任一非有限值 (如 "nan") → 视为无效 (兜底全 valid=0)
+                    bool fin = true;
+                    for (int k = 0; k < 12 && fin; ++k) fin = std::isfinite(v[30+k]);
+                    if (fin) {
+                        for (int k = 0; k < 12; ++k) g_occ_joints[k] = v[30+k];
+                        g_occ_joints_ok = true;
+                    }
                 }
                 sendLineRaw(sock, "JOINTS_ACK");
             }
@@ -2688,13 +2699,14 @@ int main() {
         if(g_precreating.load()){
             if(g_pre_phase==1){
                 // 握手阶段: 等待 slave 预检回复 (15s 超时保护, 防止断连卡死)
-                if(g_pre_peer_reject.load()||
-                   chrono::duration<double>(chrono::steady_clock::now()-g_pre_t0).count()>15.0){
+                // slave 有 h5 (BLOCKED) 不再中止 — 双端统一"只建缺失"补创建语义
+                if(chrono::duration<double>(chrono::steady_clock::now()-g_pre_t0).count()>15.0){
                     g_precreating=false;
-                    cout<<(g_pre_peer_reject.load()?"[HDF5] Slave has existing h5 — aborted."
-                                                   :"[HDF5] Slave pre-check timeout — aborted.")<<endl;
-                }else if(g_pre_peer_clear.load()){
-                    // 双端均无 h5 → 下令双方同时开始创建
+                    cout<<"[HDF5] Slave pre-check timeout — aborted."<<endl;
+                }else if(g_pre_peer_clear.load()||g_pre_peer_reject.load()){
+                    // 下令双方同时开始 (各自跳过已存在文件)
+                    if(g_pre_peer_reject.load())
+                        cout<<"[HDF5] Slave has existing h5 — creating MISSING files only there."<<endl;
                     g_pre_peer_done=false;g_pre_local_done=false;
                     sendLineRaw(g_cmd_sock,"PRECREATE_BEGIN");
                     if(g_pre_thread.joinable())g_pre_thread.join();
@@ -2839,18 +2851,20 @@ int main() {
         }
         else if(is_master_pc&&(key=='i'||key=='I')&&!g_piper_busy&&!is_recording&&!is_dumping&&!g_precreating.load()){
             // 提前创建 25×N 个 h5: 双机握手预检 → 各自串行创建 → 握手退出
-            if(anyLocalH5()){cout<<"[HDF5] Existing h5 on master — pre-create skipped."<<endl;}
-            else if(!enable_net_sync){
+            // 已有 h5 → 补创建模式: precreateSerial 逐文件 exists 跳过, ACC_TRUNC 只作用于
+            // 新文件 (不碰已录数据) — 支持采集中途补建, 消除跨 chunk 边界的十几秒创建尖峰
+            if(anyLocalH5()) cout<<"[HDF5] Existing h5 on master — creating MISSING files only."<<endl;
+            if(!enable_net_sync){
                 // 单机模式: 直接创建 (无握手)
                 g_pre_phase=2;g_precreating=true;g_pre_local_done=false;
                 if(g_pre_thread.joinable())g_pre_thread.join();
                 g_pre_thread=thread([]{precreateSerial();g_pre_local_done=true;});
             }else{
-                // 双机模式: 先握手检查 slave (master 本机已确认无 h5)
+                // 双机模式: 先握手检查 slave (已录数据只提示, 双端同样只建缺失)
                 g_pre_peer_clear=false;g_pre_peer_reject=false;
                 g_precreating=true;g_pre_phase=1;g_pre_t0=chrono::steady_clock::now();
                 sendLineRaw(g_cmd_sock,"PRECHECK_REQ");
-                cout<<"[HDF5] Master clear. Pre-checking slave..."<<endl;
+                cout<<"[HDF5] Pre-checking slave..."<<endl;
             }
         }
         else if(is_master_pc&&(key=='t'||key=='T')){
