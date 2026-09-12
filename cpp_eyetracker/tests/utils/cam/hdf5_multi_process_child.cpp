@@ -47,18 +47,10 @@ static int runPrecreate(int argc, char* argv[]) {
             pl.setFillTime(H5D_FILL_TIME_NEVER);          // 不逐字节清零 ~10GB
             hsize_t gd[2] = {(hsize_t)capacity, 3};
             f.createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd), pl);
-            hsize_t jd[2] = {(hsize_t)capacity, 12};
-            f.createDataSet("occ_joints", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, jd), pl);
-            hsize_t sd[1] = {(hsize_t)capacity};
-            f.createDataSet("occ_status", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, sd), pl);
-            hsize_t ed[2] = {(hsize_t)capacity, 2};
-            f.createDataSet("occ_check_err", H5::PredType::NATIVE_FLOAT, H5::DataSpace(2, ed), pl);
-            hsize_t ad[1] = {(hsize_t)capacity};
-            f.createDataSet("occ_arm", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, ad), pl);
-            hsize_t fd[2] = {(hsize_t)capacity, 14};
-            f.createDataSet("occ_flange", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, fd), pl);
-            hsize_t pd[2] = {(hsize_t)capacity, 12};
-            f.createDataSet("occ_arm_pose", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, pd), pl);
+            // 判定元数据+关节 合一 [42]: arm,status,err[2],flange[14],arm_pose[12],joints[12]
+            // (总 dataset 数须 ≤8: 恰好 9 个时 HDF5 close 触发 NTFS 对 9.3GB raw 区零填充 ~4s/文件)
+            hsize_t md[2] = {(hsize_t)capacity, 42};
+            f.createDataSet("occ_meta", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, md), pl);
             hsize_t vd[1] = {(hsize_t)capacity};
             f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd), pl);
             hsize_t rd[3] = {(hsize_t)capacity, (hsize_t)cam_h, (hsize_t)cam_w};
@@ -131,11 +123,13 @@ int main(int argc, char* argv[]) {
         parse_list(argc > 20 ? argv[20] : nullptr, occ_arm_pose, 12); }
 
     // 判定所用关节 (qU6+qL6; 无效/缺失 → NaN, 与图像/valid 同时序可辨识)
+    // 无效标记判别必须整串比对 "-": 负关节角表 "-0.182,...,-" 首字符也是 '-',
+    // 曾被 argv[14][0] != '-' 误判 → 整表丢弃写 NaN (NaN 三采根因)
     double joints[12];
     {
         const double NAN_VAL = numeric_limits<double>::quiet_NaN();
         bool ok = false;
-        if (argc > 14 && argv[14][0] != '-') {
+        if (argc > 14 && strlen(argv[14]) > 1) {
             ok = true;
             stringstream js(argv[14]); string tok;
             int k = 0;
@@ -146,10 +140,6 @@ int main(int argc, char* argv[]) {
             ok = ok && (k == 12);
         }
         if (!ok) for (int k = 0; k < 12; ++k) joints[k] = NAN_VAL;
-        // 排障日志: child 实际收到的 argv[14] 与解析结果 (与主程序 [Dump#N] argv14 对账)
-        cerr << "[Child cam " << cam_idx << "] argc=" << argc << " argv14=["
-             << (argc > 14 ? string(argv[14]).substr(0, 24) : "(none)") << "] j0="
-             << joints[0] << endl;
     }
 
     // ---- Open shared memory ----
@@ -215,81 +205,26 @@ int main(int argc, char* argv[]) {
             gaze_ds.write(gz_buf.data(), H5::PredType::NATIVE_DOUBLE, gz_mem, gz_file);
         }
 
-        // ---- occ_joints: 判定所用关节 (qU6+qL6, 每录恒定; 调试用) ----
-        // 旧文件可能缺该数据集 (预创建早于本字段引入) → 跳过, 不影响其他写入
+        // ---- occ_meta: 判定元数据+关节 合一 [42] (每录恒定) ----
+        // 列: [0]arm [1]status [2:4]check_err [4:18]flange [18:30]arm_pose [30:42]joints
+        // 旧文件可能缺该数据集 (预创建早于本格式) → 跳过, 不影响其他写入
         try {
-            H5::DataSet jnt_ds = f.openDataSet("occ_joints");
-            hsize_t jn_start[2] = {(hsize_t)frame_offset, 0};
-            hsize_t jn_count[2] = {(hsize_t)N, 12};
-            H5::DataSpace jn_mem(2, jn_count);
-            H5::DataSpace jn_file = jnt_ds.getSpace();
-            jn_file.selectHyperslab(H5S_SELECT_SET, jn_count, jn_start);
-            vector<double> jn_buf((size_t)N * 12);
-            for (int i = 0; i < N; ++i)
-                for (int k = 0; k < 12; ++k)
-                    jn_buf[i * 12 + k] = joints[k];
-            jnt_ds.write(jn_buf.data(), H5::PredType::NATIVE_DOUBLE, jn_mem, jn_file);
-        } catch (const H5::Exception&) {}
-
-        // ---- occ_status / occ_check_err / occ_arm / occ_flange / occ_arm_pose ----
-        // 判定状态 + 对账误差 + 录制臂 + SDK 法兰位姿 + 运行时手眼值 (每录恒定; 离线排障)
-        // 旧文件可能缺数据集 (预创建早于本字段引入) → 跳过, 不影响其他写入
-        try {
-            {
-                H5::DataSet st_ds = f.openDataSet("occ_status");
-                hsize_t st_start[1] = {(hsize_t)frame_offset};
-                hsize_t st_count[1] = {(hsize_t)N};
-                H5::DataSpace st_mem(1, st_count);
-                H5::DataSpace st_file = st_ds.getSpace();
-                st_file.selectHyperslab(H5S_SELECT_SET, st_count, st_start);
-                vector<uint8_t> st_buf((size_t)N, (uint8_t)occ_status);
-                st_ds.write(st_buf.data(), H5::PredType::NATIVE_UINT8, st_mem, st_file);
+            H5::DataSet md_ds = f.openDataSet("occ_meta");
+            hsize_t md_start[2] = {(hsize_t)frame_offset, 0};
+            hsize_t md_count[2] = {(hsize_t)N, 42};
+            H5::DataSpace md_mem(2, md_count);
+            H5::DataSpace md_file = md_ds.getSpace();
+            md_file.selectHyperslab(H5S_SELECT_SET, md_count, md_start);
+            vector<double> md_buf((size_t)N * 42);
+            for (int i = 0; i < N; ++i) {
+                double* row = &md_buf[i * 42];
+                row[0] = occ_arm; row[1] = occ_status;
+                row[2] = occ_err[0]; row[3] = occ_err[1];
+                for (int k = 0; k < 14; ++k) row[4 + k]  = occ_flange[k];
+                for (int k = 0; k < 12; ++k) row[18 + k] = occ_arm_pose[k];
+                for (int k = 0; k < 12; ++k) row[30 + k] = joints[k];
             }
-            {
-                H5::DataSet er_ds = f.openDataSet("occ_check_err");
-                hsize_t er_start[2] = {(hsize_t)frame_offset, 0};
-                hsize_t er_count[2] = {(hsize_t)N, 2};
-                H5::DataSpace er_mem(2, er_count);
-                H5::DataSpace er_file = er_ds.getSpace();
-                er_file.selectHyperslab(H5S_SELECT_SET, er_count, er_start);
-                vector<float> er_buf((size_t)N * 2);
-                for (int i = 0; i < N; ++i) { er_buf[i*2] = occ_err[0]; er_buf[i*2+1] = occ_err[1]; }
-                er_ds.write(er_buf.data(), H5::PredType::NATIVE_FLOAT, er_mem, er_file);
-            }
-            {
-                H5::DataSet ar_ds = f.openDataSet("occ_arm");
-                hsize_t ar_start[1] = {(hsize_t)frame_offset};
-                hsize_t ar_count[1] = {(hsize_t)N};
-                H5::DataSpace ar_mem(1, ar_count);
-                H5::DataSpace ar_file = ar_ds.getSpace();
-                ar_file.selectHyperslab(H5S_SELECT_SET, ar_count, ar_start);
-                vector<uint8_t> ar_buf((size_t)N, (uint8_t)occ_arm);
-                ar_ds.write(ar_buf.data(), H5::PredType::NATIVE_UINT8, ar_mem, ar_file);
-            }
-            {
-                H5::DataSet fl_ds = f.openDataSet("occ_flange");
-                hsize_t fl_start[2] = {(hsize_t)frame_offset, 0};
-                hsize_t fl_count[2] = {(hsize_t)N, 14};
-                H5::DataSpace fl_mem(2, fl_count);
-                H5::DataSpace fl_file = fl_ds.getSpace();
-                fl_file.selectHyperslab(H5S_SELECT_SET, fl_count, fl_start);
-                vector<double> fl_buf((size_t)N * 14);
-                for (int i = 0; i < N; ++i)
-                    for (int k = 0; k < 14; ++k) fl_buf[i*14+k] = occ_flange[k];
-                fl_ds.write(fl_buf.data(), H5::PredType::NATIVE_DOUBLE, fl_mem, fl_file);
-            }
-            {
-                H5::DataSet ap_ds = f.openDataSet("occ_arm_pose");
-                hsize_t ap_start[2] = {(hsize_t)frame_offset, 0};
-                hsize_t ap_count[2] = {(hsize_t)N, 12};
-                H5::DataSpace ap_mem(2, ap_count);
-                H5::DataSpace ap_file = ap_ds.getSpace();
-                ap_file.selectHyperslab(H5S_SELECT_SET, ap_count, ap_start);
-                vector<double> ap_buf((size_t)N * 12);
-                for (int i = 0; i < N; ++i)
-                    for (int k = 0; k < 12; ++k) ap_buf[i*12+k] = occ_arm_pose[k];
-                ap_ds.write(ap_buf.data(), H5::PredType::NATIVE_DOUBLE, ap_mem, ap_file);
-            }
+            md_ds.write(md_buf.data(), H5::PredType::NATIVE_DOUBLE, md_mem, md_file);
         } catch (const H5::Exception&) {}
 
         // ---- valid: 被遮挡相机整段写 0, 其余全 1 (tiny, ~0.001s) ----

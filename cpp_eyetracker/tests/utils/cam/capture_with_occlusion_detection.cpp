@@ -1042,8 +1042,6 @@ bool sendJointsToSlave() {
       for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), ",%.6f", g_occ_arm_pose[k]); msg += b; }
       if (g_occ_joints_ok)
           for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), ",%.6f", g_occ_joints[k]); msg += b; } }
-    // 排障日志 (NaN 三采未定位): 发送的消息尾段 = joints 值 (好值/"nan"/缺失)
-    cout << "[Joints] TX len=" << msg.size() << " tail=" << msg.substr(msg.size() > 60 ? msg.size() - 60 : 0) << endl;
     lock_guard<mutex> lk(g_joints_send_mtx);
     for (int attempt = 1; attempt <= 5; ++attempt) {
         if (send(g_joints_sock, (msg + "\n").c_str(), (int)msg.size() + 1, 0) <= 0)
@@ -1204,9 +1202,6 @@ void jointsClientWorker(const string& master_ip, int joints_port, const string& 
                         g_occ_joints_ok = true;
                     }
                 }
-                // 排障日志: 收到的值数 + 存储结果 (与 master TX 对照定位断链)
-                cout << "[Joints] RX n=" << v.size() << " ok=" << g_occ_joints_ok
-                     << " j0=" << g_occ_joints[0] << endl;
                 sendLineRaw(sock, "JOINTS_ACK");
             }
         }
@@ -2404,9 +2399,6 @@ int main() {
                     rec_occ_status = 5;
                     for (auto& ctx : cam_ctxs) rec_occl.insert(ctx->id);
                 }
-                // 排障日志: dump 时刻的关节快照状态 (与 [Joints] RX 对照定位时序/覆盖)
-                cout << "[Dump#" << g_recording_number << "] joints ok=" << rec_joints_ok
-                     << " j0=" << rec_joints[0] << " st=" << rec_occ_status << endl;
                 // gaze target 各相机系快照 (h5 按相机系保存):
                 // Master 用 day 外参现算; Slave 用 GAZE_CAM 接收值 (缺相机回退中心系)
                 map<string, array<double,3>> rec_gaze_cam;
@@ -2461,18 +2453,8 @@ int main() {
                         H5::DSetCreatPropList pl=allocEarlyPl();
                         hsize_t gd[2]={(hsize_t)g_hdf5_chunk_capacity,3};
                         f.createDataSet("gaze_target",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,gd),pl);
-                        hsize_t jd[2]={(hsize_t)g_hdf5_chunk_capacity,12};
-                        f.createDataSet("occ_joints",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,jd),pl);
-                        hsize_t sd[1]={(hsize_t)g_hdf5_chunk_capacity};
-                        f.createDataSet("occ_status",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,sd),pl);
-                        hsize_t ed[2]={(hsize_t)g_hdf5_chunk_capacity,2};
-                        f.createDataSet("occ_check_err",H5::PredType::NATIVE_FLOAT,H5::DataSpace(2,ed),pl);
-                        hsize_t ad[1]={(hsize_t)g_hdf5_chunk_capacity};
-                        f.createDataSet("occ_arm",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,ad),pl);
-                        hsize_t fd[2]={(hsize_t)g_hdf5_chunk_capacity,14};
-                        f.createDataSet("occ_flange",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,fd),pl);
-                        hsize_t pd[2]={(hsize_t)g_hdf5_chunk_capacity,12};
-                        f.createDataSet("occ_arm_pose",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,pd),pl);
+                        hsize_t md[2]={(hsize_t)g_hdf5_chunk_capacity,42};   // 判定元数据+关节合一 (≤8 个数据集)
+                        f.createDataSet("occ_meta",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,md),pl);
                         hsize_t vd[1]={(hsize_t)g_hdf5_chunk_capacity};
                         f.createDataSet("valid",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,vd),pl);
                         hsize_t rd[3]={(hsize_t)g_hdf5_chunk_capacity,(hsize_t)cam_h,(hsize_t)cam_w};
@@ -2507,11 +2489,6 @@ int main() {
                             }
                         } else args << "-";
                     }
-                    // 排障日志: joints 段是此刻 args 的最后一个 token (与 child 端打印对账)
-                    {   const string full = args.str();
-                        size_t sp = full.rfind(' ');
-                        cout << "[Dump#" << g_recording_number << "] cam" << i << " argv14=["
-                             << full.substr(sp + 1, 24) << "]" << endl; }
                     // 判定状态 + 双臂对账误差 (h5 occ_status / occ_check_err; NaN → "nan" 字面量)
                     {   char eb[2][32];
                         for (int k = 0; k < 2; ++k)

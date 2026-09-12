@@ -113,26 +113,39 @@ static bool loadFrame(int global_idx) {
                     gt_ds.read(c.gt, H5::PredType::NATIVE_DOUBLE, g_mem, g_file);
                 } catch (const H5::Exception&) {}
             }
-            // occ_status / occ_check_err / occ_arm: 判定状态/对账误差/录制臂 (旧文件缺 → 保持 -1)
+            // 判定元数据: occ_meta [1,42] 优先 (新格式), 旧文件回退分散数据集
+            // 列: [0]arm [1]status [2:4]check_err [4:18]flange [18:30]arm_pose [30:42]joints
             try {
-                H5::DataSet st_ds = f.openDataSet("occ_status");
-                hsize_t s_start[1] = {(hsize_t)c.frame_offset}, s_count[1] = {1};
-                H5::DataSpace s_mem(1, s_count), s_file = st_ds.getSpace();
-                s_file.selectHyperslab(H5S_SELECT_SET, s_count, s_start);
-                uint8_t st = 0; st_ds.read(&st, H5::PredType::NATIVE_UINT8, s_mem, s_file);
-                c.occ_status = (int)st;
-                H5::DataSet er_ds = f.openDataSet("occ_check_err");
-                hsize_t e_start[2] = {(hsize_t)c.frame_offset, 0}, e_count[2] = {1, 2};
-                H5::DataSpace e_mem(2, e_count), e_file = er_ds.getSpace();
-                e_file.selectHyperslab(H5S_SELECT_SET, e_count, e_start);
-                float ev[2]; er_ds.read(ev, H5::PredType::NATIVE_FLOAT, e_mem, e_file);
-                c.occ_err[0] = ev[0]; c.occ_err[1] = ev[1];
-                H5::DataSet ar_ds = f.openDataSet("occ_arm");
-                H5::DataSpace a_file = ar_ds.getSpace();
-                a_file.selectHyperslab(H5S_SELECT_SET, s_count, s_start);
-                uint8_t av = 0; ar_ds.read(&av, H5::PredType::NATIVE_UINT8, s_mem, a_file);
-                c.occ_arm = (int)av;
-            } catch (const H5::Exception&) {}
+                H5::DataSet md_ds = f.openDataSet("occ_meta");
+                hsize_t m_start[2] = {(hsize_t)c.frame_offset, 0}, m_count[2] = {1, 42};
+                H5::DataSpace m_mem(2, m_count), m_file = md_ds.getSpace();
+                m_file.selectHyperslab(H5S_SELECT_SET, m_count, m_start);
+                double row[42];
+                md_ds.read(row, H5::PredType::NATIVE_DOUBLE, m_mem, m_file);
+                c.occ_arm = (int)row[0];
+                c.occ_status = (int)row[1];
+                c.occ_err[0] = row[2]; c.occ_err[1] = row[3];
+            } catch (const H5::Exception&) {
+                try {   // 旧格式回退: occ_status / occ_check_err / occ_arm (缺 → 保持 -1)
+                    H5::DataSet st_ds = f.openDataSet("occ_status");
+                    hsize_t s_start[1] = {(hsize_t)c.frame_offset}, s_count[1] = {1};
+                    H5::DataSpace s_mem(1, s_count), s_file = st_ds.getSpace();
+                    s_file.selectHyperslab(H5S_SELECT_SET, s_count, s_start);
+                    uint8_t st = 0; st_ds.read(&st, H5::PredType::NATIVE_UINT8, s_mem, s_file);
+                    c.occ_status = (int)st;
+                    H5::DataSet er_ds = f.openDataSet("occ_check_err");
+                    hsize_t e_start[2] = {(hsize_t)c.frame_offset, 0}, e_count[2] = {1, 2};
+                    H5::DataSpace e_mem(2, e_count), e_file = er_ds.getSpace();
+                    e_file.selectHyperslab(H5S_SELECT_SET, e_count, e_start);
+                    float ev[2]; er_ds.read(ev, H5::PredType::NATIVE_FLOAT, e_mem, e_file);
+                    c.occ_err[0] = ev[0]; c.occ_err[1] = ev[1];
+                    H5::DataSet ar_ds = f.openDataSet("occ_arm");
+                    H5::DataSpace a_file = ar_ds.getSpace();
+                    a_file.selectHyperslab(H5S_SELECT_SET, s_count, s_start);
+                    uint8_t av = 0; ar_ds.read(&av, H5::PredType::NATIVE_UINT8, s_mem, a_file);
+                    c.occ_arm = (int)av;
+                } catch (const H5::Exception&) {}
+            }
             c.loaded = true;
             any_loaded = true;
         } catch (const H5::Exception&) {}
