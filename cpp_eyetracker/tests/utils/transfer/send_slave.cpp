@@ -44,6 +44,7 @@ using namespace gazeestimation;
 static string g_server_ip, g_participant;
 static int g_server_port = 5001, g_workers = 4;
 static vector<string> g_roots;
+static vector<string> g_cam_ids;           // capture.yaml cam_indices (与 root 一一配对)
 static vector<string> g_cams;              // 空 = 全部相机
 static bool g_tx_user = false;             // --tx user: 用户态重叠读发 (对照 TransmitFile)
 
@@ -101,15 +102,35 @@ vector<Job> scanFiles() {
     auto cam_wanted = [&](const string& sn) {
         return g_cams.empty() || find(g_cams.begin(), g_cams.end(), sn) != g_cams.end();
     };
-    for (auto& root : g_roots) {
-        fs::path base = fs::path(root) / g_participant;
-        if (!fs::exists(base)) { cout << "[Scan] skip missing " << base.string() << endl; continue; }
-        for (auto& e : fs::recursive_directory_iterator(base)) {
-            if (!e.is_regular_file() || e.path().extension() != ".h5") continue;
-            string sn = e.path().parent_path().filename().string();
+    // capture.yaml 语义: participant_root[i] ↔ cam_indices[i] 一一配对 (loader 同口径)。
+    // root 列表含重复盘符 (5×D + 5×E), 整目录扫会 ×5 重复入队 → 总量虚标/重复传输
+    if (!g_cam_ids.empty()) {
+        for (size_t i = 0; i < g_cam_ids.size(); ++i) {
+            const string& sn = g_cam_ids[i];
             if (!cam_wanted(sn)) continue;
-            string rel = g_participant + "/" + sn + "/" + e.path().filename().string();
-            jobs.push_back({e.path(), rel, (uint64_t)e.file_size()});
+            fs::path dir = fs::path(g_roots[i % g_roots.size()]) / g_participant / sn;
+            if (!fs::exists(dir)) { cout << "[Scan] skip missing " << dir.string() << endl; continue; }
+            for (auto& e : fs::directory_iterator(dir)) {
+                if (!e.is_regular_file() || e.path().extension() != ".h5") continue;
+                string rel = g_participant + "/" + sn + "/" + e.path().filename().string();
+                jobs.push_back({e.path(), rel, (uint64_t)e.file_size()});
+            }
+        }
+    } else {
+        // 兜底: cam_indices 缺失 → root 去重后整扫
+        vector<string> uniq;
+        for (auto& r : g_roots)
+            if (find(uniq.begin(), uniq.end(), r) == uniq.end()) uniq.push_back(r);
+        for (auto& root : uniq) {
+            fs::path base = fs::path(root) / g_participant;
+            if (!fs::exists(base)) { cout << "[Scan] skip missing " << base.string() << endl; continue; }
+            for (auto& e : fs::recursive_directory_iterator(base)) {
+                if (!e.is_regular_file() || e.path().extension() != ".h5") continue;
+                string sn = e.path().parent_path().filename().string();
+                if (!cam_wanted(sn)) continue;
+                string rel = g_participant + "/" + sn + "/" + e.path().filename().string();
+                jobs.push_back({e.path(), rel, (uint64_t)e.file_size()});
+            }
         }
     }
     return jobs;
@@ -288,6 +309,7 @@ int main(int argc, char** argv) {
                         ? c["participant_id"].as<string>() : participant_override;
         if (roots_override.empty()) g_roots = c["participant_root"].as<vector<string>>();
         else g_roots = roots_override;
+        try { g_cam_ids = c["cam_indices"].as<vector<string>>(); } catch (...) {}
         Cfg xf(cfg_dir + "/transfer.yaml"); auto& t = xf["transfer"];
         g_server_ip = data_ip_override.empty() ? t["server_ip_slave_link"].as<string>()
                                                : data_ip_override;
