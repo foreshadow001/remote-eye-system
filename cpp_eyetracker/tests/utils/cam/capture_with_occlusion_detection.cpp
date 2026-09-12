@@ -1506,6 +1506,20 @@ static void updateSentry(const string& root) {
     string sp=root+"/sentry.txt"; ofstream out(sp);
     out<<g_chunk_idx<<"\n"<<g_frame_offset<<"\n";
 }
+// 'z' 回退一次录制: 只把写盘位置 (chunk/offset) 退回 core_frames 帧并落盘 sentry;
+// h5 文件不删 — 下一次录制同槽覆写 (raw_image/gaze_target/valid/occ_joints 全部重写)。
+// 进度/OVER/断点续录均由 (chunk,offset) 派生, 回退即全局生效 (UI 右上角自动同步)。
+static bool rollbackH5Sentry() {
+    if ((int64_t)g_chunk_idx * g_hdf5_chunk_capacity + g_frame_offset.load() < g_core_frames)
+        return false;                                  // 尚无一次完整录制可退
+    g_frame_offset.store(g_frame_offset.load() - g_core_frames);
+    if (g_frame_offset.load() < 0) {                    // 跨 chunk 回退
+        g_chunk_idx -= 1;
+        g_frame_offset.store(g_frame_offset.load() + g_hdf5_chunk_capacity);
+    }
+    updateSentry(g_sentry_root);
+    return true;
+}
 
 // ================== Cmd worker (TCP command channel) ==================
 void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
@@ -1585,6 +1599,12 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
                     bool& cd=(g_arm=="upper")?g_upper_done:g_lower_done; g_show_exhausted=cd;
                 }
                 else if(line=="GAZE_DONE"){g_gaze_done=true;cout<<"[Cmd] Received GAZE_DONE from Master."<<endl;}
+                else if(line=="SENTRY_RB"){
+                    // Master 'z' 回退一次录制: 同步回退本机写盘位置 (READY 期到达, 与 dump 无并发)
+                    if(rollbackH5Sentry())
+                        cout<<"[Cmd] SENTRY_RB: h5 rolled back -> chunk="<<g_chunk_idx
+                            <<" offset="<<g_frame_offset.load()<<endl;
+                    else cout<<"[Cmd] SENTRY_RB ignored: no completed recording"<<endl;}
                 else if(line=="PRECHECK_REQ"){   // master 请求预检 → 回复本机是否有 h5
                     bool has=anyLocalH5();
                     sendLineRaw(g_cmd_sock,has?"PRECHECK_BLOCKED":"PRECHECK_CLEAR");
@@ -2019,7 +2039,7 @@ int main() {
         }
     }
     cout<<"[HDF5] Ready."<<endl;
-    if(is_master_pc)cout<<"[s] Start session  [SPACE] Record  [b] Re-zero  [c] Clear piper sentry  [t] Switch arm  [ESC/q] Quit\n";
+    if(is_master_pc)cout<<"[s] Start session  [SPACE] Record  [z] Rollback 1 rec  [b] Re-zero  [c] Clear piper sentry  [t] Switch arm  [ESC/q] Quit\n";
     else cout<<"Waiting for Master... [ESC/q] to quit.\n";
 
     // 断点续录: 启动即按 h5 sentry 恢复本臂 OVER 状态 (upper 进度 = 已写帧数, lower = 溢出部分)
@@ -2073,7 +2093,7 @@ int main() {
                 char buf[64];
                 snprintf(buf,sizeof(buf),"%d / %d targets recorded", armRecorded(g_arm), recordingsPerArm());
                 cv::putText(canvas,buf,cv::Point(g_win_w/4,g_win_h/2+10),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(255,255,255),1);
-                string hints = "Press 'b' to reset or 't' to switch arm | 'q' to quit";
+                string hints = "Press 'z' to roll back last rec | 'b' to reset | 't' to switch arm | 'q' to quit";
                 cv::putText(canvas,hints,cv::Point(g_win_w/4,g_win_h/2+50),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,255),1);
                 if(is_master_pc) drawLedIndicator(canvas);
                 cv::imshow("Multi-Cam Preview", canvas);
@@ -2131,8 +2151,8 @@ int main() {
                 else if (g_syncing.load()) hints = "Syncing sentry - please wait...";
                 else if (enable_net_sync && !is_master_pc) hints = "[s][space] disabled (Slave) | Waiting for Master...";
                 else if (is_master_pc) {
-                    if (!g_recording_enabled) hints = "[s] Start session  [SPACE/b/c/t]  [ESC/q] quit";
-                    else hints = "[SPACE] Record  [t] Switch arm  [b] Zero  [c] Clear  [ESC/q] quit";
+                    if (!g_recording_enabled) hints = "[s] Start session  [SPACE/z/b/c/t]  [ESC/q] quit";
+                    else hints = "[SPACE] Record  [z] Rollback 1 rec  [t] Switch arm  [b] Zero  [c] Clear  [ESC/q] quit";
                 }
                 cv::putText(canvas, hints, cv::Point(hx, hy), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
                 hy += 18;
@@ -2675,6 +2695,31 @@ int main() {
             g_recording_enabled=false; updatePiperSentry();
             syncPiperToSlave();
             cout<<"[Piper] Both arms' sentry cleared (upper+lower)."<<endl;
+        }
+        else if(is_master_pc&&(key=='z'||key=='Z')&&!g_piper_busy&&!is_recording&&!is_dumping&&!g_syncing.load()){
+            // h5 sentry 回退一次录制 (READY 或 OVER): 只退写盘位置, 下一录同槽覆写;
+            // piper sentry 与臂目标序列不动 (重拍的是当前目标, 写入上一槽位)。
+            // OVER 态回退 (= 最后一录拍坏): 配额回退后自动解除 OVER 恢复 READY。
+            // 双机模式先令 Slave 回退, 发送失败则整体放弃 — 两机要么都退要么都不退
+            if(!g_recording_enabled&&!g_show_over)
+                cout<<"[z] ignored: only in READY/OVER state (press s to start session first)"<<endl;
+            else if(g_delay_pending.load()||g_show_exhausted)
+                cout<<"[z] ignored: busy (delay/exhausted)"<<endl;
+            else if((int64_t)g_chunk_idx*g_hdf5_chunk_capacity+g_frame_offset.load()<g_core_frames)
+                cout<<"[z] ignored: no completed recording to roll back"<<endl;
+            else if(enable_net_sync&&g_cmd_sock!=INVALID_SOCKET&&!sendLineRaw(g_cmd_sock,"SENTRY_RB"))
+                cerr<<"[z] SENTRY_RB send failed - rollback aborted (Slave not synced)"<<endl;
+            else{
+                rollbackH5Sentry();
+                if(g_show_over&&armRecorded(g_arm)<recordingsPerArm()){
+                    g_show_over=false;              // 最后一录回退 → 配额内, 解除 OVER
+                    g_recording_enabled=true;       // 恢复 READY (SPACE 可录)
+                }
+                cout<<"[z] h5 sentry -1 recording -> chunk="<<g_chunk_idx
+                    <<" offset="<<g_frame_offset.load()<<" (next recording overwrites)"
+                    <<(g_recording_enabled?"":" | still OVER")
+                    <<(enable_net_sync?" | SENTRY_RB sent":"")<<endl;
+            }
         }
         else if(is_master_pc&&(key=='i'||key=='I')&&!g_piper_busy&&!is_recording&&!is_dumping&&!g_precreating.load()){
             // 提前创建 25×N 个 h5: 双机握手预检 → 各自串行创建 → 握手退出
