@@ -21,10 +21,62 @@
 #include <string>
 #include <cstdlib>
 #include <limits>
+#include <filesystem>
 
+namespace fs = std::filesystem;
 using namespace std;
 
+// ---- precreate 模式: 串行创建 <dir> 下全部 chunk 文件 ----
+// 用法: hdf5_multi_process_child.exe --precreate <hdf5_dir> <n_chunks> <capacity> <cam_h> <cam_w>
+// 每相机一个进程由主程序拉起 (10 路并行); 数据集布局/顺序必须与主程序
+// precreateParallel/dump Step 0 逐字一致 (布局在 raw_image 前的小数据集决定 NTFS 行为)
+static int runPrecreate(int argc, char* argv[]) {
+    string dir       = argv[2];
+    int    n_chunks  = atoi(argv[3]);
+    int    capacity  = atoi(argv[4]);
+    int    cam_h     = atoi(argv[5]);
+    int    cam_w     = atoi(argv[6]);
+    int    created   = 0;
+    for (int ci = 0; ci < n_chunks; ++ci) {
+        stringstream pss; pss << dir << "/" << setw(4) << setfill('0') << ci << ".h5";
+        if (fs::exists(pss.str())) continue;              // 补创建: 已存在 (含已录数据) 跳过
+        try {
+            H5::H5File f(pss.str(), H5F_ACC_TRUNC);
+            H5::DSetCreatPropList pl;
+            pl.setAllocTime(H5D_ALLOC_TIME_EARLY);        // 创建即分配 (文件扩展到满尺寸)
+            pl.setFillTime(H5D_FILL_TIME_NEVER);          // 不逐字节清零 ~10GB
+            hsize_t gd[2] = {(hsize_t)capacity, 3};
+            f.createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd), pl);
+            hsize_t jd[2] = {(hsize_t)capacity, 12};
+            f.createDataSet("occ_joints", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, jd), pl);
+            hsize_t sd[1] = {(hsize_t)capacity};
+            f.createDataSet("occ_status", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, sd), pl);
+            hsize_t ed[2] = {(hsize_t)capacity, 2};
+            f.createDataSet("occ_check_err", H5::PredType::NATIVE_FLOAT, H5::DataSpace(2, ed), pl);
+            hsize_t ad[1] = {(hsize_t)capacity};
+            f.createDataSet("occ_arm", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, ad), pl);
+            hsize_t fd[2] = {(hsize_t)capacity, 14};
+            f.createDataSet("occ_flange", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, fd), pl);
+            hsize_t pd[2] = {(hsize_t)capacity, 12};
+            f.createDataSet("occ_arm_pose", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, pd), pl);
+            hsize_t vd[1] = {(hsize_t)capacity};
+            f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd), pl);
+            hsize_t rd[3] = {(hsize_t)capacity, (hsize_t)cam_h, (hsize_t)cam_w};
+            f.createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd), pl);
+            ++created;
+        } catch (const H5::Exception& e) {
+            cerr << "[Precreate " << fs::path(dir).filename().string() << "] chunk " << ci
+                 << " FAILED: " << e.getCDetailMsg() << endl;
+            return 1;
+        }
+    }
+    cout << "[Precreate " << fs::path(dir).filename().string() << "] " << created << " files created" << endl;
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
+    if (argc == 7 && string(argv[1]) == "--precreate") return runPrecreate(argc, argv);
+
     // Expected arguments (10 values after the program name):
     // argv[1]  = camera_index    argv[2]  = hdf5_dir
     // argv[3]  = chunk_idx       argv[4]  = frame_offset

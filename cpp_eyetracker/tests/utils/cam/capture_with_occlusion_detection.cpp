@@ -304,12 +304,12 @@ int g_chunk_idx = 0; atomic<int> g_frame_offset{0};
 // upper 先录满 → lower, 因此 sentry 可唯一推导两臂进度 → 断点续录。
 // 配额从配置推导 (不硬编码): 每臂帧数 = num_targets_per_arm × core_frames
 //   = 250 录 × ceil(fps×record_time) 帧 = 25000 帧/臂;
-// 两臂合计 50000 帧 = 25 chunk (0000..0024, precreateSerial 按此创建)
+// 两臂合计 50000 帧 = 25 chunk (0000..0024, precreateParallel 按此创建)
 int g_core_frames = 100;                   // 每次录制帧数 = ceil(fps×record_time), main 填充
 int64_t g_frames_per_arm = 25000;          // = num_targets_per_arm × g_core_frames, main 填充
 vector<string> g_participant_roots; string g_sentry_root;
 int g_hdf5_chunk_capacity = 2000;
-int g_cam_w = 0, g_cam_h = 0;          // 相机分辨率 (main 加载, precreateSerial 用)
+int g_cam_w = 0, g_cam_h = 0;          // 相机分辨率 (main 加载, precreateParallel 用)
 int64_t h5FramesWritten() { return (int64_t)g_chunk_idx * g_hdf5_chunk_capacity + g_frame_offset.load(); }
 int recordingsPerArm() { return g_num_targets_per_arm; }
 int armRecorded(const string& a) {
@@ -317,7 +317,7 @@ int armRecorded(const string& a) {
     int64_t v = (a == "upper") ? min(tot, g_frames_per_arm) : max((int64_t)0, tot - g_frames_per_arm);
     return (int)(min(v, g_frames_per_arm) / max(g_core_frames, 1));
 }
-// 两臂合计所需 chunk 数 (ceil, precreateSerial 用)
+// 两臂合计所需 chunk 数 (ceil, precreateParallel 用)
 int precreateChunkCount() {
     return (int)((2 * g_frames_per_arm + g_hdf5_chunk_capacity - 1) / g_hdf5_chunk_capacity);
 }
@@ -1500,50 +1500,69 @@ H5::DSetCreatPropList allocEarlyPl() {
     return pl;
 }
 
-// 串行创建 25×N 个 h5 (H5 文件必须逐个创建, 不可并行); 进度写入 g_pre_done/g_pre_total
-void precreateSerial() {
-    int created = 0;
+// 并行预创建 25×N 个 h5: 每相机一个子进程 (10 路; 进程内串行建该相机全部 chunk)。
+// HDF5 库默认非线程安全 → 同进程多线程开文件不可行; 子进程地址空间独立, 安全。
+// 进度: 轮询磁盘已存在文件数 → g_pre_done (UI 进度条实时刷新)。
+void precreateParallel() {
     const int n_chunks = precreateChunkCount();
     g_pre_total = (int)cam_ctxs.size() * n_chunks;
     g_pre_done = 0;
-    for (auto& ctx : cam_ctxs)
-        for (int ci = 0; ci < n_chunks; ++ci) {
-            stringstream pss; pss << ctx->hdf5_dir << "/" << setw(4) << setfill('0') << ci << ".h5";
-            if (!fs::exists(pss.str())) {   // 双端预检保证为空, 此处仅防御
-                try {
-                    H5::H5File f(pss.str(), H5F_ACC_TRUNC);
-                    H5::DSetCreatPropList pl = allocEarlyPl();
-                    // 顺序关键: 小数据集必须先创建 (文件布局在 raw_image 之前) —
-                    // 否则首写 gaze/valid (位于 10GB raw 区之后) 越过 NTFS 有效数据长度,
-                    // close 时触发整个空洞的同步零填充 (~115ms/GB, 首录尖峰根因)
-                    hsize_t gd[2] = {(hsize_t)g_hdf5_chunk_capacity, 3};
-                    f.createDataSet("gaze_target", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, gd), pl);
-                    hsize_t jd[2] = {(hsize_t)g_hdf5_chunk_capacity, 12};
-                    f.createDataSet("occ_joints", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, jd), pl);
-                    hsize_t sd[1] = {(hsize_t)g_hdf5_chunk_capacity};
-                    f.createDataSet("occ_status", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, sd), pl);
-                    hsize_t ed[2] = {(hsize_t)g_hdf5_chunk_capacity, 2};
-                    f.createDataSet("occ_check_err", H5::PredType::NATIVE_FLOAT, H5::DataSpace(2, ed), pl);
-                    hsize_t ad[1] = {(hsize_t)g_hdf5_chunk_capacity};
-                    f.createDataSet("occ_arm", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, ad), pl);
-                    hsize_t fd[2] = {(hsize_t)g_hdf5_chunk_capacity, 14};
-                    f.createDataSet("occ_flange", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, fd), pl);
-                    hsize_t pd[2] = {(hsize_t)g_hdf5_chunk_capacity, 12};
-                    f.createDataSet("occ_arm_pose", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, pd), pl);
-                    hsize_t vd[1] = {(hsize_t)g_hdf5_chunk_capacity};
-                    f.createDataSet("valid", H5::PredType::NATIVE_UINT8, H5::DataSpace(1, vd), pl);
-                    hsize_t rd[3] = {(hsize_t)g_hdf5_chunk_capacity, (hsize_t)g_cam_h, (hsize_t)g_cam_w};
-                    f.createDataSet("raw_image", H5::PredType::NATIVE_UINT8, H5::DataSpace(3, rd), pl);
-                    created++;
-                } catch (const H5::Exception& e) {
-                    logException("ERROR", "hdf5:precreate", e.getCDetailMsg());
-                } catch (...) {
-                    logException("ERROR", "hdf5:precreate", "unknown exception");
-                }
+    char exe_path[MAX_PATH]; GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    string child_exe = fs::path(exe_path).parent_path().string() + "\\hdf5_multi_process_child.exe";
+    if (!fs::exists(child_exe)) {
+        cerr << "[HDF5] child exe missing (" << child_exe << ") — pre-create FAILED" << endl;
+        logException("ERROR", "hdf5:precreate", "child exe missing");
+        return;
+    }
+    HANDLE hJob = CreateJobObjectA(NULL, NULL);
+    if (hJob) { JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli{};
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli)); }
+    vector<PROCESS_INFORMATION> procs;
+    auto count_existing = [&]() {
+        int n = 0;
+        for (auto& ctx : cam_ctxs)
+            for (int ci = 0; ci < n_chunks; ++ci) {
+                stringstream pss; pss << ctx->hdf5_dir << "/" << setw(4) << setfill('0') << ci << ".h5";
+                if (fs::exists(pss.str())) ++n;
             }
-            g_pre_done++;
+        return n;
+    };
+    for (auto& ctx : cam_ctxs) {
+        stringstream args;
+        args << "\"hdf5_multi_process_child.exe\" --precreate \"" << ctx->hdf5_dir << "\" "
+             << n_chunks << " " << g_hdf5_chunk_capacity << " " << g_cam_h << " " << g_cam_w;
+        STARTUPINFOA si{sizeof(si)}; PROCESS_INFORMATION pi{};
+        string cmd_line = args.str();
+        if (CreateProcessA(child_exe.c_str(), &cmd_line[0], NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
+            procs.push_back(pi);
+        } else {
+            cerr << "[HDF5] spawn precreate child FAILED for " << ctx->hdf5_dir
+                 << " (err " << GetLastError() << ")" << endl;
+            logException("ERROR", "hdf5:precreate", "CreateProcess failed " + ctx->hdf5_dir);
         }
-    cout << "[HDF5] Pre-create: " << created << " files created." << endl;
+    }
+    vector<HANDLE> handles;
+    for (auto& p : procs) handles.push_back(p.hProcess);
+    while (!handles.empty()) {
+        g_pre_done = count_existing();                       // 进度 (250 次 stat, 微秒级)
+        DWORD w = WaitForMultipleObjects((DWORD)handles.size(), handles.data(), TRUE, 400);
+        if (w == WAIT_OBJECT_0) break;
+        if (!global_running) break;                          // 程序退出: JobObject 兜底杀子进程
+    }
+    g_pre_done = count_existing();
+    int failed = 0;
+    for (auto& p : procs) {
+        DWORD code = 0; GetExitCodeProcess(p.hProcess, &code);
+        if (code != 0) ++failed;
+        CloseHandle(p.hProcess);
+    }
+    if (hJob) CloseHandle(hJob);
+    cout << "[HDF5] Pre-create: " << (g_pre_done.load()) << "/" << g_pre_total.load()
+         << " files exist" << (failed ? " — WARN: " + to_string(failed) + " children FAILED" : "")
+         << endl;
 }
 
 void renderEnlargedView(cv::Mat& canvas, int cam_idx, bool is_recording,
@@ -1690,7 +1709,7 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
                 else if(line=="PRECREATE_BEGIN"){   // master 令开始创建 → 独立线程, 完成后回报
                     g_pre_phase=2;g_precreating=true;g_pre_local_done=false;
                     if(g_pre_thread.joinable())g_pre_thread.join();
-                    g_pre_thread=thread([]{precreateSerial();g_pre_local_done=true;sendLineRaw(g_cmd_sock,"PRECREATE_DONE");});
+                    g_pre_thread=thread([]{precreateParallel();g_pre_local_done=true;sendLineRaw(g_cmd_sock,"PRECREATE_DONE");});
                     cout<<"[Cmd] Pre-create started on slave."<<endl;}
                 else if(line=="TRIGGER"){instantTrigger();net_cmd_record=true;}
                 else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){
@@ -2421,7 +2440,7 @@ int main() {
                     });
                 }
 
-                // Step 0: Pre-create HDF5 files (小数据集先创建 — 布局须在 raw_image 前, 见 precreateSerial 注释)
+                // Step 0: Pre-create HDF5 files (小数据集先创建 — 布局须在 raw_image 前, 布局须在 raw_image 前)
                 for (auto& ctx:cam_ctxs){ctx->dump_start_time=chrono::steady_clock::now();
                     stringstream pss;pss<<ctx->hdf5_dir<<"/"<<setw(4)<<setfill('0')<<g_chunk_idx<<".h5";
                     if(!fs::exists(pss.str())){try{H5::H5File f(pss.str(),H5F_ACC_TRUNC);
@@ -2710,7 +2729,7 @@ int main() {
                     g_pre_peer_done=false;g_pre_local_done=false;
                     sendLineRaw(g_cmd_sock,"PRECREATE_BEGIN");
                     if(g_pre_thread.joinable())g_pre_thread.join();
-                    g_pre_thread=thread([]{precreateSerial();g_pre_local_done=true;});
+                    g_pre_thread=thread([]{precreateParallel();g_pre_local_done=true;});
                     g_pre_phase=2;
                     cout<<"[HDF5] Pre-create started on master + slave."<<endl;
                 }
@@ -2851,14 +2870,14 @@ int main() {
         }
         else if(is_master_pc&&(key=='i'||key=='I')&&!g_piper_busy&&!is_recording&&!is_dumping&&!g_precreating.load()){
             // 提前创建 25×N 个 h5: 双机握手预检 → 各自串行创建 → 握手退出
-            // 已有 h5 → 补创建模式: precreateSerial 逐文件 exists 跳过, ACC_TRUNC 只作用于
+            // 已有 h5 → 补创建模式: precreateParallel 逐文件 exists 跳过, ACC_TRUNC 只作用于
             // 新文件 (不碰已录数据) — 支持采集中途补建, 消除跨 chunk 边界的十几秒创建尖峰
             if(anyLocalH5()) cout<<"[HDF5] Existing h5 on master — creating MISSING files only."<<endl;
             if(!enable_net_sync){
                 // 单机模式: 直接创建 (无握手)
                 g_pre_phase=2;g_precreating=true;g_pre_local_done=false;
                 if(g_pre_thread.joinable())g_pre_thread.join();
-                g_pre_thread=thread([]{precreateSerial();g_pre_local_done=true;});
+                g_pre_thread=thread([]{precreateParallel();g_pre_local_done=true;});
             }else{
                 // 双机模式: 先握手检查 slave (已录数据只提示, 双端同样只建缺失)
                 g_pre_peer_clear=false;g_pre_peer_reject=false;
