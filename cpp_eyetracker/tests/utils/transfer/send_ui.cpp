@@ -1,26 +1,24 @@
 // ================== send_ui ==================
-// 交互式并行传输 (Windows, master/slave 自动识别): OpenCV UI 确认配置 →
-// SPACE 开始 → 两机同时发送到处理主机 (baseline_recv_data --out /data/dataset)。
+// 交互式串行传输 (Windows, master/slave 自动识别): OpenCV UI 确认配置 →
+// SPACE 开始 → master 先传, 完成后令 slave 传输 (接收端 baseline_recv_data
+// 直写 ZFS 归档柜, 见 plan/data_pipeline.md)。
 //
-// 并行原理: 接收端 v3.2 为单 blob 单写流 (staging 分段调度), 连接数不影响
-// 写盘形态 → 两机 16 流并发与单机 8 流对 QLC 等价, 盘全程单流顺序写;
-// 且避开串行模式的 QLC 折叠债 (master 写 2.4TB 后 slave 紧接传, SLC 缓存
-// 耗尽 + 后台折叠竞争 → 2 GB/s 跌至 0.2 GB/s)。并行 = 一次连续写完全量。
-//
-// 阶段 (slave: 1-2; master: 1-5):
+// 阶段 (slave: 1-2; master: 1-6):
 //   1/2. D:/capture、E:/capture 的 h5 → /data/dataset/capture/{P}/
 //   3. 相机内外参 XML ({calib_save_dir}/{P}/output) → /data/dataset/calib/cams/{P}/
 //   4. 红外发射器位置 cfg/IR/{day_id}.txt → /data/dataset/calib/IR/{day_id}.txt
-//   5. cfg/day_participant_map.json → /data/dataset/day_participant_map.json
+//   5. arm pose cfg/arm_pose/{day_id}.yaml → /data/dataset/calib/arm_pose/{day_id}.yaml
+//   6. cfg/day_participant_map.json → /data/dataset/day_participant_map.json
 //
 // 配置: capture.yaml (participant_id/is_master/master_ip), transfer.yaml (链路/流数),
 //       cam_calib.yaml (calib_save_dir), calib_arm.yaml (record.day_id)
 // 按键 (仅 master 有效, slave 全程由 master 控制):
-//   SPACE = 开始 (两机同时) / 中断后续传 (SKIP 断点, 已传文件秒过)
+//   SPACE = 开始 / 中断后续传 (SKIP 断点, 已传文件秒过)
 //   z     = 中断 (文件粒度温和停止, 两机联动; SPACE 续传)
 //   q/ESC = 退出 (任意时刻含 SPACE 前; 两机联动退出)
 //   传输中 q = 当前文件完成后温和中止 (终态, 非中断)
-// 引擎: TransmitFile 内核态读发重叠, SKIP 断点续传。
+// 引擎: 用户态读发管线 (reader/sender 双线程 3×8MB 槽) + 64MB 块 CRC32C
+//       硬件校验 trailer (TransmitFile 已弃用 — 数据流损坏, 见 plan/transfer_direct_mode.md §8)。
 // =================================================================
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -28,7 +26,8 @@
     #include <winsock2.h>
     #include <ws2tcpip.h>
     #include <windows.h>
-    #include <mswsock.h>              // TransmitFile: 内核级 读盘+发送 重叠
+    #include <mswsock.h>              // (TransmitFile 已弃用, 保留头无副作用)
+    #include <intrin.h>               // _mm_crc32_u64 (SSE4.2 硬件 CRC32C)
     #pragma comment(lib, "ws2_32.lib")
     #pragma comment(lib, "Mswsock.lib")
 #else
@@ -38,6 +37,7 @@
 #include <opencv2/opencv.hpp>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -58,7 +58,19 @@ using namespace gazeestimation;
 static const int CHUNK = 8 * 1024 * 1024;
 static const int SOCK_BUF = 32 * 1024 * 1024;
 static const int RETRIES = 3;
-static const int REPLY_TIMEOUT_MS = 180000;   // direct 接收端 OK=整文件写完 (~10GB@0.3GB/s≈33s), 3 倍余量防超时重传并发写 .part
+static const int REPLY_TIMEOUT_MS = 180000;   // direct 接收端 OK=整文件写完 (~33s), 3 倍余量防超时重传并发写 .part
+
+// ---- CRC32C 硬件校验 (SSE4.2, 与 send_slave.cpp / baseline_recv_data.cpp 同步) —
+// 64MB 块。查表版 0.43GB/s/核 (串行依赖链, 曾把聚合压到 1.4 GB/s), 硬件版
+// 7GB/s/核 (对照 crc_bench.c)。初值直传累计, 无 pre/post xor。
+static const size_t CRC_BLK = 64ull << 20;
+static uint32_t crc32c_hw(uint32_t crc, const void* p, size_t n) {
+    const uint8_t* b = (const uint8_t*)p;
+    while (n >= 8) { crc = (uint32_t)_mm_crc32_u64(crc, *(const uint64_t*)b); b += 8; n -= 8; }
+    if (n >= 4) { crc = _mm_crc32_u32(crc, *(const uint32_t*)b); b += 4; n -= 4; }
+    while (n--) crc = _mm_crc32_u8(crc, *b++);
+    return crc;
+}
 
 // ================== 配置 ==================
 struct UiCfg {
@@ -71,6 +83,7 @@ struct UiCfg {
     string cfg_dir;                   // cpp_eyetracker/cfg (xml/IR/map 源)
     string xml_dir;                   // {calib_save_dir}/{P}/output (master)
     string ir_file;                   // cfg/IR/{day_id}.txt (master)
+    string arm_pose_file;             // cfg/arm_pose/{day_id}.yaml (master, 按天共享)
     string map_file;                  // cfg/day_participant_map.json (master)
     string master_ip;                 // 握手用 (capture.yaml network.master_ip)
     int handshake_port = 50100;       // transfer.yaml
@@ -94,10 +107,8 @@ static int g_total_files = 0;
 static atomic<uint64_t> g_t0_us{0}, g_t_end_us{0};
 static string g_last_fail;
 
-// master↔slave 握手 (走现有 192.168.10.x 网): master SPACE 后发 "START <gen>",
-// 两机并行传输 (接收端单 blob 单写流, 连接数不影响盘写形态);
-// master 本机完成后 BYE 在接收端等两机全部数据落盘, 再收同号 SLAVE_DONE —
-// 全程 slave 按键无效
+// master↔slave 握手 (走现有 192.168.10.x 网): master SPACE 后先传自己,
+// 完成后 START 令 slave 传输, 收 SLAVE_DONE 回 ACK — 全程 slave 按键无效
 static SOCKET g_hs = INVALID_SOCKET;
 static atomic<bool> g_slave_ready{false};
 static atomic<bool> g_master_connected{false};   // slave 视角: 已连上 master
@@ -108,8 +119,6 @@ static string g_conn_target;
 static atomic<bool> g_4090_ok{false};            // 4090 数据链路已连通至少一次
 static atomic<uint64_t> g_skip_bytes{0};         // SKIP 文件字节 (进度条计入)
 static atomic<uint64_t> g_wait_t0_us{0};         // WAIT_SLAVE 起始 (显示等待时长)
-static atomic<int> g_hs_gen{0};                  // START/SLAVE_DONE 会话号
-                                                 // (z 中断遗留的旧 SLAVE_DONE 按号丢弃)
 
 // ================== 日志 (时间戳) ==================
 static string ts() {
@@ -174,33 +183,102 @@ static SOCKET openStream() {
     return s;
 }
 
-// ================== 传输引擎 (TransmitFile, 两段式协议) ==================
-// FILE|FORCE 头 → 等 GO/SKIP → (GO 时) TransmitFile 数据 → 等 OK
+// ================== 传输引擎 (用户态读发管线 + 块 CRC32C, 同 send_slave 定稿版) ====
+// TransmitFile 已弃用: 两次独立复现数据流损坏 (帧错位, 大小校验拦不住)。
+// reader/sender 双线程 3×8MB 槽重叠; 边读边算 64MB 块 CRC32C,
+// 数据流后追加 "CRC32 c1 c2 ..." trailer — 接收端逐块比对, 不符 ERR → 重试自愈。
 // 先应答后发数据: 接收端对已存在文件回 SKIP 后不再读数据流,
 // 若发送端先行灌数据会 TCP 背压死锁 (10GB 大文件 SKIP 场景)
 static int sendOne(SOCKET s, const Job& j) {
     // FILE   = 大小一致则 SKIP (断点续传, 图像用)
-    // FORCE  = 总是覆盖写入 (标定附件: xml / IR / map)
-    string hdr = string(j.force ? "FORCE " : "FILE ") + j.rel + " "
-               + to_string(j.size) + " 0";
-    if (!sendLine(s, hdr)) return -1;
+    // FORCE  = 总是覆盖写入 (标定附件: xml / IR / arm_pose / map)
+    ifstream in(j.path, ios::binary);
+    if (!in) return -1;
+    if (!sendLine(s, string(j.force ? "FORCE " : "FILE ") + j.rel + " "
+                   + to_string(j.size) + " crc32")) return -1;
+    string preply;
+    if (!recvLine(s, preply, REPLY_TIMEOUT_MS)) return -1;   // 先应答后数据
+    if (preply.rfind("SKIP", 0) == 0) return 1;
+    if (preply.rfind("GO", 0) != 0) {
+        cerr << ts() << "[Recv] " << j.rel << ": " << preply << endl; return -1;
+    }
+
+    struct Slot { vector<char> buf; uint64_t len = 0; };
+    vector<Slot> slots(3, Slot{vector<char>(CHUNK), 0});
+    mutex mtx;
+    condition_variable cv_empty, cv_full;
+    size_t rd = 0, wr = 0, count = 0;      // 环形槽
+    bool read_done = false, read_fail = false;
+    uint64_t total_read = 0;
+
+    // 块 CRC 累计 (reader 线程私有; 64MB 边界跨 8MB 槽切割, 文件尾封口)
+    uint32_t rcrc = 0; size_t rfill = 0;
+    vector<uint32_t> rcrcs;
+    auto feed = [&](const char* p, int n) {
+        while (n > 0) {
+            size_t take = min((size_t)n, CRC_BLK - rfill);
+            rcrc = crc32c_hw(rcrc, p, take);
+            rfill += take; p += take; n -= (int)take;
+            if (rfill == CRC_BLK) { rcrcs.push_back(rcrc); rcrc = 0; rfill = 0; }
+        }
+    };
+
+    thread reader([&]() {
+        while (true) {
+            unique_lock<mutex> lk(mtx);
+            cv_empty.wait(lk, [&] { return count < slots.size() || read_done; });
+            if (read_done) return;
+            lk.unlock();
+            in.read(slots[wr].buf.data(), CHUNK);
+            int got = (int)in.gcount();
+            if (got > 0) feed(slots[wr].buf.data(), got);
+            lk.lock();
+            if (got <= 0) {
+                read_fail = total_read < j.size;
+                if (rfill > 0) { rcrcs.push_back(rcrc); rcrc = 0; rfill = 0; }  // 尾块
+                read_done = true;
+            } else {
+                slots[wr].len = (uint64_t)got; total_read += (uint64_t)got;
+                wr = (wr + 1) % slots.size(); ++count;
+            }
+            cv_full.notify_one();
+            if (read_done) return;
+        }
+    });
+
+    bool send_fail = false;
+    while (true) {
+        unique_lock<mutex> lk(mtx);
+        cv_full.wait(lk, [&] { return count > 0 || read_done; });
+        if (count == 0) break;                    // 读尽
+        Slot& sl = slots[rd];
+        lk.unlock();
+        const char* p = sl.buf.data();
+        uint64_t off = 0;
+        while (off < sl.len) {
+            int n = send(s, p + off, (int)min<uint64_t>(sl.len - off, 1u << 30), 0);
+            if (n <= 0) { send_fail = true; break; }
+            off += (uint64_t)n;
+        }
+        lk.lock();
+        rd = (rd + 1) % slots.size(); --count;
+        cv_empty.notify_one();
+        if (send_fail) break;
+    }
+    { unique_lock<mutex> lk(mtx); read_done = true; }
+    cv_empty.notify_all();
+    reader.join();
+    if (read_fail || send_fail || total_read != j.size) return -1;
+
+    // trailer: 块 CRC 清单 (接收端比对后回 OK / ERR checksum)
+    { ostringstream os; os << "CRC32";
+      for (uint32_t c : rcrcs) os << " " << hex << c;
+      if (!sendLine(s, os.str())) return -1; }
+
     string reply;
     if (!recvLine(s, reply, REPLY_TIMEOUT_MS)) return -1;
-    if (reply.rfind("SKIP", 0) == 0) return 1;
-    if (reply.rfind("GO", 0) != 0) return -1;      // ERR / 异常
-
-    HANDLE hf = CreateFileA(j.path.string().c_str(), GENERIC_READ, FILE_SHARE_READ,
-                            NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (hf == INVALID_HANDLE_VALUE) return -1;
-    uint64_t remaining = j.size;
-    while (remaining > 0) {
-        DWORD chunk = (DWORD)min<uint64_t>(remaining, 1ull << 30);
-        if (!TransmitFile(s, hf, chunk, 0, NULL, NULL, 0)) { CloseHandle(hf); return -1; }
-        remaining -= chunk;
-    }
-    CloseHandle(hf);
-    if (!recvLine(s, reply, REPLY_TIMEOUT_MS)) return -1;
     if (reply.rfind("OK", 0) == 0) return 0;
+    cerr << ts() << "[Recv] " << j.rel << ": " << reply << endl;
     return -1;
 }
 
@@ -259,16 +337,8 @@ static void transferController() {
     g_t_end_us.store(chrono::duration_cast<chrono::microseconds>(
         chrono::steady_clock::now().time_since_epoch()).count());
 
-    // master: 本机阶段完成 → 提前切 WAIT_SLAVE
-    // (下方 BYE 在接收端等两机全部数据落盘, 可能长时间阻塞 — 状态先切, UI 立即显示)
-    if (g_cfg.is_master && !g_abort.load()) {
-        g_wait_t0_us.store(chrono::duration_cast<chrono::microseconds>(
-            chrono::steady_clock::now().time_since_epoch()).count());
-        g_phase.store((int)Phase::WAIT_SLAVE);
-    }
-
-    // 退出屏障: BYE 让接收端等全部数据 (含并行 slave 在途) 落盘后应答 —
-    // 数据全在盘上才算传完 (无此屏障时接收端 OK=已入RAM, 本机退出后盘还在写)
+    // 退出屏障: BYE 让接收端等 RAM 全部落盘后应答 — 数据全在盘上才算传完
+    // (无此屏障时接收端 OK=已入RAM, 本机退出后盘还在写)
     {
         SOCKET s = connectTo(g_cfg.server_ip, g_cfg.server_port);
         if (s != INVALID_SOCKET) {
@@ -282,32 +352,34 @@ static void transferController() {
         }
     }
 
-    // master: 等 slave 完成并汇报 (并行模式: START 已在 SPACE 时发出)
+    // master: 本机完成后令 slave 传输, 等 SLAVE_DONE
     if (g_cfg.is_master && g_hs != INVALID_SOCKET) {
-        if (g_abort.load()) {
-            // q 中止 / z 中断: 令 slave 停止待命 (z 时 UI 已直接发过, 此处兜底幂等)
+        if (g_abort.load() && !g_pause.load()) {
+            // q 温和中止 (终态): 通知 slave 停止待命; 握手保留至 master 退出发 QUIT
             sendLine(g_hs, "ABORT");
             cout << ts() << "[HS] ABORT sent to slave (standing by)" << endl;
-        } else {
-            // 只认本会话号的 SLAVE_DONE — z 中断遗留的旧应答按号丢弃
-            string want = "SLAVE_DONE " + to_string(g_hs_gen.load()) + " ";
+        } else if (!g_abort.load()) {
+            sendLine(g_hs, "START");
+            cout << ts() << "[HS] START sent to slave" << endl;
+            g_wait_t0_us.store(chrono::duration_cast<chrono::microseconds>(
+                chrono::steady_clock::now().time_since_epoch()).count());
+            g_phase.store((int)Phase::WAIT_SLAVE);
             cout << ts() << "[HS] Waiting for slave to finish..." << endl;
-            bool got = false;
             string line;
-            while (recvLine(g_hs, line, 4 * 3600 * 1000)) {
-                if (line.rfind(want, 0) == 0) { got = true; break; }
-                cout << ts() << "[HS] stale slave msg ignored: " << line << endl;
-            }
-            if (got) {
-                g_slave_summary = line.substr(want.size());
+            if (recvLine(g_hs, line, 4 * 3600 * 1000) &&
+                line.rfind("SLAVE_DONE", 0) == 0) {
+                g_slave_summary = line.substr(10);
                 cout << ts() << "[HS] Slave done:" << g_slave_summary << endl;
             } else {
                 g_slave_summary = " (no response)";
                 cout << ts() << "[HS] Slave no SLAVE_DONE response!" << endl;
                 g_fail += 1;                          // 对端异常计入失败
             }
+            sendLine(g_hs, "ACK");
             // 不关闭 g_hs: 留给 master 退出 (ESC/q) 发 QUIT 或 z 中断后续传再发 START
         }
+        // z 中断 (pause): 本机停在文件边界, slave 尚未启动, 无需发令;
+        //   WAIT_SLAVE 期间的中断由 UI 线程直接发 ABORT, 此处收到 SLAVE_DONE 后同路返回
     }
     g_phase.store((int)(g_pause.load() ? Phase::PAUSED :
                         g_abort.load() ? Phase::ABORTED : Phase::DONE));
@@ -359,7 +431,7 @@ static void slaveQuitWatcher(SOCKET hs) {
 }
 
 // slave: 连 master (上限 ~2min, master 未启/已退出则自行退出) → READY →
-// 命令循环: "START <gen>"=传输(→"SLAVE_DONE <gen> ..."→待命), ABORT=待命,
+// 命令循环: START=传输(→SLAVE_DONE→ACK→待命), ABORT=待命(master 中止/暂停),
 // QUIT/掉线=退出 — 支持 master 多次 START (z 中断后 SPACE 续传)
 static void slaveHandshakeAndRun() {
     cout << ts() << "[HS] Slave connecting to master " << g_cfg.master_ip
@@ -389,9 +461,7 @@ static void slaveHandshakeAndRun() {
             cout << ts() << "[HS] master ABORT — standing by" << endl;
             continue;
         }
-        if (cmd.rfind("START", 0) != 0) continue;     // 其余 (旧 ACK 等) 忽略
-        int gen = 0;
-        { istringstream iss(cmd); string t; iss >> t >> gen; }
+        if (cmd != "START") continue;
 
         cout << ts() << "[HS] Master ordered START — slave transferring." << endl;
         g_phase.store((int)Phase::RUNNING);           // UI 切进度屏
@@ -400,10 +470,10 @@ static void slaveHandshakeAndRun() {
         int ok = g_done_files.load() - g_skip.load() - g_fail.load();
         cout << ts() << "[HS] Sending SLAVE_DONE ok=" << ok << " skip="
              << g_skip.load() << " fail=" << g_fail.load() << endl;
-        // 回同号 SLAVE_DONE (master 按号丢弃中断遗留的旧应答); 不再等 ACK
-        sendLine(s, "SLAVE_DONE " + to_string(gen) + " ok=" + to_string(ok)
-                     + " skip=" + to_string(g_skip.load())
-                     + " fail=" + to_string(g_fail.load()));
+        sendLine(s, "SLAVE_DONE " + to_string(ok) + " "
+                      + to_string(g_skip.load()) + " " + to_string(g_fail.load()));
+        string ack;
+        recvLine(s, ack, 60000);                      // ACK (尽力而为)
         g_phase.store((int)Phase::PAUSED);            // 待命: master 决定续传 (START) 或退出 (QUIT)
     }
 }
@@ -520,7 +590,7 @@ static void drawConfig(cv::Mat& cv) {
     put(tot.str(), 0.55, {0, 215, 255}, 52);
     if (g_cfg.is_master) {
         if (g_slave_ready.load())
-            cv::putText(cv, "[SPACE] Start (both hosts in parallel)      [q/ESC] Quit",
+            cv::putText(cv, "[SPACE] Start (master first, slave follows)      [q/ESC] Quit",
                         {40, y}, cv::FONT_HERSHEY_SIMPLEX, 0.65, {0, 255, 0}, 2, cv::LINE_AA);
         else
             cv::putText(cv, "Waiting for slave handshake...      [q/ESC] Quit",
@@ -535,8 +605,8 @@ static void drawProgress(cv::Mat& cv) {
     cv = cv::Mat::zeros(600, 900, CV_8UC3);
     Phase ph = (Phase)g_phase.load();
     int y = 64;
-    cv::putText(cv, ph == Phase::RUNNING ? "Transferring (both hosts)..." :
-                ph == Phase::WAIT_SLAVE ? "Master done - waiting slave + disk flush..." :
+    cv::putText(cv, ph == Phase::RUNNING ? "Transferring..." :
+                ph == Phase::WAIT_SLAVE ? "Master done - slave transferring..." :
                 ph == Phase::PAUSED ? "PAUSED - interrupted (SPACE resumes)" :
                 (ph == Phase::DONE ? "DONE" : "ABORTED"),
                 {40, y}, cv::FONT_HERSHEY_DUPLEX, 0.9, {0, 215, 255}, 2, cv::LINE_AA);
@@ -664,8 +734,10 @@ int main(int argc, char** argv) {
         } catch (...) {}
         if (!calib_save.empty())
             g_cfg.xml_dir = (fs::path(calib_save) / calib_part / "output").string();
-        if (!day_id.empty())
+        if (!day_id.empty()) {
             g_cfg.ir_file = g_cfg.cfg_dir + "/IR/" + day_id + ".txt";
+            g_cfg.arm_pose_file = g_cfg.cfg_dir + "/arm_pose/" + day_id + ".yaml";
+        }
         g_cfg.map_file = g_cfg.cfg_dir + "/day_participant_map.json";
     }
 
@@ -677,6 +749,10 @@ int main(int argc, char** argv) {
         if (!g_cfg.ir_file.empty())
             addFilePhase(g_cfg.ir_file, "calib/IR/" + fs::path(g_cfg.ir_file).filename().generic_string(),
                          "IR positions (calib/IR)");
+        if (!g_cfg.arm_pose_file.empty())
+            addFilePhase(g_cfg.arm_pose_file,
+                         "calib/arm_pose/" + fs::path(g_cfg.arm_pose_file).filename().generic_string(),
+                         "arm pose (calib/arm_pose, 按天共享)");
         if (!g_cfg.map_file.empty())
             addFilePhase(g_cfg.map_file, "day_participant_map.json",
                          "day_participant_map.json");
@@ -703,8 +779,6 @@ int main(int argc, char** argv) {
         if (!g_cfg.is_master) continue;                 // slave: 按键全失效, 由 master 控制退出
         if (ph == Phase::CONFIG) {
             if (key == ' ' && g_slave_ready.load()) {   // 需 slave 已握手
-                // 并行: 先令 slave 开传 (带会话号), 本机同时启动
-                sendLine(g_hs, "START " + to_string(g_hs_gen.fetch_add(1) + 1));
                 g_phase.store((int)Phase::RUNNING);
                 ctl = thread(transferController);
             } else if (key == 'q' || key == 27) {       // 通知 slave 一并退出
@@ -721,8 +795,6 @@ int main(int argc, char** argv) {
             if (key == 'z') {                    // 中断: 文件粒度温和停止 → PAUSED
                 g_pause.store(true);
                 g_abort.store(true);
-                if (g_hs != INVALID_SOCKET)       // 并行: slave 同时在传, 令其一并停
-                    sendLine(g_hs, "ABORT");
             } else if (key == 'q' || key == 27) { // 温和中止 (终态)
                 g_abort = true;
             }
@@ -736,11 +808,9 @@ int main(int argc, char** argv) {
                 break;
             }
         } else if (ph == Phase::PAUSED) {
-            if (key == ' ') {                             // 续传: 重跑全程 (SKIP 秒过)
+            if (key == ' ' ) {                            // 续传: 重跑全程 (SKIP 秒过)
                 if (ctl.joinable()) ctl.join();           // 上一会话 controller 已结束
                 g_pause.store(false);
-                if (g_hs != INVALID_SOCKET)               // 令 slave 同步续传
-                    sendLine(g_hs, "START " + to_string(g_hs_gen.fetch_add(1) + 1));
                 g_phase.store((int)Phase::RUNNING);
                 ctl = thread(transferController);
             } else if (key == 'q' || key == 27) {

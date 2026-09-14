@@ -100,3 +100,30 @@ slave 照常 `send_ui`/`send_slave`（server_ip_slave_link 不变, workers=8）�
 - 配套 (计划外, 必要): send_ui + send_slave 的 `REPLY_TIMEOUT_MS`
   60s → 180s — direct 的 OK 等整文件写完 (~10GB@0.3GB/s≈33s), 60s 超时
   会触发重传并撞上在途保护; 180s 给 5 倍余量。**slave 端需重编发送器**
+
+## 8. 正确性与性能收官 (2026-09-14 晚)
+
+**重大根因修正**: 11:10 批次的帧偏移损坏 **不是 blob 接收链路** — 是发送端
+**TransmitFile 路径本身产生数据损坏** (两次独立复现: v3.3+TransmitFile 11:10 批次、
+v4 修复版+transmitfile 3.2GB/s 图片错乱; 而 user 路径 + CRC 两次 md5 全对)。
+TransmitFile 内核态读发用户态无法校验 → **弃用**, 生产 = user 路径 + 块 CRC。
+(blob 被冤枉, 但退役决定不变。)
+
+**调试链** (方法论再次生效: 5b014939 版本对比 + crc_bench.c 隔离测量):
+1. v4 重写时 bcrc.add 无条件进热路径 → transmitfile 0.5 (修: 条件化)
+2. 查表 CRC32 串行依赖链 0.43GB/s/核 → user+CRC 1.4 (crc_bench: A=0.43/B=6.99/C=0.37/D=4.27)
+3. 两端换 SSE4.2 CRC32C (函数级 target 属性免编译开关) → **3.1 GB/s 单相机**
+   (= TransmitFile 时代单盘读上限, CRC 开销趋零)
+
+**最终架构**: slave/master 串行 → direct 直写 /archive + 64MB 块 CRC32C 硬件校验
++ trailer 重传自愈。单相机 3.1 (单盘读上限), 全量预期 3.3-3.5。
+
+## 9. 定稿 (2026-09-14 晚, 用户拍板)
+
+**生产版本 = 当前 CRC32C 版**: 单相机 3.1 GB/s + 图片正确。
+单相机 3.1 = 单盘 8 流读上限 (全量多盘历史 3.5, 接收端上限 4.27/连接);
+读侧优化 (CreateFile 直读/32MB 块/深管线) 经评估收益有限, 不做。
+备份: send_slave_crc32c_3.1_backup.cpp。
+
+**两端必须同版本**: CRC32C 算法两端绑定 (单边更新会 ERR checksum)。
+master 采集机需拉新代码重编后才可传输。
