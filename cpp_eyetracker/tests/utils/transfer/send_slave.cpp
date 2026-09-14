@@ -9,6 +9,9 @@
 //       master 附件另读 cam_calib.yaml (calib_save_dir) + calib_arm.yaml (day_id)
 // CLI 覆盖: --data-ip <ip> --port <p> --participant <id> --roots <dir>... --workers <n>
 //           --cams <SN> [<SN> ...] (只传指定相机目录, 附件不受此过滤)
+//           --tx transmitfile|user (默认 user: 边读边算 64MB 块 CRC32,
+//               数据后发 "CRC32 c1 c2 ..." 行供接收端逐块校验, 不符自动重传;
+//               transmitfile = 内核态对照路径, 无内容校验)
 // =================================================================
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -49,8 +52,27 @@ static int g_server_port = 5001, g_workers = 4;
 static vector<string> g_roots;
 static vector<string> g_cam_ids;           // capture.yaml cam_indices (与 root 一一配对)
 static vector<string> g_cams;              // 空 = 全部相机
-static bool g_tx_user = false;             // --tx user: 用户态重叠读发 (对照 TransmitFile)
+static bool g_tx_user = true;              // 默认用户态路径: 唯一能边读边算 CRC 的路径
+                                           // (--tx transmitfile = 无校验对照)
 static bool g_is_master = false;           // capture.yaml is_master → 附加标定/arm_pose
+
+// ---- CRC32 (查表, zlib 兼容多项式 0xEDB88320) — 64MB 块校验 ----
+// 与 preprocess-server/transfer/baseline_recv_data.cpp 的实现保持同步
+static const size_t CRC_BLK = 64ull << 20;
+static uint32_t s_crc_table[256];
+static void crc32_init() {
+    for (uint32_t i = 0; i < 256; ++i) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+        s_crc_table[i] = c;
+    }
+}
+static uint32_t crc32_update(uint32_t crc, const char* p, size_t n) {
+    crc ^= 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; ++i)
+        crc = s_crc_table[(crc ^ (uint8_t)p[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
 
 static const int CHUNK = 8 * 1024 * 1024;     // 8MB 流式块 (与 C++ 接收端一致)
 static const int SOCK_BUF = 32 * 1024 * 1024;
@@ -237,13 +259,20 @@ int sendOne(SOCKET s, const Job& j) {
     return -1;
 }
 
-// ---- 用户态重叠读发 (--tx user): 每文件一个读线程填 3 槽缓冲, 发送线程送出 ----
-// 用于对照 TransmitFile 是否存在全机吞吐上限
+// ---- 用户态重叠读发 (默认): 每文件一个读线程填 3 槽缓冲, 发送线程送出 ----
+// 边读边算 64MB 块 CRC32, 数据流后追加 "CRC32 c1,c2,..." 行 —
+// 接收端逐块比对, 不符回 ERR checksum → 本函数 -1 → worker 重试 (自愈)
 int sendOneUser(SOCKET s, const Job& j) {
     ifstream in(j.path, ios::binary);
     if (!in) return -1;
     if (!sendLine(s, string(j.force ? "FORCE " : "FILE ") + j.rel + " "
-                   + to_string(j.size) + " 0")) return -1;
+                   + to_string(j.size) + " crc32")) return -1;
+    string preply;
+    if (!recvLine(s, preply, REPLY_TIMEOUT_MS)) return -1;   // 先应答后数据 (SKIP 不读流)
+    if (preply.rfind("SKIP", 0) == 0) return 1;
+    if (preply.rfind("GO", 0) != 0) {
+        cerr << "\n[Recv] " << j.rel << ": " << preply << endl; return -1;
+    }
 
     struct Slot { vector<char> buf; uint64_t len = 0; };
     vector<Slot> slots(3, Slot{vector<char>(CHUNK), 0});
@@ -253,6 +282,18 @@ int sendOneUser(SOCKET s, const Job& j) {
     bool read_done = false, read_fail = false;
     uint64_t total_read = 0;
 
+    // 块 CRC 累计 (reader 线程私有; 64MB 边界跨 8MB 槽切割, 文件尾封口)
+    uint32_t rcrc = 0; size_t rfill = 0;
+    vector<uint32_t> rcrcs;
+    auto feed = [&](const char* p, int n) {
+        while (n > 0) {
+            size_t take = min((size_t)n, CRC_BLK - rfill);
+            rcrc = crc32_update(rcrc, p, take);
+            rfill += take; p += take; n -= (int)take;
+            if (rfill == CRC_BLK) { rcrcs.push_back(rcrc); rcrc = 0; rfill = 0; }
+        }
+    };
+
     thread reader([&]() {
         while (true) {
             unique_lock<mutex> lk(mtx);
@@ -261,10 +302,16 @@ int sendOneUser(SOCKET s, const Job& j) {
             lk.unlock();
             in.read(slots[wr].buf.data(), CHUNK);
             int got = (int)in.gcount();
+            if (got > 0) feed(slots[wr].buf.data(), got);
             lk.lock();
-            if (got <= 0) { read_fail = total_read < j.size; read_done = true; }
-            else { slots[wr].len = (uint64_t)got; total_read += (uint64_t)got;
-                   wr = (wr + 1) % slots.size(); ++count; }
+            if (got <= 0) {
+                read_fail = total_read < j.size;
+                if (rfill > 0) { rcrcs.push_back(rcrc); rcrc = 0; rfill = 0; }  // 尾块
+                read_done = true;
+            } else {
+                slots[wr].len = (uint64_t)got; total_read += (uint64_t)got;
+                wr = (wr + 1) % slots.size(); ++count;
+            }
             cv_full.notify_one();
             if (read_done) return;
         }
@@ -294,10 +341,14 @@ int sendOneUser(SOCKET s, const Job& j) {
     reader.join();
     if (read_fail || send_fail || total_read != j.size) return -1;
 
+    // trailer: 块 CRC 清单 (接收端比对后回 OK / ERR checksum)
+    { ostringstream os; os << "CRC32";
+      for (uint32_t c : rcrcs) os << " " << hex << c;
+      if (!sendLine(s, os.str())) return -1; }
+
     string reply;
     if (!recvLine(s, reply, REPLY_TIMEOUT_MS)) return -1;
     if (reply.rfind("OK", 0) == 0) return 0;
-    if (reply.rfind("SKIP", 0) == 0) return 1;
     cerr << "\n[Recv] " << j.rel << ": " << reply << endl;
     return -1;
 }
@@ -330,6 +381,7 @@ void workerMain(const vector<Job>* jobs, atomic<size_t>* next) {
 // ================== main ==================
 int main(int argc, char** argv) {
     WSAData wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+    crc32_init();
     string data_ip_override, participant_override;
     int port_override = 0, workers_override = 0;
     vector<string> roots_override;
