@@ -58,7 +58,7 @@ using namespace gazeestimation;
 static const int CHUNK = 8 * 1024 * 1024;
 static const int SOCK_BUF = 32 * 1024 * 1024;
 static const int RETRIES = 3;
-static const int REPLY_TIMEOUT_MS = 60000;
+static const int REPLY_TIMEOUT_MS = 180000;   // direct 接收端 OK=整文件写完 (~10GB@0.3GB/s≈33s), 3 倍余量防超时重传并发写 .part
 
 // ================== 配置 ==================
 struct UiCfg {

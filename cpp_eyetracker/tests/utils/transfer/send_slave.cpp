@@ -51,7 +51,7 @@ static bool g_tx_user = false;             // --tx user: 用户态重叠读发 (
 static const int CHUNK = 8 * 1024 * 1024;     // 8MB 流式块 (与 C++ 接收端一致)
 static const int SOCK_BUF = 32 * 1024 * 1024;
 static const int RETRIES = 3;
-static const int REPLY_TIMEOUT_MS = 60000;
+static const int REPLY_TIMEOUT_MS = 180000;   // direct 接收端 OK=整文件写完 (~10GB@0.3GB/s≈33s), 3 倍余量防超时重传并发写 .part
 
 // ================== TCP 基础 ==================
 bool sendLine(SOCKET s, const string& msg) {

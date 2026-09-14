@@ -257,3 +257,9 @@ finalize 段 clone 增加数秒。可靠性机制 (abandoned/BYE 屏障/多批�
   文件不会跨 blob (finalize 仅在 g_pending==0 && g_open_files==0 时执行,
   即无任何在途文件), 双 blob 各自 reflink, 数据零丢失
 - 备份: send_ui_serial_backup.cpp (串行版)
+
+## 13. 后续: 数据流水线定稿 (2026-09-14)
+
+4.8TB 并行实测 53min 确认 QLC SLC 缓存上限 (~每盘 1.2TB) 后, 流程演进为
+**两机并发 + slave 直写硬盘柜 + NVMe 仅中转 master** 的流水线 (总 ~40min,
+NVMe 永远缓存内满速)。完整推演与部署见 `data_pipeline.md`。
