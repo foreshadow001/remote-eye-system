@@ -256,7 +256,7 @@ def main():
     ap.add_argument("--participant", default=None,
                     help="participant id (default: read from cfg/capture.yaml)")
     ap.add_argument("--num", type=int, default=500, help="targets per arm")
-    ap.add_argument("--edge", type=float, default=0.0, help="gen box inset (m)")
+    ap.add_argument("--edge", type=float, default=0.002, help="gen box inset (m)")
     ap.add_argument("--max-dist", type=float, default=0.2,
                     help="max adjacent target distance after reorder (m)")
     ap.add_argument("--seed", type=int, default=None,

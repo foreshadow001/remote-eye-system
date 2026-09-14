@@ -147,9 +147,9 @@ struct Progress {
         double rate = bytes.load() / max(el, 1e-6) / 1e9;
         double eta = rate > 0.01 ? (double)(total_bytes - bytes.load()) / (rate * 1e9) : 0;
         lock_guard<mutex> lk(print_mtx);
-        printf("\r%d/%d files  %.2f/%.2f TB  %.1f GB/s  ETA %.1f min  (skip %d, fail %d)",
+        printf("\r%d/%d files  %.2f/%.2f TB  %.1f GB/s  elapsed %dm%02ds  ETA %.1f min  (skip %d, fail %d)",
                done.load(), total_files, (double)bytes.load() / 1e12, (double)total_bytes / 1e12,
-               rate, eta / 60.0, skip.load(), fail.load());
+               rate, (int)el / 60, (int)el % 60, eta / 60.0, skip.load(), fail.load());
         fflush(stdout);
     }
 } g_prog;
@@ -349,6 +349,21 @@ int main(int argc, char** argv) {
         for (int i = 0; i < nw; ++i) ths.emplace_back(workerMain, &buckets[b], &nexts[b]);
     }
     for (auto& t : ths) t.join();
+
+    // 退出屏障: BYE 让接收端等 RAM 全部落盘后应答 — 本进程退出即数据全在盘上
+    // (无此屏障时接收端 OK=已入RAM, 发送端退出后盘还在写)
+    {
+        SOCKET s = connectTo(g_server_ip, g_server_port);
+        if (s != INVALID_SOCKET) {
+            sendLine(s, "BYE");
+            string reply;
+            if (recvLine(s, reply, 4 * 3600 * 1000) && reply == "BYE")
+                cout << "[Recv] all data flushed to disk" << endl;
+            else
+                cerr << "[Recv] WARN: no BYE ack (receiver draining?)" << endl;
+            closesocket(s);
+        }
+    }
     g_prog.line(); cout << endl;
     double el = chrono::duration<double>(chrono::steady_clock::now() - g_prog.t0).count();
     cout << "=== done in " << fixed << setprecision(1) << el / 60 << " min: ok="

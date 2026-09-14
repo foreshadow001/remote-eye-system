@@ -10,8 +10,12 @@
 //
 // 配置: capture.yaml (participant_id/is_master/master_ip), transfer.yaml (链路/流数),
 //       cam_calib.yaml (calib_save_dir), calib_arm.yaml (record.day_id)
-// 按键: SPACE=开始, q/ESC=退出 (传输中 q=当前文件完成后温和中止)
-// 引擎: TransmitFile 内核态读发重叠, 默认 4 流, SKIP 断点续传。
+// 按键 (仅 master 有效, slave 全程由 master 控制):
+//   SPACE = 开始 / 中断后续传 (SKIP 断点, 已传文件秒过)
+//   z     = 中断 (文件粒度温和停止, 两机联动; SPACE 续传)
+//   q/ESC = 退出 (任意时刻含 SPACE 前; 两机联动退出)
+//   传输中 q = 当前文件完成后温和中止 (终态, 非中断)
+// 引擎: TransmitFile 内核态读发重叠, SKIP 断点续传。
 // =================================================================
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -73,9 +77,10 @@ struct Job { fs::path path; string rel; uint64_t size; bool force = false; };   
 struct PhasePlan { string label; vector<Job> jobs; uint64_t bytes = 0; };
 static vector<PhasePlan> g_plans;
 
-enum class Phase { CONFIG, RUNNING, WAIT_SLAVE, DONE, ABORTED };
+enum class Phase { CONFIG, RUNNING, WAIT_SLAVE, PAUSED, DONE, ABORTED };
 static atomic<int> g_phase{(int)Phase::CONFIG};
 static atomic<bool> g_abort{false};
+static atomic<bool> g_pause{false};             // z 中断: 文件粒度停止, SPACE 续传
 static atomic<int> g_done_files{0}, g_skip{0}, g_fail{0};
 static atomic<uint64_t> g_bytes{0};
 static atomic<int> g_plan_idx{0};
@@ -129,7 +134,7 @@ static bool recvLine(SOCKET s, string& line, int timeout_ms) {
     }
     return false;
 }
-static SOCKET connectTo(const string& ip, int port) {
+static SOCKET connectTo(const string& ip, int port, int max_retry = 0) {  // 0=无限 (数据链路)
     int retry = 0;
     while (true) {
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -144,9 +149,10 @@ static SOCKET connectTo(const string& ip, int port) {
         ++retry;
         g_conn_target = ip + ":" + to_string(port);
         g_conn_fail.store(true);                      // UI 红字: 环境问题一眼可见
+        if (max_retry && retry >= max_retry) return INVALID_SOCKET;
         if (retry == 1 || retry % 10 == 0)
             cout << ts() << "[Net] connect " << ip << ":" << port
-                 << " failed (retry #" << retry << ", receiver running?)" << endl;
+                 << " failed (retry #" << retry << ", peer running?)" << endl;
         this_thread::sleep_for(chrono::milliseconds(500));
     }
 }
@@ -211,6 +217,11 @@ static void workerLoop(vector<Job>* jobs, atomic<size_t>* next) {
 }
 
 static void transferController() {
+    // 会话重置 (z 中断后续传): 已传文件由接收端 SKIP 重新计入,
+    // 进度条口径 = 本会话 sent + skip, 天然覆盖历史进度
+    g_abort.store(false);
+    g_done_files.store(0); g_skip.store(0); g_fail.store(0);
+    g_bytes.store(0); g_skip_bytes.store(0); g_plan_idx.store(0);
     g_t0_us.store(chrono::duration_cast<chrono::microseconds>(
         chrono::steady_clock::now().time_since_epoch()).count());
     for (size_t d = 0; d < g_plans.size(); ++d) {
@@ -239,11 +250,30 @@ static void transferController() {
     g_t_end_us.store(chrono::duration_cast<chrono::microseconds>(
         chrono::steady_clock::now().time_since_epoch()).count());
 
+    // 退出屏障: BYE 让接收端等 RAM 全部落盘后应答 — 数据全在盘上才算传完
+    // (无此屏障时接收端 OK=已入RAM, 本机退出后盘还在写)
+    {
+        SOCKET s = connectTo(g_cfg.server_ip, g_cfg.server_port);
+        if (s != INVALID_SOCKET) {
+            sendLine(s, "BYE");
+            string reply;
+            if (recvLine(s, reply, 4 * 3600 * 1000) && reply == "BYE")
+                cout << ts() << "[Recv] all data flushed to disk" << endl;
+            else
+                cout << ts() << "[Recv] WARN: no BYE ack (receiver draining?)" << endl;
+            closesocket(s);
+        }
+    }
+
     // master: 本机完成后令 slave 传输, 等 SLAVE_DONE
     if (g_cfg.is_master && g_hs != INVALID_SOCKET) {
-        sendLine(g_hs, g_abort.load() ? "ABORT" : "START");
-        cout << ts() << "[HS] " << (g_abort.load() ? "ABORT" : "START") << " sent to slave" << endl;
-        if (!g_abort.load()) {
+        if (g_abort.load() && !g_pause.load()) {
+            // q 温和中止 (终态): 通知 slave 停止待命; 握手保留至 master 退出发 QUIT
+            sendLine(g_hs, "ABORT");
+            cout << ts() << "[HS] ABORT sent to slave (standing by)" << endl;
+        } else if (!g_abort.load()) {
+            sendLine(g_hs, "START");
+            cout << ts() << "[HS] START sent to slave" << endl;
             g_wait_t0_us.store(chrono::duration_cast<chrono::microseconds>(
                 chrono::steady_clock::now().time_since_epoch()).count());
             g_phase.store((int)Phase::WAIT_SLAVE);
@@ -259,13 +289,13 @@ static void transferController() {
                 g_fail += 1;                          // 对端异常计入失败
             }
             sendLine(g_hs, "ACK");
-            // 不关闭 g_hs: 留给 master 退出 (ESC/q) 时发 QUIT 通知 slave
-        } else {
-            closesocket(g_hs);
-            g_hs = INVALID_SOCKET;
+            // 不关闭 g_hs: 留给 master 退出 (ESC/q) 发 QUIT 或 z 中断后续传再发 START
         }
+        // z 中断 (pause): 本机停在文件边界, slave 尚未启动, 无需发令;
+        //   WAIT_SLAVE 期间的中断由 UI 线程直接发 ABORT, 此处收到 SLAVE_DONE 后同路返回
     }
-    g_phase.store((int)(g_abort.load() ? Phase::ABORTED : Phase::DONE));
+    g_phase.store((int)(g_pause.load() ? Phase::PAUSED :
+                        g_abort.load() ? Phase::ABORTED : Phase::DONE));
 }
 
 // master: 监听握手, 等 slave READY (SPACE 需 g_slave_ready)
@@ -313,41 +343,51 @@ static void slaveQuitWatcher(SOCKET hs) {
     }
 }
 
-// slave: 连 master → READY → 等 START (master SPACE 且本机完成后才来) → 传输
-// 完成后回 SLAVE_DONE, 等 ACK; slave 全程无有效按键
+// slave: 连 master (上限 ~2min, master 未启/已退出则自行退出) → READY →
+// 命令循环: START=传输(→SLAVE_DONE→ACK→待命), ABORT=待命(master 中止/暂停),
+// QUIT/掉线=退出 — 支持 master 多次 START (z 中断后 SPACE 续传)
 static void slaveHandshakeAndRun() {
     cout << ts() << "[HS] Slave connecting to master " << g_cfg.master_ip
          << ":" << g_cfg.handshake_port << " ..." << endl;
-    SOCKET s = connectTo(g_cfg.master_ip, g_cfg.handshake_port);
-    sendLine(s, "READY " + to_string(g_total_files) + " " + to_string(g_total_bytes));
-    g_master_connected.store(true);                   // UI: 已连上, 等 START
-    string cmd;
-    if (!recvLine(s, cmd, 2 * 3600 * 1000) || cmd != "START") {
-        cerr << ts() << "[HS] master cmd: " << cmd << " — aborted" << endl;
-        closesocket(s);
+    SOCKET s = connectTo(g_cfg.master_ip, g_cfg.handshake_port, 240);
+    if (s == INVALID_SOCKET) {                        // master 未启动或已退出
+        cerr << ts() << "[HS] cannot reach master — exiting" << endl;
         g_phase.store((int)Phase::ABORTED);
+        g_exit.store(true);
         return;
     }
-    cout << ts() << "[HS] Master ordered START — slave transferring." << endl;
-    g_phase.store((int)Phase::RUNNING);               // UI 切进度屏
-    thread(slaveQuitWatcher, s).detach();             // 监测 master QUIT/掉线
-    transferController();                             // 结束时置 DONE/ABORTED
-    int ok = g_done_files.load() - g_skip.load() - g_fail.load();
-    cout << ts() << "[HS] Sending SLAVE_DONE ok=" << ok << " skip="
-         << g_skip.load() << " fail=" << g_fail.load() << endl;
-    sendLine(s, "SLAVE_DONE " + to_string(ok) + " "
-                  + to_string(g_skip.load()) + " " + to_string(g_fail.load()));
-    string ack;
-    recvLine(s, ack, 60000);                          // ACK (尽力而为)
-    // 挂等 master 的最终退出信号 (master 按 ESC/q 时发 QUIT / 或连接关闭) —
-    // 收到前保持 DONE/ABORTED 屏, 由 master 决定两机何时一起结束
-    while (!g_exit.load()) {
-        fd_set rf; FD_ZERO(&rf); FD_SET(s, &rf);
-        timeval tv{2, 0};
-        if (select(0, &rf, nullptr, nullptr, &tv) > 0) {
-            g_exit.store(true);                       // QUIT 或 master 已关闭连接
+    sendLine(s, "READY " + to_string(g_total_files) + " " + to_string(g_total_bytes));
+    g_master_connected.store(true);                   // UI: 已连上, 等 START
+    for (;;) {
+        string cmd;
+        if (!recvLine(s, cmd, 2 * 3600 * 1000)) {     // master 掉线 (含已退出)
+            cout << ts() << "[HS] master disconnected — exiting" << endl;
+            g_exit.store(true);
             return;
         }
+        if (cmd == "QUIT") {
+            cout << ts() << "[HS] master QUIT — exiting" << endl;
+            g_exit.store(true);
+            return;
+        }
+        if (cmd == "ABORT") {                         // master 温和中止/暂停 → 待命
+            cout << ts() << "[HS] master ABORT — standing by" << endl;
+            continue;
+        }
+        if (cmd != "START") continue;
+
+        cout << ts() << "[HS] Master ordered START — slave transferring." << endl;
+        g_phase.store((int)Phase::RUNNING);           // UI 切进度屏
+        thread(slaveQuitWatcher, s).detach();         // 监测 master 中止/掉线
+        transferController();                         // 结束时置 PAUSED/DONE/ABORTED
+        int ok = g_done_files.load() - g_skip.load() - g_fail.load();
+        cout << ts() << "[HS] Sending SLAVE_DONE ok=" << ok << " skip="
+             << g_skip.load() << " fail=" << g_fail.load() << endl;
+        sendLine(s, "SLAVE_DONE " + to_string(ok) + " "
+                      + to_string(g_skip.load()) + " " + to_string(g_fail.load()));
+        string ack;
+        recvLine(s, ack, 60000);                      // ACK (尽力而为)
+        g_phase.store((int)Phase::PAUSED);            // 待命: master 决定续传 (START) 或退出 (QUIT)
     }
 }
 
@@ -480,6 +520,7 @@ static void drawProgress(cv::Mat& cv) {
     int y = 64;
     cv::putText(cv, ph == Phase::RUNNING ? "Transferring..." :
                 ph == Phase::WAIT_SLAVE ? "Master done - slave transferring..." :
+                ph == Phase::PAUSED ? "PAUSED - interrupted (SPACE resumes)" :
                 (ph == Phase::DONE ? "DONE" : "ABORTED"),
                 {40, y}, cv::FONT_HERSHEY_DUPLEX, 0.9, {0, 215, 255}, 2, cv::LINE_AA);
     y += 52;
@@ -535,9 +576,14 @@ static void drawProgress(cv::Mat& cv) {
     }
     string hint;
     if (ph == Phase::RUNNING)
-        hint = g_cfg.is_master ? "[q] Abort after current file" : "Controlled by master";
+        hint = g_cfg.is_master ? "[z] Pause (SPACE resumes)   [q] Abort after current file"
+                               : "Controlled by master";
     else if (ph == Phase::WAIT_SLAVE)
-        hint = "[q] Abort wait (slave continues)";
+        hint = "[z] Pause (slave stops at file boundary)   [q] Abort wait (slave continues)";
+    else if (ph == Phase::PAUSED)
+        hint = g_cfg.is_master ? "[SPACE] Resume   [q/ESC] Quit (quits slave too)"
+                               : (g_abort.load() ? "Paused - waiting for master command..."
+                                                 : "Done - waiting for master to exit...");
     else if (!g_cfg.is_master)
         hint = "Waiting for master to exit...";
     else
@@ -647,20 +693,42 @@ int main(int argc, char** argv) {
                     sendLine(g_hs, "QUIT");
                     closesocket(g_hs); g_hs = INVALID_SOCKET;
                 } else {
-                    cout << ts() << "[HS] slave not connected — it will keep waiting" << endl;
+                    cout << ts() << "[HS] slave not connected — "
+                         << "if it starts later it gives up after ~2min" << endl;
                 }
                 break;
             }
         } else if (ph == Phase::RUNNING) {
-            if (key == 'q' || key == 27) g_abort = true;   // 完成后 controller 发 ABORT
+            if (key == 'z') {                    // 中断: 文件粒度温和停止 → PAUSED
+                g_pause.store(true);
+                g_abort.store(true);
+            } else if (key == 'q' || key == 27) { // 温和中止 (终态)
+                g_abort = true;
+            }
         } else if (ph == Phase::WAIT_SLAVE) {
-            if ((key == 'q' || key == 27) && g_hs != INVALID_SOCKET) {
-                sendLine(g_hs, "QUIT");                    // slave 看门狗捕获后中止
+            if (key == 'z' && g_hs != INVALID_SOCKET) {   // 中断 slave 传输 (文件粒度)
+                g_pause.store(true);
+                sendLine(g_hs, "ABORT");                  // slave 看门狗捕获后停止
+            } else if ((key == 'q' || key == 27) && g_hs != INVALID_SOCKET) {
+                sendLine(g_hs, "QUIT");                   // slave 看门狗捕获后中止
                 closesocket(g_hs); g_hs = INVALID_SOCKET;
                 break;
             }
+        } else if (ph == Phase::PAUSED) {
+            if (key == ' ' ) {                            // 续传: 重跑全程 (SKIP 秒过)
+                if (ctl.joinable()) ctl.join();           // 上一会话 controller 已结束
+                g_pause.store(false);
+                g_phase.store((int)Phase::RUNNING);
+                ctl = thread(transferController);
+            } else if (key == 'q' || key == 27) {
+                if (g_hs != INVALID_SOCKET) {
+                    sendLine(g_hs, "QUIT");
+                    closesocket(g_hs); g_hs = INVALID_SOCKET;
+                }
+                break;
+            }
         } else {
-            if (key == 'q' || key == 27) break;         // DONE: 仅 ESC/q 退出
+            if (key == 'q' || key == 27) break;         // DONE/ABORTED: 仅 ESC/q 退出
         }
     }
     g_abort = true;
