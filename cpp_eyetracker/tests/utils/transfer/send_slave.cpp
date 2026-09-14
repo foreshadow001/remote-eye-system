@@ -1,11 +1,14 @@
 // ================== send_slave ==================
-// slave (Windows) 独立发送器 — 100G 直连传给数据处理主机 (4090, recv_data.py)。
-// 阶段一版本: 不做 master 握手 (后续并入 send_data 的串行流程)。
-// 协议: "FILE <rel> <size> 0\n" + <size 字节> → 应答 "OK <n>"/"SKIP"/"ERR ..."
-// SKIP = 对端已有同大小文件 (断点续传)。失败重试 3 次。
-// 配置: cfg/capture.yaml (participant/participant_root) + cfg/transfer.yaml (slave 链路)
+// 采集机 (Windows) 独立发送器 — 100G 直连传给数据处理主机 (4090, baseline_recv_data)。
+// 无握手依赖, master/slave 均可用 (角色由 capture.yaml is_master 决定链路与附件):
+//   slave: 相机 h5 → 10.10.2.1 (slave 链路, direct 模式直写归档柜)
+//   master: 相机 h5 + 标定附件 (xml/IR/arm_pose/map.json, FORCE 覆盖) → 10.10.1.1
+// 协议: "FILE|FORCE <rel> <size> 0\n" + <size 字节> → 应答 "OK"/"SKIP"/"ERR ..."
+// FILE = 大小一致 SKIP (断点续传); FORCE = 覆盖重写 (附件)。失败重试 3 次。
+// 配置: cfg/capture.yaml (participant/roots/is_master) + cfg/transfer.yaml (链路/流数)
+//       master 附件另读 cam_calib.yaml (calib_save_dir) + calib_arm.yaml (day_id)
 // CLI 覆盖: --data-ip <ip> --port <p> --participant <id> --roots <dir>... --workers <n>
-//           --cams <SN> [<SN> ...] (只传指定相机目录, 不给则传 participant 下全部)
+//           --cams <SN> [<SN> ...] (只传指定相机目录, 附件不受此过滤)
 // =================================================================
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -47,6 +50,7 @@ static vector<string> g_roots;
 static vector<string> g_cam_ids;           // capture.yaml cam_indices (与 root 一一配对)
 static vector<string> g_cams;              // 空 = 全部相机
 static bool g_tx_user = false;             // --tx user: 用户态重叠读发 (对照 TransmitFile)
+static bool g_is_master = false;           // capture.yaml is_master → 附加标定/arm_pose
 
 static const int CHUNK = 8 * 1024 * 1024;     // 8MB 流式块 (与 C++ 接收端一致)
 static const int SOCK_BUF = 32 * 1024 * 1024;
@@ -95,7 +99,7 @@ SOCKET connectTo(const string& ip, int port) {
 }
 
 // ================== 文件清单与进度 ==================
-struct Job { fs::path path; string rel; uint64_t size; };
+struct Job { fs::path path; string rel; uint64_t size; bool force = false; };
 
 vector<Job> scanFiles() {
     vector<Job> jobs;
@@ -112,7 +116,7 @@ vector<Job> scanFiles() {
             if (!fs::exists(dir)) { cout << "[Scan] skip missing " << dir.string() << endl; continue; }
             for (auto& e : fs::directory_iterator(dir)) {
                 if (!e.is_regular_file() || e.path().extension() != ".h5") continue;
-                string rel = g_participant + "/" + sn + "/" + e.path().filename().string();
+                string rel = "capture/" + g_participant + "/" + sn + "/" + e.path().filename().string();
                 jobs.push_back({e.path(), rel, (uint64_t)e.file_size()});
             }
         }
@@ -128,12 +132,58 @@ vector<Job> scanFiles() {
                 if (!e.is_regular_file() || e.path().extension() != ".h5") continue;
                 string sn = e.path().parent_path().filename().string();
                 if (!cam_wanted(sn)) continue;
-                string rel = g_participant + "/" + sn + "/" + e.path().filename().string();
+                string rel = "capture/" + g_participant + "/" + sn + "/" + e.path().filename().string();
                 jobs.push_back({e.path(), rel, (uint64_t)e.file_size()});
             }
         }
     }
     return jobs;
+}
+
+// master 附加数据 (capture.yaml is_master=true 时自动附带, 与 send_ui 阶段 3-5 对齐):
+//   1. 相机标定 XML  {calib_save_dir}/{P}/output/**.xml → calib/cams/{P}/...
+//   2. IR 位置       cfg/IR/{day_id}.txt                 → calib/IR/
+//   3. arm pose      cfg/arm_pose/{day_id}.yaml          → calib/arm_pose/  (按天共享,
+//      与 calib/IR 同级; rm-participant 的 */P00x 扫描不会误删)
+//   4. 参与者映射    cfg/day_participant_map.json        → 根目录
+// 全部 FORCE 覆盖语义 (小文件, 每次传输重写); 缺失项告警跳过不报错
+static void addMasterExtras(const string& cfg_dir, vector<Job>& jobs) {
+    size_t before = jobs.size();
+    string calib_save, calib_part, day_id;
+    try {
+        Cfg cc(cfg_dir + "/cam_calib.yaml");
+        calib_save = cc["calib"]["calib_save_dir"].as<string>();
+        try { calib_part = cc["calib"]["participant_id"].as<string>(); }
+        catch (...) { calib_part = g_participant; }
+    } catch (...) {}
+    try {
+        Cfg arm(cfg_dir + "/calib_arm.yaml");
+        day_id = arm["record"]["day_id"].as<string>();
+    } catch (...) {}
+
+    if (!calib_save.empty()) {
+        fs::path xml_dir = fs::path(calib_save) / calib_part / "output";
+        if (fs::exists(xml_dir)) {
+            for (auto& e : fs::recursive_directory_iterator(xml_dir)) {
+                if (!e.is_regular_file() || e.path().extension() != ".xml") continue;
+                fs::path sub = fs::relative(e.path(), xml_dir);
+                jobs.push_back({e.path(), "calib/cams/" + calib_part + "/"
+                                + sub.generic_string(), (uint64_t)e.file_size(), true});
+            }
+        } else cout << "[Scan] skip missing " << xml_dir.string() << endl;
+    }
+    auto add1 = [&](const string& src, const string& rel) {
+        error_code ec;
+        if (fs::exists(src, ec) && fs::is_regular_file(src, ec))
+            jobs.push_back({fs::path(src), rel, (uint64_t)fs::file_size(src, ec), true});
+        else cout << "[Scan] skip missing " << src << endl;
+    };
+    if (!day_id.empty()) {
+        add1(cfg_dir + "/IR/" + day_id + ".txt", "calib/IR/" + day_id + ".txt");
+        add1(cfg_dir + "/arm_pose/" + day_id + ".yaml", "calib/arm_pose/" + day_id + ".yaml");
+    }
+    add1(cfg_dir + "/day_participant_map.json", "day_participant_map.json");
+    cout << "[Scan] +" << (jobs.size() - before) << " master extras (xml/IR/arm_pose/map)" << endl;
 }
 
 struct Progress {
@@ -161,7 +211,9 @@ struct Progress {
 // TransmitFile: 内核级 读盘+发送 重叠, 每次调用上限 DWORD, 大文件分段
 // 返回 0=OK 1=SKIP -1=失败
 int sendOne(SOCKET s, const Job& j) {
-    if (!sendLine(s, "FILE " + j.rel + " " + to_string(j.size) + " 0")) return -1;
+    // FILE = 大小一致 SKIP (h5 续传); FORCE = 覆盖重写 (标定附件每次必更新)
+    if (!sendLine(s, string(j.force ? "FORCE " : "FILE ") + j.rel + " "
+                   + to_string(j.size) + " 0")) return -1;
     string reply;
     if (!recvLine(s, reply, REPLY_TIMEOUT_MS)) return -1;
     if (reply.rfind("SKIP", 0) == 0) return 1;
@@ -190,7 +242,8 @@ int sendOne(SOCKET s, const Job& j) {
 int sendOneUser(SOCKET s, const Job& j) {
     ifstream in(j.path, ios::binary);
     if (!in) return -1;
-    if (!sendLine(s, "FILE " + j.rel + " " + to_string(j.size) + " 0")) return -1;
+    if (!sendLine(s, string(j.force ? "FORCE " : "FILE ") + j.rel + " "
+                   + to_string(j.size) + " 0")) return -1;
 
     struct Slot { vector<char> buf; uint64_t len = 0; };
     vector<Slot> slots(3, Slot{vector<char>(CHUNK), 0});
@@ -310,9 +363,12 @@ int main(int argc, char** argv) {
         if (roots_override.empty()) g_roots = c["participant_root"].as<vector<string>>();
         else g_roots = roots_override;
         try { g_cam_ids = c["cam_indices"].as<vector<string>>(); } catch (...) {}
+        try { g_is_master = c["is_master"].as<bool>(); } catch (...) {}
         Cfg xf(cfg_dir + "/transfer.yaml"); auto& t = xf["transfer"];
-        g_server_ip = data_ip_override.empty() ? t["server_ip_slave_link"].as<string>()
-                                               : data_ip_override;
+        // 链路按角色自动选: master → 口1 (10.10.1.1), slave → 口2 (10.10.2.1)
+        g_server_ip = data_ip_override.empty()
+            ? t[g_is_master ? "server_ip_master_link" : "server_ip_slave_link"].as<string>()
+            : data_ip_override;
         g_server_port = port_override ? port_override : t["server_port"].as<int>();
         g_workers = workers_override ? workers_override : t["workers"].as<int>();
     } catch (const exception& e) {
@@ -320,6 +376,7 @@ int main(int argc, char** argv) {
     }
 
     vector<Job> jobs = scanFiles();
+    if (g_is_master) addMasterExtras(cfg_dir, jobs);
     if (jobs.empty()) {
         cerr << "[Error] no h5 under roots for " << g_participant << endl;
         return 1;
