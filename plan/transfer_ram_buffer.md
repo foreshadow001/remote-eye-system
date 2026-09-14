@@ -236,3 +236,24 @@ finalize 段 clone 增加数秒。可靠性机制 (abandoned/BYE 屏障/多批�
   自然续传。slave 由一次性 START 改为命令循环, 支持多次 START
 - q (传输中) 保持原语义: 温和中止为终态 ABORTED (与 z 的可恢复中断区分)
 - 注意: 握手协议变化需两台主机同时升级二进制
+
+## 12. 并行传输模式 (2026-09-14)
+
+串行模式的实测问题: master 2.4TB 传完紧接 slave, SLC 缓存耗尽 + 后台折叠债
+竞争 → slave 段 2 GB/s 跌至 0.2 GB/s。fstrim 无删除可回收 (无效操作),
+静置需 20-40min (折叠债时长)。
+
+**方案: 两机并行**。v3.2 接收端单 blob 单写流, 连接数不影响盘写形态 →
+两机 16 流对 QLC 与单机 8 流等价; 全量一次连续写完, 只经历一个 SLC 周期。
+预期 4.8TB / ~3.7 GB/s ≈ 22min 全程满速。
+
+- send_ui: SPACE 即发 "START <gen>" 令 slave 同步开传 (旧串行: 本机完成后才发);
+  master 本机完成后提前切 WAIT_SLAVE (BYE 在接收端等两机全部数据落盘, 会阻塞),
+  只收**同号** SLAVE_DONE (z 中断遗留旧应答按号丢弃); slave 命令循环解析
+  "START <gen>" 回 "SLAVE_DONE <gen> ok=.. skip=.. fail=..", 取消 ACK 等待
+- z 中断 (RUNNING): UI 线程直接发 ABORT 令 slave 同停 (不等 controller,
+  否则 master 的 BYE 会挂到 slave 传完)
+- 接收端: blob_finalize 加互斥锁 (双机 BYE 并发触发; 第二个 no-op);
+  文件不会跨 blob (finalize 仅在 g_pending==0 && g_open_files==0 时执行,
+  即无任何在途文件), 双 blob 各自 reflink, 数据零丢失
+- 备份: send_ui_serial_backup.cpp (串行版)
