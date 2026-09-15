@@ -10,7 +10,8 @@
 //   5. arm pose cfg/arm_pose/{day_id}.yaml → /data/dataset/calib/arm_pose/{day_id}.yaml
 //   6. cfg/day_participant_map.json → /data/dataset/day_participant_map.json
 //
-// 配置: capture.yaml (participant_id/is_master/master_ip), transfer.yaml (链路/流数),
+// 配置: capture.yaml (participant_id/is_master/master_ip + participant_root↔cam_indices
+//       动态配对加载, 两盘按字节量加权分流), transfer.yaml (链路/流数),
 //       cam_calib.yaml (calib_save_dir), calib_arm.yaml (record.day_id)
 // 按键 (仅 master 有效, slave 全程由 master 控制):
 //   SPACE = 开始 / 中断后续传 (SKIP 断点, 已传文件秒过)
@@ -41,6 +42,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -80,6 +82,7 @@ struct UiCfg {
     string participant;
     bool is_master = false;
     vector<string> roots;             // 图像盘串行顺序: D:/capture, E:/capture
+    vector<string> cam_ids;           // capture.yaml cam_indices (与 root 一一配对)
     string cfg_dir;                   // cpp_eyetracker/cfg (xml/IR/map 源)
     string xml_dir;                   // {calib_save_dir}/{P}/output (master)
     string ir_file;                   // cfg/IR/{day_id}.txt (master)
@@ -479,25 +482,57 @@ static void slaveHandshakeAndRun() {
 }
 
 // ================== 阶段构建 ==================
-static void addImagePhase(const string& root) {
+// 按配对逐相机扫描 (capture.yaml participant_root[i] ↔ cam_indices[i], 与
+// send_slave.scanFiles / loader 同口径), 全部盘合并为**单个 phase** —
+// transferController 的 phase 是串行的, 若按盘拆 phase 会"先 D 后 E"单盘轮流;
+// 合并后 phase 内按文件盘符分桶 + 字节量加权分流, 各盘全程并行。
+// 兜底: cam_indices 缺失 → root 去重后整目录扫。
+static void addImagePhases() {
     PhasePlan plan;
-    plan.label = root + "  (h5 -> capture/" + g_cfg.participant + ")";
-    fs::path base = fs::path(root) / g_cfg.participant;
-    if (fs::exists(base)) {
-        for (auto& e : fs::recursive_directory_iterator(base)) {
-            if (!e.is_regular_file() || e.path().extension() != ".h5") continue;
-            string rel = "capture/" + g_cfg.participant + "/"
-                       + e.path().parent_path().filename().string()
-                       + "/" + e.path().filename().string();
-            uint64_t sz = (uint64_t)e.file_size();
-            plan.jobs.push_back({e.path(), rel, sz});
-            plan.bytes += sz;
+    map<string, pair<int, uint64_t>> stat;            // 盘 → (files, bytes), 展示用
+    auto add_dir = [&](const fs::path& dir, const string& sn) {
+        if (!fs::exists(dir)) {
+            cout << ts() << "[Warn] missing " << dir.string() << endl;
+            return;
         }
-        sort(plan.jobs.begin(), plan.jobs.end(),
-             [](const Job& a, const Job& b) { return a.rel < b.rel; });
+        auto& s = stat[dir.root_name().string()];
+        for (auto& e : fs::directory_iterator(dir)) {
+            if (!e.is_regular_file() || e.path().extension() != ".h5") continue;
+            string rel = "capture/" + g_cfg.participant + "/" + sn
+                       + "/" + e.path().filename().string();
+            plan.jobs.push_back({e.path(), rel, (uint64_t)e.file_size()});
+            plan.bytes += (uint64_t)e.file_size();
+            s.first += 1; s.second += (uint64_t)e.file_size();
+        }
+    };
+    if (!g_cfg.cam_ids.empty()) {
+        for (size_t i = 0; i < g_cfg.cam_ids.size(); ++i)
+            add_dir(fs::path(g_cfg.roots[i % g_cfg.roots.size()]) / g_cfg.participant
+                    / g_cfg.cam_ids[i], g_cfg.cam_ids[i]);
     } else {
-        cout << ts() << "[Warn] missing " << base.string() << endl;
+        vector<string> uniq;                          // 兜底: root 去重整扫
+        for (auto& r : g_cfg.roots)
+            if (find(uniq.begin(), uniq.end(), r) == uniq.end()) uniq.push_back(r);
+        for (auto& root : uniq) {
+            fs::path base = fs::path(root) / g_cfg.participant;
+            if (!fs::exists(base)) {
+                cout << ts() << "[Warn] missing " << base.string() << endl;
+                continue;
+            }
+            for (auto& e : fs::recursive_directory_iterator(base)) {
+                if (!e.is_regular_file() || e.path().extension() != ".h5") continue;
+                add_dir(e.path().parent_path(), e.path().parent_path().filename().string());
+            }
+        }
     }
+    sort(plan.jobs.begin(), plan.jobs.end(),
+         [](const Job& a, const Job& b) { return a.rel < b.rel; });
+    { ostringstream os;
+      os << "h5 -> capture/" << g_cfg.participant << "  ";
+      for (auto& [drv, s] : stat)
+          os << drv << " (" << s.first << " files, "
+             << fixed << setprecision(2) << (double)s.second / 1e9 << " GB)  ";
+      plan.label = os.str(); }
     g_total_files += (int)plan.jobs.size();
     g_total_bytes += plan.bytes;
     g_plans.push_back(move(plan));
@@ -706,6 +741,12 @@ int main(int argc, char** argv) {
         g_cfg.master_ip = cap["capture"]["master_ip"].as<string>();
         g_cfg.participant = participant_override.empty()
                             ? cap["capture"]["participant_id"].as<string>() : participant_override;
+        // 动态加载存储配置: participant_root[i] ↔ cam_indices[i] 一一配对
+        // (与 send_slave.scanFiles / loader 同口径; 不再硬编码盘符)
+        if (roots_override.empty())
+            g_cfg.roots = cap["capture"]["participant_root"].as<vector<string>>();
+        else g_cfg.roots = roots_override;
+        try { g_cfg.cam_ids = cap["capture"]["cam_indices"].as<vector<string>>(); } catch (...) {}
         Cfg xf(g_cfg.cfg_dir + "/transfer.yaml"); auto& t = xf["transfer"];
         string link = g_cfg.is_master ? t["server_ip_master_link"].as<string>()
                                       : t["server_ip_slave_link"].as<string>();
@@ -716,8 +757,6 @@ int main(int argc, char** argv) {
     } catch (const exception& e) {
         cerr << ts() << "[Error] config: " << e.what() << endl; return 1;
     }
-    if (roots_override.empty()) g_cfg.roots = {"D:/capture", "E:/capture"};
-    else g_cfg.roots = roots_override;
 
     // master 附加源 (xml / IR / map); 缺失则跳过该阶段并告警
     if (g_cfg.is_master) {
@@ -741,9 +780,8 @@ int main(int argc, char** argv) {
         g_cfg.map_file = g_cfg.cfg_dir + "/day_participant_map.json";
     }
 
-    // 构建阶段
-    addImagePhase(g_cfg.roots[0]);
-    if (g_cfg.roots.size() > 1) addImagePhase(g_cfg.roots[1]);
+    // 构建阶段 (按 capture.yaml 配对逐相机扫描)
+    addImagePhases();
     if (g_cfg.is_master) {
         if (!g_cfg.xml_dir.empty()) addXmlPhase();
         if (!g_cfg.ir_file.empty())
