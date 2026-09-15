@@ -497,67 +497,60 @@ static void slaveHandshakeAndRun() {
 }
 
 // ================== 阶段构建 ==================
-static void addImagePhase(const string& root) {
+// 按配对逐相机扫描 (capture.yaml participant_root[i] ↔ cam_indices[i], 与
+// send_slave.scanFiles / loader 同口径), 全部盘合并为**单个 phase** —
+// transferController 的 phase 是串行的, 若按盘拆 phase 会"先 D 后 E"单盘轮流;
+// 合并后 phase 内按文件盘符分桶 + 字节量加权分流, 各盘全程并行。
+// 兜底: cam_indices 缺失 → root 去重后整目录扫。
+static void addImagePhases() {
     PhasePlan plan;
-    plan.label = root + "  (h5 -> capture/" + g_cfg.participant + ")";
-    fs::path base = fs::path(root) / g_cfg.participant;
-    if (fs::exists(base)) {
-        for (auto& e : fs::recursive_directory_iterator(base)) {
-            if (!e.is_regular_file() || e.path().extension() != ".h5") continue;
-            string rel = "capture/" + g_cfg.participant + "/"
-                       + e.path().parent_path().filename().string()
-                       + "/" + e.path().filename().string();
-            uint64_t sz = (uint64_t)e.file_size();
-            plan.jobs.push_back({e.path(), rel, sz});
-            plan.bytes += sz;
+    map<string, pair<int, uint64_t>> stat;            // 盘 → (files, bytes), 展示用
+    auto add_dir = [&](const fs::path& dir, const string& sn) {
+        if (!fs::exists(dir)) {
+            cout << ts() << "[Warn] missing " << dir.string() << endl;
+            return;
         }
-        sort(plan.jobs.begin(), plan.jobs.end(),
-             [](const Job& a, const Job& b) { return a.rel < b.rel; });
+        auto& s = stat[dir.root_name().string()];
+        for (auto& e : fs::directory_iterator(dir)) {
+            if (!e.is_regular_file() || e.path().extension() != ".h5") continue;
+            string rel = "capture/" + g_cfg.participant + "/" + sn
+                       + "/" + e.path().filename().string();
+            plan.jobs.push_back({e.path(), rel, (uint64_t)e.file_size()});
+            plan.bytes += (uint64_t)e.file_size();
+            s.first += 1; s.second += (uint64_t)e.file_size();
+        }
+    };
+    if (!g_cfg.cam_ids.empty()) {
+        for (size_t i = 0; i < g_cfg.cam_ids.size(); ++i)
+            add_dir(fs::path(g_cfg.roots[i % g_cfg.roots.size()]) / g_cfg.participant
+                    / g_cfg.cam_ids[i], g_cfg.cam_ids[i]);
     } else {
-        cout << ts() << "[Warn] missing " << base.string() << endl;
+        vector<string> uniq;                          // 兜底: root 去重整扫
+        for (auto& r : g_cfg.roots)
+            if (find(uniq.begin(), uniq.end(), r) == uniq.end()) uniq.push_back(r);
+        for (auto& root : uniq) {
+            fs::path base = fs::path(root) / g_cfg.participant;
+            if (!fs::exists(base)) {
+                cout << ts() << "[Warn] missing " << base.string() << endl;
+                continue;
+            }
+            for (auto& e : fs::recursive_directory_iterator(base)) {
+                if (!e.is_regular_file() || e.path().extension() != ".h5") continue;
+                add_dir(e.path().parent_path(), e.path().parent_path().filename().string());
+            }
+        }
     }
+    sort(plan.jobs.begin(), plan.jobs.end(),
+         [](const Job& a, const Job& b) { return a.rel < b.rel; });
+    { ostringstream os;
+      os << "h5 -> capture/" << g_cfg.participant << "  ";
+      for (auto& [drv, s] : stat)
+          os << drv << " (" << s.first << " files, "
+             << fixed << setprecision(2) << (double)s.second / 1e9 << " GB)  ";
+      plan.label = os.str(); }
     g_total_files += (int)plan.jobs.size();
     g_total_bytes += plan.bytes;
     g_plans.push_back(move(plan));
-}
-
-// 按配对逐相机扫描 (capture.yaml participant_root[i] ↔ cam_indices[i], 与
-// send_slave.scanFiles / loader 同口径); phase 仍按数据盘组织 (配置屏按盘展示)。
-// 兜底: cam_indices 缺失 → root 去重后整目录扫 (旧行为)。
-static void addImagePhases() {
-    if (!g_cfg.cam_ids.empty()) {
-        map<string, PhasePlan> by_root;               // 盘符 → phase
-        for (size_t i = 0; i < g_cfg.cam_ids.size(); ++i) {
-            const string& sn = g_cfg.cam_ids[i];
-            fs::path dir = fs::path(g_cfg.roots[i % g_cfg.roots.size()])
-                         / g_cfg.participant / sn;
-            if (!fs::exists(dir)) {
-                cout << ts() << "[Warn] missing " << dir.string() << endl;
-                continue;
-            }
-            PhasePlan& plan = by_root[dir.root_name().string()];
-            for (auto& e : fs::directory_iterator(dir)) {
-                if (!e.is_regular_file() || e.path().extension() != ".h5") continue;
-                string rel = "capture/" + g_cfg.participant + "/" + sn
-                           + "/" + e.path().filename().string();
-                plan.jobs.push_back({e.path(), rel, (uint64_t)e.file_size()});
-                plan.bytes += (uint64_t)e.file_size();
-            }
-        }
-        for (auto& [drv, plan] : by_root) {
-            sort(plan.jobs.begin(), plan.jobs.end(),
-                 [](const Job& a, const Job& b) { return a.rel < b.rel; });
-            plan.label = drv + "/capture  (h5 -> capture/" + g_cfg.participant + ")";
-            g_total_files += (int)plan.jobs.size();
-            g_total_bytes += plan.bytes;
-            g_plans.push_back(move(plan));
-        }
-        return;
-    }
-    vector<string> uniq;                              // 兜底: root 去重整扫
-    for (auto& r : g_cfg.roots)
-        if (find(uniq.begin(), uniq.end(), r) == uniq.end()) uniq.push_back(r);
-    for (auto& root : uniq) addImagePhase(root);
 }
 
 static void addFilePhase(const string& src, const string& rel, const string& label) {
