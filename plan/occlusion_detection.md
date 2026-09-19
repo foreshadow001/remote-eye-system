@@ -177,3 +177,22 @@ z 偏 10cm 只影响这两台; 其余 18 台看不见下臂, 故"90% 正常"。
 
 诊断工具: `tests/utils/cam/viz_occ_overlay.py` (投影叠加, 分类统计命中/边距带/
 跨近平面, 支持扰动对比)。
+
+## 录制顺序可翻转 (2026-09-19, capture.cpp)
+
+**需求**: 平衡系统误差, 支持从 lower 开始录制 (lower250→upper250 或
+upper250→lower250 两种纯两段式顺序; 交错段不在工况内出现)。
+
+**实现** (capture.cpp = capture_with_occlusion_detection.cpp 副本, 新 CMake target):
+- `armRecorded()` 对称翻转: `(a == g_first_arm) ? min(tot, 配额) : max(0, tot-配额)`
+  — OVER/右上角/断点续录/z 回退全部调用者自动一致, 调用点零改动
+- 顺序自证 `detectFirstArm()`: chunk0 `occ_meta[0][0]` (occ_arm 0/1) 即第一录
+  的臂; 数据为空 → 当前 g_arm。**零新增持久状态, 完全依赖 h5**
+- init 按 t 切臂 (原有能力, 守卫未动): 空数据时切换即定下顺序
+  (`h5FramesWritten()==0` → `g_first_arm=新臂`); 已有数据则顺序不变 (历史事实)
+- 右上角两行加 `>` 前缀标记当前活动臂
+
+**边界** (与旧版一致): 中途未录满切臂后继续录 = 交错段, h5 帧区间映射失准
+— 调试用; 正式录制前 z 回退或清盘恢复两段式。
+
+测试: num_targets_per_arm=5 验证 lower-first 全流程 + 断点续录顺序自证。
