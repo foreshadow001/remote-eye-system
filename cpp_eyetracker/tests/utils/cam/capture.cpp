@@ -1,0 +1,3017 @@
+// capture_with_occlusion_detection.cpp — capture_with_M5Stack + 臂入画面遮挡判定
+// Master: camera capture + arm control + gaze forwarding to Slave + M5Stack LED 状态同步
+// Slave:  camera capture only, receives gaze from Master via TCP
+// 遮挡判定 (plan/occlusion_detection.md): 两臂 URDF 连杆 (末端无工具) 按当前关节角
+// FK 到世界系 (= 相机标定参考系), 任一三角形进入相机画面 → 该相机本目标 valid=0;
+// 判定在 ARM_OK 后同步执行 (完成才进 READY), 每目标一次, 结果缓存至 h5 阶段。
+// LED 状态 → 图案映射见 plan/m5stack_atom_matrix.md
+// ====================================================================
+#ifdef _WIN32
+    #define WIN32_LEAN_AND_MEAN
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #include <windows.h>
+    #pragma comment(lib, "ws2_32.lib")
+#else
+    #include <sys/socket.h>  /* ... omitted for brevity ... */
+#endif
+
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <chrono>
+#include <thread>
+#include <filesystem>
+#include <vector>
+#include <mutex>
+#include <queue>
+#include <atomic>
+#include <iomanip>
+#include <cmath>
+#include <functional>
+#include <fstream>
+#include <algorithm>
+#include <system_error>
+#include <set>
+#include <map>
+#include <array>
+#include <sstream>
+#include <cstring>
+#include <pugixml.hpp>
+#include <pylon/PylonIncludes.h>
+#include <H5Cpp.h>
+
+#include "cam/basler.hpp"
+#include "cfg/config.hpp"
+#include "piper/piper.hpp"
+#include <yaml-cpp/yaml.h>
+
+namespace fs = std::filesystem;
+using namespace std;
+using namespace gazeestimation;
+
+// ================== 控制台时间戳 (每行前缀 [YYYY-MM-DD HH:MM:SS]) ==================
+string nowTimestamp() {
+    auto t = chrono::system_clock::to_time_t(chrono::system_clock::now());
+    tm tmv{};
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    char buf[32];
+    strftime(buf, sizeof(buf), "[%Y-%m-%d %H:%M:%S] ", &tmv);
+    return string(buf);
+}
+
+// 自定义 streambuf: 每个换行后的行首自动插入时间戳
+class TimestampBuf : public std::streambuf {
+    std::streambuf* dst_;
+    bool at_line_start_ = true;
+    mutex mtx_;  // 序列化输出, 防止多线程行交错
+public:
+    explicit TimestampBuf(std::streambuf* dst) : dst_(dst) {}
+protected:
+    int_type overflow(int_type c) override {
+        if (c == traits_type::eof()) return c;
+        lock_guard<mutex> lk(mtx_);
+        if (at_line_start_) {
+            string ts = nowTimestamp();
+            for (char ch : ts) dst_->sputc(ch);
+            at_line_start_ = false;
+        }
+        if (c == '\n') at_line_start_ = true;
+        return dst_->sputc((char)c);
+    }
+    int sync() override {
+        lock_guard<mutex> lk(mtx_);
+        return dst_->pubsync();
+    }
+};
+
+// ================== UI / Recording globals ==================
+atomic<bool> global_running{true};
+atomic<bool> net_cmd_record{false};
+string shared_record_timestr;
+chrono::steady_clock::time_point global_record_start_time;
+bool g_use_hw_trigger = false;
+
+// ================== TCP command channel (cmd port, replaces UDP) ==================
+SOCKET g_cmd_listen_sock = INVALID_SOCKET;
+SOCKET g_cmd_sock = INVALID_SOCKET;
+mutex g_cmd_send_mtx;
+
+// ================== Gaze forwarding (gaze port) ==================
+SOCKET g_gaze_listen_sock = INVALID_SOCKET;
+SOCKET g_gaze_sock = INVALID_SOCKET;
+mutex g_gaze_send_mtx;
+atomic<double> g_gaze_x{0}, g_gaze_y{0}, g_gaze_z{0};
+atomic<bool> g_gaze_ready{false};
+atomic<bool> g_gaze_need_send{false};
+atomic<bool> g_gaze_connected{false};
+atomic<bool> g_slave_hdf5_done{false};
+atomic<bool> g_gaze_done{false};
+bool g_show_exhausted = false;           // true = render EXHAUSTED UI after dump
+
+// LED state (Master only, effective after main loop starts)
+enum class LedState { PIPER_INIT, READY, CAPTURING, WAITING, EXHAUSTED, OVER };
+LedState g_led_state = LedState::PIPER_INIT;
+
+void drawLedIndicator(cv::Mat& canvas) {
+    cv::Scalar color; string text;
+    switch (g_led_state) {
+        case LedState::PIPER_INIT: color={255,0,0};   text="PIPER INIT"; break;  // BGR: RGB 蓝 0000ff
+        case LedState::READY:      color={0,255,0};   text="READY (breath)"; break;   // 25 全绿呼吸
+        case LedState::CAPTURING:  color={0,255,0};   text="CAPTURING (cross)"; break; // 绿白十字常亮
+        case LedState::WAITING:    color={0,128,255}; text="WAITING"; break;    // BGR: RGB 橙 ff8000
+        case LedState::EXHAUSTED:  color={0,0,255};   text="EXHAUSTED"; break;  // BGR: RGB 红 ff0000
+        case LedState::OVER:       color={255,0,255}; text="OVER"; break;
+    }
+    int cw=canvas.cols, ch=canvas.rows;
+    int bx=cw-160, by=ch-35;
+    cv::rectangle(canvas, cv::Rect(bx, by, 20, 20), color, -1);
+    cv::putText(canvas, text, cv::Point(bx+26, by+15), cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv::LINE_AA);
+}
+
+// ================== M5Stack 状态灯 (Atom Matrix 5x5, 串口) ==================
+HANDLE g_led_upper = INVALID_HANDLE_VALUE;   // upper M5Stack 串口
+HANDLE g_led_lower = INVALID_HANDLE_VALUE;   // lower M5Stack 串口
+
+bool openLedSerial(HANDLE& h, const string& port, int baud) {
+    if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); h = INVALID_HANDLE_VALUE; }
+    string path = "\\\\.\\" + port;
+    HANDLE hh = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (hh == INVALID_HANDLE_VALUE) {
+        cerr << "[M5Stack] Cannot open " << port << " (error " << GetLastError() << ")" << endl;
+        return false;
+    }
+    DCB dcb{}; dcb.DCBlength = sizeof(dcb);
+    if (!GetCommState(hh, &dcb)) { CloseHandle(hh); return false; }
+    dcb.BaudRate = baud; dcb.ByteSize = 8; dcb.Parity = NOPARITY; dcb.StopBits = ONESTOPBIT;
+    if (!SetCommState(hh, &dcb)) { CloseHandle(hh); return false; }
+    COMMTIMEOUTS to{};
+    to.ReadIntervalTimeout = 50; to.ReadTotalTimeoutConstant = 50; to.ReadTotalTimeoutMultiplier = 0;
+    to.WriteTotalTimeoutConstant = 300; to.WriteTotalTimeoutMultiplier = 0;
+    SetCommTimeouts(hh, &to);
+    h = hh;
+    cout << "[M5Stack] Opened " << port << " @ " << baud << endl;
+    return true;
+}
+
+void sendLedCmd(HANDLE h, const string& cmd) {
+    if (h == INVALID_HANDLE_VALUE) return;
+    string line = cmd + "\n";
+    DWORD written = 0;
+    if (!WriteFile(h, line.c_str(), (DWORD)line.size(), &written, NULL) || written != line.size())
+        cerr << "[M5Stack] Write failed." << endl;
+}
+
+extern string g_arm;   // 当前机械臂 ("upper"/"lower"), 定义在下方 Piper arm state 区
+
+// 状态 → LED 图案命令 (每次切换仅一条指令; 呼吸动画由固件 MODE BREATH 实现)
+string pixCrossCmd() {
+    // 十字: 外臂+中心 (2,10,12,14,22) = 绿; 内 3x3 小十字 (7,11,13,17) = 白; 其余黑
+    string px[25]; for (auto& v : px) v = "000000";
+    for (int i : {7, 11, 13, 17}) px[i] = "ffffff";
+    for (int i : {2, 10, 12, 14, 22}) px[i] = "00ff00";
+    string cmd = "PIX"; for (auto& v : px) cmd += " " + v; return cmd;
+}
+string ledPatternCmd(LedState s) {
+    switch (s) {
+        case LedState::PIPER_INIT: return "MODE ALL 0000ff";      // 25 全亮蓝
+        case LedState::READY:      return "MODE BREATH 00ff00";   // 25 全绿呼吸 (固件动画)
+        case LedState::CAPTURING:  return pixCrossCmd();          // 绿白十字常亮
+        case LedState::WAITING:    return "MODE ALL ff8000";      // 25 全亮橙
+        case LedState::EXHAUSTED:  return "MODE ALL ff0000";      // 25 全亮红
+        case LedState::OVER:       return "MODE FLOW";            // 斜向彩流
+        default: return "";
+    }
+}
+
+// 每臂各自的 M5Stack LED 状态 (两块设备独立显示各自机械臂的状态)
+LedState g_led_state_upper = LedState::PIPER_INIT;
+LedState g_led_state_lower = LedState::PIPER_INIT;
+
+void sendLedPatternTo(HANDLE h, LedState s) {
+    string cmd = ledPatternCmd(s);
+    if (cmd.empty()) return;
+    sendLedCmd(h, cmd);
+}
+
+// 每臂录制进度: 由 h5 sentry 推导 (顺序两态, first 臂由 chunk0 occ_arm 自证, 断点续录)
+// 见 armRecorded() — 不再用运行期内存计数
+
+// 设置全局状态 (UI 指示器), 只更新"当前臂"对应的设备
+void setLedState(LedState s) {
+    if (g_led_state == s) return;
+    g_led_state = s;
+    LedState& arm_st = (g_arm == "upper") ? g_led_state_upper : g_led_state_lower;
+    HANDLE arm_dev = (g_arm == "upper") ? g_led_upper : g_led_lower;
+    if (arm_st != s) {
+        arm_st = s;
+        cout << "[M5Stack] " << g_arm << " -> " << ledPatternCmd(s) << endl;
+        sendLedPatternTo(arm_dev, s);
+    }
+}
+
+// ================== Piper arm state (Master only) ==================
+SOCKET g_piper_sock = INVALID_SOCKET;
+string g_arm = "upper";
+int g_upper_idx = 0, g_lower_idx = 0;
+bool g_upper_done = false, g_lower_done = false;
+bool g_recording_enabled = false;
+
+// ================== AutoMove / OVER (capture.yaml) ==================
+bool g_enable_auto_move = false;          // READY 超时自动跳过
+double g_click_window = 0.5;              // READY 等待 SPACE 的最大时长 (s)
+int g_num_targets_per_arm = 0;            // 每臂录制次数配额 (capture.yaml; 进度/OVER 基准)
+bool g_show_over = false;                 // 当前臂的 OVER 显示标志 (随切换加载)
+atomic<int64_t> g_ready_since_us{0};      // READY 起始时刻 (us since epoch, 跨线程)
+
+// ================== Capture delay (CAPTURING → 延迟录制) ==================
+double g_capture_delay = 0.5;              // SPACE 后延迟录制的秒数 (capture.yaml)
+atomic<bool> g_delay_pending{false};       // delay 等待中 (LED 显示 CAPTURING)
+atomic<int64_t> g_delay_start_us{0};       // delay 起点
+atomic<int64_t> g_delay_deadline_us{0};    // delay 终点
+atomic<bool> g_trigger_pending{false};     // delay 结束 → 待触发录制
+double g_last_delay_s = 0.0;               // 最近一次实际 delay 时长 (日志)
+
+int64_t nowUs() {
+    return chrono::duration_cast<chrono::microseconds>(
+        chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// OVER 判断 (初版): 每次程序运行, 两臂从零开始独立计数, 不与任何 sentry 比较
+// (h5 sentry 无法区分机械臂, piper sentry 包含跳过目标, 均不作为判据)
+atomic<bool> g_init_ok{false};     // Master→Slave: all connections ready
+atomic<bool> g_piper_busy{false};
+struct ArmTransform { Pt3 tool_t, tool_r, ccs_t, ccs_r; };
+ArmTransform g_xf_upper, g_xf_lower;
+string g_arm_pose_yml;   // 加载的 arm pose yaml (cfg/... 相对路径, UI 水印显示)
+string g_participant_id; // participant_id (UI 水印显示)
+vector<array<double,3>> g_targets_upper, g_targets_lower;
+string g_gaze_dir;
+struct ArmPose { double x,y,z, qx,qy,qz,qw, alpha,beta,gamma; bool valid=false; };
+ArmPose g_last_piper_pose;
+Pt3 g_tool_ccs_pos{};
+bool g_tool_ccs_valid = false;
+
+// ================== CameraContext ==================
+enum class CamStatus { INIT, OPENED, WAITING_TRIGGER, STREAMING, ERROR_ };
+struct LogEntry { string filename; int64_t blockID; int64_t timestamp; int width; int height; };
+
+struct CameraContext {
+    int index; string id; string save_base_dir; BaslerCamera cam{""};
+    bool is_mono = true;
+    thread capture_thread, copy_thread;
+    atomic<bool> running{true}, recording{false};
+    cv::Mat latest_frame; FrameMeta latest_meta; mutex frame_mtx;
+    vector<cv::Mat> ram_buffer; vector<FrameMeta> meta_buffer;
+    int total_record_frames = 0; atomic<bool> dump_ready{false};
+    queue<pair<cv::Mat, FrameMeta>> copy_queue;  // [Fix] 队列存已拷贝 Mat, 回调内同步拷贝
+    mutex copy_mtx; condition_variable copy_cv;
+    string temp_dir, log_file_path; ofstream log_stream;
+    atomic<int> captured_frames{0}, recorded_frames{0};
+    atomic<CamStatus> status{CamStatus::INIT}; string status_msg = "Initializing";
+    int64_t frame_offset = 0; bool offset_initialized = false;
+    static atomic<int64_t> master_first_id; static atomic<bool> master_set;
+    atomic<int64_t> last_block_id{-1};
+    atomic<chrono::steady_clock::time_point> last_frame_time{chrono::steady_clock::now()};
+    atomic<bool> has_streamed{false};
+    atomic<int> max_queue_size{0};
+    int64_t first_recorded_block_id=-1, last_recorded_block_id=-1;
+    chrono::steady_clock::time_point first_frame_time;
+    atomic<int> dropped_frames{0}; int64_t prev_block_id = -1;
+    chrono::steady_clock::time_point recording_end_time, dump_start_time, dump_end_time;
+    chrono::steady_clock::time_point jpg_start_time, jpg_end_time;
+    double recover2ram_s=0, wait4disk_s=0, ram2disk_s=0;
+    string hdf5_dir;
+    HANDLE shm_handle = NULL; uint8_t* shm_base = nullptr;
+    CameraContext(int idx, string cam_id, string save_dir)
+        : index(idx), id(cam_id), save_base_dir(save_dir), cam(cam_id) {}
+};
+atomic<int64_t> CameraContext::master_first_id(-1);
+atomic<bool> CameraContext::master_set(false);
+vector<shared_ptr<CameraContext>> cam_ctxs;
+
+// ================== Global state ==================
+atomic<bool> g_fault_active{false}; atomic<int> g_faulty_cam{-1};
+atomic<bool> g_fault_on_master{false};
+chrono::steady_clock::time_point g_ready_time, g_fault_time;
+int g_chunk_idx = 0; atomic<int> g_frame_offset{0};
+
+// ================== h5 sentry → 每臂录制进度 ==================
+// h5 sentry (chunk*capacity+offset) 永远指向下一次写入位置; 录制顺序两态:
+//   upper 250 → lower 250, 或 lower 250 → upper 250 (翻转取决于第一录的臂)。
+// 顺序不引入新状态 — 由 h5 数据自证: chunk0 的 occ_meta[0][0] (occ_arm,
+// 0=upper / 1=lower) 即第一录的臂; 数据为空时 = 当前 g_arm (尚未开录,
+// 顺序由即将录的第一录决定, init 按 t 切臂即决定顺序)。
+// 配额从配置推导 (不硬编码): 每臂帧数 = num_targets_per_arm × core_frames
+//   = 250 录 × ceil(fps×record_time) 帧 = 25000 帧/臂;
+// 两臂合计 50000 帧 = 25 chunk (0000..0024, precreateParallel 按此创建)
+int g_core_frames = 100;                   // 每次录制帧数 = ceil(fps×record_time), main 填充
+int64_t g_frames_per_arm = 25000;          // = num_targets_per_arm × g_core_frames, main 填充
+vector<string> g_participant_roots; string g_sentry_root;
+int g_hdf5_chunk_capacity = 2000;
+int g_cam_w = 0, g_cam_h = 0;          // 相机分辨率 (main 加载, precreateParallel 用)
+string g_first_arm = "upper";              // 第一个 frames_per_arm 帧的归属臂 (detectFirstArm 填充)
+int64_t h5FramesWritten() { return (int64_t)g_chunk_idx * g_hdf5_chunk_capacity + g_frame_offset.load(); }
+int recordingsPerArm() { return g_num_targets_per_arm; }
+int armRecorded(const string& a) {
+    int64_t tot = h5FramesWritten();
+    // 对称两态: first 臂 = min(tot, 每臂配额), 另一臂 = 溢出 — 与录制顺序无耦合
+    int64_t v = (a == g_first_arm) ? min(tot, g_frames_per_arm)
+                                   : max((int64_t)0, tot - g_frames_per_arm);
+    return (int)(min(v, g_frames_per_arm) / max(g_core_frames, 1));
+}
+// 两臂合计所需 chunk 数 (ceil, precreateParallel 用)
+int precreateChunkCount() {
+    return (int)((2 * g_frames_per_arm + g_hdf5_chunk_capacity - 1) / g_hdf5_chunk_capacity);
+}
+
+// 顺序自证: 读 chunk0 首帧 occ_meta[0][0] (occ_arm: 0=upper / 1=lower)。
+// 数据为空 (无 chunk0 / 无 occ_meta / sentry 为 0) → 取当前 g_arm。
+// main 启动时调用一次; 之后顺序不再变化 (第一录已定, t 切臂不改写历史)。
+static void detectFirstArm() {
+    if (h5FramesWritten() <= 0 || cam_ctxs.empty()) { g_first_arm = g_arm; return; }
+    stringstream pss; pss << cam_ctxs[0]->hdf5_dir << "/0000.h5";
+    try {
+        H5::H5File f(pss.str(), H5F_ACC_RDONLY);
+        if (!f.nameExists("occ_meta")) { g_first_arm = g_arm; return; }
+        H5::DataSet d = f.openDataSet("occ_meta");
+        hsize_t start[2] = {0, 0}, count[2] = {1, 1};
+        H5::DataSpace mem(2, count);
+        H5::DataSpace sp = d.getSpace();
+        sp.selectHyperslab(H5S_SELECT_SET, count, start);
+        double v = 0;
+        d.read(&v, H5::PredType::NATIVE_DOUBLE, mem, sp);
+        g_first_arm = ((int)(v + 0.5) == 1) ? "lower" : "upper";
+        cout << "[Piper] first arm by h5 chunk0 occ_arm=" << (int)(v + 0.5)
+             << " -> " << g_first_arm << endl;
+    } catch (...) {
+        g_first_arm = g_arm;                       // 读失败保守取当前臂
+    }
+}
+
+// ================== i 键: 预创建 HDF5 (双机握手 + 串行创建 + 进度 UI) ==================
+atomic<bool> g_precreating{false};      // 创建状态: 全屏进度 UI, 屏蔽所有按键
+atomic<int>  g_pre_phase{0};            // 1=握手检查 2=创建中
+atomic<int>  g_pre_total{0}, g_pre_done{0};
+atomic<bool> g_pre_local_done{false};   // 本机创建完成
+atomic<bool> g_pre_peer_clear{false};   // master: slave 检查通过 (无 h5)
+atomic<bool> g_pre_peer_reject{false};  // master: slave 已有 h5 → 放弃
+atomic<bool> g_pre_peer_done{false};    // master: slave 创建完成
+thread g_pre_thread;                    // 本机创建线程 (cleanup 时 join)
+chrono::steady_clock::time_point g_pre_t0;   // 握手阶段起始 (超时保护)
+int g_sentry_mismatch_count = 0, g_consecutive_faults = 0;
+atomic<bool> g_syncing{false};
+string g_session_log_path; int g_recording_number = 0; ofstream g_session_log;
+// Timing metrics (per-recording, updated after each dump)
+double g_arm_stage_s = 0;       // ARM stage wall time
+double g_master_hdf5_s = 0;    // Master HDF5 write (hdf5 phase in par)
+double g_slave_hdf5_s = 0;     // Slave HDF5 write (hdf5 phase in par)
+double g_wait_slave_hdf5_s = 0; // Wait for Slave HDF5_DONE
+double g_gaze_forward_s = 0;    // GAZE forward + GAZE_DONE
+double g_sentry_sync_s = 0;     // Sentry handshake
+double g_recording_end_to_end_s = 0; // Total from SPACE to SPACE-ready (delay + record + arm&h5 + sync)
+atomic<int64_t> g_e2e_start_us{0};   // SPACE 按下时刻 (End-to-end 起点; slave 由 TRIGGER 兜底)
+atomic<int> g_exc_fatal{0}, g_exc_error{0}, g_exc_warn{0}, g_exc_info{0};
+int64_t g_peer_first_block_id = -1;
+atomic<int> g_enlarged_cam{-1};
+int g_win_w=1224, g_win_h=1024, g_left_w=0, g_right_x=0, g_right_w=0;
+int g_thumb_w=0, g_thumb_h=0;
+bool g_is_master = true;
+string g_master_ip;
+
+void logException(const string& level, const string& source, const string& msg) {
+    auto t = chrono::system_clock::now();
+    auto tt = chrono::system_clock::to_time_t(t);
+    auto ms = chrono::duration_cast<chrono::milliseconds>(t.time_since_epoch()) % 1000;
+    char tb[16]; strftime(tb, sizeof(tb), "%H:%M:%S", localtime(&tt));
+    string ts = string(tb)+"."+to_string(ms.count()/100)+to_string((ms.count()/10)%10)+to_string(ms.count()%10);
+    string line = "> **["+level+"]** `"+ts+"` | "+source+" | "+msg;
+    if (level=="FATAL") { g_exc_fatal++; cerr << line << endl; }
+    else if (level=="ERROR") { g_exc_error++; cerr << line << endl; }
+    else if (level=="WARN") { g_exc_warn++; cout << line << endl; }
+    else { g_exc_info++; cout << line << endl; }
+    if (g_session_log.is_open()) g_session_log << line << "\n" << flush;
+}
+
+// ================== TCP helpers ==================
+bool recvLine(SOCKET sock, string& line, int timeout_ms = 3000) {
+    DWORD to = timeout_ms;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+    char buf[256]; string acc;
+    auto deadline = chrono::steady_clock::now() + chrono::milliseconds(timeout_ms);
+    while (chrono::steady_clock::now() < deadline) {
+        int n = recv(sock, buf, sizeof(buf)-1, 0);
+        if (n <= 0) return false;
+        buf[n] = '\0'; acc += buf;
+        size_t nl = acc.find('\n');
+        if (nl != string::npos) { line = acc.substr(0,nl);
+            if (!line.empty() && line.back()=='\r') line.pop_back(); return true; }
+    }
+    return false;
+}
+
+// 带状态返回的 recvLine: 0=收到一行, 1=超时(无数据), 2=连接关闭/错误
+// 每套接字残留缓冲跨调用保留: 一次 recv 可能带回多行 (Nagle 合并分段),
+// 只取首行返回、剩余必须存回, 否则同分段的后续行被静默丢弃
+// (P001 教训: OCCL+OCCL_J 连发合并 → GAZE_DONE 被丢 → 流水线死锁)
+static mutex s_linebuf_mtx;
+static map<SOCKET,string> s_linebuf;
+int recvLineStatus(SOCKET sock, string& line, int timeout_ms = 3000) {
+    DWORD to = timeout_ms;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+    char buf[256]; string acc;
+    { lock_guard<mutex> lk(s_linebuf_mtx); acc.swap(s_linebuf[sock]); }   // 取走残留
+    auto deadline = chrono::steady_clock::now() + chrono::milliseconds(timeout_ms);
+    while (chrono::steady_clock::now() < deadline) {
+        size_t nl = acc.find('\n');              // 先查已有缓冲 (可能残留完整行)
+        if (nl != string::npos) { line = acc.substr(0,nl);
+            if (!line.empty() && line.back()=='\r') line.pop_back();
+            { lock_guard<mutex> lk(s_linebuf_mtx); s_linebuf[sock] = acc.substr(nl+1); }
+            return 0; }
+        int n = recv(sock, buf, sizeof(buf)-1, 0);
+        if (n == 0) { lock_guard<mutex> lk(s_linebuf_mtx); s_linebuf[sock] = acc; return 2; }   // 对端正常关闭 (残留仍存回)
+        if (n < 0) {
+#ifdef _WIN32
+            int e = WSAGetLastError();
+            if (e == WSAETIMEDOUT) { lock_guard<mutex> lk(s_linebuf_mtx); s_linebuf[sock] = acc; return 1; }   // 空闲超时
+#else
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { lock_guard<mutex> lk(s_linebuf_mtx); s_linebuf[sock] = acc; return 1; }
+#endif
+            { lock_guard<mutex> lk(s_linebuf_mtx); s_linebuf[sock] = acc; return 2; }            // 其他错误视为断连
+        }
+        buf[n] = '\0'; acc += buf;
+    }
+    { lock_guard<mutex> lk(s_linebuf_mtx); s_linebuf[sock] = acc; }       // 超时退出也存回
+    return 1;
+}
+bool sendLineRaw(SOCKET sock, const string& msg) {
+    string data = msg + "\n";
+    return send(sock, data.c_str(), (int)data.length(), 0) > 0;
+}
+bool sendLine(SOCKET sock, const string& msg) {
+    lock_guard<mutex> lk(g_cmd_send_mtx);
+    return sendLineRaw(sock, msg);
+}
+
+// ================== Piper: parse MOVED response ==================
+bool parsePoseResponse(const string& resp, string& arm, ArmPose& pose) {
+    if (resp.rfind("MOVED:",0)!=0 && resp.rfind("POSE:",0)!=0) return false;
+    size_t c1=resp.find(':'), c2=resp.find(':',c1+1);
+    if (c1==string::npos||c2==string::npos) return false;
+    arm = resp.substr(c1+1,c2-c1-1);
+    string vals=resp.substr(c2+1); vector<double> nums;
+    stringstream ss(vals); string token;
+    while(getline(ss,token,',')) { try{nums.push_back(stod(token));}catch(...){return false;} }
+    if(nums.size()!=10) return false;
+    pose.x=nums[0];pose.y=nums[1];pose.z=nums[2];
+    pose.qx=nums[3];pose.qy=nums[4];pose.qz=nums[5];pose.qw=nums[6];
+    pose.alpha=nums[7];pose.beta=nums[8];pose.gamma=nums[9];
+    pose.valid=true; return true;
+}
+
+// ================== Occlusion detection (臂入画面判定) ==================
+// 世界系 = 相机标定参考系 (= 40772280 相机系, 与 arm_in_ccs 的 CCS 同系)。
+// 口径: 任一臂连杆三角形进入相机画面 (顶点投影落像面且 z>0, 或三角形横跨
+// 像面边界/近平面) → 该相机遮挡。加载失败/查询失败/对账超差 → 停用 (valid 恒 1)。
+static bool g_occ_enabled = false;        // 兼容保留 (恒 true; occSetup 失败已 fail-fast, 停用机制已删)
+static set<string> g_occ_occluded;        // 本目标被遮挡 SN (Master: 判定; Slave: OCCL 同步)
+static map<string,int> g_occ_stats;       // 每相机累计遮挡目标数 (Master, 报告用)
+static mutex g_occ_mtx;
+static string g_occ_last_line;            // UI 一行摘要
+static array<double,12> g_occ_joints{};   // 本目标判定所用关节 (qU6+qL6; h5 occ_joints 调试数据集)
+static bool g_occ_joints_ok = false;      // false = 本目标无有效关节 (h5 写 NaN)
+// 本目标判定状态 (h5 occ_status; 离线区分 valid=0 的成因):
+// 0=判定正常 2=关节查询失败 3=关节下发失败 4=对账失配(证据关节已存)
+static atomic<int> g_occ_status{0};
+// 双臂 FK↔真实法兰对账误差 mm (h5 occ_check_err; NaN=未对账) — 离线看漂移趋势/失配根因
+static double g_occ_check_err[2] = {NAN, NAN};
+// 本目标 SDK 法兰原始位姿 (h5 occ_flange; U:x,y,z,qx,qy,qz,qw + L:同; NaN=未查到) —
+// 离线独立重构对账: URDF FK(occ_joints) vs SDK(occ_flange), 分离关节错/标定错/实现错
+static double g_occ_flange[14];
+// 本录录制臂 (h5 occ_arm; 0=upper 1=lower) — gaze_target 归属哪条臂的工装
+static atomic<int> g_occ_arm{0};
+// master 运行时实际手眼值 (h5 occ_arm_pose; U:t3+zxz3, L:同) — slave 本地 yaml 可能过时, 以此为准
+static double g_occ_arm_pose[12];
+
+bool sendJointsToSlave();                                    // 专用 joints 通道推送 (ACK+重试; 定义在 gaze 段前)
+static string g_occ_xml_dir;                                 // day 标定 XML 目录 (Master 权威; 启动推送给 Slave)
+
+// ---- 小型 3x3 数学 (FK 专用, 不引入新依赖) ----
+struct OccMat3 { double m[3][3]; };
+struct OccFrame { OccMat3 R; double t[3]; };          // p' = R·p + t
+static OccMat3 occId() { OccMat3 r{}; r.m[0][0]=r.m[1][1]=r.m[2][2]=1; return r; }
+static OccMat3 occMul(const OccMat3& a, const OccMat3& b) {
+    OccMat3 r{};
+    for (int i=0;i<3;++i) for (int j=0;j<3;++j)
+        for (int k=0;k<3;++k) r.m[i][j]+=a.m[i][k]*b.m[k][j];
+    return r;
+}
+static void occMv(const OccMat3& a, const double v[3], double out[3]) {
+    for (int i=0;i<3;++i) out[i]=a.m[i][0]*v[0]+a.m[i][1]*v[1]+a.m[i][2]*v[2];
+}
+static OccMat3 occRx(double t){ OccMat3 r=occId(); double c=cos(t),s=sin(t); r.m[1][1]=c;r.m[1][2]=-s;r.m[2][1]=s;r.m[2][2]=c; return r; }
+static OccMat3 occRy(double t){ OccMat3 r=occId(); double c=cos(t),s=sin(t); r.m[0][0]=c;r.m[0][2]=s;r.m[2][0]=-s;r.m[2][2]=c; return r; }
+static OccMat3 occRz(double t){ OccMat3 r=occId(); double c=cos(t),s=sin(t); r.m[0][0]=c;r.m[0][1]=-s;r.m[1][0]=s;r.m[1][1]=c; return r; }
+static OccMat3 occRpy(double r,double p,double y){   // URDF rpy: R = Rz(y)·Ry(p)·Rx(r)
+    return occMul(occRz(y), occMul(occRy(p), occRx(r))); }
+static OccMat3 occGba(double a,double b,double g){   // HALCON XML gba: R = Rx(a)·Ry(b)·Rz(g)
+    return occMul(occRx(a), occMul(occRy(b), occRz(g))); }
+static OccMat3 occQuatMat(const Quat& q) {           // 四元数 → 旋转矩阵
+    OccMat3 r{}; double x=q.x,y=q.y,z=q.z,w=q.w;
+    r.m[0][0]=1-2*(y*y+z*z); r.m[0][1]=2*(x*y-w*z);   r.m[0][2]=2*(x*z+w*y);
+    r.m[1][0]=2*(x*y+w*z);   r.m[1][1]=1-2*(x*x+z*z); r.m[1][2]=2*(y*z-w*x);
+    r.m[2][0]=2*(x*z-w*y);   r.m[2][1]=2*(y*z+w*x);   r.m[2][2]=1-2*(x*x+y*y);
+    return r; }
+static OccFrame occFm(const OccFrame& a, const OccFrame& b) {
+    OccFrame r; r.R=occMul(a.R,b.R); occMv(a.R,b.t,r.t);
+    for (int i=0;i<3;++i) r.t[i]+=a.t[i]; return r; }
+
+// ---- URDF 链 + STL 网格 (三角形扁平存储: 每 3 顶点一个三角形) ----
+struct OccMesh { vector<array<double,3>> tris; };
+struct OccNode {                              // 链节点: parent --joint--> child(link)
+    string link; double xyz[3], rpy[3]; bool revolute; OccMesh mesh;
+};
+struct OccArmModel { OccMesh base_mesh; vector<OccNode> chain; };   // base_link + joint1..6 + gripper_base
+static OccArmModel g_occ_arm_upper, g_occ_arm_lower;
+
+static bool occLoadStl(const fs::path& p, OccMesh& out) {
+    ifstream f(p, ios::binary);
+    if (!f) return false;
+    char head[84]{};
+    f.read(head, 84);
+    if (!f) return false;
+    if (strncmp(head, "solid", 5) == 0) {     // ASCII STL
+        f.seekg(0); string line; array<double,3> tri[3]; int vi = 0;
+        while (getline(f, line)) {
+            istringstream ss(line); string tok; ss >> tok;
+            if (tok == "vertex") {
+                double x,y,z; ss >> x >> y >> z;
+                tri[vi++] = {x,y,z};
+                if (vi == 3) { for (auto& v : tri) out.tris.push_back(v); vi = 0; }
+            }
+        }
+        return !out.tris.empty();
+    }
+    // 二进制 STL: 80 头 + uint32 三角数 + 每三角 50 字节
+    uint32_t n; memcpy(&n, head + 80, 4);
+    out.tris.reserve(n * 3);
+    for (uint32_t i = 0; i < n; ++i) {
+        char rec[50];
+        if (!f.read(rec, 50)) return false;
+        float v[9]; memcpy(v, rec + 12, 36);   // 跳过 normal, 9 floats = 3 顶点
+        for (int k = 0; k < 3; ++k)
+            out.tris.push_back({v[k*3], v[k*3+1], v[k*3+2]});
+    }
+    return true;
+}
+
+static bool occLoadUrdf(const fs::path& urdf, OccArmModel& mdl) {
+    pugi::xml_document doc;
+    if (!doc.load_file(urdf.string().c_str())) return false;
+    pugi::xml_node root = doc.child("robot");
+    fs::path mesh_dir = urdf.parent_path().parent_path() / "meshes";
+    map<string, fs::path> link_mesh;
+    for (auto L : root.children("link")) {
+        auto fn = L.child("visual").child("geometry").child("mesh").attribute("filename").value();
+        if (fn && *fn) link_mesh[L.attribute("name").value()] = mesh_dir / (fs::path(fn).filename());
+    }
+    struct JInfo { string type, parent, child; double xyz[3], rpy[3]; };
+    vector<JInfo> js;
+    for (auto J : root.children("joint")) {
+        JInfo j{}; j.type = J.attribute("type").value();
+        j.parent = J.child("parent").attribute("link").value();
+        j.child  = J.child("child").attribute("link").value();
+        auto o = J.child("origin");
+        sscanf(o.attribute("xyz").value() ? o.attribute("xyz").value() : "0 0 0",
+               "%lf %lf %lf", &j.xyz[0], &j.xyz[1], &j.xyz[2]);
+        sscanf(o.attribute("rpy").value() ? o.attribute("rpy").value() : "0 0 0",
+               "%lf %lf %lf", &j.rpy[0], &j.rpy[1], &j.rpy[2]);
+        js.push_back(j);
+    }
+    // 链: base_link 起, 依次取 parent==cur 的关节 (revolute 到 link6, fixed 到 gripper_base)
+    if (!link_mesh.count("base_link") || !occLoadStl(link_mesh["base_link"], mdl.base_mesh)) return false;
+    string cur = "base_link";
+    for (int step = 0; step < 8; ++step) {
+        JInfo* pick = nullptr;
+        for (auto& j : js) {
+            if (j.parent != cur) continue;
+            if (j.type == "revolute" && j.child.rfind("link", 0) == 0) pick = &j;          // joint1..6 → linkN
+            else if (j.type == "fixed" && j.child == "gripper_base") pick = &j;            // joint6_to_gripper_base
+            if (pick) break;
+        }
+        if (!pick) break;
+        OccNode n; n.link = pick->child; n.revolute = (pick->type == "revolute");
+        memcpy(n.xyz, pick->xyz, sizeof(n.xyz)); memcpy(n.rpy, pick->rpy, sizeof(n.rpy));
+        // gripper_base 网格不加载: URDF 里是原装夹爪安装座 (14.5cm 大支架), 实际装置
+        // 仅装法兰盘大小转接件 (理想化裸臂止于 link6) — 该网格会造成幻影遮挡
+        auto it = link_mesh.find(n.link);
+        if (it != link_mesh.end() && n.link != "gripper_base") occLoadStl(it->second, n.mesh);   // 网格缺失不致命
+        mdl.chain.push_back(move(n));
+        cur = pick->child;
+        if (cur == "gripper_base") break;
+    }
+    return mdl.chain.size() >= 6;                                   // joint1..6 必须齐全
+}
+
+// ---- 相机 (内参 K + 外参 R|T; p_w = R·p_cam + t → p_cam = Rᵀ·(p_w − t)) ----
+struct OccCam { string sn; double fx, fy, cx, cy, w, h; OccMat3 R; double t[3]; };
+static vector<OccCam> g_occ_cams;
+
+static bool occLoadCamXml(const fs::path& p, OccCam& c) {
+    pugi::xml_document doc;
+    if (!doc.load_file(p.string().c_str())) return false;
+    auto root = doc.child("CameraData");
+    // 内参 RawData: "<type> Focus Kappa Sx Sy Cx Cy W H"
+    istringstream ss(root.child("InternalParameters").child("RawData").text().as_string());
+    string type; double focus, kappa, sx, sy;
+    if (!(ss >> type >> focus >> kappa >> sx >> sy >> c.cx >> c.cy >> c.w >> c.h)) return false;
+    c.fx = focus / sx; c.fy = focus / sy;
+    auto ext = root.child("ExternalParameters");
+    c.t[0] = ext.child("Translation").child("X").text().as_double();
+    c.t[1] = ext.child("Translation").child("Y").text().as_double();
+    c.t[2] = ext.child("Translation").child("Z").text().as_double();
+    double a = ext.child("Rotation").child("Alpha").text().as_double();
+    double b = ext.child("Rotation").child("Beta").text().as_double();
+    double g = ext.child("Rotation").child("Gamma").text().as_double();
+    constexpr double kD2R = 3.14159265358979323846 / 180.0;
+    c.R = occGba(a * kD2R, b * kD2R, g * kD2R);
+    return true;
+}
+
+// ---- FK: 关节角 → 各 link 三角形世界系顶点 (复用缓冲) ----
+static void occFkWorld(const OccArmModel& mdl, const double q[6], const ArmTransform& xf,
+                       vector<array<double,3>>& out) {
+    Quat qa = zxzToQuat(xf.ccs_r.x, xf.ccs_r.y, xf.ccs_r.z);        // 臂基座系 → 世界
+    OccMat3 Rw = occQuatMat(qa);
+    auto push_link = [&](const OccMesh& mesh, const OccFrame& M) {
+        // p_w = Rw·(M_R·v + M_t) + ccs_t — link 原点平移 M_t 必须同样经 Rw 旋转入世界
+        // (P001 教训: 漏转 M.t → 网格整体错位几十 cm, 法兰自检却因路径不同而通过)
+        double wt[3];
+        occMv(Rw, M.t, wt);                                         // link 原点: 臂基座系 → 世界系
+        for (auto& v : mesh.tris) {
+            double va[3], vw[3];
+            occMv(M.R, &v[0], va);                                  // link 局部 → 臂基座系
+            occMv(Rw, va, vw);                                      // 臂基座系 → 世界系
+            out.push_back({vw[0] + wt[0] + xf.ccs_t.x,
+                           vw[1] + wt[1] + xf.ccs_t.y,
+                           vw[2] + wt[2] + xf.ccs_t.z});
+        }
+    };
+    out.clear();
+    push_link(mdl.base_mesh, OccFrame{occId(), {0,0,0}});           // base_link: 臂基座系原点
+    OccFrame M{occId(), {0,0,0}};
+    int qi = 0;
+    for (auto& n : mdl.chain) {
+        OccFrame o{occRpy(n.rpy[0], n.rpy[1], n.rpy[2]), {n.xyz[0], n.xyz[1], n.xyz[2]}};
+        OccFrame jr{occId(), {0,0,0}};
+        if (n.revolute && qi < 6) jr.R = occRz(q[qi++]);            // revolute 绕 z
+        M = occFm(M, occFm(o, jr));
+        push_link(n.mesh, M);
+    }
+}
+
+// ---- 画面进入判定 ----
+// 线段与矩形 [x0,y1]×[x1,y1] 相交 (Liang-Barsky)
+static bool occSegHitsRect(double u0,double v0,double u1,double v1,
+                           double x0,double y0,double x1,double y1) {
+    double t0=0, t1=1, du=u1-u0, dv=v1-v0;
+    double clip[4][3] = {{-du, u0-x0},  {du,  x1-u0},
+                         {-dv, v0-y0},  {dv,  y1-v0}};
+    for (auto& c : clip) {
+        double p=c[0], q=c[1];
+        if (p == 0) { if (q < 0) return false; continue; }
+        double r = q / p;
+        if (p < 0) { if (r > t1) return false; if (r > t0) t0 = r; }
+        else       { if (r < t0) return false; if (r < t1) t1 = r; }
+    }
+    return true;
+}
+// 入画边距: 投影几何须穿透画面边界 ≥ 此深度才算遮挡 (px)。
+// 大致内参的固有角误差 ~1.6° (≈170px @fx5900) 会把画外物体画入边缘 → 擦边误报;
+// 200px ≈ 2° 覆盖该误差并留余量。深穿透的真遮挡不受影响。
+static constexpr double kOccEdgeMargin = 200.0;
+
+static bool occTriInFrame(const OccCam& c, const array<double,3>* tri) {
+    double P[3][3];                                   // 三角形顶点 → 相机系 (z 可为任意值)
+    for (int k = 0; k < 3; ++k) {
+        double d[3] = {tri[k][0]-c.t[0], tri[k][1]-c.t[1], tri[k][2]-c.t[2]};
+        for (int i=0;i<3;++i)
+            P[k][i] = c.R.m[0][i]*d[0] + c.R.m[1][i]*d[1] + c.R.m[2][i]*d[2];
+    }
+    // 近平面 z>=eps 裁剪 (Sutherland-Hodgman 单平面, 三角形→至多四边形):
+    // 横跨相机平面的三角形只保留镜头前方部分再投影判入画, 视场外的跨越不再误报
+    const double eps = 1e-4;                          // 0.1mm (镜头内顶点视为不可见)
+    double Q[4][3]; int n = 0;
+    for (int a = 0; a < 3; ++a) {
+        int b = (a+1)%3;
+        bool ain = P[a][2] >= eps, bin = P[b][2] >= eps;
+        if (ain) { for (int i=0;i<3;++i) Q[n][i] = P[a][i]; ++n; }
+        if (ain != bin) {
+            double t = (eps - P[a][2]) / (P[b][2] - P[a][2]);
+            for (int i=0;i<3;++i) Q[n][i] = P[a][i] + t*(P[b][i]-P[a][i]);
+            ++n;
+        }
+    }
+    if (n < 3) return false;                          // 完全在镜头后方或裁剪后零面积
+    double u[4], v[4];
+    for (int k = 0; k < n; ++k) { u[k]=c.fx*Q[k][0]/Q[k][2]+c.cx; v[k]=c.fy*Q[k][1]/Q[k][2]+c.cy; }
+    // 判定矩形 = 画面内缩 kOccEdgeMargin: 擦边 (标定误差量级) 不算遮挡
+    const double x0 = kOccEdgeMargin, y0 = kOccEdgeMargin,
+                 x1 = c.w - kOccEdgeMargin, y1 = c.h - kOccEdgeMargin;
+    if (x1 <= x0 || y1 <= y0) return false;           // 边距配得比画面还大 (异常配置)
+    for (int k = 0; k < n; ++k) {                     // 顶点入内矩形 / 边与内矩形相交 (含闭合边)
+        if (u[k]>=x0 && u[k]<=x1 && v[k]>=y0 && v[k]<=y1) return true;
+        int k2=(k+1)%n;
+        if (occSegHitsRect(u[k], v[k], u[k2], v[k2], x0, y0, x1, y1)) return true;
+    }
+    double px=c.w/2, py=c.h/2;                        // 画面中心在裁剪后凸多边形内 (近处大三角包围整幅)
+    bool allp = true, alln = true;
+    for (int k = 0; k < n; ++k) {
+        int k2=(k+1)%n;
+        double cr = (u[k2]-u[k])*(py-v[k]) - (v[k2]-v[k])*(px-u[k]);
+        if (cr > 0) alln = false; else if (cr < 0) allp = false;
+    }
+    return allp || alln;
+}
+
+// ---- 启动加载: URDF + 全部相机 XML (Master; Slave 经 OCCL 同步结果, 不加载) ----
+static bool occSetup(const string& cfg_dir, const string& day) {
+    fs::path urdf = fs::path(cfg_dir).parent_path().parent_path().parent_path()
+                    / "piper_ros" / "src" / "piper_description" / "urdf" / "piper_description.urdf";
+    if (!occLoadUrdf(urdf, g_occ_arm_upper) || !occLoadUrdf(urdf, g_occ_arm_lower)) {
+        cerr << "[Occ] WARN: URDF load failed (" << urdf.string() << ") — occlusion disabled" << endl;
+        return false;
+    }
+    // 相机 XML: 只用 {day}/output (精确外参 + 大致内参; 不加载 participant 内参)
+    string save_dir;
+    try { Cfg cc(cfg_dir + "/cam_calib.yaml"); save_dir = cc["calib"]["calib_save_dir"].as<string>(); }
+    catch (...) {}
+    if (save_dir.empty()) {
+        cerr << "[Occ] WARN: cam_calib.yaml calib_save_dir missing — occlusion disabled" << endl;
+        return false;
+    }
+    fs::path xml_dir = fs::path(save_dir) / day / "output";
+    if (!fs::is_directory(xml_dir)) {
+        cerr << "[Occ] WARN: no calib XML dir (" << xml_dir.string() << ") — occlusion disabled" << endl;
+        return false;
+    }
+    g_occ_xml_dir = xml_dir.string();      // 记录权威目录 (joints 通道启动时推送给 Slave)
+    for (auto& e : fs::directory_iterator(xml_dir)) {
+        string fn = e.path().filename().string();
+        if (fn.size() > 9 && fn.substr(fn.size()-9) == "_Data.xml") {
+            OccCam c;
+            if (occLoadCamXml(e.path(), c)) { c.sn = fn.substr(0, fn.size()-9); g_occ_cams.push_back(move(c)); }
+        }
+    }
+    if (g_occ_cams.empty()) {
+        cerr << "[Occ] WARN: no camera XML parsed from " << xml_dir.string() << " — occlusion disabled" << endl;
+        return false;
+    }
+    size_t tris = (g_occ_arm_upper.base_mesh.tris.size() + g_occ_arm_lower.base_mesh.tris.size()) / 3;
+    for (auto& n : g_occ_arm_upper.chain) tris += n.mesh.tris.size()/3;
+    for (auto& n : g_occ_arm_lower.chain) tris += n.mesh.tris.size()/3;
+    cout << "[Occ] loaded: " << g_occ_cams.size() << " cams, URDF chain "
+         << g_occ_arm_upper.chain.size() << " joints, " << tris << " tris/arm-pair" << endl;
+    return true;
+}
+
+// ---- gaze target 各相机系转换 (外参 = day XML; h5 gaze_target 按相机系保存) ----
+static map<string, array<double,3>> g_gaze_cam;   // Slave: GAZE_CAM 接收的各相机系值
+static mutex g_gaze_cam_mtx;
+
+static void occToCam(const OccCam& c, const double p_w[3], double out[3]) {
+    double d[3] = {p_w[0]-c.t[0], p_w[1]-c.t[1], p_w[2]-c.t[2]};
+    for (int i=0;i<3;++i) out[i] = c.R.m[0][i]*d[0] + c.R.m[1][i]*d[1] + c.R.m[2][i]*d[2];  // Rᵀ·d
+}
+
+static string buildGazeCamMsg() {
+    // "GAZE_CAM:<中心系 x,y,z>[;<sn>:<相机系 x,y,z>...]" — 中心系值 + 全部 20 相机系值
+    // (g_occ_cams 加载后只读, 无需加锁; 加载失败时仅含中心系值, 从机回退中心系)
+    double pw[3] = {g_gaze_x.load(), g_gaze_y.load(), g_gaze_z.load()};
+    char head[64];
+    snprintf(head, sizeof(head), "GAZE_CAM:%.6f,%.6f,%.6f", pw[0], pw[1], pw[2]);
+    string msg = head;
+    for (auto& cam : g_occ_cams) {
+        double pc[3]; occToCam(cam, pw, pc);
+        char e[96];
+        snprintf(e, sizeof(e), ";%s:%.6f,%.6f,%.6f", cam.sn.c_str(), pc[0], pc[1], pc[2]);
+        msg += e;
+    }
+    return msg;
+}
+
+// ---- GET_JOINTS 查询 (复用 piper 控制连接; 调用时臂静止且 socket 空闲) ----
+// NaN 防线 (P001 二采教训): 服务器可能回报 "nan" 关节 — stod("nan") 不抛异常且
+// NaN 参与一切比较均为 false, 会穿透对账/判定所有防线 (err=NaN 判"通过"、
+// FK=NaN 判"不遮挡") → 必须在入口按查询失败处理
+static bool occQueryJoints(const string& arm, double q[6]) {
+    if (g_piper_sock == INVALID_SOCKET) return false;
+    if (!sendLineRaw(g_piper_sock, "GET_JOINTS:" + arm)) return false;
+    string resp;
+    if (!recvLine(g_piper_sock, resp, 5000)) return false;
+    string tag = "JOINTS:" + arm + ":";
+    if (resp.rfind(tag, 0) != 0) return false;
+    stringstream ss(resp.substr(tag.size())); string tok; int i = 0;
+    try { while (i < 6 && getline(ss, tok, ',')) q[i++] = stod(tok); } catch (...) { return false; }
+    if (i != 6) return false;
+    for (int k = 0; k < 6; ++k) if (!std::isfinite(q[k])) return false;
+    return true;
+}
+
+// ---- 主判定 (Master, moveArmToTarget ARM_OK 后同步调用, 完成才置 READY 计时) ----
+static vector<array<double,3>> g_occ_wu, g_occ_wl;   // FK 世界系三角形缓冲 (复用)
+
+// FK 法兰 (世界系): 链求至 link6, 经 zxz 臂变换入世界
+static void occFkFlange(const OccArmModel& mdl, const double q[6],
+                        const ArmTransform& xf, double out[3]) {
+    OccFrame M{occId(), {0,0,0}}; int qi = 0;
+    for (auto& n : mdl.chain) {
+        OccFrame o{occRpy(n.rpy[0], n.rpy[1], n.rpy[2]), {n.xyz[0], n.xyz[1], n.xyz[2]}};
+        OccFrame jr{occId(), {0,0,0}};
+        if (n.revolute && qi < 6) jr.R = occRz(q[qi++]);
+        M = occFm(M, occFm(o, jr));
+        if (qi == 6) break;                                   // M = link6 (flange) 臂基座系
+    }
+    Quat qa = zxzToQuat(xf.ccs_r.x, xf.ccs_r.y, xf.ccs_r.z);
+    Pt3 fk_flange = quatRotate(qa, Pt3{M.t[0], M.t[1], M.t[2]});
+    out[0] = fk_flange.x + xf.ccs_t.x;
+    out[1] = fk_flange.y + xf.ccs_t.y;
+    out[2] = fk_flange.z + xf.ccs_t.z;
+}
+
+// GET_POSE:臂 → 法兰位姿 (停臂对账用)
+static bool occQueryPose(const string& arm, ArmPose& pose) {
+    if (g_piper_sock == INVALID_SOCKET) return false;
+    if (!sendLineRaw(g_piper_sock, "GET_POSE:" + arm)) return false;
+    string resp;
+    if (!recvLine(g_piper_sock, resp, 5000)) return false;
+    string resp_arm;
+    return parsePoseResponse(resp, resp_arm, pose) && resp_arm == arm;
+}
+
+// OCCL 集下发 (cmd 通道); 无法判定时传全集 → Slave 该录全 valid=0
+static void sendOcclSet(const set<string>& occ) {
+    if (g_cmd_sock == INVALID_SOCKET) return;
+    string msg = "OCCL:";
+    for (auto& sn : occ) msg += (msg.size() > 5 ? "," : "") + sn;
+    sendLine(g_cmd_sock, msg);
+}
+
+// GET_JOINTS 双臂 (3 次重试, 间隔 500ms); 停用期与判定期共用
+static bool occQueryJointsRetry(double qU[6], double qL[6]) {
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        if (occQueryJoints("upper", qU) && occQueryJoints("lower", qL)) return true;
+        cerr << "[Occ] GET_JOINTS attempt " << attempt << "/3 failed — retrying..." << endl;
+        this_thread::sleep_for(chrono::milliseconds(500));
+    }
+    return false;
+}
+
+static void runOcclusionCheck(const string& arm, int target_idx) {
+    // 本录元数据 (h5 occ_arm / occ_arm_pose; Slave 经 JOINTS 头部同步):
+    // 录制臂 + master 运行时实际手眼值 (slave 本地 yaml 副本可能过时, 离线以此为准)
+    { lock_guard<mutex> lk(g_occ_mtx);
+      g_occ_arm = (arm == "upper") ? 0 : 1;
+      g_occ_arm_pose[0] = g_xf_upper.ccs_t.x; g_occ_arm_pose[1] = g_xf_upper.ccs_t.y;
+      g_occ_arm_pose[2] = g_xf_upper.ccs_t.z; g_occ_arm_pose[3] = g_xf_upper.ccs_r.x;
+      g_occ_arm_pose[4] = g_xf_upper.ccs_r.y; g_occ_arm_pose[5] = g_xf_upper.ccs_r.z;
+      g_occ_arm_pose[6] = g_xf_lower.ccs_t.x; g_occ_arm_pose[7] = g_xf_lower.ccs_t.y;
+      g_occ_arm_pose[8] = g_xf_lower.ccs_t.z; g_occ_arm_pose[9] = g_xf_lower.ccs_r.x;
+      g_occ_arm_pose[10]= g_xf_lower.ccs_r.y; g_occ_arm_pose[11]= g_xf_lower.ccs_r.z; }
+
+    double qU[6], qL[6];
+    // 关节查询 (3 次重试): 失败不允许静默发生 — 无法判定的录制按全相机 valid=0 处理
+    if (!occQueryJointsRetry(qU, qL)) {
+        cerr << "[Occ] WARN: joint query exhausted retries — ALL cameras valid=0 this target" << endl;
+        logException("WARN","occ","joint query failed - all valid=0");
+        set<string> occ_all;
+        { lock_guard<mutex> lk(g_occ_mtx);
+          g_occ_occluded.clear();
+          for (auto& c : g_occ_cams) { g_occ_occluded.insert(c.sn); ++g_occ_stats[c.sn]; }
+          occ_all = g_occ_occluded;
+          g_occ_joints_ok = false;
+          g_occ_status = 2;
+          g_occ_check_err[0] = g_occ_check_err[1] = NAN;
+          for (int k = 0; k < 14; ++k) g_occ_flange[k] = NAN;
+          g_occ_last_line = "Occ: JOINTS QUERY FAILED (all valid=0)"; }
+        sendOcclSet(occ_all);                                   // 全集 → Slave 同步全 valid=0
+        sendJointsToSlave();                                    // 空关节 (NaN) — 重试耗尽仍尝试下发
+        return;
+    }
+
+    // ---- 双臂关节对账 (每判定): FK 法兰 ↔ 真实法兰 (动臂=MOVED 应答, 停臂=GET_POSE) ----
+    // P001 教训: 关节若串到另一臂/停更, 模型错位 → valid 写出系统性错误值。
+    // 失配只废当次目标 (全 valid=0, 证据关节照存 h5) — 下一目标重新对账自愈;
+    // 不再"停用到重启" (旧设计一次毛刺即丢整场判定, 132/500 NaN 的帮凶)
+    double err_mm[2] = {NAN, NAN};                              // 对账误差 (h5 occ_check_err)
+    double flange_raw[14];                                      // SDK 法兰原始位姿 (h5 occ_flange)
+    for (int k = 0; k < 14; ++k) flange_raw[k] = NAN;
+    for (int i = 0; i < 2; ++i) {
+        const string& a = (i == 0) ? "upper" : "lower";
+        ArmPose real;
+        bool have_real = false;
+        if (a == arm) { real = g_last_piper_pose; have_real = true; }   // 刚移动的臂
+        else          { have_real = occQueryPose(a, real); }           // 停臂: 现查
+        if (!have_real) continue;                                      // 查不到 → 无法对账, 跳过
+        flange_raw[i*7+0]=real.x; flange_raw[i*7+1]=real.y; flange_raw[i*7+2]=real.z;
+        flange_raw[i*7+3]=real.qx; flange_raw[i*7+4]=real.qy; flange_raw[i*7+5]=real.qz; flange_raw[i*7+6]=real.qw;
+        const OccArmModel& mdl = (a == "upper") ? g_occ_arm_upper : g_occ_arm_lower;
+        const double* q       = (a == "upper") ? qU : qL;
+        const ArmTransform& xf= (a == "upper") ? g_xf_upper : g_xf_lower;
+        double fk[3];
+        occFkFlange(mdl, q, xf, fk);
+        Pose sdk_flange{{real.x, real.y, real.z},
+                        {real.qx, real.qy, real.qz, real.qw}};
+        Pose sdk_ccs = armToolToCamPose(sdk_flange, {0,0,0}, {0,0,0}, xf.ccs_t, xf.ccs_r);
+        double dx = fk[0] - sdk_ccs.pos.x, dy = fk[1] - sdk_ccs.pos.y, dz = fk[2] - sdk_ccs.pos.z;
+        double err = sqrt(dx*dx + dy*dy + dz*dz);
+        err_mm[i] = err * 1000.0;
+        cout << "[Occ] joint check " << a << ": FK vs real flange err = " << err * 1000.0 << " mm" << endl;
+        // NaN 防线: err 为 NaN/Inf 时 (NaN>x 恒 false 会被误判"通过") 按失配处理
+        if (!std::isfinite(err) || err > 0.01) {
+            cerr << "[Occ] WARN: " << a << " joints mismatch real pose > 10 mm"
+                 << " (joints wrong/stale/crossed?) — this target ALL valid=0, next target re-checks" << endl;
+            logException("ERROR","occ","joint check mismatch - all valid=0 this target");
+            // 失配关节/法兰仍原样记录 (h5 occ_joints/occ_flange) — 离线重放定位串台来源的证据;
+            // 本目标不可判定 → 全集 OCCL (失配 joints 不允许 valid=1)
+            set<string> occ_bad;
+            { lock_guard<mutex> lk(g_occ_mtx);
+              for (auto& c : g_occ_cams) { g_occ_occluded.insert(c.sn); ++g_occ_stats[c.sn]; }
+              occ_bad = g_occ_occluded;
+              g_occ_status = 4;
+              g_occ_check_err[0] = err_mm[0]; g_occ_check_err[1] = err_mm[1];
+              for (int k = 0; k < 14; ++k) g_occ_flange[k] = flange_raw[k];
+              g_occ_last_line = "Occ: JOINTS MISMATCH (all valid=0 this target)";
+              for (int k = 0; k < 6; ++k) { g_occ_joints[k] = qU[k]; g_occ_joints[6+k] = qL[k]; }
+              g_occ_joints_ok = true; }
+            sendOcclSet(occ_bad);
+            sendJointsToSlave();                              // 失配关节仍经专用通道下发 (证据)
+            return;
+        }
+    }
+
+    occFkWorld(g_occ_arm_upper, qU, g_xf_upper, g_occ_wu);
+    occFkWorld(g_occ_arm_lower, qL, g_xf_lower, g_occ_wl);
+
+    set<string> occ;
+    for (auto& cam : g_occ_cams) {
+        bool hit = false;
+        for (auto* w : {&g_occ_wu, &g_occ_wl}) {
+            if (hit) break;
+            for (size_t i = 0; i + 2 < w->size(); i += 3)
+                if (occTriInFrame(cam, &(*w)[i])) { hit = true; break; }
+        }
+        if (hit) occ.insert(cam.sn);
+    }
+    {
+        lock_guard<mutex> lk(g_occ_mtx);
+        g_occ_occluded = occ;
+        for (int k = 0; k < 6; ++k) { g_occ_joints[k] = qU[k]; g_occ_joints[6+k] = qL[k]; }
+        g_occ_joints_ok = true;
+        g_occ_status = 0;
+        g_occ_check_err[0] = err_mm[0]; g_occ_check_err[1] = err_mm[1];
+        for (int k = 0; k < 14; ++k) g_occ_flange[k] = flange_raw[k];
+        for (auto& sn : occ) ++g_occ_stats[sn];
+        string sns; for (auto& sn : occ) sns += (sns.empty() ? "" : " ") + sn;
+        g_occ_last_line = "Occluded: " + to_string(occ.size()) + "/" + to_string(g_occ_cams.size())
+                          + (sns.empty() ? "" : " — " + sns);
+    }
+    cout << "[Occ] " << arm << " target #" << (target_idx + 1) << ": "
+         << occ.size() << "/" << g_occ_cams.size() << " cams occluded" << endl;
+    // 同步 Slave: 关节先经专用通道下发 (ACK+重试); 下发失败 → 本目标全相机 valid=0
+    // (occ_joints=NaN 的录制无法离线判定, 不允许静默按 valid=1 放行)
+    if (!sendJointsToSlave()) {
+        cerr << "[Occ] WARN: joints delivery to Slave failed — ALL cameras valid=0 this target" << endl;
+        logException("WARN","occ","joints delivery failed - all valid=0");
+        occ.clear();
+        for (auto& c : g_occ_cams) { occ.insert(c.sn); ++g_occ_stats[c.sn]; }
+        { lock_guard<mutex> lk(g_occ_mtx);
+          g_occ_occluded = occ;
+          g_occ_status = 3;
+          g_occ_last_line = "Occ: JOINTS DELIVERY FAILED (all valid=0)"; }
+    }
+    // 遮挡集走 cmd (Slave 自行与本机相机求交)
+    sendOcclSet(occ);
+}
+
+// ================== Piper: compute tool in CCS ==================
+void computeToolCcs(const string& arm_name) {
+    auto& xf = (arm_name=="upper") ? g_xf_upper : g_xf_lower;
+    Pose flange{{g_last_piper_pose.x,g_last_piper_pose.y,g_last_piper_pose.z},
+                {g_last_piper_pose.qx,g_last_piper_pose.qy,g_last_piper_pose.qz,g_last_piper_pose.qw}};
+    Pose tccs = armToolToCamPose(flange, xf.tool_t, xf.tool_r, xf.ccs_t, xf.ccs_r);
+    g_tool_ccs_pos = tccs.pos;
+    g_tool_ccs_valid = true;
+}
+
+// ================== Piper: zero arm ==================
+bool zeroArm(const string& arm_name) {
+    g_piper_busy = true;
+    cout << "[Piper] Zeroing " << arm_name << "..." << endl;
+    string cmd = "MOVE_JOINTS:" + arm_name + ":0.0,0.0,0.0,0.0,0.0,0.0";
+    if (!sendLineRaw(g_piper_sock, cmd)) { g_piper_busy = false; return false; }
+    string resp, resp_arm; ArmPose pose;
+    if (recvLine(g_piper_sock, resp, 30000)) {
+        if (parsePoseResponse(resp, resp_arm, pose)) {
+            g_last_piper_pose = pose;
+            computeToolCcs(arm_name);
+            cout << "[Piper] " << arm_name << " zeroed" << endl;
+            g_piper_busy = false; return true;
+        }
+        cerr << "[Piper] " << arm_name << " zero FAIL: " << resp << endl;
+    } else { cerr << "[Piper] " << arm_name << " zero timeout" << endl; }
+    g_piper_busy = false; return false;
+}
+
+// ================== Piper: update sentry ==================
+void updatePiperSentry() {
+    ofstream sf(g_gaze_dir + "/sentry.txt");
+    sf << "upper:" << g_upper_idx << "\nlower:" << g_lower_idx << "\n";
+}
+// ================== Piper: sync state to Slave via cmd_port ==================
+void syncPiperToSlave(bool send_init_ok=false) {
+    if(g_cmd_sock==INVALID_SOCKET) return;
+    char buf[64];
+    snprintf(buf,sizeof(buf),"PIPER:active:%s",g_arm.c_str());
+    sendLineRaw(g_cmd_sock,buf); this_thread::sleep_for(chrono::milliseconds(50));
+    snprintf(buf,sizeof(buf),"PIPER:upper:%d:%s",g_upper_idx,g_upper_done?"done":"ok");
+    sendLineRaw(g_cmd_sock,buf); this_thread::sleep_for(chrono::milliseconds(50));
+    snprintf(buf,sizeof(buf),"PIPER:lower:%d:%s",g_lower_idx,g_lower_done?"done":"ok");
+    sendLineRaw(g_cmd_sock,buf); this_thread::sleep_for(chrono::milliseconds(50));
+    if(send_init_ok) {
+        sendLineRaw(g_cmd_sock,"INIT_OK"); this_thread::sleep_for(chrono::milliseconds(50));
+        cout<<"[Init] INIT_OK sent to Slave."<<endl;
+    }
+}
+
+// ================== Joints channel (遮挡判定关节, 独立端口) ==================
+// Master 判定所用关节 (qU6+qL6) 推送给 Slave → 随本录写入各相机 h5 occ_joints。
+// 不走 cmd 通道: 调试数据流与控制流隔离, 且避免 cmd 上多行连发被合并分段。
+static SOCKET g_joints_listen_sock = INVALID_SOCKET;
+static SOCKET g_joints_sock = INVALID_SOCKET;
+static atomic<bool> g_joints_connected{false};
+static mutex g_joints_send_mtx;
+
+// Master: 把本目标判定全套数据推给 Slave (逗号定长流, NaN → "nan"):
+//   JOINTS:arm,status,errU,errL, flangeU[7],flangeL[7], arm_pose[12], joints[12]
+//   (关节无效 → 末段 12 值缺省, 共 30 值; h5 occ_joints 写 NaN)
+// 带 ACK 确认 + 重发 (P001 教训: 单次丢消息 → 该录 occ_joints=NaN 无法判定);
+// 返回 false = 重试耗尽, 调用方须将本目标全相机 valid=0
+bool sendJointsToSlave() {
+    if (g_joints_sock == INVALID_SOCKET) return false;
+    string msg = "JOINTS:";
+    { lock_guard<mutex> lk(g_occ_mtx);
+      char b[40];
+      snprintf(b, sizeof(b), "%d,%d,%.3f,%.3f", g_occ_arm.load(), g_occ_status.load(),
+               g_occ_check_err[0], g_occ_check_err[1]);
+      msg += b;
+      for (int k = 0; k < 14; ++k) { snprintf(b, sizeof(b), ",%.6f", g_occ_flange[k]); msg += b; }
+      for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), ",%.6f", g_occ_arm_pose[k]); msg += b; }
+      if (g_occ_joints_ok)
+          for (int k = 0; k < 12; ++k) { snprintf(b, sizeof(b), ",%.6f", g_occ_joints[k]); msg += b; } }
+    lock_guard<mutex> lk(g_joints_send_mtx);
+    for (int attempt = 1; attempt <= 5; ++attempt) {
+        if (send(g_joints_sock, (msg + "\n").c_str(), (int)msg.size() + 1, 0) <= 0)
+            cerr << "[Joints] send failed (err " << WSAGetLastError() << ")" << endl;
+        string ack;
+        if (recvLine(g_joints_sock, ack, 2000) && ack == "JOINTS_ACK") return true;
+        cerr << "[Joints] ACK not received, retry " << attempt << "/5" << endl;
+        this_thread::sleep_for(chrono::milliseconds(300));
+    }
+    return false;
+}
+
+// ---- base64 (标定 XML 经文本通道传输; 无第三方依赖) ----
+static string occB64Encode(const string& in) {
+    static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    string out; out.reserve((in.size() + 2) / 3 * 4);
+    size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        uint32_t v = (uint32_t)(uint8_t)in[i] << 16 | (uint32_t)(uint8_t)in[i+1] << 8 | (uint8_t)in[i+2];
+        out += T[v >> 18 & 63]; out += T[v >> 12 & 63]; out += T[v >> 6 & 63]; out += T[v & 63];
+    }
+    if (i + 1 == in.size()) {
+        uint32_t v = (uint32_t)(uint8_t)in[i] << 16;
+        out += T[v >> 18 & 63]; out += T[v >> 12 & 63]; out += "==";
+    } else if (i + 2 == in.size()) {
+        uint32_t v = (uint32_t)(uint8_t)in[i] << 16 | (uint32_t)(uint8_t)in[i+1] << 8;
+        out += T[v >> 18 & 63]; out += T[v >> 12 & 63]; out += T[v >> 6 & 63]; out += '=';
+    }
+    return out;
+}
+static bool occB64Decode(const string& in, string& out) {
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    out.clear(); uint32_t buf = 0; int bits = 0;
+    for (char c : in) {
+        if (c == '=') break;
+        int v = val(c); if (v < 0) return false;
+        buf = buf << 6 | (uint32_t)v; bits += 6;
+        if (bits >= 8) { bits -= 8; out += char(buf >> bits & 0xFF); }
+    }
+    return true;
+}
+
+// Master: day 标定 XML 推送给 Slave (Slave 本地副本可能过时, 离线重放需要权威数据)
+string findDayForParticipant(const string& map_path, const string& participant);   // 前置声明 (定义在 main 前)
+static void sendCalibToSlave() {
+    if (g_occ_xml_dir.empty() || g_joints_sock == INVALID_SOCKET) return;
+    int n = 0;
+    try {
+        for (auto& e : fs::directory_iterator(g_occ_xml_dir)) {
+            string fn = e.path().filename().string();
+            if (fn.size() <= 9 || fn.substr(fn.size() - 9) != "_Data.xml") continue;
+            ifstream f(e.path(), ios::binary);
+            stringstream ss; ss << f.rdbuf();
+            { lock_guard<mutex> lk(g_joints_send_mtx);
+              sendLineRaw(g_joints_sock, "CALIB:" + fn.substr(0, fn.size() - 9) + ":" + occB64Encode(ss.str())); }
+            ++n;
+        }
+    } catch (...) {}
+    { lock_guard<mutex> lk(g_joints_send_mtx);
+      sendLineRaw(g_joints_sock, "CALIB_END:" + to_string(n)); }
+    cout << "[Calib] pushed " << n << " day XMLs to Slave" << endl;
+}
+
+void jointsServerWorker(int joints_port) {                       // Master: 监听 + 保持连接
+    g_joints_listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (g_joints_listen_sock == INVALID_SOCKET) return;
+    int opt = 1; setsockopt(g_joints_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(joints_port); sa.sin_addr.s_addr = INADDR_ANY;
+    if (::bind(g_joints_listen_sock, (sockaddr*)&sa, sizeof(sa)) != 0 || listen(g_joints_listen_sock, 1) != 0) {
+        cerr << "[Joints] Master bind/listen on port " << joints_port << " failed (err " << WSAGetLastError() << ")" << endl;
+        return;
+    }
+    cout << "[Joints] Master listening TCP ::" << joints_port << endl;
+    while (global_running) {
+        sockaddr_in ca; socklen_t cl = sizeof(ca);
+        SOCKET cs = accept(g_joints_listen_sock, (sockaddr*)&ca, &cl);   // 阻塞; 退出时 closesocket 打断
+        if (cs == INVALID_SOCKET) { if (!global_running) break; continue; }
+        { lock_guard<mutex> lk(g_joints_send_mtx);
+          if (g_joints_sock != INVALID_SOCKET) closesocket(g_joints_sock);
+          g_joints_sock = cs; }
+        g_joints_connected = true;
+        cout << "[Joints] Slave connected." << endl;
+        sendCalibToSlave();                       // 连上即推送 day 标定 XML (覆盖 Slave 本地可能过时的副本)
+    }
+}
+
+void jointsClientWorker(const string& master_ip, int joints_port, const string& cfg_dir) {  // Slave: 连接 + 接收
+    while (global_running) {
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) { this_thread::sleep_for(chrono::seconds(2)); continue; }
+        sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(joints_port);
+        inet_pton(AF_INET, master_ip.c_str(), &sa.sin_addr);
+        if (connect(sock, (sockaddr*)&sa, sizeof(sa)) != 0) {
+            closesocket(sock); this_thread::sleep_for(chrono::seconds(2)); continue;
+        }
+        g_joints_connected = true;
+        cout << "[Joints] Slave connected to Master." << endl;
+        static string s_calib_out_dir;          // 本地 day 输出目录 (懒初始化; 接收标定时定位)
+        while (global_running) {
+            string line;
+            int st = recvLineStatus(sock, line, 300000);
+            if (st == 2) { cerr << "[Joints] Connection closed by Master - reconnecting." << endl; break; }
+            if (st == 1) continue;
+            if (line.rfind("CALIB:", 0) == 0) {
+                // Master 推送的 day 标定 XML ("CALIB:SN:<base64>") — 覆盖本地, 保证离线重放/后续使用为权威数据
+                size_t c1 = line.find(':', 6);
+                if (c1 == string::npos) continue;
+                string sn = line.substr(6, c1 - 6), xml;
+                if (!occB64Decode(line.substr(c1 + 1), xml)) continue;
+                if (s_calib_out_dir.empty()) {
+                    try {
+                        Cfg cc(cfg_dir + "/cam_calib.yaml");
+                        string sd = cc["calib"]["calib_save_dir"].as<string>();
+                        string day = findDayForParticipant(cfg_dir + "/day_participant_map.json", g_participant_id);
+                        if (!sd.empty() && !day.empty()) {
+                            s_calib_out_dir = (fs::path(sd) / day / "output").string();
+                            fs::create_directories(s_calib_out_dir);
+                        }
+                    } catch (...) {}
+                }
+                if (!s_calib_out_dir.empty())
+                    { ofstream(s_calib_out_dir + "/" + sn + "_Data.xml", ios::binary) << xml; }
+            }
+            else if (line.rfind("CALIB_END:", 0) == 0) {
+                cout << "[Calib] synced " << line.substr(10) << " day XMLs from Master -> "
+                     << (s_calib_out_dir.empty() ? "(dir resolve FAILED)" : s_calib_out_dir) << endl;
+            }
+            else if (line.rfind("JOINTS:", 0) == 0) {
+                // 逗号定长流: arm,status,errU,errL, flange[14], arm_pose[12], joints[12?]
+                lock_guard<mutex> lk(g_occ_mtx);
+                g_occ_joints_ok = false;
+                vector<double> v; v.reserve(42);
+                { stringstream ss(line.substr(7)); string tok;
+                  while (getline(ss, tok, ',')) {
+                      try { v.push_back(stod(tok)); } catch (...) { v.clear(); break; }
+                  } }
+                if (v.size() >= 4) {
+                    g_occ_arm    = (int)v[0];
+                    g_occ_status = (int)v[1];
+                    g_occ_check_err[0] = v[2]; g_occ_check_err[1] = v[3];
+                } else { g_occ_status = -1; g_occ_check_err[0] = g_occ_check_err[1] = NAN; }
+                if (v.size() >= 18) for (int k = 0; k < 14; ++k) g_occ_flange[k] = v[4+k];
+                else for (int k = 0; k < 14; ++k) g_occ_flange[k] = NAN;
+                if (v.size() >= 30) for (int k = 0; k < 12; ++k) g_occ_arm_pose[k] = v[18+k];
+                if (v.size() >= 42) {
+                    // NaN 防线: joints 段任一非有限值 (如 "nan") → 视为无效 (兜底全 valid=0)
+                    bool fin = true;
+                    for (int k = 0; k < 12 && fin; ++k) fin = std::isfinite(v[30+k]);
+                    if (fin) {
+                        for (int k = 0; k < 12; ++k) g_occ_joints[k] = v[30+k];
+                        g_occ_joints_ok = true;
+                    }
+                }
+                sendLineRaw(sock, "JOINTS_ACK");
+            }
+        }
+        g_joints_connected = false; closesocket(sock);
+        if (!global_running) break;
+        this_thread::sleep_for(chrono::seconds(1));
+    }
+}
+
+// ================== Gaze server (Master) ==================
+void gazeServerWorker(int gaze_port) {
+    g_gaze_listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (g_gaze_listen_sock == INVALID_SOCKET) return;
+    int opt=1; setsockopt(g_gaze_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    sockaddr_in sa{}; sa.sin_family=AF_INET; sa.sin_port=htons(gaze_port);
+    sa.sin_addr.s_addr=INADDR_ANY;
+    ::bind(g_gaze_listen_sock, (sockaddr*)&sa, sizeof(sa));
+    listen(g_gaze_listen_sock, 1);
+    {DWORD to=500;setsockopt(g_gaze_listen_sock,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));}  // accept 可中断
+    cout << "[Gaze] Master listening TCP ::" << gaze_port << endl;
+    while (global_running) {
+        sockaddr_in ca; socklen_t cl=sizeof(ca);
+        SOCKET cs = accept(g_gaze_listen_sock, (sockaddr*)&ca, &cl);
+        if (cs == INVALID_SOCKET) { if (!global_running) break; continue; }  // 超时轮询, 退出时结束
+        g_gaze_sock = cs; g_gaze_connected = true;
+        cout << "[Gaze] Slave connected." << endl;
+        // Loop: wait for main thread to signal new gaze data, then send
+        while (global_running) {
+            this_thread::sleep_for(chrono::milliseconds(50));
+            if (g_gaze_need_send.exchange(false)) {
+                string msg = buildGazeCamMsg() + "\n";   // 中心系 + 各相机系 gaze target
+                lock_guard<mutex> lk(g_gaze_send_mtx);
+                if (send(g_gaze_sock, msg.c_str(), (int)msg.size(), 0) <= 0) {cerr<<"[Gaze] Send failed - exiting."<<endl;global_running=false;break;}
+                string ack; recvLine(g_gaze_sock, ack, 5000);
+                cout << "[Gaze] Sent ("<<g_gaze_x<<","<<g_gaze_y<<","<<g_gaze_z<<") ack="<<ack<<endl;
+            }
+        }
+        g_gaze_connected = false; closesocket(g_gaze_sock); g_gaze_sock = INVALID_SOCKET;
+    }
+}
+
+// ================== Gaze client (Slave) ==================
+void gazeClientWorker(const string& master_ip, int gaze_port) {
+    while (global_running) {
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) { this_thread::sleep_for(chrono::seconds(2)); continue; }
+        sockaddr_in sa{}; sa.sin_family=AF_INET; sa.sin_port=htons(gaze_port);
+        inet_pton(AF_INET, master_ip.c_str(), &sa.sin_addr);
+        if (connect(sock, (sockaddr*)&sa, sizeof(sa)) != 0) {
+            closesocket(sock); this_thread::sleep_for(chrono::seconds(2)); continue;
+        }
+        g_gaze_connected = true;
+        cout << "[Gaze] Slave connected to Master." << endl;
+        while (global_running) {
+            string line;
+            int st = recvLineStatus(sock, line, 300000);
+            if (st == 2) { cerr<<"[Gaze] Connection closed by Master - reconnecting."<<endl; break; }  // 真断连 → 重连, 不退出
+            if (st == 1) continue;  // 空闲超时 → 继续等待
+            if (line.rfind("GAZE_CAM:",0) == 0) {
+                // 中心系 + 各相机系 gaze target ("GAZE_CAM:x,y,z;sn:x,y,z;...")
+                string body = line.substr(9);
+                size_t sc = body.find(';');
+                double gx,gy,gz;
+                if (sscanf_s((sc==string::npos?body:body.substr(0,sc)).c_str(),
+                             "%lf,%lf,%lf", &gx,&gy,&gz) == 3) {
+                    g_gaze_x=gx; g_gaze_y=gy; g_gaze_z=gz;
+                    { lock_guard<mutex> lk(g_gaze_cam_mtx);
+                      g_gaze_cam.clear();
+                      if (sc != string::npos) {
+                          stringstream rest(body.substr(sc+1)); string ent;
+                          while (getline(rest, ent, ';')) {
+                              size_t c1 = ent.find(':');
+                              if (c1 == string::npos) continue;
+                              array<double,3> v{};
+                              if (sscanf_s(ent.c_str()+c1+1, "%lf,%lf,%lf",
+                                           &v[0],&v[1],&v[2]) == 3)
+                                  g_gaze_cam[ent.substr(0,c1)] = v;
+                          } } }
+                    g_gaze_ready = true;
+                    g_gaze_need_send = true;  // signal main thread ARM stage loop
+                }
+                sendLineRaw(sock, "GAZE_ACK");
+            }
+            else if (line.rfind("GAZE:",0) == 0) {
+                double gx,gy,gz; sscanf_s(line.c_str()+5, "%lf,%lf,%lf", &gx, &gy, &gz);
+                g_gaze_x=gx; g_gaze_y=gy; g_gaze_z=gz;
+                g_gaze_ready = true;
+                g_gaze_need_send = true;  // signal main thread ARM stage loop
+                sendLineRaw(sock, "GAZE_ACK");
+            }
+        }
+        g_gaze_connected = false; closesocket(sock);
+        if (!global_running) break;
+        this_thread::sleep_for(chrono::seconds(1));
+    }
+}
+
+// ================== Piper: arm result enum ==================
+enum class ArmResult { ARM_OK, ARM_EXHAUSTED, ARM_ERROR };
+
+// ================== Piper: move arm to target (auto-skip on failure) ==================
+ArmResult moveArmToTarget() {
+    auto& tgt = (g_arm=="upper") ? g_targets_upper : g_targets_lower;
+    int& idx = (g_arm=="upper") ? g_upper_idx : g_lower_idx;
+    int total = (int)tgt.size();
+    while (idx < total) {
+        auto& pt = tgt[idx];
+        char cmd[128]; snprintf(cmd,sizeof(cmd),"MOVE_TO:%s:%.6f,%.6f,%.6f", g_arm.c_str(), pt[0], pt[1], pt[2]);
+        cout << "[Piper] Moving " << g_arm << " #" << (idx+1) << "/" << total << endl;
+        g_piper_busy = true;
+        if (!sendLineRaw(g_piper_sock, cmd)) { g_piper_busy = false; return ArmResult::ARM_ERROR; }
+        string resp, resp_arm; ArmPose pose;
+        if (!recvLine(g_piper_sock, resp, 60000)) { g_piper_busy = false; return ArmResult::ARM_ERROR; }
+        if (parsePoseResponse(resp, resp_arm, pose)) {
+            g_last_piper_pose = pose;
+            computeToolCcs(g_arm);
+            // 遮挡判定同步执行 (臂静止), 完成才置 READY 计时 (Master only)
+            runOcclusionCheck(g_arm, idx);
+            g_gaze_x = g_tool_ccs_pos.x; g_gaze_y = g_tool_ccs_pos.y; g_gaze_z = g_tool_ccs_pos.z;
+            g_gaze_ready = true; g_gaze_need_send = true;
+            g_piper_busy = false;
+            g_ready_since_us.store(nowUs());   // AutoMove: READY 计时起点
+            return ArmResult::ARM_OK;
+        }
+        if (resp.rfind("ERROR:",0) == 0) {
+            cout << "[Piper] SKIPPED #" << (idx+1) << " (no solution)" << endl;
+            idx++; updatePiperSentry();
+            continue;
+        }
+        cerr << "[Piper] Bad response: " << resp << endl;
+        g_piper_busy = false; return ArmResult::ARM_ERROR;
+    }
+    bool& done = (g_arm=="upper") ? g_upper_done : g_lower_done;
+    done = true; updatePiperSentry();
+    cout << "[Piper] " << g_arm << " all targets exhausted!" << endl;
+    g_piper_busy = false;
+    return ArmResult::ARM_EXHAUSTED;
+}
+
+// ================== Camera: instantTrigger ==================
+void instantTrigger() {
+    global_record_start_time = chrono::steady_clock::now();
+    g_exc_fatal=0; g_exc_error=0; g_exc_warn=0; g_exc_info=0;
+    for (auto& ctx : cam_ctxs) {
+        { lock_guard<mutex> lock(ctx->copy_mtx); while(!ctx->copy_queue.empty()) ctx->copy_queue.pop(); }
+        ctx->recorded_frames.store(0, memory_order_relaxed);
+        ctx->dump_ready.store(false, memory_order_relaxed);
+        ctx->recording.store(true, memory_order_release);
+        ctx->max_queue_size=0; ctx->first_recorded_block_id=-1; ctx->last_recorded_block_id=-1;
+        ctx->dropped_frames=0; ctx->prev_block_id=-1;
+        ctx->recover2ram_s=0; ctx->wait4disk_s=0; ctx->ram2disk_s=0;
+    }
+}
+
+// ================== Camera: copyWorker ==================
+void copyWorker(shared_ptr<CameraContext> ctx) {
+    while (ctx->running) {
+        pair<cv::Mat, FrameMeta> task;
+        { unique_lock<mutex> lock(ctx->copy_mtx);
+          ctx->copy_cv.wait(lock,[&]{return !ctx->copy_queue.empty()||!ctx->running;});
+          if (!ctx->running && ctx->copy_queue.empty()) break;
+          task=ctx->copy_queue.front(); ctx->copy_queue.pop(); }
+        // [Fix] 队列里的 Mat 已在回调内同步拷贝, 这里只做消费
+        { lock_guard<mutex> lock(ctx->frame_mtx); ctx->latest_frame=task.first; ctx->latest_meta=task.second; }
+    }
+}
+
+// ================== Camera: captureWorker ==================
+void captureWorker(shared_ptr<CameraContext> ctx, double fps, double gain, double gamma,
+                   double exp_time, bool use_hw_trigger, bool enable_offset) {
+    TriggerMode mode = use_hw_trigger ? TriggerMode::Hardware : TriggerMode::Software;
+    if (!ctx->cam.open(mode)) { ctx->status=CamStatus::ERROR_; ctx->copy_cv.notify_all(); return; }
+    ctx->is_mono = ctx->cam.isMono();
+    try { if(!use_hw_trigger) ctx->cam.setFrameRate(fps);
+          ctx->cam.setGain(gain); ctx->cam.setGamma(gamma); ctx->cam.setExposureTime(exp_time); } catch(...){}
+    struct GrabState { int64_t frame_counter=0; };
+    auto state=make_shared<GrabState>();
+    ctx->cam.setFrameCallback([ctx,state,use_hw_trigger,enable_offset](const Pylon::CBaslerUniversalGrabResultPtr& ptr, FrameMeta meta){
+        state->frame_counter++; ctx->status=CamStatus::STREAMING;
+        if(!ctx->offset_initialized && state->frame_counter>1){
+            if(use_hw_trigger||!enable_offset){ctx->frame_offset=0;ctx->offset_initialized=true;}
+            else{if(!CameraContext::master_set.exchange(true)){CameraContext::master_first_id=meta.blockID;ctx->frame_offset=0;ctx->offset_initialized=true;}
+            else{int retry=0;while(CameraContext::master_first_id==-1&&retry<100){this_thread::sleep_for(chrono::milliseconds(10));retry++;}
+            if(CameraContext::master_first_id!=-1){ctx->frame_offset=meta.blockID-CameraContext::master_first_id.load();ctx->offset_initialized=true;}}}
+        }
+        if(ctx->offset_initialized){
+            meta.blockID=meta.blockID-ctx->frame_offset;ctx->captured_frames++;
+            if (ctx->recording) {
+                int seq = ctx->recorded_frames.load(std::memory_order_relaxed);
+                if (seq < ctx->total_record_frames) {
+                    void* pBuffer = ptr->GetBuffer();
+                    size_t payload_size = ptr->GetWidth() * ptr->GetHeight();
+                    // 溢出防护 (保留)
+                    if (payload_size <= ctx->ram_buffer[seq].total() * ctx->ram_buffer[seq].elemSize()) {
+                        memcpy(ctx->ram_buffer[seq].data, pBuffer, payload_size);
+                        ctx->meta_buffer[seq] = meta;
+                        if (seq == 0) { ctx->first_recorded_block_id = meta.blockID; ctx->first_frame_time = chrono::steady_clock::now(); }
+                        ctx->last_recorded_block_id = meta.blockID;
+                        if (ctx->prev_block_id != -1) { int64_t diff = meta.blockID - ctx->prev_block_id; if (diff > 1) ctx->dropped_frames += (int)(diff - 1); }
+                        ctx->prev_block_id = meta.blockID;
+                        int next_seq = seq + 1;
+                        ctx->recorded_frames.store(next_seq, std::memory_order_relaxed);
+                        { lock_guard<mutex> lock(ctx->frame_mtx); ctx->latest_frame = ctx->ram_buffer[seq]; ctx->latest_meta = meta; }
+                        if (next_seq == ctx->total_record_frames) {
+                            ctx->recording = false;
+                            ctx->dump_ready = true;
+                            ctx->recording_end_time = chrono::steady_clock::now();
+                        }
+                    }
+                }
+                ctx->last_block_id.store(meta.blockID, memory_order_relaxed);
+                ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
+                ctx->has_streamed.store(true, memory_order_relaxed);
+            } else {
+                // [Fix] 回调内同步拷贝
+                cv::Mat temp(ptr->GetHeight(), ptr->GetWidth(), CV_8UC1, ptr->GetBuffer());
+                cv::Mat clone_img = temp.clone();
+                lock_guard<mutex> lock(ctx->copy_mtx);
+                if (ctx->copy_queue.size() < 2) { ctx->copy_queue.push({clone_img, meta}); ctx->copy_cv.notify_one(); }
+                ctx->last_block_id.store(meta.blockID, memory_order_relaxed);
+                ctx->last_frame_time.store(chrono::steady_clock::now(), memory_order_relaxed);
+                ctx->has_streamed.store(true, memory_order_relaxed);
+            }
+        }
+    });
+    if(!ctx->cam.start()){ctx->status=CamStatus::ERROR_;ctx->copy_cv.notify_all();return;}
+    ctx->status_msg=use_hw_trigger?"HW WAITING":"STREAMING";
+    while(ctx->running) this_thread::sleep_for(chrono::milliseconds(50));
+    ctx->cam.close();
+}
+
+// ================== UI (from hdf5_multi_process.cpp) ==================
+int getNextCalibCounter(const std::string& save_dir) {
+    int max_counter = -1;
+    if (!fs::exists(save_dir)) return 0;
+    for (auto& e : fs::directory_iterator(save_dir)) {
+        if (e.path().extension() == ".jpg") {
+            try { string stem = e.path().stem().string();
+                size_t last_underscore = stem.find_last_of('_');
+                if (last_underscore != string::npos) max_counter = max(max_counter, stoi(stem.substr(last_underscore + 1)));
+            } catch (...) {}
+        }
+    }
+    return max_counter + 1;
+}
+void updateLayout() {
+    g_left_w=g_win_h*2/5; g_right_x=g_left_w; g_right_w=g_win_w-g_left_w;
+    g_thumb_w=g_left_w/2; g_thumb_h=g_win_h/5;
+}
+void onMouse(int event, int x, int y, int, void*) {
+    if(event!=cv::EVENT_LBUTTONDOWN||x>=g_left_w) return;
+    int col=x/g_thumb_w, row=y/g_thumb_h, idx=row*2+col;
+    int n=(int)cam_ctxs.size();
+    if(idx>=0&&idx<n){int prev=g_enlarged_cam.load();g_enlarged_cam.store((prev==idx)?-1:idx);}
+}
+void renderThumbnailGrid(cv::Mat& canvas, int selected_idx, bool is_recording,
+                         const chrono::steady_clock::time_point& record_start_time, int total_record_frames) {
+    int n=(int)cam_ctxs.size();
+    for(int i=0;i<10;++i){int row=i/2,col=i%2;int x=col*g_thumb_w,y=row*g_thumb_h;cv::Rect roi(x,y,g_thumb_w,g_thumb_h);
+        if(i<n){cv::Mat local_raw;{lock_guard<mutex> lock(cam_ctxs[i]->frame_mtx);local_raw=cam_ctxs[i]->latest_frame;}
+            cv::Mat cell;if(!local_raw.empty()){if(cam_ctxs[i]->is_mono)cv::cvtColor(local_raw,cell,cv::COLOR_GRAY2RGB);else cv::cvtColor(local_raw,cell,cv::COLOR_BayerRG2RGB);
+                double scale=min((double)g_thumb_w/cell.cols,(double)g_thumb_h/cell.rows);int dw=(int)(cell.cols*scale),dh=(int)(cell.rows*scale);
+                cv::Mat resized;cv::resize(cell,resized,cv::Size(dw,dh));cell=cv::Mat::zeros(g_thumb_h,g_thumb_w,CV_8UC3);
+                int ox=(g_thumb_w-dw)/2,oy=(g_thumb_h-dh)/2;resized.copyTo(cell(cv::Rect(ox,oy,dw,dh)));}
+            else{cell=cv::Mat::zeros(g_thumb_h,g_thumb_w,CV_8UC3);int bl=0;cv::Size ts=cv::getTextSize(cam_ctxs[i]->status_msg,cv::FONT_HERSHEY_SIMPLEX,0.5,1,&bl);
+                cv::putText(cell,cam_ctxs[i]->status_msg,cv::Point((g_thumb_w-ts.width)/2,(g_thumb_h+ts.height)/2),cv::FONT_HERSHEY_SIMPLEX,0.5,cv::Scalar(0,255,255),1);}
+            if(is_recording){int r=6;cv::circle(cell,cv::Point(g_thumb_w-r*2,r*2),r,cv::Scalar(0,0,255),-1,cv::LINE_AA);
+                int cf=cam_ctxs[i]->recorded_frames.load(memory_order_relaxed);cv::putText(cell,to_string(cf)+"/"+to_string(total_record_frames),cv::Point(4,14),cv::FONT_HERSHEY_SIMPLEX,0.35,cv::Scalar(0,0,0),2);
+                cv::putText(cell,to_string(cf)+"/"+to_string(total_record_frames),cv::Point(4,14),cv::FONT_HERSHEY_SIMPLEX,0.35,cv::Scalar(0,255,0),1);}
+            string label=cam_ctxs[i]->id;int bl=0;cv::Size ts=cv::getTextSize(label,cv::FONT_HERSHEY_SIMPLEX,0.4,1,&bl);
+            cv::putText(cell,label,cv::Point((g_thumb_w-ts.width)/2,g_thumb_h-5),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(0,0,0),3);
+            cv::putText(cell,label,cv::Point((g_thumb_w-ts.width)/2,g_thumb_h-5),cv::FONT_HERSHEY_SIMPLEX,0.4,cv::Scalar(255,255,255),1);
+            cell.copyTo(canvas(roi));if(i==selected_idx)cv::rectangle(canvas,roi,cv::Scalar(0,255,0),2);}
+        else{canvas(roi)=cv::Scalar(0,0,0);}
+    }
+}
+// ================== i 键: 预创建 HDF5 (检查/创建, 由创建线程调用) ==================
+// 任一相机目录下已存在 .h5 → true (双机握手时双方各自检查)
+bool anyLocalH5() {
+    for (auto& ctx : cam_ctxs) {
+        if (!fs::exists(ctx->hdf5_dir)) continue;
+        try {
+            for (auto& e : fs::directory_iterator(ctx->hdf5_dir))
+                if (e.path().extension() == ".h5") return true;
+        } catch (...) {}   // 目录不可访问等异常 → 视为无 h5, 由后续创建失败暴露
+    }
+    return false;
+}
+
+// 数据集创建属性: 创建时即分配全部存储空间 (文件扩展到满尺寸),
+// 且不写填充值 (避免逐字节清零 9.7GB; 未写区域由 valid 数据集标记)
+H5::DSetCreatPropList allocEarlyPl() {
+    H5::DSetCreatPropList pl;
+    pl.setAllocTime(H5D_ALLOC_TIME_EARLY);
+    pl.setFillTime(H5D_FILL_TIME_NEVER);
+    return pl;
+}
+
+// 并行预创建 25×N 个 h5: 每相机一个子进程 (10 路; 进程内串行建该相机全部 chunk)。
+// HDF5 库默认非线程安全 → 同进程多线程开文件不可行; 子进程地址空间独立, 安全。
+// 进度: 轮询磁盘已存在文件数 → g_pre_done (UI 进度条实时刷新)。
+void precreateParallel() {
+    const int n_chunks = precreateChunkCount();
+    g_pre_total = (int)cam_ctxs.size() * n_chunks;
+    g_pre_done = 0;
+    char exe_path[MAX_PATH]; GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    string child_exe = fs::path(exe_path).parent_path().string() + "\\hdf5_multi_process_child.exe";
+    if (!fs::exists(child_exe)) {
+        cerr << "[HDF5] child exe missing (" << child_exe << ") — pre-create FAILED" << endl;
+        logException("ERROR", "hdf5:precreate", "child exe missing");
+        return;
+    }
+    HANDLE hJob = CreateJobObjectA(NULL, NULL);
+    if (hJob) { JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli{};
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli)); }
+    vector<PROCESS_INFORMATION> procs;
+    auto count_existing = [&]() {
+        int n = 0;
+        for (auto& ctx : cam_ctxs)
+            for (int ci = 0; ci < n_chunks; ++ci) {
+                stringstream pss; pss << ctx->hdf5_dir << "/" << setw(4) << setfill('0') << ci << ".h5";
+                if (fs::exists(pss.str())) ++n;
+            }
+        return n;
+    };
+    for (auto& ctx : cam_ctxs) {
+        stringstream args;
+        args << "\"hdf5_multi_process_child.exe\" --precreate \"" << ctx->hdf5_dir << "\" "
+             << n_chunks << " " << g_hdf5_chunk_capacity << " " << g_cam_h << " " << g_cam_w;
+        STARTUPINFOA si{sizeof(si)}; PROCESS_INFORMATION pi{};
+        string cmd_line = args.str();
+        if (CreateProcessA(child_exe.c_str(), &cmd_line[0], NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
+            procs.push_back(pi);
+        } else {
+            cerr << "[HDF5] spawn precreate child FAILED for " << ctx->hdf5_dir
+                 << " (err " << GetLastError() << ")" << endl;
+            logException("ERROR", "hdf5:precreate", "CreateProcess failed " + ctx->hdf5_dir);
+        }
+    }
+    vector<HANDLE> handles;
+    for (auto& p : procs) handles.push_back(p.hProcess);
+    while (!handles.empty()) {
+        g_pre_done = count_existing();                       // 进度 (250 次 stat, 微秒级)
+        DWORD w = WaitForMultipleObjects((DWORD)handles.size(), handles.data(), TRUE, 400);
+        if (w == WAIT_OBJECT_0) break;
+        if (!global_running) break;                          // 程序退出: JobObject 兜底杀子进程
+    }
+    g_pre_done = count_existing();
+    int failed = 0;
+    for (auto& p : procs) {
+        DWORD code = 0; GetExitCodeProcess(p.hProcess, &code);
+        if (code != 0) ++failed;
+        CloseHandle(p.hProcess);
+    }
+    if (hJob) CloseHandle(hJob);
+    cout << "[HDF5] Pre-create: " << (g_pre_done.load()) << "/" << g_pre_total.load()
+         << " files exist" << (failed ? " — WARN: " + to_string(failed) + " children FAILED" : "")
+         << endl;
+}
+
+void renderEnlargedView(cv::Mat& canvas, int cam_idx, bool is_recording,
+                        const chrono::steady_clock::time_point& record_start_time, int total_record_frames) {
+    cv::Rect right_roi(g_right_x,0,g_right_w,g_win_h);if(cam_idx<0||cam_idx>=(int)cam_ctxs.size()){canvas(right_roi)=cv::Scalar(0,0,0);return;}
+    cv::Mat local_raw;{lock_guard<mutex> lock(cam_ctxs[cam_idx]->frame_mtx);local_raw=cam_ctxs[cam_idx]->latest_frame;}
+    if(local_raw.empty()){canvas(right_roi)=cv::Scalar(0,0,0);return;}
+    cv::Mat img;if(cam_ctxs[cam_idx]->is_mono)cv::cvtColor(local_raw,img,cv::COLOR_GRAY2RGB);else cv::cvtColor(local_raw,img,cv::COLOR_BayerRG2RGB);
+    double scale=min((double)g_right_w/img.cols,(double)g_win_h/img.rows);int dw=(int)(img.cols*scale),dh=(int)(img.rows*scale);
+    cv::Mat resized;cv::resize(img,resized,cv::Size(dw,dh));int off_x=g_right_x+(g_right_w-dw)/2,off_y=(g_win_h-dh)/2;
+    if(is_recording){int r=14;cv::circle(resized,cv::Point(dw-r*2,r*2),r,cv::Scalar(0,0,255),-1,cv::LINE_AA);
+        cv::putText(resized,"REC",cv::Point(dw-r*10,r*3),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,0,255),2);
+        int cf=cam_ctxs[cam_idx]->recorded_frames.load(memory_order_relaxed);double es=chrono::duration<double>(chrono::steady_clock::now()-record_start_time).count();char b[64];
+        snprintf(b,sizeof(b),"%.1fs",es);cv::putText(resized,"Frame: "+to_string(cf)+"/"+to_string(total_record_frames),cv::Point(10,30),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,0,0),3);
+        cv::putText(resized,"Frame: "+to_string(cf)+"/"+to_string(total_record_frames),cv::Point(10,30),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,255,0),2);
+        cv::putText(resized,string(b),cv::Point(10,60),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,0,0),3);cv::putText(resized,string(b),cv::Point(10,60),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,255,0),2);
+        if(cf>10&&es>0.01){double fps=cf/es;char fb[32];snprintf(fb,sizeof(fb),"%.1f fps",fps);cv::putText(resized,string(fb),cv::Point(10,90),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,0,0),3);cv::putText(resized,string(fb),cv::Point(10,90),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(0,255,0),2);}}
+    canvas(right_roi)=cv::Scalar(0,0,0);resized.copyTo(canvas(cv::Rect(off_x,off_y,dw,dh)));
+}
+void showFaultOverlay(int faulty_cam, bool is_hw) {
+    cv::Mat canvas=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);int cx=g_win_w/2,y=g_win_h/2-80;
+    auto put=[&](int y,const string& t,double s,cv::Scalar c){int bl;cv::Size sz=cv::getTextSize(t,cv::FONT_HERSHEY_SIMPLEX,s,2,&bl);cv::putText(canvas,t,cv::Point(cx-sz.width/2,y),cv::FONT_HERSHEY_SIMPLEX,s,c,2);};
+    put(y,"CAMERA FAULT DETECTED",1.0,cv::Scalar(0,0,255));y+=40;
+    string ci="Camera: "+(faulty_cam>=0&&faulty_cam<(int)cam_ctxs.size()?cam_ctxs[faulty_cam]->id:"?")+" (index "+to_string(faulty_cam)+")";put(y,ci,0.7,cv::Scalar(255,255,255));y+=30;
+    put(y,string("Host: ")+(g_fault_on_master.load()?"MASTER":"SLAVE"),0.7,cv::Scalar(255,255,255));y+=30;
+    auto uptime_s=chrono::duration<double>(g_fault_time-g_ready_time).count();int h=(int)uptime_s/3600,m=((int)uptime_s%3600)/60;char ub[64];snprintf(ub,sizeof(ub),"Uptime: %dh %dm",h,m);put(y,string(ub),0.7,cv::Scalar(255,255,255));y+=40;
+    put(y,"All cameras stopped. Press ESC to exit both hosts.",0.6,cv::Scalar(0,255,255));cv::imshow("Multi-Cam Preview",canvas);cv::waitKey(1);
+}
+
+// ================== HDF5 Sentry ==================
+static void initSentry(const string& root) {
+    fs::create_directories(root);
+    string sp=root+"/sentry.txt";
+    if(fs::exists(sp)){ifstream in(sp);int fo;in>>g_chunk_idx>>fo;g_frame_offset=fo;}
+    else{g_chunk_idx=0;g_frame_offset=0;ofstream out(sp);out<<"0\n0\n";}
+}
+static void updateSentry(const string& root) {
+    string sp=root+"/sentry.txt"; ofstream out(sp);
+    out<<g_chunk_idx<<"\n"<<g_frame_offset<<"\n";
+}
+// 'z' 回退一次录制: 只把写盘位置 (chunk/offset) 退回 core_frames 帧并落盘 sentry;
+// h5 文件不删 — 下一次录制同槽覆写 (raw_image/gaze_target/valid/occ_joints 全部重写)。
+// 进度/OVER/断点续录均由 (chunk,offset) 派生, 回退即全局生效 (UI 右上角自动同步)。
+static bool rollbackH5Sentry() {
+    if ((int64_t)g_chunk_idx * g_hdf5_chunk_capacity + g_frame_offset.load() < g_core_frames)
+        return false;                                  // 尚无一次完整录制可退
+    g_frame_offset.store(g_frame_offset.load() - g_core_frames);
+    if (g_frame_offset.load() < 0) {                    // 跨 chunk 回退
+        g_chunk_idx -= 1;
+        g_frame_offset.store(g_frame_offset.load() + g_hdf5_chunk_capacity);
+    }
+    updateSentry(g_sentry_root);
+    return true;
+}
+
+// ================== Cmd worker (TCP command channel) ==================
+void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    if (is_master) {
+        g_cmd_listen_sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); if(g_cmd_listen_sock==INVALID_SOCKET) return;
+        int opt=1;setsockopt(g_cmd_listen_sock,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
+        sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(cmd_port);sa.sin_addr.s_addr=INADDR_ANY;
+        ::bind(g_cmd_listen_sock,(sockaddr*)&sa,sizeof(sa));listen(g_cmd_listen_sock,1);
+        {DWORD to=500;setsockopt(g_cmd_listen_sock,SOL_SOCKET,SO_RCVTIMEO,(const char*)&to,sizeof(to));}  // accept 可中断
+        cout<<"[Cmd] Master listening TCP ::"<<cmd_port<<endl;
+        while(global_running){sockaddr_in ca;socklen_t cl=sizeof(ca);
+            g_cmd_sock=accept(g_cmd_listen_sock,(sockaddr*)&ca,&cl);
+            if(g_cmd_sock==INVALID_SOCKET){if(!global_running)break;continue;}  // 超时轮询, 退出时结束
+            cout<<"[Cmd] Slave connected. Handshaking..."<<endl;
+            string hl; if(recvLine(g_cmd_sock,hl,10000)&&hl=="READY"){sendLineRaw(g_cmd_sock,"ACK");cout<<"[Cmd] Handshake OK."<<endl;}
+            else{cerr<<"[Cmd] Handshake FAILED (recv:'"<<hl<<"'). Reconnecting..."<<endl;closesocket(g_cmd_sock);g_cmd_sock=INVALID_SOCKET;continue;}
+            while(global_running){
+                string line;
+                int st=recvLineStatus(g_cmd_sock,line,500);
+                if(st==2){cerr<<"[Cmd] Slave disconnected - re-accepting."<<endl;break;}  // 真断连 → 重新 accept
+                if(st==1)continue;  // 500ms 轮询超时
+                if(line.rfind("HDF5_DONE:",0)==0){g_slave_hdf5_done=true;g_slave_hdf5_s=atof(line.c_str()+10);cout<<"[Cmd] Slave HDF5 done ("<<g_slave_hdf5_s<<"s)."<<endl;}
+                else if(line=="PRECHECK_CLEAR"){g_pre_peer_clear=true;cout<<"[Cmd] Slave pre-check clear (no h5)."<<endl;}
+                else if(line=="PRECHECK_BLOCKED"){g_pre_peer_reject=true;cout<<"[Cmd] Slave has existing h5 — pre-create aborted."<<endl;}
+                else if(line=="PRECREATE_DONE"){g_pre_peer_done=true;cout<<"[Cmd] Slave pre-create done."<<endl;}
+                else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){
+                    if(line.length()<=7) continue;
+                    char hf=line[6]; int fi=stoi(line.substr(7));
+                    if(fi<0||fi>=(int)cam_ctxs.size()) continue;
+                    cout<<"[Fault] Received from SLAVE: cam "<<fi<<endl;
+                    g_fault_time=chrono::steady_clock::now();
+                    g_fault_active.store(true);g_faulty_cam.store(fi);g_fault_on_master.store(false);
+                    for(auto& c:cam_ctxs){c->running=false;c->copy_cv.notify_all();}
+                    for(auto& c:cam_ctxs){if(c->capture_thread.joinable())c->capture_thread.join();if(c->copy_thread.joinable())c->copy_thread.join();}
+                    cout<<"[Fault] All cameras stopped. Press ESC to exit."<<endl;
+                }
+            }
+            closesocket(g_cmd_sock);g_cmd_sock=INVALID_SOCKET;
+        }
+    } else {
+        while(global_running){
+            g_cmd_sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); if(g_cmd_sock==INVALID_SOCKET){this_thread::sleep_for(chrono::seconds(2));continue;}
+            sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(cmd_port);inet_pton(AF_INET,master_ip.c_str(),&sa.sin_addr);
+            if(connect(g_cmd_sock,(sockaddr*)&sa,sizeof(sa))!=0){closesocket(g_cmd_sock);g_cmd_sock=INVALID_SOCKET;this_thread::sleep_for(chrono::seconds(2));continue;}
+            cout<<"[Cmd] Slave connected. Handshaking..."<<endl;
+            if(!sendLineRaw(g_cmd_sock,"READY")){closesocket(g_cmd_sock);g_cmd_sock=INVALID_SOCKET;continue;}
+            string hl; if(!recvLine(g_cmd_sock,hl,10000)||hl!="ACK"){closesocket(g_cmd_sock);g_cmd_sock=INVALID_SOCKET;continue;}
+            cout<<"[Cmd] Handshake OK."<<endl;
+            while(global_running){
+                string line;
+                int st=recvLineStatus(g_cmd_sock,line,300000);
+                if(st==2){cerr<<"[Cmd] Connection closed by Master - reconnecting."<<endl;break;}  // 真断连 → 重连, 不退出
+                if(st==1)continue;  // 空闲超时 → 继续等待
+                if(line=="INIT_OK"){g_init_ok=true;cout<<"[Cmd] Received INIT_OK from Master."<<endl;}
+                else if(line.rfind("OCCL:",0)==0){
+                    // Master 的遮挡判定结果 (被遮挡 SN 逗号表; 空 = 本目标无遮挡)
+                    lock_guard<mutex> lk(g_occ_mtx);
+                    g_occ_occluded.clear();
+                    stringstream ss(line.substr(5)); string sn;
+                    int n = 0;
+                    while (getline(ss, sn, ',')) if (!sn.empty()) { g_occ_occluded.insert(sn); ++n; }
+                    g_occ_last_line = "Occluded: " + to_string(n) + "/20 (Master judged)";
+                    cout << "[Cmd] OCCL: " << n << " cams occluded (Master judged)" << endl;
+                }
+                else if(line.rfind("PIPER:",0)==0){
+                    size_t c2=line.find(':',6); if(c2==string::npos) continue;
+                    string an=line.substr(6,c2-6);
+                    if(an=="active"){ g_arm=line.substr(c2+1); cout<<"[Cmd] PIPER active="<<g_arm<<endl; }
+                    else {
+                        int n=stoi(line.substr(c2+1,line.find(':',c2+1)-c2-1));
+                        string st=line.substr(line.find_last_of(':')+1); bool d=(st=="done");
+                        if(an=="upper"){g_upper_idx=n;g_upper_done=d;} else {g_lower_idx=n;g_lower_done=d;}
+                        cout<<"[Cmd] PIPER: "<<an<<" idx="<<n<<" "<<(d?"done":"ok")<<endl;
+                    }
+                    // Recompute exhausted based on current active arm
+                    bool& cd=(g_arm=="upper")?g_upper_done:g_lower_done; g_show_exhausted=cd;
+                }
+                else if(line=="GAZE_DONE"){g_gaze_done=true;cout<<"[Cmd] Received GAZE_DONE from Master."<<endl;}
+                else if(line=="SENTRY_RB"){
+                    // Master 'z' 回退一次录制: 同步回退本机写盘位置 (READY 期到达, 与 dump 无并发)
+                    if(rollbackH5Sentry())
+                        cout<<"[Cmd] SENTRY_RB: h5 rolled back -> chunk="<<g_chunk_idx
+                            <<" offset="<<g_frame_offset.load()<<endl;
+                    else cout<<"[Cmd] SENTRY_RB ignored: no completed recording"<<endl;}
+                else if(line=="PRECHECK_REQ"){   // master 请求预检 → 回复本机是否有 h5
+                    bool has=anyLocalH5();
+                    sendLineRaw(g_cmd_sock,has?"PRECHECK_BLOCKED":"PRECHECK_CLEAR");
+                    cout<<"[Cmd] PRECHECK_REQ -> "<<(has?"BLOCKED":"CLEAR")<<endl;}
+                else if(line=="PRECREATE_BEGIN"){   // master 令开始创建 → 独立线程, 完成后回报
+                    g_pre_phase=2;g_precreating=true;g_pre_local_done=false;
+                    if(g_pre_thread.joinable())g_pre_thread.join();
+                    g_pre_thread=thread([]{precreateParallel();g_pre_local_done=true;sendLineRaw(g_cmd_sock,"PRECREATE_DONE");});
+                    cout<<"[Cmd] Pre-create started on slave."<<endl;}
+                else if(line=="TRIGGER"){instantTrigger();net_cmd_record=true;}
+                else if(line.rfind("FAULT:",0)==0&&!g_fault_active.load()){
+                    if(line.length()<=7) continue;
+                    char hf=line[6]; int fi=stoi(line.substr(7));
+                    if(fi<0||fi>=(int)cam_ctxs.size()) continue;
+                    cout<<"[Slave] Fault from MASTER: cam "<<fi<<endl;
+                    g_fault_time=chrono::steady_clock::now();
+                    g_fault_active.store(true);g_faulty_cam.store(fi);g_fault_on_master.store(true);
+                    for(auto& c:cam_ctxs){c->running=false;c->copy_cv.notify_all();}
+                    for(auto& c:cam_ctxs){if(c->capture_thread.joinable())c->capture_thread.join();if(c->copy_thread.joinable())c->copy_thread.join();}
+                    cout<<"[Fault] All cameras stopped. Press ESC to exit."<<endl;
+                }
+                else if(line=="EXIT"){cout<<"[Slave] Received EXIT."<<endl;global_running=false;}
+            }
+            closesocket(g_cmd_sock);g_cmd_sock=INVALID_SOCKET;
+            if(!global_running) break;
+            this_thread::sleep_for(chrono::seconds(1));
+        }
+    }
+    if(g_cmd_listen_sock!=INVALID_SOCKET){closesocket(g_cmd_listen_sock);g_cmd_listen_sock=INVALID_SOCKET;}
+    if(g_cmd_sock!=INVALID_SOCKET){closesocket(g_cmd_sock);g_cmd_sock=INVALID_SOCKET;}
+}
+
+// ================== Session report ==================
+void writeReport(const string& timestr, int rec_num, int total_frames, bool hw_trigger) {
+    if (!g_session_log.is_open()) return;
+    g_session_log << "\n---\n\n"
+                  << "## Recording #" << rec_num << ": " << timestr << "\n\n"
+                  << "- **Cameras**: " << cam_ctxs.size() << "\n"
+                  << "- **Trigger**: " << (hw_trigger ? "HW" : "SW") << "\n"
+                  << "- **Total frames**: " << total_frames << "\n\n";
+
+    // Per-Camera Metrics
+    g_session_log << "### Per-Camera Metrics\n\n";
+    g_session_log << "| # | SN | Type | Saved | Drop | FPS | QPeak | Lat(ms) | Rec2RAM(s) | Delay(s) |"
+                  << " ArmStage(s) | M-HDF5(s) | S-HDF5(s) |\n";
+    g_session_log << "|---|-----|------|-------|------|-----|-------|---------|------------|----------|"
+                  << "------------|-----------|-----------|\n";
+    g_session_log << "|   |     | mono/color | 实际保存帧数 | BlockID跳变丢帧 | 平均帧率 | 队列峰值/总帧数 | 首帧触发延迟 | RAM写完-理论完成 | SPACE→触发延迟 |"
+                  << " 并行阶段墙钟 | Master HDF5写入 | Slave HDF5写入 |\n";
+
+    double theoretical_s = total_frames / 200.0;
+    for (auto& ctx : cam_ctxs) {
+        int saved = ctx->recorded_frames.load();
+        int dropped = ctx->dropped_frames.load();
+        double fps = 0.0;
+        if (saved > 1) {
+            double dur_s = (ctx->meta_buffer[saved-1].timestamp - ctx->meta_buffer[0].timestamp) / 10000000.0;
+            if (dur_s > 0) fps = (saved - 1) / dur_s;
+        }
+        double actual_ram_s = chrono::duration<double>(ctx->recording_end_time - ctx->first_frame_time).count();
+        ctx->recover2ram_s = actual_ram_s - theoretical_s;
+        double lat_ms = ctx->first_frame_time.time_since_epoch().count() > 0
+            ? chrono::duration<double,milli>(ctx->first_frame_time - global_record_start_time).count() : 0.0;
+
+        // S-HDF5: slave side has direct measurement; master gets it from HDF5_DONE message
+        double show_shdf5 = g_slave_hdf5_s > 0 ? g_slave_hdf5_s : 0.0;
+        double show_mhdf5 = g_master_hdf5_s > 0 ? g_master_hdf5_s : 0.0;
+
+        g_session_log << "| " << ctx->index << " | " << ctx->id << " | "
+                      << (ctx->is_mono?"mono":"color") << " | "
+                      << saved << " | " << dropped << " | "
+                      << fixed << setprecision(1) << fps << " | "
+                      << ctx->max_queue_size.load() << "/" << total_frames << " | "
+                      << fixed << setprecision(1) << lat_ms << " | "
+                      << fixed << setprecision(3) << ctx->recover2ram_s << " | "
+                      << fixed << setprecision(3) << g_last_delay_s << " | "
+                      << g_arm_stage_s << " | " << show_mhdf5 << " | " << show_shdf5 << " |\n";
+    }
+
+    // Summary
+    g_session_log << "\n### Summary\n\n";
+    g_session_log << "| Metric | Value | Note |\n";
+    g_session_log << "|--------|-------|------|\n";
+    g_session_log << "| ARM stage | " << fixed << setprecision(2) << g_arm_stage_s << " s | Par. wall clock (arm || HDF5) |\n";
+    g_session_log << "| Delay | " << fixed << setprecision(3) << g_last_delay_s << " s | SPACE→录制触发 (受试者聚焦十字中心) |\n";
+    g_session_log << "| Master HDF5 write | " << g_master_hdf5_s << " s | WaitForMultipleObjects |\n";
+    g_session_log << "| Slave HDF5 write | " << g_slave_hdf5_s << " s | WaitForMultipleObjects (via TCP) |\n";
+    double max_hdf5 = max(g_master_hdf5_s, g_slave_hdf5_s);
+    g_session_log << "| Max HDF5 write | " << max_hdf5 << " s | max(Master, Slave) |\n";
+    g_session_log << "| Wait Slave HDF5_DONE | " << g_wait_slave_hdf5_s << " s | Master idle wait for Slave |\n";
+    g_session_log << "| GAZE forward | " << g_gaze_forward_s << " s | GAZE tx + GAZE_ACK + GAZE_DONE |\n";
+    g_session_log << "| Sentry sync | " << g_sentry_sync_s << " s | TCP handshake port+300 |\n";
+    g_session_log << "| End-to-end | " << g_recording_end_to_end_s << " s | SPACE→SPACE-ready (delay+record+arm&h5+sync) |\n";
+    int ef=g_exc_fatal.load(), ee=g_exc_error.load(), ew=g_exc_warn.load(), ei=g_exc_info.load();
+    auto b=[](int v){return v>0?"**"+to_string(v)+"**":to_string(v);};
+    g_session_log << "| exceptions_fatal | "<<b(ef)<<" | FATAL count |\n";
+    g_session_log << "| exceptions_error | "<<b(ee)<<" | ERROR count |\n";
+    g_session_log << "| exceptions_warn  | "<<b(ew)<<" | WARN count |\n";
+    g_session_log << "| exceptions_info  | "<<b(ei)<<" | INFO count |\n";
+    { // 本目标遮挡判定 (Master 判定, valid 整段写 0 的相机)
+      lock_guard<mutex> lk(g_occ_mtx);
+      g_session_log << "| occluded cams | " << g_occ_occluded.size()
+                    << " | 臂入画面判定 (本目标 valid=0) |\n";
+      if (!g_occ_occluded.empty()) {
+          string sns; for (auto& sn : g_occ_occluded) sns += (sns.empty()?"":" ") + sn;
+          g_session_log << "| occluded SNs | " << sns << " | |\n";
+      }
+    }
+    g_session_log << defaultfloat << flush;
+}
+
+// ================== main ==================
+// participant_id → day_id (cfg/day_participant_map.json; JSON 是 YAML 子集)
+string findDayForParticipant(const string& json_path, const string& participant) {
+    try {
+        YAML::Node root = YAML::LoadFile(json_path);
+        for (YAML::const_iterator it = root.begin(); it != root.end(); ++it) {
+            string day = it->first.as<string>();
+            for (size_t i = 0; i < it->second.size(); ++i)
+                if (it->second[i].as<string>() == participant) return day;
+        }
+    } catch (const std::exception& e) {
+        cerr << "[Piper] Failed to parse " << json_path << ": " << e.what() << endl;
+    }
+    return "";
+}
+
+int main() {
+    _putenv("HDF5_USE_FILE_LOCKING=FALSE");
+    // 安装时间戳输出 (所有 cout/cerr 行自动加 [YYYY-MM-DD HH:MM:SS] 前缀)
+    static TimestampBuf tsb_out(cout.rdbuf());
+    static TimestampBuf tsb_err(cerr.rdbuf());
+    cout.rdbuf(&tsb_out);
+    cerr.rdbuf(&tsb_err);
+    cout<<"=== [TEST] Multi-Basler Camera Tool (Sync Network Node + Piper) ==="<<endl;
+#ifdef _WIN32
+    WSADATA wsa; WSAStartup(MAKEWORD(2,2),&wsa);
+#endif
+    // ---- Load config ----
+    auto cfg_dir = (fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path()/"cfg").string();
+    Cfg cfg_cap(cfg_dir+"/capture.yaml");
+    auto& cap=cfg_cap["capture"];
+    Pylon::PylonInitialize();
+    g_participant_roots=cap["participant_root"].as<vector<string>>();
+    string participant_id; try{participant_id=cap["participant_id"].as<string>();}catch(...){participant_id="P001";}
+    g_participant_id=participant_id;
+    for(auto& r:g_participant_roots) r+="/"+participant_id;
+    g_sentry_root=g_participant_roots[0];
+    try{g_hdf5_chunk_capacity=cap["hdf5_chunk_frame_capacity"].as<int>();}catch(...){}
+    g_is_master=cap["is_master"].as<bool>();
+    g_master_ip=cap["master_ip"].as<string>();
+    string slave_ip=cap["slave_ip"].as<string>();
+    int net_port=cap["port"].as<int>();
+    int joints_port=net_port+500;                       // joints 专用端口 (遮挡判定关节 → Slave h5)
+    try{joints_port=cap["joints_port"].as<int>();}catch(...){}
+    vector<string> camera_ids=cap["cam_indices"].as<vector<string>>();
+    bool use_hw_trigger=cap["hardware_trigger"].as<bool>();
+    bool enable_offset=true, enable_intersection=true, enable_net_sync=true;
+    try{enable_offset=cap["enable_offset"].as<bool>();enable_intersection=cap["enable_intersection"].as<bool>();
+        enable_net_sync=cap["enable_net_sync"].as<bool>();}catch(...){}
+    // AutoMove / OVER 配置
+    try{g_enable_auto_move=cap["enable_auto_move"].as<bool>();}catch(...){}
+    try{g_click_window=cap["click_window"].as<double>();}catch(...){}
+    try{g_num_targets_per_arm=cap["num_targets_per_arm"].as<int>();}catch(...){}
+    if(g_num_targets_per_arm<=0){g_num_targets_per_arm=250;cout<<"[Cfg] num_targets_per_arm<=0, default 250"<<endl;}    try{g_capture_delay=cap["capture_delay"].as<double>();}catch(...){}
+    double target_fps=cap["fps"].as<double>(), gain=cap["gain"].as<double>();
+    double gammav=cap["gamma"].as<double>(), exp_time=cap["exposure_time"].as<double>();
+    g_win_w=cap["window_width"].as<int>(); g_win_h=cap["window_height"].as<int>();
+    double record_time=cap["record_time"].as<double>();
+    int cam_w=cap["cam_width"].as<int>(), cam_h=cap["cam_height"].as<int>();
+    g_cam_w=cam_w; g_cam_h=cam_h;
+    int core_frames=(int)ceil(target_fps*record_time);
+    g_core_frames=core_frames;                          // 每臂进度推导用 (armRecorded)
+    g_frames_per_arm=(int64_t)g_num_targets_per_arm*core_frames;   // 配额帧数 = 录制次数 × 每录帧数
+    double margin_ratio=cap["margin_frames_ratio"].as<double>();
+    int margin_frames=(int)ceil(core_frames*margin_ratio);
+    int total_record_frames=core_frames+2*margin_frames;
+    bool is_master_pc=g_is_master;
+    g_use_hw_trigger=use_hw_trigger;
+
+    // ---- 配置打印: 输入/输出目录 ----
+    cout<<"\n--- Data Directories ---"<<endl;
+    cout<<"Participant ID   : "<<participant_id<<endl;
+    for(size_t i=0;i<g_participant_roots.size();++i)
+        cout<<"ParticipantRoot["<<i<<"]: "<<g_participant_roots[i]<<endl;
+    cout<<"Sentry root      : "<<g_sentry_root<<endl;
+    cout<<"HDF5 chunk cap   : "<<g_hdf5_chunk_capacity<<endl;
+    cout<<"Cameras          : "<<camera_ids.size()<<endl;
+    // 版本指纹: 编译时刻 (区分运行进程与最新编译产物 — 排查"编译了但没跑新版")
+    cout<<"BUILD            : "<<__DATE__<<" "<<__TIME__<<endl;
+    cout<<"----------------------------------\n"<<endl;
+
+    cout<<"\n--- Network Sync Configuration ---"<<endl;
+    cout<<"Role             : "<<(is_master_pc?"MASTER (Sender)":"SLAVE (Receiver)")<<endl;
+    cout<<"Master IP        : "<<g_master_ip<<endl;
+    cout<<"Slave IP         : "<<slave_ip<<endl;
+    cout<<"Port             : "<<net_port<<endl;
+    cout<<"HW Trigger       : "<<(use_hw_trigger?"ON":"OFF")<<endl;
+    cout<<"SW Offset Init   : "<<(enable_offset?"ON":"OFF")<<endl;
+    cout<<"Intersection Crop: "<<(enable_intersection?"ON":"OFF")<<endl;
+    cout<<"Net Sync         : "<<(enable_net_sync?"ON":"OFF (Local Mode)")<<endl;
+    cout<<"Auto Move        : "<<(g_enable_auto_move?"ON":"OFF");
+    if(g_enable_auto_move) cout<<" (click window "<<g_click_window<<"s)";
+    cout<<endl;
+    cout<<"Recordings/arm   : "<<recordingsPerArm()<<" ("<<g_num_targets_per_arm
+        <<" x "<<g_core_frames<<" frames = "<<g_frames_per_arm<<")"<<endl;
+    cout<<"Capture Delay    : "<<g_capture_delay<<"s"<<endl;
+    cout<<"----------------------------------\n"<<endl;
+
+    // ---- Piper config (Master only) ----
+    string ubuntu_ip; int ctrl_port=49301, gaze_port=49302;
+    if (is_master_pc) {
+        Cfg cfg_piper(cfg_dir+"/piper.yaml");
+        ubuntu_ip=cfg_piper["network"]["ubuntu_ip"].as<string>();
+        ctrl_port=cfg_piper["network"]["ctrl_port"].as<int>();
+        try{gaze_port=cfg_piper["network"]["gaze_port"].as<int>();}catch(...){gaze_port=49302;}
+        g_gaze_dir="cfg/gaze_target/"+participant_id;
+        auto readPt3=[](const CfgNode& n)->Pt3{return{n[0].as<double>(),n[1].as<double>(),n[2].as<double>()};};
+        // 位姿从 cfg/arm_pose/{day_id}.yaml 加载 (day_id 由 participant_id 经 day_participant_map.json 映射, 不再是 piper.yaml)
+        string day_id=findDayForParticipant(cfg_dir+"/day_participant_map.json",participant_id);
+        string arm_pose_yml=cfg_dir+"/arm_pose/"+day_id+".yaml";
+        if(!day_id.empty()&&fs::exists(arm_pose_yml)){
+            g_arm_pose_yml="cfg/arm_pose/"+day_id+".yaml";   // UI 水印用相对路径 (从 cfg 开始)
+            Cfg cfg_pose(arm_pose_yml);
+            for (auto& an:{"upper","lower"}) {
+                try{auto& a=cfg_pose["arms"][an];auto& tl=a["tool"];auto& cc=a["arm_in_ccs"];
+                    auto& xf=(an==string("upper"))?g_xf_upper:g_xf_lower;
+                    xf.tool_t=readPt3(tl["translation"]);xf.tool_r=readPt3(tl["rotation_zxz"]);
+                    xf.ccs_t=readPt3(cc["translation"]);xf.ccs_r=readPt3(cc["rotation_zxz"]);}
+                catch(...){cerr<<"[Piper] WARN: cannot load "<<an<<" transform from "<<arm_pose_yml<<endl;}
+            }
+            cout<<"[Piper] Arm transforms loaded from "<<arm_pose_yml<<" (day "<<day_id<<")"<<endl;
+        }else{
+            cerr<<"[Piper] WARN: no arm_pose yaml for participant "<<participant_id
+                <<" — check cfg/day_participant_map.json. Transforms NOT loaded."<<endl;
+        }
+        // 遮挡检测资源加载 (Master only; Slave 经 OCCL 消息接收判定结果)
+        // 自检失败 = 遮挡判定无从谈起 → fail-fast 退出, 不允许带病采集 (旧版仅告警停用,
+        // 停用期数据 valid 恒 1 且无法离线验证, P001 重采教训)
+        if (!occSetup(cfg_dir, day_id)) {
+            cerr << "\n[Occ] FATAL: occlusion setup failed — check:"
+                 << "\n    1. cam_calib.yaml calib_save_dir / day XMLs (20 cams)"
+                 << "\n    2. piper URDF + meshes"
+                 << "\n    3. cfg/arm_pose/" << day_id << ".yaml"
+                 << "\nFix and restart. Exiting." << endl;
+            return 1;
+        }
+        g_occ_enabled = true;
+        auto loadTgts=[&](const string& path)->vector<array<double,3>>{
+            vector<array<double,3>> out; ifstream in(path); string line;
+            while(getline(in,line)){if(line.empty())continue;stringstream ss(line);string token;array<double,3>pt{};
+                for(int i=0;i<3&&getline(ss,token,',');++i)try{pt[i]=stod(token);}catch(...){break;}out.push_back(pt);}return out;};
+        g_targets_upper=loadTgts(g_gaze_dir+"/piper_upper.txt");
+        g_targets_lower=loadTgts(g_gaze_dir+"/piper_lower.txt");
+        string sp=g_gaze_dir+"/sentry.txt";
+        if (ifstream sf(sp);sf) {string line;while(getline(sf,line)){
+            if(line.rfind("upper:",0)==0)g_upper_idx=stoi(line.substr(6));
+            if(line.rfind("lower:",0)==0)g_lower_idx=stoi(line.substr(6));}}
+        g_upper_done=(g_upper_idx>=(int)g_targets_upper.size());
+        g_lower_done=(g_lower_idx>=(int)g_targets_lower.size());
+        cout<<"[Piper] Targets: upper="<<g_targets_upper.size()<<" idx="<<g_upper_idx
+            <<(g_upper_done?" DONE":"")<<" lower="<<g_targets_lower.size()<<" idx="<<g_lower_idx
+            <<(g_lower_done?" DONE":"")<<endl;
+
+        // ---- M5Stack 状态灯串口 (cfg/M5Stack.yaml: upper/lower COM) ----
+        try {
+            Cfg cfg_led(cfg_dir+"/M5Stack.yaml");
+            string led_upper=cfg_led["ports"]["upper"].as<string>();
+            string led_lower=cfg_led["ports"]["lower"].as<string>();
+            int led_baud=115200;
+            try{led_baud=cfg_led["serial"]["baud_rate"].as<int>();}catch(...){}
+            openLedSerial(g_led_upper, led_upper, led_baud);
+            openLedSerial(g_led_lower, led_lower, led_baud);
+            // 初始状态同步: 两块设备各自 INIT
+            sendLedPatternTo(g_led_upper, LedState::PIPER_INIT);
+            sendLedPatternTo(g_led_lower, LedState::PIPER_INIT);
+        } catch (...) {
+            cerr<<"[M5Stack] cfg/M5Stack.yaml load failed — LED disabled."<<endl;
+        }
+    }
+
+    // ====== TCP handshakes (sequential, one port at a time, before camera init) ======
+    thread cmd_thread, gaze_thread, joints_thread;
+    atomic<bool> cmd_ready{false}, gaze_ready{false};
+
+    if (enable_net_sync) {
+        int cmd_port=net_port+400;
+        // 1. Cmd channel
+        cout<<"[Cmd] Starting TCP command channel on port "<<cmd_port<<"..."<<endl;
+        cmd_thread=thread(cmdWorker, is_master_pc, g_master_ip, cmd_port);
+        while (!cmd_ready.load() && global_running) {
+            if (g_cmd_sock != INVALID_SOCKET) cmd_ready = true;
+            else this_thread::sleep_for(chrono::milliseconds(100));
+        }
+        if (!cmd_ready) { cerr<<"[Cmd] FATAL: Command channel failed."<<endl;
+            if(is_master_pc){global_running=false;if(cmd_thread.joinable())cmd_thread.join();}return 1; }
+        cout<<"[Cmd] Command channel established."<<endl;
+
+        // 2. Gaze channel
+        cout<<"[Gaze] Starting gaze channel on port "<<gaze_port<<"..."<<endl;
+        if (is_master_pc) gaze_thread=thread(gazeServerWorker, gaze_port);
+        else gaze_thread=thread(gazeClientWorker, g_master_ip, gaze_port);
+        while (!gaze_ready.load() && global_running) {
+            if (g_gaze_connected.load()) gaze_ready = true;
+            if (!gaze_ready) this_thread::sleep_for(chrono::milliseconds(100));
+        }
+        if (!gaze_ready) { cerr<<"[Gaze] FATAL: Gaze channel failed."<<endl;
+            if(is_master_pc&&g_cmd_sock!=INVALID_SOCKET)sendLineRaw(g_cmd_sock,"EXIT");
+            global_running=false;if(cmd_thread.joinable())cmd_thread.join();return 1; }
+        cout<<"[Gaze] Gaze channel established."<<endl;
+
+        // 3. Joints channel (遮挡判定关节 → Slave h5 occ_joints; 与 cmd 控制流隔离)
+        cout<<"[Joints] Starting joints channel on port "<<joints_port<<"..."<<endl;
+        if (is_master_pc) joints_thread=thread(jointsServerWorker, joints_port);
+        else joints_thread=thread(jointsClientWorker, g_master_ip, joints_port, cfg_dir);
+    }
+
+    // 3. Piper connection (Master only, with retry)
+    if (is_master_pc) {
+        cout<<"[Piper] Connecting to Ubuntu "<<ubuntu_ip<<":"<<ctrl_port<<"..."<<endl;
+        bool piper_ok = false;
+        for (int retry = 0; retry < 30 && global_running; ++retry) {
+            g_piper_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (g_piper_sock == INVALID_SOCKET) { this_thread::sleep_for(chrono::seconds(2)); continue; }
+            sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(ctrl_port);
+            inet_pton(AF_INET, ubuntu_ip.c_str(), &sa.sin_addr);
+            if (connect(g_piper_sock, (sockaddr*)&sa, sizeof(sa)) == 0) {
+                piper_ok = true; break;
+            }
+            cerr << "[Piper] Connect attempt " << (retry+1) << "/30 failed, retrying..." << endl;
+            closesocket(g_piper_sock); g_piper_sock = INVALID_SOCKET;
+            this_thread::sleep_for(chrono::seconds(2));
+        }
+        if (!piper_ok) {
+            cerr << "[Piper] FATAL: Cannot connect to Ubuntu after 30 attempts." << endl;
+            if (enable_net_sync && g_cmd_sock != INVALID_SOCKET)
+                sendLineRaw(g_cmd_sock, "EXIT");  // tell Slave to exit
+            return 1;
+        }
+        cout<<"[Piper] Connected to Ubuntu."<<endl;
+        cout<<"[Piper] Zeroing both arms..."<<endl;
+        if(!zeroArm("upper")) cerr<<"[Piper] WARN: upper zero FAIL"<<endl;
+        if(!zeroArm("lower")) cerr<<"[Piper] WARN: lower zero FAIL"<<endl;
+        cout<<"[Piper] Arm initialization complete."<<endl;
+    }
+
+    // 6.1 Startup exhaustion check
+    if(is_master_pc && ((g_arm=="upper" && g_upper_done) || (g_arm=="lower" && g_lower_done))){
+        g_show_exhausted = true;
+        cout<<"[Piper] WARNING: "<<g_arm<<" exhausted at startup."<<endl;
+    }
+
+    // ====== Master signals Slave: all connections ready ======
+    if (enable_net_sync && is_master_pc) {
+        syncPiperToSlave(true);  // sends PIPER + INIT_OK atomically
+    }
+    if (enable_net_sync && !is_master_pc) {
+        cout<<"[Init] Waiting for Master INIT_OK signal..."<<endl;
+        auto t0=chrono::steady_clock::now();
+        while (global_running && !g_init_ok.load()){
+            this_thread::sleep_for(chrono::milliseconds(100));
+            if(chrono::duration<double>(chrono::steady_clock::now()-t0).count()>30.0){
+                cerr<<"[Init] Timeout waiting for INIT_OK (30s)."<<endl; break;
+            }
+        }
+        if (!g_init_ok.load()) { cerr<<"[Init] Never received INIT_OK."<<endl; return 1; }
+    }
+    cout<<"[Init] All 3 hosts ready. Starting camera initialization..."<<endl;
+
+    // ---- Camera init ----
+    for (int i=0;i<(int)camera_ids.size();++i)
+        cam_ctxs.push_back(make_shared<CameraContext>(i,camera_ids[i],g_participant_roots[i]));
+    cout<<"[System] Pre-allocating shared memory for "<<total_record_frames<<" frames..."<<endl;
+    for (auto& ctx:cam_ctxs) {
+        ctx->total_record_frames=total_record_frames;ctx->ram_buffer.resize(total_record_frames);ctx->meta_buffer.resize(total_record_frames);
+        string shm_name="HDF5_"+to_string(GetCurrentProcessId())+"_CAM_"+to_string(ctx->index);
+        size_t total_bytes=(size_t)total_record_frames*(size_t)cam_h*(size_t)cam_w;
+        HANDLE hMap=CreateFileMappingA(INVALID_HANDLE_VALUE,NULL,PAGE_READWRITE,0,(DWORD)total_bytes,shm_name.c_str());
+        if(!hMap){logException("FATAL","shm","CreateFileMapping failed");return 1;}
+        uint8_t* shm_base=(uint8_t*)MapViewOfFile(hMap,FILE_MAP_WRITE,0,0,total_bytes);
+        if(!shm_base){logException("FATAL","shm","MapViewOfFile failed");CloseHandle(hMap);return 1;}
+        memset(shm_base,0,total_bytes);
+        for(int k=0;k<total_record_frames;++k)ctx->ram_buffer[k]=cv::Mat(cam_h,cam_w,CV_8UC1,shm_base+(size_t)k*(size_t)cam_h*(size_t)cam_w);
+        ctx->shm_handle=hMap;ctx->shm_base=shm_base;
+    }
+    cout<<"[System] Shared memory allocated.\n"<<endl;
+    CameraContext::master_set.store(false);CameraContext::master_first_id.store(-1);
+    for (auto& ctx:cam_ctxs){ctx->running=true;ctx->dump_ready=false;ctx->offset_initialized=false;
+        ctx->copy_thread=thread(copyWorker,ctx);
+        ctx->capture_thread=thread(captureWorker,ctx,target_fps,gain,gammav,exp_time,use_hw_trigger,enable_offset);}
+
+    // ---- UI init ----
+    cv::namedWindow("Multi-Cam Preview",cv::WINDOW_NORMAL);cv::resizeWindow("Multi-Cam Preview",g_win_w,g_win_h);
+    updateLayout();cv::setMouseCallback("Multi-Cam Preview",onMouse);
+    {auto t=chrono::system_clock::to_time_t(chrono::system_clock::now());char tb[64];strftime(tb,sizeof(tb),"%Y%m%d_%H%M%S",localtime(&t));
+        error_code ec;fs::create_directories("log/capture",ec);
+        g_session_log_path=string("log/capture/session_")+tb+".md";g_session_log.open(g_session_log_path,ios::out|ios::app);
+        if(g_session_log.is_open())g_session_log<<"# Session: "<<tb<<"\n\n- **Cameras**: "<<camera_ids.size()
+            <<"\n- **Trigger**: "<<(use_hw_trigger?"HW":"SW")<<"\n- **Target FPS**: "<<target_fps
+            <<"\n- **Storage**: HDF5+Piper\n\n---\n"<<flush;}
+    initSentry(g_sentry_root);
+    cout<<"[HDF5] Sentry (local): chunk="<<g_chunk_idx<<" offset="<<g_frame_offset<<endl;
+    for (auto& ctx:cam_ctxs){ctx->hdf5_dir=g_participant_roots[ctx->index]+"/"+ctx->id;fs::create_directories(ctx->hdf5_dir);}
+
+    // ====== Startup sentry handshake ======
+    if (enable_net_sync) {
+        cv::namedWindow("Multi-Cam Preview",cv::WINDOW_NORMAL);
+        cv::resizeWindow("Multi-Cam Preview",g_win_w,g_win_h);
+        cv::Mat loading=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
+        cv::putText(loading,"Startup sentry handshake in progress...",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,255,255),2);
+        if(is_master_pc) drawLedIndicator(loading);
+        cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1);
+    }
+    if (enable_net_sync) {
+        auto local_ci=g_chunk_idx; auto local_fo=g_frame_offset.load();
+        int64_t local_total=(int64_t)local_ci*g_hdf5_chunk_capacity+local_fo;
+        cout<<"[Sentry] Startup handshake: local="<<local_total<<" (chunk="<<local_ci<<" offset="<<local_fo<<")"<<endl;
+        if (is_master_pc) {
+            SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);int opt=1;setsockopt(hs,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
+            sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(net_port+300);sa.sin_addr.s_addr=INADDR_ANY;
+            ::bind(hs,(sockaddr*)&sa,sizeof(sa));listen(hs,1);
+            cout<<"[Sentry] Master waiting for Slave startup handshake on port "<<net_port+300<<"..."<<endl;
+            sockaddr_in ca;socklen_t cl=sizeof(ca);SOCKET cs=accept(hs,(sockaddr*)&ca,&cl);
+            if(cs!=INVALID_SOCKET){int64_t peer_buf[2];recv(cs,(char*)peer_buf,sizeof(peer_buf),0);int64_t peer_total=peer_buf[0];
+                int64_t send_buf[2]={local_total,local_total};send(cs,(const char*)send_buf,sizeof(send_buf),0);closesocket(cs);
+                if(peer_total!=local_total){int peer_ci=(int)(peer_total/g_hdf5_chunk_capacity),peer_fo=(int)(peer_total%g_hdf5_chunk_capacity);
+                    logException("WARN","sentry","Startup mismatch: Master("+to_string(local_ci)+","+to_string(local_fo)
+                        +") Slave("+to_string(peer_ci)+","+to_string(peer_fo)+") diff="+to_string(llabs(local_total-peer_total))+" - using min");
+                    if(peer_total<local_total){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;updateSentry(g_sentry_root);}}
+                cout<<"[Sentry] Startup handshake done. Synced to: chunk="<<g_chunk_idx<<" offset="<<g_frame_offset<<endl;}
+            closesocket(hs);
+        } else {
+            cout<<"[Sentry] Slave connecting to Master for startup handshake on port "<<net_port+300<<"..."<<endl;
+            SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(net_port+300);
+            inet_pton(AF_INET,g_master_ip.c_str(),&sa.sin_addr);
+            while(connect(hs,(sockaddr*)&sa,sizeof(sa))==-1&&global_running) this_thread::sleep_for(chrono::milliseconds(100));
+            if(hs!=INVALID_SOCKET){int64_t send_buf[2]={local_total,local_total};send(hs,(const char*)send_buf,sizeof(send_buf),0);
+                int64_t peer_buf[2];recv(hs,(char*)peer_buf,sizeof(peer_buf),0);int64_t peer_total=peer_buf[0];closesocket(hs);
+                if(peer_total!=local_total){int peer_ci=(int)(peer_total/g_hdf5_chunk_capacity),peer_fo=(int)(peer_total%g_hdf5_chunk_capacity);
+                    logException("WARN","sentry","Startup mismatch: Master("+to_string(peer_ci)+","+to_string(peer_fo)
+                        +") Slave("+to_string(local_ci)+","+to_string(local_fo)+") diff="+to_string(llabs(local_total-peer_total))+" - using min");
+                    if(peer_total<local_total){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;updateSentry(g_sentry_root);}}
+                cout<<"[Sentry] Startup handshake done. Synced to: chunk="<<g_chunk_idx<<" offset="<<g_frame_offset<<endl;}
+        }
+    }
+    cout<<"[HDF5] Ready."<<endl;
+    if(is_master_pc)cout<<"[s] Start session  [SPACE] Record  [z] Rollback 1 rec  [b] Re-zero  [c] Clear piper sentry  [t] Switch arm  [ESC/q] Quit\n";
+    else cout<<"Waiting for Master... [ESC/q] to quit.\n";
+
+    // 断点续录: 顺序自证 (chunk0 occ_arm) → 按 h5 sentry 恢复本臂 OVER 状态
+    // (first 臂进度 = 已写帧数, 另一臂 = 溢出部分 — 与开录顺序无关)
+    detectFirstArm();
+    g_show_over = (armRecorded(g_arm) >= recordingsPerArm());
+    if (is_master_pc && g_show_over)
+        cout << "[Piper] " << g_arm << " already OVER by h5 sentry ("
+             << armRecorded(g_arm) << "/" << recordingsPerArm() << ")" << endl;
+
+    // ================== MAIN LOOP ==================
+    bool is_recording=false; atomic<bool> is_dumping{false};
+    string current_record_timestr; chrono::steady_clock::time_point record_start_time;
+    int dump_wait_reports=0;   // 相机就绪等待进度已打印次数 (每录重置, 每 2s 一次)
+    double target_ui_fps=cap["ui_fps"].as<double>();
+    auto ui_interval=chrono::milliseconds((int)(1000.0/target_ui_fps));
+    auto last_ui_time=chrono::steady_clock::now()-ui_interval;
+    g_ready_time=chrono::steady_clock::now();
+
+    while (global_running) {
+        auto current_time=chrono::steady_clock::now();
+        bool need_ui_update=(current_time-last_ui_time)>=ui_interval;
+
+        // ===== LED state update (Master only; 状态变化时同步到 M5Stack) =====
+        if (is_master_pc) {
+            if (g_show_over) {
+                setLedState(LedState::OVER);
+            } else if (g_show_exhausted) {
+                setLedState(LedState::EXHAUSTED);
+            } else if (is_dumping) {
+                setLedState(LedState::WAITING);
+            } else if (g_delay_pending.load()) {
+                setLedState(LedState::CAPTURING);
+            } else if (is_recording) {
+                setLedState(LedState::CAPTURING);
+            } else if (g_recording_enabled) {
+                setLedState(LedState::READY);
+            } else {
+                setLedState(LedState::PIPER_INIT);
+            }
+        }
+
+        // ===== UI render (from hdf5_multi_process.cpp) =====
+        if (need_ui_update && !is_dumping) {
+            if (g_fault_active.load()) {
+                showFaultOverlay(g_faulty_cam.load(), g_use_hw_trigger);
+            } else if (g_show_over) {
+                // OVER UI — 当前臂成功录制数达到 num_targets_per_arm
+                cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
+                string arm_name = g_arm; for(auto& c:arm_name) c=toupper(c);
+                string msg = arm_name + " OVER";
+                cv::putText(canvas, msg, cv::Point(g_win_w/4, g_win_h/2-40), cv::FONT_HERSHEY_DUPLEX, 1.2, cv::Scalar(255,0,255), 2);
+                char buf[64];
+                snprintf(buf,sizeof(buf),"%d / %d targets recorded", armRecorded(g_arm), recordingsPerArm());
+                cv::putText(canvas,buf,cv::Point(g_win_w/4,g_win_h/2+10),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(255,255,255),1);
+                string hints = "Press 'z' to roll back last rec | 'b' to reset | 't' to switch arm | 'q' to quit";
+                cv::putText(canvas,hints,cv::Point(g_win_w/4,g_win_h/2+50),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,255),1);
+                if(is_master_pc) drawLedIndicator(canvas);
+                cv::imshow("Multi-Cam Preview", canvas);
+            } else if (g_show_exhausted) {
+                // EXHAUSTED UI — no camera rendering
+                cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
+                string arm_name = g_arm; for(auto& c:arm_name) c=toupper(c);
+                string msg = arm_name + " INST EXHAUSTED";
+                if(g_upper_done && g_lower_done) msg = "BOTH ARMS EXHAUSTED";
+                cv::putText(canvas, msg, cv::Point(g_win_w/4, g_win_h/2-40), cv::FONT_HERSHEY_DUPLEX, 1.2, cv::Scalar(0,0,255), 2);
+                char buf[64];
+                snprintf(buf,sizeof(buf),"Upper: %d/%d %s | Lower: %d/%d %s",
+                    g_upper_idx,(int)g_targets_upper.size(),g_upper_done?"DONE":"ok",
+                    g_lower_idx,(int)g_targets_lower.size(),g_lower_done?"DONE":"ok");
+                cv::putText(canvas,buf,cv::Point(g_win_w/4,g_win_h/2+10),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(255,255,255),1);
+                string hints = "Press 't' to switch arm | 'c' to clear sentry | 'q' to quit";
+                if(g_upper_done&&g_lower_done) hints = "Press 'c' to clear sentry | 'q' to quit";
+                cv::putText(canvas,hints,cv::Point(g_win_w/4,g_win_h/2+50),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,255),1);
+                if(is_master_pc) drawLedIndicator(canvas);
+                cv::imshow("Multi-Cam Preview", canvas);
+            } else {
+                cv::Mat canvas = cv::Mat::zeros(g_win_h, g_win_w, CV_8UC3);
+                int sel = g_enlarged_cam.load();
+                renderThumbnailGrid(canvas, sel, is_recording, record_start_time, total_record_frames);
+                renderEnlargedView(canvas, sel, is_recording, record_start_time, total_record_frames);
+                cv::line(canvas, cv::Point(g_left_w, 0), cv::Point(g_left_w, g_win_h), cv::Scalar(60, 60, 60), 2);
+
+                // LED state indicator (Master, top-left of canvas)
+                if (is_master_pc) drawLedIndicator(canvas);
+
+                // 右上角 (LED 指示下方): HDF5 chunk/offset + 每臂进度 (h5 sentry 推导)
+                // '>' 标记当前活动臂; 计数与开录顺序无关 (first 臂 = 前半帧数)
+                {
+                    string quota = to_string(recordingsPerArm());
+                    char lb[96]; int bl = 0;
+                    snprintf(lb, sizeof(lb), "chunk: %d   offset: %d", g_chunk_idx, g_frame_offset.load());
+                    cv::Size wsz = cv::getTextSize(lb, cv::FONT_HERSHEY_SIMPLEX, 0.6, 2, &bl);
+                    cv::putText(canvas, lb, cv::Point(g_win_w - wsz.width - 15, 64),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 215, 255), 2, cv::LINE_AA);
+                    snprintf(lb, sizeof(lb), "%s UPPER: %d/%s", (g_arm=="upper"?">":" "),
+                             armRecorded("upper"), quota.c_str());
+                    wsz = cv::getTextSize(lb, cv::FONT_HERSHEY_SIMPLEX, 0.75, 2, &bl);
+                    cv::putText(canvas, lb, cv::Point(g_win_w - wsz.width - 15, 98),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 255, 200), 2, cv::LINE_AA);
+                    snprintf(lb, sizeof(lb), "%s LOWER: %d/%s", (g_arm=="lower"?">":" "),
+                             armRecorded("lower"), quota.c_str());
+                    wsz = cv::getTextSize(lb, cv::FONT_HERSHEY_SIMPLEX, 0.75, 2, &bl);
+                    cv::putText(canvas, lb, cv::Point(g_win_w - wsz.width - 15, 132),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 255, 200), 2, cv::LINE_AA);
+                }
+
+                // Watermark hints (bottom-left of right panel)
+                int hx = g_right_x + 10, hy = g_win_h - 60;
+                string hints;
+                if (g_delay_pending.load()) hints = "[DELAY] Focus on the cross...";
+                else if (is_recording) hints = "[REC] Recording in progress...";
+                else if (is_dumping) hints = "[DUMP] Writing to disk...";
+                else if (g_syncing.load()) hints = "Syncing sentry - please wait...";
+                else if (enable_net_sync && !is_master_pc) hints = "[s][space] disabled (Slave) | Waiting for Master...";
+                else if (is_master_pc) {
+                    if (!g_recording_enabled) hints = "[s] Start session  [SPACE/z/b/c/t]  [ESC/q] quit";
+                    else hints = "[SPACE] Record  [z] Rollback 1 rec  [t] Switch arm  [b] Zero  [c] Clear  [ESC/q] quit";
+                }
+                cv::putText(canvas, hints, cv::Point(hx, hy), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
+                hy += 18;
+                string role = enable_net_sync ? (is_master_pc ? "Role: MASTER | Net Sync: ON" : "Role: SLAVE | Net Sync: ON") : "Role: STANDALONE | Net Sync: OFF";
+                cv::putText(canvas, role, cv::Point(hx, hy), cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(110, 110, 110), 1, cv::LINE_AA);
+                // Piper status line (Master only)
+                if (is_master_pc) {
+                    hy += 16; char pb[128];
+                    snprintf(pb, sizeof(pb), "Arm: %s | U:%d/%d%s | L:%d/%d%s | %s",
+                        g_arm.c_str(), g_upper_idx, (int)g_targets_upper.size(), g_upper_done?" DONE":"",
+                        g_lower_idx, (int)g_targets_lower.size(), g_lower_done?" DONE":"",
+                        g_piper_busy?"BUSY":(g_recording_enabled?"Ready":""));
+                    cv::putText(canvas, pb, cv::Point(hx, hy), cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(0, 200, 255), 1, cv::LINE_AA);
+                    if (g_tool_ccs_valid) {
+                        hy += 16; snprintf(pb, sizeof(pb), "Tool CCS: [%.4f %.4f %.4f]  Gaze: [%.4f %.4f %.4f]",
+                            g_tool_ccs_pos.x, g_tool_ccs_pos.y, g_tool_ccs_pos.z,
+                            g_gaze_x.load(), g_gaze_y.load(), g_gaze_z.load());
+                        cv::putText(canvas, pb, cv::Point(hx, hy), cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(0, 255, 200), 1, cv::LINE_AA);
+                    }
+                }
+
+                // Bottom-right 水印: participant + arm pose (位于状态行上方, 右对齐)
+                string wm = "Participant: " + g_participant_id;
+                cv::Size wsz = cv::getTextSize(wm, cv::FONT_HERSHEY_SIMPLEX, 0.35, 1, 0);
+                cv::putText(canvas, wm, cv::Point(g_right_x + g_right_w - wsz.width - 10, g_win_h - 95),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
+                if (is_master_pc && !g_arm_pose_yml.empty()) {
+                    string ap = "Arm pose: " + g_arm_pose_yml;
+                    cv::Size apsz = cv::getTextSize(ap, cv::FONT_HERSHEY_SIMPLEX, 0.35, 1, 0);
+                    cv::putText(canvas, ap, cv::Point(g_right_x + g_right_w - apsz.width - 10, g_win_h - 75),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(140, 140, 140), 1, cv::LINE_AA);
+                }
+                // 遮挡摘要 (本目标判定结果; Master 判定, Slave 经 OCCL 同步)
+                { lock_guard<mutex> lk(g_occ_mtx);
+                  if (!g_occ_last_line.empty()) {
+                    cv::Size osz = cv::getTextSize(g_occ_last_line, cv::FONT_HERSHEY_SIMPLEX, 0.35, 1, 0);
+                    cv::putText(canvas, g_occ_last_line,
+                                cv::Point(g_right_x + g_right_w - osz.width - 10, g_win_h - 55),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(0, 80, 255), 1, cv::LINE_AA);
+                } }
+
+                // Crosshair at center of enlarged area
+                int cx = g_right_x + g_right_w / 2, cy = g_win_h / 2, cl = 20;
+                cv::line(canvas, cv::Point(cx - cl, cy), cv::Point(cx + cl, cy), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
+                cv::line(canvas, cv::Point(cx, cy - cl), cv::Point(cx, cy + cl), cv::Scalar(100, 100, 100), 1, cv::LINE_AA);
+
+                cv::imshow("Multi-Cam Preview", canvas);
+            }
+            last_ui_time = current_time;
+        }
+
+        // ---- Dump wait logic ----
+        if (is_recording&&!is_dumping) {
+            bool all_done=true;
+            for(auto& ctx:cam_ctxs) if(!ctx->dump_ready.load()){all_done=false;break;}
+            // 进度上报 (每 2s): 哪台相机没就绪、录到第几帧 — 停更相机一目了然
+            if (!all_done && record_start_time.time_since_epoch().count() > 0) {
+                double rec_waited = chrono::duration<double>(chrono::steady_clock::now()-record_start_time).count();
+                int report_due = (int)(rec_waited / 2.0);
+                if (report_due > dump_wait_reports) {
+                    dump_wait_reports = report_due;
+                    int ready = 0; string pend;
+                    for(auto& ctx:cam_ctxs){ if(ctx->dump_ready.load()) ++ready;
+                        else pend += ctx->id + "(" + to_string(ctx->recorded_frames.load()) + "/"
+                                  + to_string(total_record_frames) + ") "; }
+                    cout<<"[Dump#"<<g_recording_number<<"] cameras ready "<<ready<<"/"<<cam_ctxs.size()
+                        <<" — not ready: "<<pend<<endl;
+                }
+            }
+            // 超时保护: 相机停更 (如 CXP 掉链) 时 dump_ready 永不置位 → 整条流水线
+            // (dump→sync→GAZE_DONE→sentry 握手) 死等。15s 后点名卡住的相机并强制继续。
+            if (!all_done && record_start_time.time_since_epoch().count() > 0) {
+                double rec_waited = chrono::duration<double>(chrono::steady_clock::now()-record_start_time).count();
+                if (rec_waited > 15.0) {
+                    string stuck;
+                    for(auto& ctx:cam_ctxs) if(!ctx->dump_ready.load())
+                        stuck += ctx->id + "(" + to_string(ctx->recorded_frames.load()) + "/"
+                               + to_string(total_record_frames) + ") ";
+                    cerr<<"[REC] WARN: camera dump timeout after 15s — stuck: "<<stuck<<"— proceeding anyway"<<endl;
+                    logException("WARN","rec","camera dump timeout: "+stuck);
+                    all_done = true;
+                }
+            }
+            if (all_done) {
+                dump_wait_reports = 0;
+                g_consecutive_faults=0; is_recording=false; g_recording_number++;
+                // 录制后延迟: 与录制前 capture_delay 对称 (SPACE→delay→录制→delay→dump)
+                if (g_capture_delay > 0.0) {
+                    logException("INFO","delay_post",to_string(g_capture_delay)+"s");
+                    cout<<"[Delay] Post-record pause "<<g_capture_delay<<"s..."<<endl;
+                    auto until=chrono::steady_clock::now()+chrono::duration<double>(g_capture_delay);
+                    while (chrono::steady_clock::now()<until && global_running) {
+                        cv::Mat loading=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
+                        cv::putText(loading,"Post-record delay...",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,200,255),2);
+                        if(is_master_pc) drawLedIndicator(loading);   // LED 仍为 CAPTURING
+                        cv::imshow("Multi-Cam Preview",loading);
+                        while(cv::waitKey(1)>=0){}   // 延迟期间吞掉按键
+                    }
+                }
+                is_dumping=true;
+                cout<<"[Dump#"<<g_recording_number<<"] stage start ("<<(is_master_pc?"Master":"Slave")
+                    <<", "<<cam_ctxs.size()<<" cams)"<<endl;
+                if(is_master_pc) setLedState(LedState::WAITING);  // update before loading screens
+                // OVER 检查 (h5 sentry 推导): 本次录制提交后本臂即满 → 提前移动前进入 OVER
+                if (is_master_pc && armRecorded(g_arm) + 1 >= recordingsPerArm()) {
+                    g_show_over = true;
+                    g_recording_enabled = false;
+                    cout << "[Piper] " << g_arm << " will reach " << recordingsPerArm()
+                         << " recordings — OVER." << endl;
+                }
+                auto t0=chrono::steady_clock::now();
+
+                // Save old gaze (recording #N position) before arm overwrites it
+                double rec_gaze_x = g_gaze_x.load();
+                double rec_gaze_y = g_gaze_y.load();
+                double rec_gaze_z = g_gaze_z.load();
+                // 同理快照 #N 的遮挡集与判定关节 (ARM_OK(#N+1) 的 OCCL 可能先于本机子进程启动)
+                set<string> rec_occl;
+                array<double,12> rec_joints{}; bool rec_joints_ok;
+                int rec_occ_status = 0; double rec_occ_err[2] = {NAN, NAN};
+                int rec_occ_arm = 0; double rec_occ_flange[14]; double rec_occ_arm_pose[12];
+                { lock_guard<mutex> lk(g_occ_mtx);
+                  rec_occl = g_occ_occluded; rec_joints = g_occ_joints; rec_joints_ok = g_occ_joints_ok;
+                  rec_occ_status = g_occ_status.load();
+                  rec_occ_err[0] = g_occ_check_err[0]; rec_occ_err[1] = g_occ_check_err[1];
+                  rec_occ_arm = g_occ_arm.load();
+                  for (int k = 0; k < 14; ++k) rec_occ_flange[k] = g_occ_flange[k];
+                  for (int k = 0; k < 12; ++k) rec_occ_arm_pose[k] = g_occ_arm_pose[k]; }
+                // 兜底 (写盘前最后防线): 本录无有效关节 (occ_joints 将为 NaN) 时无法
+                // 离线判定遮挡 → 本机全部相机 valid=0。不依赖 Master 的任何消息到达,
+                // 无论判定停用/查询失败/下发丢失, NaN ⇒ valid=0 恒成立。
+                // status 覆写为 5: 区分 "Slave 端 joints 缺失/无效" (本机兜底触发) 与
+                // Master 判定失败 (2/3/4) — P001 三采排障: status=0+NaN 无法归因
+                if (!rec_joints_ok) {
+                    rec_occ_status = 5;
+                    for (auto& ctx : cam_ctxs) rec_occl.insert(ctx->id);
+                }
+                // gaze target 各相机系快照 (h5 按相机系保存):
+                // Master 用 day 外参现算; Slave 用 GAZE_CAM 接收值 (缺相机回退中心系)
+                map<string, array<double,3>> rec_gaze_cam;
+                {
+                    double pw[3] = {rec_gaze_x, rec_gaze_y, rec_gaze_z};
+                    if (is_master_pc) {
+                        for (auto& cam : g_occ_cams) {
+                            double pc[3]; occToCam(cam, pw, pc);
+                            rec_gaze_cam[cam.sn] = {pc[0], pc[1], pc[2]};
+                        }
+                    } else {
+                        lock_guard<mutex> lk(g_gaze_cam_mtx);
+                        rec_gaze_cam = g_gaze_cam;
+                    }
+                }
+
+                // ====== PARALLEL: ARM (thread) + HDF5 (main thread) ======
+                { cv::Mat loading=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
+                  cv::putText(loading,"ARM + HDF5 STAGE ("+to_string(cam_ctxs.size())+" cameras)",
+                              cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,1.0,cv::Scalar(0,200,255),2);
+                  char gb[128];snprintf(gb,sizeof(gb),"Gaze (rec #%d): [%.4f, %.4f, %.4f]",g_recording_number,rec_gaze_x,rec_gaze_y,rec_gaze_z);
+                  cv::putText(loading,gb,cv::Point(g_win_w/4,g_win_h/2+40),cv::FONT_HERSHEY_SIMPLEX,0.6,cv::Scalar(0,255,0),1);
+                  if(is_master_pc) drawLedIndicator(loading);
+                  cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
+
+                auto t_par0=chrono::steady_clock::now();
+
+                // 6.4: Check exhaustion BEFORE launching arm thread
+                if(is_master_pc && ((g_arm=="upper" && g_upper_idx >= (int)g_targets_upper.size()) ||
+                                    (g_arm=="lower" && g_lower_idx >= (int)g_targets_lower.size()))) {
+                    g_show_exhausted = true;
+                    cout<<"[Piper] "<<g_arm<<" targets exhausted (pre-check). Skipping ARM."<<endl;
+                }
+                // Master: start arm thread (parallel with HDF5); OVER 时不移动
+                thread arm_thread;
+                if (is_master_pc && !g_show_exhausted && !g_show_over) {
+                    cout<<"[Piper] Moving to next target..."<<endl;
+                    arm_thread=thread([&](){
+                        ArmResult ar = moveArmToTarget();
+                        if(ar==ArmResult::ARM_EXHAUSTED){
+                            g_show_exhausted = true;
+                        } else if(ar==ArmResult::ARM_ERROR){
+                            logException("ERROR","piper","arm move failed");
+                        }   // ARM_OK: 正常, 不记错误
+                    });
+                }
+
+                // Step 0: Pre-create HDF5 files (小数据集先创建 — 布局须在 raw_image 前, 布局须在 raw_image 前)
+                for (auto& ctx:cam_ctxs){ctx->dump_start_time=chrono::steady_clock::now();
+                    stringstream pss;pss<<ctx->hdf5_dir<<"/"<<setw(4)<<setfill('0')<<g_chunk_idx<<".h5";
+                    if(!fs::exists(pss.str())){try{H5::H5File f(pss.str(),H5F_ACC_TRUNC);
+                        H5::DSetCreatPropList pl=allocEarlyPl();
+                        hsize_t gd[2]={(hsize_t)g_hdf5_chunk_capacity,3};
+                        f.createDataSet("gaze_target",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,gd),pl);
+                        hsize_t md[2]={(hsize_t)g_hdf5_chunk_capacity,42};   // 判定元数据+关节合一 (≤8 个数据集)
+                        f.createDataSet("occ_meta",H5::PredType::NATIVE_DOUBLE,H5::DataSpace(2,md),pl);
+                        hsize_t vd[1]={(hsize_t)g_hdf5_chunk_capacity};
+                        f.createDataSet("valid",H5::PredType::NATIVE_UINT8,H5::DataSpace(1,vd),pl);
+                        hsize_t rd[3]={(hsize_t)g_hdf5_chunk_capacity,(hsize_t)cam_h,(hsize_t)cam_w};
+                        f.createDataSet("raw_image",H5::PredType::NATIVE_UINT8,H5::DataSpace(3,rd),pl);}
+                        catch(const H5::Exception& e){logException("ERROR","hdf5:precreate",e.getCDetailMsg());}}}
+                auto t_pre=chrono::steady_clock::now();
+
+                // Step 1: Launch child processes
+                char exe_path[MAX_PATH];GetModuleFileNameA(NULL,exe_path,MAX_PATH);
+                string parent_dir=fs::path(exe_path).parent_path().string();
+                string child_exe=parent_dir+"\\hdf5_multi_process_child.exe";
+                HANDLE hJob=CreateJobObjectA(NULL,NULL); if(hJob){JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli{};jeli.BasicLimitInformation.LimitFlags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;SetInformationJobObject(hJob,JobObjectExtendedLimitInformation,&jeli,sizeof(jeli));}
+                vector<PROCESS_INFORMATION> procs(cam_ctxs.size());
+                for (size_t i=0;i<cam_ctxs.size();++i){auto& ctx=cam_ctxs[i];
+                    string shm_name="HDF5_"+to_string(GetCurrentProcessId())+"_CAM_"+to_string(i);
+                    // gaze target: 本相机系值 (无则回退中心系)
+                    auto git = rec_gaze_cam.find(ctx->id);
+                    double gz_x = (git!=rec_gaze_cam.end()) ? git->second[0] : rec_gaze_x;
+                    double gz_y = (git!=rec_gaze_cam.end()) ? git->second[1] : rec_gaze_y;
+                    double gz_z = (git!=rec_gaze_cam.end()) ? git->second[2] : rec_gaze_z;
+                    stringstream args; args<<"\"hdf5_multi_process_child.exe\" "<<i<<" \""<<ctx->hdf5_dir<<"\" "<<g_chunk_idx
+                        <<" "<<g_frame_offset<<" "<<core_frames<<" "<<cam_h<<" "<<cam_w<<" "<<margin_frames<<" "<<shm_name
+                        <<" "<<gz_x<<" "<<gz_y<<" "<<gz_z
+                        <<" "<<(rec_occl.count(ctx->id) ? 1 : 0);   // 本相机 #N 遮挡标志 → valid
+                    {   // 判定所用关节 (qU6+qL6 逗号表; "-" = 本目标无有效关节 → NaN)
+                        args << " ";
+                        if (rec_joints_ok) {
+                            char jb[32];
+                            for (int k = 0; k < 12; ++k) {
+                                snprintf(jb, sizeof(jb), "%s%.6f", k ? "," : "", rec_joints[k]);
+                                args << jb;
+                            }
+                        } else args << "-";
+                    }
+                    // 判定状态 + 双臂对账误差 (h5 occ_status / occ_check_err; NaN → "nan" 字面量)
+                    {   char eb[2][32];
+                        for (int k = 0; k < 2; ++k)
+                            snprintf(eb[k], sizeof(eb[k]), "%.3f", rec_occ_err[k]);
+                        args << " " << rec_occ_status << " " << eb[0] << " " << eb[1]; }
+                    // 录制臂 + SDK 法兰位姿 + 运行时手眼值 (h5 occ_arm / occ_flange / occ_arm_pose)
+                    {   args << " " << rec_occ_arm;
+                        char fb[32];
+                        for (int k = 0; k < 14; ++k) {
+                            snprintf(fb, sizeof(fb), "%s%.6f", k ? "," : "", rec_occ_flange[k]);
+                            args << (k ? "" : " ") << fb;
+                        }
+                        args << " ";
+                        for (int k = 0; k < 12; ++k) {
+                            snprintf(fb, sizeof(fb), "%s%.6f", k ? "," : "", rec_occ_arm_pose[k]);
+                            args << fb;
+                        } }
+                    STARTUPINFOA si{sizeof(si)};PROCESS_INFORMATION pi{};
+                    string cmd_line=args.str();
+                    if(CreateProcessA(child_exe.c_str(),&cmd_line[0],NULL,NULL,FALSE,0,NULL,NULL,&si,&pi)){
+                        CloseHandle(pi.hThread);if(hJob)AssignProcessToJobObject(hJob,pi.hProcess);procs[i]=pi;}
+                    else{logException("ERROR","hdf5:proc","CreateProcess failed cam "+to_string(i));procs[i].hProcess=NULL;}}
+                auto t_launch=chrono::steady_clock::now();
+
+                // Step 2-3: Wait for children + cleanup
+                cout<<"[Dump#"<<g_recording_number<<"] children launched ("<<cam_ctxs.size()
+                    <<"), waiting exit... (precreate "
+                    <<chrono::duration<double>(t_pre-t_par0).count()*1000.0<<"ms)"<<endl;
+                vector<HANDLE> handles;for(auto&p:procs)if(p.hProcess)handles.push_back(p.hProcess);
+                if(!handles.empty())WaitForMultipleObjects((DWORD)handles.size(),handles.data(),TRUE,INFINITE);
+                auto t_hdf5_done=chrono::steady_clock::now();
+                bool all_ok=true;
+                for(auto&p:procs){if(!p.hProcess){all_ok=false;continue;}DWORD ec;if(GetExitCodeProcess(p.hProcess,&ec)&&ec!=0){all_ok=false;logException("ERROR","hdf5:cam","child exit "+to_string(ec));}CloseHandle(p.hProcess);}
+                if(hJob)CloseHandle(hJob);
+                for(auto& ctx:cam_ctxs)ctx->dump_end_time=chrono::steady_clock::now();
+                cout<<"[Dump#"<<g_recording_number<<"] children done in "
+                    <<chrono::duration<double>(t_hdf5_done-t_launch).count()*1000.0<<"ms, all_ok="<<all_ok<<endl;
+
+                // Join arm thread (if Master)
+                cout<<"[Dump#"<<g_recording_number<<"] joining arm thread..."<<endl;
+                if(arm_thread.joinable()) arm_thread.join();
+                auto t_arm_done=chrono::steady_clock::now();
+                cout<<"[Dump#"<<g_recording_number<<"] arm thread joined at +"
+                    <<chrono::duration<double>(t_arm_done-t_par0).count()*1000.0<<"ms"<<endl;
+
+                // ====== SYNC: Wait Slave HDF5 → GAZE forward → GAZE_DONE ======
+                if (is_master_pc) {
+                    // (1) Wait for Slave HDF5_DONE (120s 超时: 消息丢失/Slave 掉线时不永久卡住按键)
+                    auto t_wait0=chrono::steady_clock::now();
+                    cout<<"[Sync] Waiting for Slave HDF5_DONE..."<<endl;
+                    while(global_running && !g_slave_hdf5_done.load()) {
+                        this_thread::sleep_for(chrono::milliseconds(50));
+                        if (chrono::duration<double>(chrono::steady_clock::now()-t_wait0).count() > 120.0) {
+                            logException("WARN","sync","Slave HDF5_DONE timeout (120s) - continuing");
+                            cout<<"[Sync] WARN: Slave HDF5_DONE timeout - continuing"<<endl;
+                            break;
+                        }
+                    }
+                    g_slave_hdf5_done = false;
+                    auto t_wait1=chrono::steady_clock::now();
+                    g_wait_slave_hdf5_s = chrono::duration<double>(t_wait1-t_wait0).count();
+                    // (2)+(3) Forward gaze + GAZE_DONE
+                    cout<<"[Gaze] Forwarding to Slave: ("<<g_gaze_x<<","<<g_gaze_y<<","<<g_gaze_z<<")"<<endl;
+                    string gmsg = buildGazeCamMsg();                  // 中心系 + 各相机系
+                    { lock_guard<mutex> lk(g_gaze_send_mtx);
+                      send(g_gaze_sock, (gmsg+"\n").c_str(), (int)gmsg.size()+1, 0); }
+                    string ack; recvLine(g_gaze_sock, ack, 5000);
+                    cout<<"[Gaze] Slave ACK: "<<ack<<endl;
+                    // GAZE_DONE 发送结果显式检查 (发送失败 = Slave 永远等不到, 流水线死锁)
+                    if (sendLineRaw(g_cmd_sock, "GAZE_DONE"))
+                        cout<<"[Dump#"<<g_recording_number<<"] GAZE_DONE sent to Slave"<<endl;
+                    else {
+                        cerr<<"[Dump#"<<g_recording_number<<"] WARN: GAZE_DONE send FAILED (err "
+                            <<WSAGetLastError()<<") — Slave will hit GAZE_DONE timeout"<<endl;
+                        logException("WARN","sync","GAZE_DONE send failed");
+                    }
+                    auto t_gaze_done=chrono::steady_clock::now();
+                    g_gaze_forward_s = chrono::duration<double>(t_gaze_done-t_wait1).count();
+                } else {
+                    // Signal Master: HDF5 done + timing (发送结果显式检查 — 失败则 Master 死等)
+                    char hbuf[64]; snprintf(hbuf,sizeof(hbuf),"HDF5_DONE:%.3f",g_slave_hdf5_s);
+                    if (sendLineRaw(g_cmd_sock, hbuf))
+                        cout<<"[Dump#"<<g_recording_number<<"] HDF5_DONE sent to Master"<<endl;
+                    else {
+                        cerr<<"[Dump#"<<g_recording_number<<"] WARN: HDF5_DONE send FAILED (err "
+                            <<WSAGetLastError()<<") — Master will hit wait timeout"<<endl;
+                        logException("WARN","sync","HDF5_DONE send failed");
+                    }
+                    // Wait for gaze from Master (30s 超时: Master 掉线时自报卡点, 不再无限等)
+                    g_gaze_need_send = false;
+                    cout<<"[Sync] Waiting for Master GAZE..."<<endl;
+                    { auto tw0=chrono::steady_clock::now();
+                      while(global_running && !g_gaze_need_send.load()) {
+                        this_thread::sleep_for(chrono::milliseconds(50));
+                        if (chrono::duration<double>(chrono::steady_clock::now()-tw0).count() > 30.0) {
+                            cerr<<"[Sync] WARN: Master GAZE timeout (30s) - continuing without"<<endl;
+                            logException("WARN","sync","slave: master GAZE timeout");
+                            break;
+                        } } }
+                    g_gaze_need_send = false;
+                    // Wait for GAZE_DONE from Master (cmdWorker sets g_gaze_done)
+                    cout<<"[Sync] Waiting for Master GAZE_DONE..."<<endl;
+                    { auto tw0=chrono::steady_clock::now();
+                      while(global_running && !g_gaze_done.load()) {
+                        this_thread::sleep_for(chrono::milliseconds(50));
+                        if (chrono::duration<double>(chrono::steady_clock::now()-tw0).count() > 30.0) {
+                            cerr<<"[Sync] WARN: Master GAZE_DONE timeout (30s) - continuing without"<<endl;
+                            logException("WARN","sync","slave: master GAZE_DONE timeout");
+                            break;
+                        } } }
+                    g_gaze_done = false;
+                }
+                auto t_sync_done=chrono::steady_clock::now();
+
+                // Step 4: Post-dump sentry handshake (原版: net_port+300, 阻塞 accept/重试 connect)
+                auto t_sentry0=chrono::steady_clock::now();
+                if (enable_net_sync) {
+                    g_syncing=true;
+                    int handshake_port=net_port+300;
+                    auto local_ci=g_chunk_idx; auto local_fo=g_frame_offset.load();
+                    int64_t local_total=(int64_t)local_ci*g_hdf5_chunk_capacity+local_fo;
+                    if (is_master_pc) {
+                        SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);int opt=1;setsockopt(hs,SOL_SOCKET,SO_REUSEADDR,(const char*)&opt,sizeof(opt));
+                        sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(handshake_port);sa.sin_addr.s_addr=INADDR_ANY;
+                        ::bind(hs,(sockaddr*)&sa,sizeof(sa));listen(hs,1);sockaddr_in ca;socklen_t cl=sizeof(ca);SOCKET cs=accept(hs,(sockaddr*)&ca,&cl);
+                        if(cs!=INVALID_SOCKET){int64_t peer_buf[2];recv(cs,(char*)peer_buf,sizeof(peer_buf),0);int64_t peer_total=peer_buf[0];
+                            int64_t send_buf[2]={local_total,local_total};send(cs,(const char*)send_buf,sizeof(send_buf),0);closesocket(cs);
+                            int64_t peer_val=peer_total,local_val=local_total;
+                            cout<<"[Sentry] Post-dump handshake: Local="<<local_val<<" Peer="<<peer_val<<endl;
+                            if(peer_val!=local_val){g_sentry_mismatch_count++;int peer_ci=(int)(peer_val/g_hdf5_chunk_capacity),peer_fo=(int)(peer_val%g_hdf5_chunk_capacity);
+                                if(peer_val<local_val){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;}
+                                logException("WARN","sentry","Mismatch #"+to_string(g_sentry_mismatch_count)+" diff="+to_string(llabs(local_val-peer_val))+" - using min");
+                                if(g_sentry_mismatch_count>=3){logException("FATAL","sentry","3 consecutive mismatches - exiting.");global_running=false;}}
+                            else{g_sentry_mismatch_count=0;}}
+                        closesocket(hs);
+                    } else {
+                        SOCKET hs=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);sockaddr_in sa{};sa.sin_family=AF_INET;sa.sin_port=htons(handshake_port);
+                        inet_pton(AF_INET,g_master_ip.c_str(),&sa.sin_addr);
+                        while(connect(hs,(sockaddr*)&sa,sizeof(sa))==-1&&global_running){this_thread::sleep_for(chrono::milliseconds(100));cv::waitKey(1);}
+                        if(hs!=INVALID_SOCKET){int64_t send_buf[2]={local_total,local_total};send(hs,(const char*)send_buf,sizeof(send_buf),0);
+                            int64_t peer_buf[2];recv(hs,(char*)peer_buf,sizeof(peer_buf),0);int64_t peer_total=peer_buf[0];closesocket(hs);
+                            int64_t peer_val=peer_total,local_val=local_total;
+                            cout<<"[Sentry] Post-dump handshake: Local="<<local_val<<" Peer="<<peer_val<<endl;
+                            if(peer_val!=local_val){g_sentry_mismatch_count++;int peer_ci=(int)(peer_val/g_hdf5_chunk_capacity),peer_fo=(int)(peer_val%g_hdf5_chunk_capacity);
+                                if(peer_val<local_val){g_chunk_idx=peer_ci;g_frame_offset=peer_fo;}
+                                logException("WARN","sentry","Mismatch #"+to_string(g_sentry_mismatch_count)+" diff="+to_string(llabs(local_val-peer_val))+" - using min");
+                                if(g_sentry_mismatch_count>=3){logException("FATAL","sentry","3 consecutive mismatches - exiting.");global_running=false;}}
+                            else{g_sentry_mismatch_count=0;}}
+                    }
+                    g_syncing=false;
+                }
+                auto t_sentry1=chrono::steady_clock::now();
+
+                // Step 5: Increment sentry AFTER handshake
+                cout<<"[DEBUG-HDF5] frame_offset "<<g_frame_offset<<" -> "<<(g_frame_offset+core_frames)<<endl;
+                if(all_ok){g_frame_offset+=core_frames;if(g_frame_offset>=g_hdf5_chunk_capacity){g_chunk_idx++;g_frame_offset-=g_hdf5_chunk_capacity;}updateSentry(g_sentry_root);}
+                else{logException("WARN","hdf5","Child failures - sentry NOT updated");}
+
+                // ---- Per-phase timing ----
+                auto d_par=chrono::duration<double>(t_arm_done-t_par0).count();
+                auto d_pre=chrono::duration<double>(t_pre-t_par0).count();
+                auto d_launch=chrono::duration<double>(t_launch-t_pre).count();
+                auto d_wait=chrono::duration<double>(t_hdf5_done-t_launch).count();
+                auto d_arm_wait=chrono::duration<double>(t_arm_done-t_hdf5_done).count();
+                auto d_sync=chrono::duration<double>(t_sync_done-t_arm_done).count();
+                auto d_sentry=chrono::duration<double>(t_sentry1-t_sentry0).count();
+                auto d_total=chrono::duration<double>(t_sentry1-t0).count();
+                // End-to-end = SPACE → SPACE-ready: capture_delay + 录制(含margin) + arm&h5 + sync/sentry
+                auto e2e_start=chrono::steady_clock::time_point(chrono::microseconds(g_e2e_start_us.load()));
+                g_recording_end_to_end_s = chrono::duration<double>(t_sentry1-e2e_start).count();
+                g_e2e_start_us.store(0);
+                // Store for report
+                g_arm_stage_s = d_par;
+                if(is_master_pc) g_master_hdf5_s = d_wait; else g_slave_hdf5_s = d_wait;
+                g_sentry_sync_s = d_sentry;
+                double d_sync_total = d_sync; // keep for console output
+                cout<<"[Timing] par="<<fixed<<setprecision(2)<<d_par
+                    <<"s (pre="<<d_pre<<" launch="<<d_launch
+                    <<" hdf5="<<d_wait<<" armExtra="<<d_arm_wait
+                    <<") waitSlave="<<g_wait_slave_hdf5_s<<" gazeFwd="<<g_gaze_forward_s
+                    <<" sentry="<<d_sentry<<" TOTAL="<<d_total<<"s"<<endl;
+                writeReport(current_record_timestr.empty()?"-":current_record_timestr, g_recording_number, total_record_frames, use_hw_trigger);
+                if(is_master_pc && g_show_exhausted) syncPiperToSlave();
+                cout<<"[Recording #"<<g_recording_number<<"] Done in "<<fixed<<setprecision(1)<<d_total<<"s\n";
+                is_dumping=false;while(cv::waitKey(1)>=0);last_ui_time=chrono::steady_clock::now();
+        }}
+
+        // ---- AutoMove: READY 超时未按 SPACE → 跳过本次 capture+dump, 直接移动机械臂 ----
+        if (is_master_pc && g_enable_auto_move && g_recording_enabled
+            && !is_recording && !is_dumping && !g_piper_busy
+            && !g_show_exhausted && !g_show_over) {
+            auto ready_tp = chrono::steady_clock::time_point(chrono::microseconds(g_ready_since_us.load()));
+            double waited = chrono::duration<double>(chrono::steady_clock::now() - ready_tp).count();
+            if (waited > g_click_window) {
+                cout << "[AutoMove] No SPACE within " << fixed << setprecision(1) << g_click_window
+                     << "s — skipping this capture, moving " << g_arm << " to next target..." << endl;
+                int& idx = (g_arm=="upper") ? g_upper_idx : g_lower_idx;
+                idx++; updatePiperSentry();          // 目标被跳过 (不录制, 仍消耗)
+                ArmResult ar = moveArmToTarget();
+                while(cv::waitKey(1)>=0){}           // 清空移动期间滞留的按键 (SPACE 仅 READY 内有效)
+                if (ar == ArmResult::ARM_OK) {
+                    cout << "[AutoMove] " << g_arm << " at next target. Waiting for SPACE..." << endl;
+                } else if (ar == ArmResult::ARM_EXHAUSTED) {
+                    g_show_exhausted = true;
+                } else {
+                    cout << "[AutoMove] Arm ERROR." << endl;
+                }
+            }
+        }
+
+        // ---- Capture delay: 等待期结束 → 真正开始录制 ----
+        if (g_delay_pending.load() && nowUs() >= g_delay_deadline_us.load()) {
+            g_delay_pending.store(false);
+            g_last_delay_s = (nowUs() - g_delay_start_us.load()) / 1e6;
+            instantTrigger();
+            g_trigger_pending.store(true);
+            if(enable_net_sync&&g_cmd_sock!=INVALID_SOCKET) sendLineRaw(g_cmd_sock,"TRIGGER");
+            logException("INFO","delay",to_string(g_last_delay_s)+"s");
+            cout<<"[Delay] "<<g_last_delay_s<<"s elapsed - recording started."<<endl;
+        }
+
+        // ---- HDF5 预创建状态 (i 键): 状态机 + 全屏进度, 屏蔽所有按键 ----
+        if(g_precreating.load()){
+            if(g_pre_phase==1){
+                // 握手阶段: 等待 slave 预检回复 (15s 超时保护, 防止断连卡死)
+                // slave 有 h5 (BLOCKED) 不再中止 — 双端统一"只建缺失"补创建语义
+                if(chrono::duration<double>(chrono::steady_clock::now()-g_pre_t0).count()>15.0){
+                    g_precreating=false;
+                    cout<<"[HDF5] Slave pre-check timeout — aborted."<<endl;
+                }else if(g_pre_peer_clear.load()||g_pre_peer_reject.load()){
+                    // 下令双方同时开始 (各自跳过已存在文件)
+                    if(g_pre_peer_reject.load())
+                        cout<<"[HDF5] Slave has existing h5 — creating MISSING files only there."<<endl;
+                    g_pre_peer_done=false;g_pre_local_done=false;
+                    sendLineRaw(g_cmd_sock,"PRECREATE_BEGIN");
+                    if(g_pre_thread.joinable())g_pre_thread.join();
+                    g_pre_thread=thread([]{precreateParallel();g_pre_local_done=true;});
+                    g_pre_phase=2;
+                    cout<<"[HDF5] Pre-create started on master + slave."<<endl;
+                }
+            }else if(g_pre_phase==2){
+                // 创建阶段: slave 本机完成即退出 (PRECREATE_DONE 已作为确认发给 master);
+                //           master 需等本机 + slave 双方完成
+                bool peer_ok=(!enable_net_sync)||(!is_master_pc)||g_pre_peer_done.load();
+                if(g_pre_local_done.load()&&peer_ok){
+                    g_precreating=false;
+                    cout<<"[HDF5] Pre-create complete on both hosts."<<endl;
+                }
+            }
+            if(g_precreating.load()){
+                cv::Mat pc=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
+                string ph=(g_pre_phase==1)?string("Checking slave cameras..."):
+                    (g_pre_local_done.load()?string("Waiting for slave to finish..."):string("Creating HDF5 files (serial)..."));
+                cv::putText(pc,"PRE-CREATING HDF5 FILES",cv::Point(g_win_w/4,g_win_h/2-70),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,200,255),2);
+                cv::putText(pc,ph,cv::Point(g_win_w/4,g_win_h/2-20),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(255,255,255),1);
+                int tot=g_pre_total.load(),dn=g_pre_done.load();
+                if(tot>0){
+                    int bw=g_win_w/2,bx=(g_win_w-bw)/2,by=g_win_h/2+20;
+                    cv::rectangle(pc,cv::Rect(bx,by,bw,30),cv::Scalar(80,80,80),1);
+                    int pw=(int)(bw*(double)dn/tot);
+                    if(pw>0)cv::rectangle(pc,cv::Rect(bx,by,pw,30),cv::Scalar(0,255,0),-1);
+                    char pb[64];snprintf(pb,sizeof(pb),"%d / %d files",dn,tot);
+                    cv::putText(pc,pb,cv::Point(bx+bw/2-60,by+21),cv::FONT_HERSHEY_SIMPLEX,0.55,cv::Scalar(255,255,255),1);
+                }
+                cv::putText(pc,"Do not press any key - this may take a while",cv::Point(g_win_w/4,g_win_h/2+90),cv::FONT_HERSHEY_SIMPLEX,0.5,cv::Scalar(150,150,150),1);
+                cv::imshow("Multi-Cam Preview",pc);
+                while(cv::waitKey(1)>=0){}   // 创建期间吞掉所有按键 (含 ESC, 中断会产生残缺 h5)
+                goto next_iter;
+            }
+        }
+
+        // ---- Key handling ----
+        char key=(char)cv::waitKey(1); bool trigger_start=false;
+        if(g_syncing.load()){}
+        else if(key=='q'||key==27){
+            if(is_master_pc){
+                cout<<"\nExiting - zeroing both arms..."<<endl;
+                zeroArm("upper"); zeroArm("lower");
+                sendLineRaw(g_piper_sock,"SHUTDOWN"); string ack; recvLine(g_piper_sock,ack,2000);
+                if(enable_net_sync&&g_cmd_sock!=INVALID_SOCKET){sendLineRaw(g_cmd_sock,"EXIT");this_thread::sleep_for(chrono::milliseconds(200));}
+                global_running=false;
+            }else{if(g_fault_active.load())global_running=false;}
+        }else if(g_fault_active.load()){}
+        else if(g_delay_pending.load()){/* delay 等待期间仅 ESC/q 可用 */}
+        // ---- Master-only keys ----
+        else if(is_master_pc&&key=='s'&&!is_recording&&!is_dumping&&!g_piper_busy&&!g_show_over){
+            bool all_streaming=true;
+            for(auto& ctx:cam_ctxs) if(ctx->status.load()!=CamStatus::STREAMING){all_streaming=false;break;}
+            if(!all_streaming){cout<<"[s] Waiting for cameras to be STREAMING..."<<endl;goto next_iter;}
+            if((g_arm=="upper"&&g_upper_done)||(g_arm=="lower"&&g_lower_done)){
+                cout<<"[s] "<<g_arm<<" done - press T to switch arm"<<endl;goto next_iter;}
+            cout<<"[s] Starting session - moving "<<g_arm<<" to sentry target..."<<endl;
+            { cv::Mat loading=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
+              cv::putText(loading,"Waiting for arm to get in position...",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,200,255),2);
+              if(is_master_pc) drawLedIndicator(loading);
+              cv::putText(loading,"Arm: "+g_arm,cv::Point(g_win_w/4,g_win_h/2+40),cv::FONT_HERSHEY_SIMPLEX,0.7,cv::Scalar(255,255,255),1);
+              cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
+            ArmResult ar = moveArmToTarget();
+            if(ar==ArmResult::ARM_OK){
+                this_thread::sleep_for(chrono::milliseconds(200));
+                while(cv::waitKey(1)>=0){}   // 清空移动期间滞留的按键 (SPACE 仅 READY 内有效)
+                g_recording_enabled=true;
+                cout<<"[s] Session started. SPACE to record."<<endl;
+            } else if(ar==ArmResult::ARM_EXHAUSTED){
+                g_show_exhausted=true; g_recording_enabled=false;
+                cout<<"[s] "<<g_arm<<" exhausted. Press t or c."<<endl;
+            } else { cout<<"[s] Arm ERROR."<<endl; }
+        }
+        else if(is_master_pc&&key==' '
+                &&!is_recording&&!is_dumping&&!g_piper_busy&&!g_delay_pending
+                &&g_recording_enabled&&!g_show_over&&!g_show_exhausted&&!g_syncing.load()){
+            // SPACE 仅 READY 状态有效 (完整 READY 谓词; 状态切换处另有滞留按键清空)
+            g_e2e_start_us.store(nowUs());   // End-to-end 起点: SPACE 按下时刻
+            if(g_capture_delay>0.0){
+                // 进入 CAPTURING, 延迟 capture_delay 后再真正录制 (受试者聚焦十字中心)
+                setLedState(LedState::CAPTURING);
+                g_delay_start_us.store(nowUs());
+                g_delay_deadline_us.store(g_delay_start_us.load()+(int64_t)(g_capture_delay*1e6));
+                g_delay_pending.store(true);
+                cout<<"[Delay] Capturing - waiting "<<g_capture_delay<<"s before recording..."<<endl;
+            }else{
+                instantTrigger(); trigger_start=true;
+                if(enable_net_sync&&g_cmd_sock!=INVALID_SOCKET) sendLineRaw(g_cmd_sock,"TRIGGER");
+                cout<<"[Recording] Started."<<endl;
+            }
+        }
+        else if(is_master_pc&&(key=='b'||key=='B')&&!g_piper_busy&&!is_recording&&!is_dumping){
+            g_recording_enabled=false;               // 回零后需按 s 才能录制
+            g_show_exhausted=false;
+            setLedState(LedState::WAITING);          // 立刻进入 WAITING 状态
+            { cv::Mat loading=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
+              cv::putText(loading,"Zeroing arm...",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,200,255),2);
+              drawLedIndicator(loading);
+              cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
+            zeroArm(g_arm);
+            // 回零后按 h5 sentry 重估本臂进度 (已满 → 仍 OVER; 断点续录语义)
+            g_show_over = (armRecorded(g_arm) >= recordingsPerArm());
+            setLedState(LedState::PIPER_INIT);       // 回零完成 → INIT (按 s 开始录制)
+            while(cv::waitKey(1)>=0){}   // 清空回零期间滞留的按键 (SPACE 仅 READY 内有效)
+            cout<<"[Piper] "<<g_arm<<" zeroed. Press [s] to start session."<<endl;
+        }
+        else if(is_master_pc&&(key=='c'||key=='C')&&!g_piper_busy&&!is_recording&&!is_dumping&&!g_show_over){
+            // 两臂 piper sentry 一并清零 (否则另一臂 done 时 't' 无法切入, 也无法单独清它)
+            g_upper_idx=0; g_upper_done=false;
+            g_lower_idx=0; g_lower_done=false;
+            g_show_exhausted=false;
+            g_recording_enabled=false; updatePiperSentry();
+            syncPiperToSlave();
+            cout<<"[Piper] Both arms' sentry cleared (upper+lower)."<<endl;
+        }
+        else if(is_master_pc&&(key=='z'||key=='Z')&&!g_piper_busy&&!is_recording&&!is_dumping&&!g_syncing.load()){
+            // h5 sentry 回退一次录制 (READY 或 OVER): 只退写盘位置, 下一录同槽覆写;
+            // piper sentry 与臂目标序列不动 (重拍的是当前目标, 写入上一槽位)。
+            // OVER 态回退 (= 最后一录拍坏): 配额回退后自动解除 OVER 恢复 READY。
+            // 双机模式先令 Slave 回退, 发送失败则整体放弃 — 两机要么都退要么都不退
+            if(!g_recording_enabled&&!g_show_over)
+                cout<<"[z] ignored: only in READY/OVER state (press s to start session first)"<<endl;
+            else if(g_delay_pending.load()||g_show_exhausted)
+                cout<<"[z] ignored: busy (delay/exhausted)"<<endl;
+            else if((int64_t)g_chunk_idx*g_hdf5_chunk_capacity+g_frame_offset.load()<g_core_frames)
+                cout<<"[z] ignored: no completed recording to roll back"<<endl;
+            else if(enable_net_sync&&g_cmd_sock!=INVALID_SOCKET&&!sendLineRaw(g_cmd_sock,"SENTRY_RB"))
+                cerr<<"[z] SENTRY_RB send failed - rollback aborted (Slave not synced)"<<endl;
+            else{
+                rollbackH5Sentry();
+                if(g_show_over&&armRecorded(g_arm)<recordingsPerArm()){
+                    g_show_over=false;              // 最后一录回退 → 配额内, 解除 OVER
+                    g_recording_enabled=true;       // 恢复 READY (SPACE 可录)
+                }
+                cout<<"[z] h5 sentry -1 recording -> chunk="<<g_chunk_idx
+                    <<" offset="<<g_frame_offset.load()<<" (next recording overwrites)"
+                    <<(g_recording_enabled?"":" | still OVER")
+                    <<(enable_net_sync?" | SENTRY_RB sent":"")<<endl;
+            }
+        }
+        else if(is_master_pc&&(key=='i'||key=='I')&&!g_piper_busy&&!is_recording&&!is_dumping&&!g_precreating.load()){
+            // 提前创建 25×N 个 h5: 双机握手预检 → 各自串行创建 → 握手退出
+            // 已有 h5 → 补创建模式: precreateParallel 逐文件 exists 跳过, ACC_TRUNC 只作用于
+            // 新文件 (不碰已录数据) — 支持采集中途补建, 消除跨 chunk 边界的十几秒创建尖峰
+            if(anyLocalH5()) cout<<"[HDF5] Existing h5 on master — creating MISSING files only."<<endl;
+            if(!enable_net_sync){
+                // 单机模式: 直接创建 (无握手)
+                g_pre_phase=2;g_precreating=true;g_pre_local_done=false;
+                if(g_pre_thread.joinable())g_pre_thread.join();
+                g_pre_thread=thread([]{precreateParallel();g_pre_local_done=true;});
+            }else{
+                // 双机模式: 先握手检查 slave (已录数据只提示, 双端同样只建缺失)
+                g_pre_peer_clear=false;g_pre_peer_reject=false;
+                g_precreating=true;g_pre_phase=1;g_pre_t0=chrono::steady_clock::now();
+                sendLineRaw(g_cmd_sock,"PRECHECK_REQ");
+                cout<<"[HDF5] Pre-checking slave..."<<endl;
+            }
+        }
+        else if(is_master_pc&&(key=='t'||key=='T')){
+            // 守卫被挡时显式提示 (原来静默吞掉, 排障无从下手)
+            if(g_piper_busy)      cout<<"[t] ignored: arm busy (moving/zeroing/occlusion check)"<<endl;
+            else if(is_recording) cout<<"[t] ignored: recording in progress"<<endl;
+            else if(is_dumping)   cout<<"[t] ignored: HDF5 dump in progress (stuck? see [Sync]/[Sentry] lines)"<<endl;
+            else {
+            string new_arm=(g_arm=="upper")?"lower":"upper";
+            bool nd=(new_arm=="upper")?g_upper_done:g_lower_done;
+            if(nd){cout<<"[t] "<<new_arm<<" already done."<<endl;goto next_iter;}
+            g_recording_enabled=false;               // 切换后需按 s 才能录制
+            g_show_exhausted=false;
+            setLedState(LedState::WAITING);          // 立刻进入 WAITING 状态
+            { cv::Mat loading=cv::Mat::zeros(g_win_h,g_win_w,CV_8UC3);
+              cv::putText(loading,"Zeroing arm...",cv::Point(g_win_w/4,g_win_h/2),cv::FONT_HERSHEY_DUPLEX,0.9,cv::Scalar(0,200,255),2);
+              drawLedIndicator(loading);
+              cv::imshow("Multi-Cam Preview",loading);cv::waitKey(1); }
+            zeroArm(g_arm);
+            // 原来的机械臂 → INIT (其设备回到 INIT 图案; 即使已 OVER, 不在工作状态即显示蓝色)
+            if (g_arm == "upper") {
+                g_led_state_upper = LedState::PIPER_INIT;
+                sendLedPatternTo(g_led_upper, LedState::PIPER_INIT);
+            } else {
+                g_led_state_lower = LedState::PIPER_INIT;
+                sendLedPatternTo(g_led_lower, LedState::PIPER_INIT);
+            }
+            g_arm=new_arm;
+            if (h5FramesWritten() == 0) g_first_arm = new_arm;   // 数据为空: 切换即决定录制顺序
+            // 加载新臂的 OVER 状态 (h5 sentry 推导, 切多少次都一致)
+            g_show_over = (armRecorded(new_arm) >= recordingsPerArm());
+            if (g_show_over) {
+                setLedState(LedState::OVER);         // 新臂已 OVER → 彩流
+            } else {
+                setLedState(LedState::PIPER_INIT);   // 新臂 → INIT (按 s 开始录制)
+            }
+            syncPiperToSlave();
+            while(cv::waitKey(1)>=0){}   // 清空切臂/回零期间滞留的按键 (SPACE 仅 READY 内有效)
+            cout<<"[t] Switched to "<<g_arm<<" (press 's' to start session)"<<endl;
+            }
+        }
+
+        bool trig_fired = trigger_start || g_trigger_pending.exchange(false);
+        if((trig_fired||net_cmd_record.exchange(false))&&!is_recording&&!is_dumping){
+            if(is_master_pc&&trig_fired){
+                // 录制开始: 当前目标指令已被使用, 此时才推进 sentry (按 t/b 放弃时不推进)
+                int& idx=(g_arm=="upper")?g_upper_idx:g_lower_idx;
+                idx++; updatePiperSentry();
+            }
+            // 吞掉快速连按/自动重复的残留按键 (此时它们已无效), 防止 READY 下 SPACE 二次触发
+            while(cv::waitKey(1)>=0){}
+            current_record_timestr=shared_record_timestr;
+            record_start_time=global_record_start_time;
+            // End-to-end 起点兜底 (slave TRIGGER / 未走 SPACE 路径): 触发时刻
+            if(g_e2e_start_us.load()==0) g_e2e_start_us.store(nowUs());
+            is_recording=true; cout<<"[Info] Recording in progress..."<<endl;
+        }
+        next_iter:;
+    }
+
+    // ---- Cleanup ----
+    cout<<"[System] Shutting down..."<<endl;
+    if(g_pre_thread.joinable())g_pre_thread.join();   // HDF5 预创建线程
+    for(auto& ctx:cam_ctxs){ctx->running=false;ctx->copy_cv.notify_all();}
+    // 退出前熄灭两个 M5Stack
+    sendLedCmd(g_led_upper,"CLEAR");
+    sendLedCmd(g_led_lower,"CLEAR");
+    this_thread::sleep_for(chrono::milliseconds(50));   // 等待串口写出
+    if(g_led_upper!=INVALID_HANDLE_VALUE){CloseHandle(g_led_upper);g_led_upper=INVALID_HANDLE_VALUE;}
+    if(g_led_lower!=INVALID_HANDLE_VALUE){CloseHandle(g_led_lower);g_led_lower=INVALID_HANDLE_VALUE;}
+    if(g_piper_sock!=INVALID_SOCKET) closesocket(g_piper_sock);
+    if(g_gaze_sock!=INVALID_SOCKET) closesocket(g_gaze_sock);
+    if(g_gaze_listen_sock!=INVALID_SOCKET) closesocket(g_gaze_listen_sock);
+    global_running=false;
+    if(g_cmd_sock!=INVALID_SOCKET) closesocket(g_cmd_sock);
+    if(g_cmd_listen_sock!=INVALID_SOCKET) closesocket(g_cmd_listen_sock);  // 打断 accept
+    if(g_joints_listen_sock!=INVALID_SOCKET) closesocket(g_joints_listen_sock);  // 打断 joints accept
+    if(g_joints_sock!=INVALID_SOCKET) closesocket(g_joints_sock);
+    for(auto& ctx:cam_ctxs){
+        if(ctx->capture_thread.joinable())ctx->capture_thread.join();
+        if(ctx->copy_thread.joinable())ctx->copy_thread.join();
+    }
+    if(cmd_thread.joinable()) cmd_thread.join();
+    if(gaze_thread.joinable()) gaze_thread.join();
+    if(joints_thread.joinable()) joints_thread.join();
+    // 遮挡统计汇总 (Master; 每相机被遮挡目标数)
+    if (!g_occ_stats.empty()) {
+        cout << "\n=== Occlusion summary (targets with arm in frame) ===" << endl;
+        for (auto& cam : g_occ_cams) {
+            auto it = g_occ_stats.find(cam.sn);
+            cout << "  " << cam.sn << ": " << (it == g_occ_stats.end() ? 0 : it->second) << endl;
+        }
+    }
+    if(g_session_log.is_open()) g_session_log.close();
+    cv::destroyAllWindows(); Pylon::PylonTerminate();
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    return 0;
+}
