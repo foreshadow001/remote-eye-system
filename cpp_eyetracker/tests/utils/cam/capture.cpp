@@ -1037,6 +1037,8 @@ void syncPiperToSlave(bool send_init_ok=false) {
     char buf[64];
     snprintf(buf,sizeof(buf),"PIPER:active:%s",g_arm.c_str());
     sendLineRaw(g_cmd_sock,buf); this_thread::sleep_for(chrono::milliseconds(50));
+    snprintf(buf,sizeof(buf),"PIPER:first:%s",g_first_arm.c_str());   // 顺序锚点: slave 的
+    sendLineRaw(g_cmd_sock,buf); this_thread::sleep_for(chrono::milliseconds(50)); // armRecorded 与 master 一致
     snprintf(buf,sizeof(buf),"PIPER:upper:%d:%s",g_upper_idx,g_upper_done?"done":"ok");
     sendLineRaw(g_cmd_sock,buf); this_thread::sleep_for(chrono::milliseconds(50));
     snprintf(buf,sizeof(buf),"PIPER:lower:%d:%s",g_lower_idx,g_lower_done?"done":"ok");
@@ -1716,6 +1718,7 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
                     size_t c2=line.find(':',6); if(c2==string::npos) continue;
                     string an=line.substr(6,c2-6);
                     if(an=="active"){ g_arm=line.substr(c2+1); cout<<"[Cmd] PIPER active="<<g_arm<<endl; }
+                    else if(an=="first"){ g_first_arm=line.substr(c2+1); cout<<"[Cmd] PIPER first="<<g_first_arm<<endl; }
                     else {
                         int n=stoi(line.substr(c2+1,line.find(':',c2+1)-c2-1));
                         string st=line.substr(line.find_last_of(':')+1); bool d=(st=="done");
