@@ -314,6 +314,7 @@ vector<string> g_participant_roots; string g_sentry_root;
 int g_hdf5_chunk_capacity = 2000;
 int g_cam_w = 0, g_cam_h = 0;          // 相机分辨率 (main 加载, precreateParallel 用)
 string g_first_arm = "upper";              // 第一个 frames_per_arm 帧的归属臂 (detectFirstArm 填充)
+bool g_first_checked = false;              // 已从 h5 事实确定 (chunk0 不会变, 只推一次)
 int64_t h5FramesWritten() { return (int64_t)g_chunk_idx * g_hdf5_chunk_capacity + g_frame_offset.load(); }
 int recordingsPerArm() { return g_num_targets_per_arm; }
 int armRecorded(const string& a) {
@@ -345,10 +346,11 @@ static void detectFirstArm() {
         double v = 0;
         d.read(&v, H5::PredType::NATIVE_DOUBLE, mem, sp);
         g_first_arm = ((int)(v + 0.5) == 1) ? "lower" : "upper";
+        g_first_checked = true;                    // h5 事实已定 (权威, 覆盖任何 sync 预判)
         cout << "[Piper] first arm by h5 chunk0 occ_arm=" << (int)(v + 0.5)
              << " -> " << g_first_arm << endl;
     } catch (...) {
-        g_first_arm = g_arm;                       // 读失败保守取当前臂
+        g_first_arm = g_arm;                       // 读失败保守取当前臂 (下次再试)
     }
 }
 
@@ -1718,7 +1720,8 @@ void cmdWorker(bool is_master, const string& master_ip, int cmd_port) {
                     size_t c2=line.find(':',6); if(c2==string::npos) continue;
                     string an=line.substr(6,c2-6);
                     if(an=="active"){ g_arm=line.substr(c2+1); cout<<"[Cmd] PIPER active="<<g_arm<<endl; }
-                    else if(an=="first"){ g_first_arm=line.substr(c2+1); cout<<"[Cmd] PIPER first="<<g_first_arm<<endl; }
+                    else if(an=="first"){ if(!g_first_checked) g_first_arm=line.substr(c2+1);   // h5 事实已定则不覆盖
+                                          cout<<"[Cmd] PIPER first="<<g_first_arm<<(g_first_checked?" (kept h5 fact)":"")<<endl; }
                     else {
                         int n=stoi(line.substr(c2+1,line.find(':',c2+1)-c2-1));
                         string st=line.substr(line.find_last_of(':')+1); bool d=(st=="done");
@@ -2682,8 +2685,10 @@ int main() {
 
                 // Step 5: Increment sentry AFTER handshake
                 cout<<"[DEBUG-HDF5] frame_offset "<<g_frame_offset<<" -> "<<(g_frame_offset+core_frames)<<endl;
-                if(all_ok){g_frame_offset+=core_frames;if(g_frame_offset>=g_hdf5_chunk_capacity){g_chunk_idx++;g_frame_offset-=g_hdf5_chunk_capacity;}updateSentry(g_sentry_root);}
-                else{logException("WARN","hdf5","Child failures - sentry NOT updated");}
+                if(all_ok){g_frame_offset+=core_frames;if(g_frame_offset>=g_hdf5_chunk_capacity){g_chunk_idx++;g_frame_offset-=g_hdf5_chunk_capacity;}updateSentry(g_sentry_root);
+                    // 第一录落盘: 顺序自证 (slave 不依赖 PIPER:first 消息到达/部署版本,
+                    // 本地 chunk0 occ_arm 即权威事实; 已 checked 则跳过)
+                    if(!g_first_checked) detectFirstArm();}
 
                 // ---- Per-phase timing ----
                 auto d_par=chrono::duration<double>(t_arm_done-t_par0).count();
