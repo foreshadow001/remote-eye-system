@@ -196,3 +196,16 @@ upper250→lower250 两种纯两段式顺序; 交错段不在工况内出现)。
 — 调试用; 正式录制前 z 回退或清盘恢复两段式。
 
 测试: num_targets_per_arm=5 验证 lower-first 全流程 + 断点续录顺序自证。
+
+## 录制顺序翻转 — 收官 (2026-09-20)
+
+lower-first 双机验证通过。最终机制 (三层, h5 事实最高权威):
+1. master 主动同步: `PIPER:first:<arm>` 消息 (随 syncPiperToSlave 全时机携带)
+2. slave 自愈: 第一录落盘后 detectFirstArm() 读本地 chunk0 occ_arm,
+   一次即定 (g_first_checked) — 不依赖 master 部署版本/消息到达
+3. 优先级: sync 的 first 是 master 预判 (可能基于空数据), 不覆盖已自证的
+   h5 事实
+
+排障记录: 首轮 slave 仍 UPPER 递增 = master 未部署新 exe (不发 first 消息)。
+教训: 双机系统改协议/加消息时, 两台必须同时重编 — 本次新增的 slave 自愈层
+已把此类部署错位变成无害。
